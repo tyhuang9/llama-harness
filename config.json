@@ -1,0 +1,13 @@
+{
+  "ollama_endpoint": "http://localhost:11434",
+  "default_model": null,
+  "generation": {
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "max_tokens": 512
+  },
+  "logging_enabled": true,
+  "api_token": null,
+  "theme": "light"
+}
+

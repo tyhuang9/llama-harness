@@ -1,0 +1,16 @@
+{
+  "name": "@llama-harness/client",
+  "version": "0.1.0",
+  "description": "TypeScript client for the local llama-harness API",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  }
+}
+
