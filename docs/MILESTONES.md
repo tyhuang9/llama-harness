@@ -32,7 +32,7 @@ The repo was empty except for `.git`. `origin` exists, but `origin/main` was not
 - The server and UI are run as separate local processes.
 
 ### Commit / PR
-Pending local commit on `feature/initial-mvp`.
+Local implementation commit: `8336012`. PR not created yet.
 
 ## Milestone 1 - Ollama Connection
 
@@ -63,7 +63,7 @@ The server calls Ollama `/api/tags` for reachability and model listing. Health r
 - Verified locally with Ollama reporting one installed model, `qwen2.5:7b`.
 
 ### Commit / PR
-Pending local commit on `feature/initial-mvp`.
+Local implementation commit: `8336012`. PR not created yet.
 
 ## Milestone 2 - Basic Chat API
 
@@ -94,7 +94,7 @@ Chat requests can pass `messages` or a simple `prompt`. Each request can overrid
 - Non-streaming chat was smoke-tested with local `qwen2.5:7b`; streaming should still be tested manually with a longer prompt.
 
 ### Commit / PR
-Pending local commit on `feature/initial-mvp`.
+Local implementation commit: `8336012`. PR not created yet.
 
 ## Milestone 3 - Settings
 
@@ -124,7 +124,7 @@ Settings are persisted as pretty JSON. The server discovers `config.json` from t
 - The API token setting is persisted but not enforced.
 
 ### Commit / PR
-Pending local commit on `feature/initial-mvp`.
+Local implementation commit: `8336012`. PR not created yet.
 
 ## Milestone 4 - Lightweight Runs/Audit
 
@@ -155,7 +155,7 @@ The server keeps the most recent 100 runs in memory and appends to `runs.jsonl` 
 - Live run metadata was verified through `/api/runs` after a successful local chat smoke test.
 
 ### Commit / PR
-Pending local commit on `feature/initial-mvp`.
+Local implementation commit: `8336012`. PR not created yet.
 
 ## Milestone 5 - TypeScript Client
 
@@ -184,4 +184,4 @@ The SDK exposes `health`, `listModels`, `chat`, `streamChat`, `runs`, `settings`
 - Package publishing metadata is intentionally minimal.
 
 ### Commit / PR
-Pending local commit on `feature/initial-mvp`.
+Local implementation commit: `8336012`. PR not created yet.

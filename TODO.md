@@ -19,32 +19,33 @@
 
 ## In Progress
 
-- [ ] Initial MVP branch.
-  - Branch: feature/initial-mvp
-  - Owner: Codex
-  - Notes: Builds the server, admin UI, TypeScript client, and MVP docs.
+None.
 
 ## Completed
 
 - [x] ~~Create initial project structure.~~
-  - Completed in: pending local commit on `feature/initial-mvp`
+  - Completed in: `8336012`
   - Notes: Added `server/`, `admin-ui/`, `clients/ts/`, and `docs/`.
 
 - [x] ~~Implement Ollama-only MVP API surface.~~
-  - Completed in: pending local commit on `feature/initial-mvp`
+  - Completed in: `8336012`
   - Notes: Added health, models, chat, streaming chat, settings, runs, and tools placeholder endpoints.
 
 - [x] ~~Create minimal local admin UI.~~
-  - Completed in: pending local commit on `feature/initial-mvp`
+  - Completed in: `8336012`
   - Notes: Added dashboard, models, runs, tools, and settings views.
 
 - [x] ~~Create TypeScript client SDK skeleton.~~
-  - Completed in: pending local commit on `feature/initial-mvp`
+  - Completed in: `8336012`
   - Notes: Added health, listModels, chat, streamChat, runs, settings, and updateSettings helpers.
 
 - [x] ~~Verify the MVP against a live Ollama model on the target machine.~~
-  - Completed in: pending local commit on `feature/initial-mvp`
+  - Completed in: `8336012`
   - Notes: Verified `/health`, `/api/settings`, `/api/runs`, and `/api/chat` with local `qwen2.5:7b`.
+
+- [x] ~~Complete initial MVP branch.~~
+  - Completed in: `8336012`
+  - Notes: Built the server, admin UI, TypeScript client, and MVP docs on `feature/initial-mvp`.
 
 ## Backlog / Future
 
