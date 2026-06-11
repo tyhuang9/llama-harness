@@ -493,8 +493,8 @@ function Dashboard(props: {
         <StatCard label="Running tasks" value={runningTasks} hint="agent queue" />
         <StatCard label="Running sandboxes" value={runningSandboxes} hint="execution contexts" />
         <StatCard label="Pending approvals" value={props.approvals.length} hint="human review" />
-        <StatCard label="Completed" value={completedTasks} hint="sample task store" />
-        <StatCard label="Failed" value={failedTasks} hint="sample task store" />
+        <StatCard label="Completed" value={completedTasks} hint="local task state" />
+        <StatCard label="Failed" value={failedTasks} hint="local task state" />
       </section>
 
       <section className="two-column wide-left">
