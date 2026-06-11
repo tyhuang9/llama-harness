@@ -47,6 +47,14 @@ None.
   - Completed in: `8336012`
   - Notes: Built the server, admin UI, TypeScript client, and MVP docs on `feature/initial-mvp`.
 
+- [x] ~~Merge initial MVP into main.~~
+  - Completed in: local `main` branch at `41652ac`
+  - Notes: Created local `main` from the completed initial MVP branch because the repo had no existing main commit.
+
+- [x] ~~Add global instructions and admin UI refresh.~~
+  - Completed in: `144d739`
+  - Notes: Added global/request-specific LLM instructions and a softer dark admin UI.
+
 ## Backlog / Future
 
 - [ ] Add a production static-file mode for serving the built admin UI from the Rust server.

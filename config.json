@@ -6,8 +6,12 @@
     "top_p": 0.9,
     "max_tokens": 512
   },
+  "instructions": {
+    "enabled": false,
+    "system_prompt": "",
+    "tool_context": ""
+  },
   "logging_enabled": true,
   "api_token": null,
-  "theme": "light"
+  "theme": "dark"
 }
-

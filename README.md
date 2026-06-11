@@ -11,7 +11,7 @@ The API is the product. The admin UI is only a local configuration and inspectio
 - Minimal resource usage.
 - API-first integration surface for other local apps.
 - JSON config and optional JSONL logs instead of a database.
-- Simple black-on-white admin UI for local control.
+- Soft, low-noise admin UI for local control.
 
 ## MVP Scope
 
@@ -20,6 +20,7 @@ Implemented MVP capabilities:
 - Rust Axum server with health, model, chat, settings, runs, and tools-placeholder endpoints.
 - Ollama HTTP API integration using `http://localhost:11434` by default.
 - Config persistence in `config.json`.
+- Global instruction settings that can be prepended to every LLM run.
 - In-memory recent run history with optional append-only `runs.jsonl`.
 - Minimal React + TypeScript admin UI.
 - TypeScript client SDK for external apps.
@@ -89,7 +90,12 @@ The default Ollama endpoint is stored in `config.json`:
 ```json
 {
   "ollama_endpoint": "http://localhost:11434",
-  "default_model": null
+  "default_model": null,
+  "instructions": {
+    "enabled": false,
+    "system_prompt": "",
+    "tool_context": ""
+  }
 }
 ```
 
@@ -99,6 +105,32 @@ You can edit `config.json` directly or update settings through:
 curl -X PUT http://127.0.0.1:8787/api/settings \
   -H 'content-type: application/json' \
   -d '{"ollama_endpoint":"http://localhost:11434","default_model":"llama3.2"}'
+```
+
+## Configure Global Instructions
+
+Global instructions are saved in `config.json` and prepended as a system message for every chat, model test, and streaming chat request when enabled.
+
+```bash
+curl -X PUT http://127.0.0.1:8787/api/settings \
+  -H 'content-type: application/json' \
+  -d '{
+    "instructions": {
+      "enabled": true,
+      "system_prompt": "You are a careful local assistant.",
+      "tool_context": "summarize_note: summarize note text\nextract_actions: return action items"
+    }
+  }'
+```
+
+Apps can also pass request-specific instructions without changing the global config:
+
+```json
+{
+  "source_app": "note",
+  "prompt": "Extract action items from this note.",
+  "instructions": "Return only a checklist."
+}
 ```
 
 ## API Examples
@@ -131,6 +163,7 @@ curl -X POST http://127.0.0.1:8787/api/chat \
   -d '{
     "source_app": "note",
     "prompt": "Extract action items from this note.",
+    "instructions": "Return only actionable checklist items.",
     "model": "llama3.2"
   }'
 ```
@@ -161,6 +194,7 @@ const models = await harness.listModels();
 const result = await harness.chat({
   source_app: "note",
   prompt: "Summarize these notes.",
+  instructions: "Use terse bullet points.",
 });
 ```
 
@@ -169,7 +203,7 @@ const result = await harness.chat({
 - Ollama must already be installed and running locally.
 - No default model is selected until one is configured.
 - API token storage exists in settings, but request enforcement is not implemented in the MVP.
+- Instruction settings steer model behavior, but they do not implement real tool execution.
 - Run history is intentionally lightweight and capped in memory.
 - Streaming is a direct SSE bridge over Ollama chat chunks and should be treated as an MVP interface.
 - The admin UI is a local developer dashboard, not an embeddable product surface.
-

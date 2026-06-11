@@ -4,6 +4,12 @@ export type GenerationSettings = {
   max_tokens: number;
 };
 
+export type InstructionSettings = {
+  enabled: boolean;
+  system_prompt: string;
+  tool_context: string;
+};
+
 export type ChatMessage = {
   role: "system" | "user" | "assistant" | string;
   content: string;
@@ -14,6 +20,7 @@ export type ChatRequest = {
   source_app?: string;
   messages?: ChatMessage[];
   prompt?: string;
+  instructions?: string;
   generation?: GenerationSettings;
 };
 
@@ -77,6 +84,7 @@ export type Settings = {
   ollama_endpoint: string;
   default_model: string | null;
   generation: GenerationSettings;
+  instructions: InstructionSettings;
   logging_enabled: boolean;
   api_token: string | null;
   theme: string;
@@ -228,4 +236,3 @@ function parseSseChunk(chunk: string): StreamEvent | null {
     data: data.join("\n"),
   };
 }
-

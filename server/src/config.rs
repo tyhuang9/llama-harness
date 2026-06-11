@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub ollama_endpoint: String,
     pub default_model: Option<String>,
     pub generation: GenerationSettings,
+    pub instructions: InstructionSettings,
     pub logging_enabled: bool,
     pub api_token: Option<String>,
     pub theme: String,
@@ -25,15 +26,24 @@ pub struct GenerationSettings {
     pub max_tokens: u32,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InstructionSettings {
+    pub enabled: bool,
+    pub system_prompt: String,
+    pub tool_context: String,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             ollama_endpoint: "http://localhost:11434".to_string(),
             default_model: None,
             generation: GenerationSettings::default(),
+            instructions: InstructionSettings::default(),
             logging_enabled: true,
             api_token: None,
-            theme: "light".to_string(),
+            theme: "dark".to_string(),
         }
     }
 }
@@ -44,6 +54,16 @@ impl Default for GenerationSettings {
             temperature: 0.2,
             top_p: 0.9,
             max_tokens: 512,
+        }
+    }
+}
+
+impl Default for InstructionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            system_prompt: String::new(),
+            tool_context: String::new(),
         }
     }
 }
