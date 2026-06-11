@@ -219,4 +219,4 @@ Global instructions are stored in `config.json` under `instructions`. When enabl
 - Instructions describe available tools, but real tool execution remains out of scope for the MVP.
 
 ### Commit / PR
-Local implementation commit: `144d739`. PR not created yet.
+Local implementation commit: `33050fa`. PR not created yet.

@@ -52,7 +52,7 @@ None.
   - Notes: Created local `main` from the completed initial MVP branch because the repo had no existing main commit.
 
 - [x] ~~Add global instructions and admin UI refresh.~~
-  - Completed in: `144d739`
+  - Completed in: `33050fa`
   - Notes: Added global/request-specific LLM instructions and a softer dark admin UI.
 
 ## Backlog / Future
