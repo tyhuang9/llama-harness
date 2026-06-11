@@ -1,6 +1,6 @@
 {
   "ollama_endpoint": "http://localhost:11434",
-  "default_model": null,
+  "default_model": "qwen2.5:7b",
   "generation": {
     "temperature": 0.2,
     "top_p": 0.9,
