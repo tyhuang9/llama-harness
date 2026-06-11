@@ -1,0 +1,14 @@
+{
+  "name": "llama-harness-workspace",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run tauri:dev",
+    "api:dev": "cargo run --manifest-path server/Cargo.toml",
+    "web:dev": "npm --prefix admin-ui run dev",
+    "build": "npm --prefix admin-ui run build",
+    "desktop:before-dev": "node scripts/tauri-before-dev.mjs",
+    "tauri:dev": "cd desktop && npm exec tauri -- dev",
+    "tauri:build": "cd desktop && npm exec tauri -- build"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "@llama-harness/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.5"
+  }
+}
