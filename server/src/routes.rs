@@ -1,5 +1,5 @@
 use crate::{
-    config::{self, AppConfig, GenerationSettings},
+    config::{self, AppConfig, GenerationSettings, InstructionSettings},
     ollama::{ChatMessage, OllamaClient, OllamaModel},
     runs::{self, RunRecord, RunStatus},
 };
@@ -72,6 +72,7 @@ struct ChatRequest {
     source_app: Option<String>,
     messages: Option<Vec<ChatMessage>>,
     prompt: Option<String>,
+    instructions: Option<String>,
     generation: Option<GenerationSettings>,
 }
 
@@ -100,6 +101,7 @@ struct SettingsPatch {
     ollama_endpoint: Option<String>,
     default_model: Option<String>,
     generation: Option<GenerationSettings>,
+    instructions: Option<InstructionSettings>,
     logging_enabled: Option<bool>,
     api_token: Option<String>,
     theme: Option<String>,
@@ -383,6 +385,9 @@ async fn update_settings(
         if let Some(generation) = patch.generation {
             config.generation = generation;
         }
+        if let Some(instructions) = patch.instructions {
+            config.instructions = instructions;
+        }
         if let Some(logging_enabled) = patch.logging_enabled {
             config.logging_enabled = logging_enabled;
         }
@@ -505,6 +510,7 @@ struct ResolvedChat {
 async fn resolve_chat(state: &AppState, payload: ChatRequest) -> ApiResult<ResolvedChat> {
     let config = state.config.read().await.clone();
     let messages = normalize_messages(payload.messages, payload.prompt)?;
+    let messages = apply_instructions(&config.instructions, payload.instructions, messages);
     let model = payload
         .model
         .filter(|model| !model.trim().is_empty())
@@ -551,6 +557,51 @@ fn normalize_messages(
     ))
 }
 
+fn apply_instructions(
+    settings: &InstructionSettings,
+    request_instructions: Option<String>,
+    mut messages: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    let mut parts = Vec::new();
+
+    if settings.enabled {
+        push_trimmed(&mut parts, &settings.system_prompt);
+
+        let tool_context = settings.tool_context.trim();
+        if !tool_context.is_empty() {
+            parts.push(format!(
+                "Available tools and tool instructions:\n{tool_context}"
+            ));
+        }
+    }
+
+    if let Some(instructions) = request_instructions {
+        let instructions = instructions.trim();
+        if !instructions.is_empty() {
+            parts.push(format!("Request-specific instructions:\n{instructions}"));
+        }
+    }
+
+    if !parts.is_empty() {
+        messages.insert(
+            0,
+            ChatMessage {
+                role: "system".to_string(),
+                content: parts.join("\n\n"),
+            },
+        );
+    }
+
+    messages
+}
+
+fn push_trimmed(parts: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        parts.push(value.to_string());
+    }
+}
+
 async fn record_run(state: &AppState, record: RunRecord) {
     let logging_enabled = state.config.read().await.logging_enabled;
     {
@@ -568,7 +619,13 @@ async fn record_run(state: &AppState, record: RunRecord) {
 fn summarize_messages(messages: &[ChatMessage]) -> String {
     let joined = messages
         .iter()
-        .map(|message| format!("{}: {}", message.role, message.content.replace('\n', " ")))
+        .map(|message| {
+            if message.role == "system" {
+                "system: [instructions applied]".to_string()
+            } else {
+                format!("{}: {}", message.role, message.content.replace('\n', " "))
+            }
+        })
         .collect::<Vec<_>>()
         .join(" | ");
     truncate(&joined, 240)
@@ -589,4 +646,75 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Jso
             error: message.into(),
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applies_global_and_request_instructions_as_system_message() {
+        let settings = InstructionSettings {
+            enabled: true,
+            system_prompt: "You are a local automation assistant.".to_string(),
+            tool_context: "read_file: inspect a local file".to_string(),
+        };
+        let messages = apply_instructions(
+            &settings,
+            Some("Prefer concise answers.".to_string()),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Summarize this note.".to_string(),
+            }],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0]
+            .content
+            .contains("You are a local automation assistant."));
+        assert!(messages[0]
+            .content
+            .contains("Available tools and tool instructions"));
+        assert!(messages[0].content.contains("Prefer concise answers."));
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn request_instructions_apply_even_when_global_settings_are_disabled() {
+        let settings = InstructionSettings {
+            enabled: false,
+            system_prompt: "Ignored".to_string(),
+            tool_context: "Ignored".to_string(),
+        };
+        let messages = apply_instructions(
+            &settings,
+            Some("Use bullet points.".to_string()),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "List tasks.".to_string(),
+            }],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0].content.contains("Use bullet points."));
+        assert!(!messages[0].content.contains("Ignored"));
+    }
+
+    #[test]
+    fn run_summary_masks_instruction_text() {
+        let summary = summarize_messages(&[
+            ChatMessage {
+                role: "system".to_string(),
+                content: "Do not leak this instruction.".to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            },
+        ]);
+
+        assert_eq!(summary, "system: [instructions applied] | user: Hello");
+    }
 }

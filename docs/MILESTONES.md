@@ -185,3 +185,38 @@ The SDK exposes `health`, `listModels`, `chat`, `streamChat`, `runs`, `settings`
 
 ### Commit / PR
 Local implementation commit: `8336012`. PR not created yet.
+
+## Milestone 6 - Global Instructions and UI Refresh
+
+### Status
+Completed
+
+### Summary
+Adds persisted global instruction settings, request-specific chat instructions, and a softer dark admin UI with a dedicated Instructions page.
+
+### Files Changed
+- `config.json`
+- `server/src/config.rs`
+- `server/src/routes.rs`
+- `admin-ui/src/App.tsx`
+- `admin-ui/src/App.css`
+- `admin-ui/src/api.ts`
+- `clients/ts/src/index.ts`
+- `clients/ts/README.md`
+- `README.md`
+- `TODO.md`
+
+### Implementation Notes
+Global instructions are stored in `config.json` under `instructions`. When enabled, the server prepends them as a system message before forwarding chat requests to Ollama. Per-request `instructions` can also be supplied through the API and TypeScript client.
+
+### Manual Test Steps
+1. Run `cargo test` in `server/`.
+2. Run `npm run build` in `admin-ui/`.
+3. Run `npm run build` in `clients/ts/`.
+4. Update `/api/settings` with enabled instructions and verify `/api/settings` returns the saved values.
+
+### Known Issues / Follow-ups
+- Instructions describe available tools, but real tool execution remains out of scope for the MVP.
+
+### Commit / PR
+Local implementation commit: `33050fa`. PR not created yet.

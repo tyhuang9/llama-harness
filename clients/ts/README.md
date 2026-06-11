@@ -11,6 +11,7 @@ const health = await harness.health();
 const models = await harness.listModels();
 const response = await harness.chat({
   prompt: "Extract action items from this note.",
+  instructions: "Return only actionable checklist items.",
   source_app: "note",
 });
 ```
@@ -24,4 +25,3 @@ for await (const event of harness.streamChat({ prompt: "Write a short summary." 
   }
 }
 ```
-

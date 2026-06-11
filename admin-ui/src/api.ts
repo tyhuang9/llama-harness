@@ -4,10 +4,17 @@ export type GenerationSettings = {
   max_tokens: number;
 };
 
+export type InstructionSettings = {
+  enabled: boolean;
+  system_prompt: string;
+  tool_context: string;
+};
+
 export type Settings = {
   ollama_endpoint: string;
   default_model: string | null;
   generation: GenerationSettings;
+  instructions: InstructionSettings;
   logging_enabled: boolean;
   api_token: string | null;
   theme: string;
@@ -118,16 +125,16 @@ export const api = {
         source_app: "admin-ui",
       }),
     }),
-  chat: (prompt: string, model?: string) =>
+  chat: (prompt: string, model?: string, instructions?: string) =>
     request<ChatResponse>("/api/chat", {
       method: "POST",
       body: JSON.stringify({
         model,
         prompt,
+        instructions,
         source_app: "admin-ui",
       }),
     }),
   runs: (limit = 50) => request<{ runs: RunRecord[] }>(`/api/runs?limit=${limit}`),
   tools: () => request<unknown>("/api/tools"),
 };
-

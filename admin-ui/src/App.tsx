@@ -11,12 +11,13 @@ import {
   Settings,
 } from "./api";
 
-type Tab = "dashboard" | "models" | "runs" | "tools" | "settings";
+type Tab = "dashboard" | "models" | "runs" | "instructions" | "tools" | "settings";
 
 const tabs: Array<{ id: Tab; label: string }> = [
   { id: "dashboard", label: "Dashboard" },
   { id: "models", label: "Models" },
   { id: "runs", label: "Runs" },
+  { id: "instructions", label: "Instructions" },
   { id: "tools", label: "Tools" },
   { id: "settings", label: "Settings" },
 ];
@@ -38,6 +39,7 @@ export default function App() {
     () => runs.filter((run) => run.status === "failed").slice(0, 5),
     [runs],
   );
+  const activeTab = tabs.find((item) => item.id === tab) || tabs[0];
 
   async function refreshAll() {
     setError(null);
@@ -134,76 +136,95 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div>
+    <div className="app-shell" data-theme={settings?.theme || "dark"}>
+      <aside className="sidebar">
+        <div className="brand">
           <h1>llama-harness</h1>
-          <p>Local API control plane for Ollama-backed LLM runs</p>
+          <span className={health?.ollama_reachable ? "status-pill good-pill" : "status-pill bad-pill"}>
+            {health?.ollama_reachable ? "Ollama online" : "Ollama offline"}
+          </span>
         </div>
-        <button className="primary" type="button" onClick={refreshAll} disabled={busy}>
-          Refresh
-        </button>
-      </header>
 
-      <nav className="tabs" aria-label="Sections">
-        {tabs.map((item) => (
-          <button
-            key={item.id}
-            className={tab === item.id ? "active" : ""}
-            type="button"
-            onClick={() => setTab(item.id)}
-          >
-            {item.label}
+        <nav className="tabs" aria-label="Sections">
+          {tabs.map((item) => (
+            <button
+              key={item.id}
+              className={tab === item.id ? "active" : ""}
+              type="button"
+              onClick={() => setTab(item.id)}
+            >
+              {item.label}
+            </button>
+          ))}
+        </nav>
+
+        <div className="sidebar-footer">
+          <span>API</span>
+          <code>{getApiBase()}</code>
+        </div>
+      </aside>
+
+      <section className="workspace">
+        <header className="topbar">
+          <div>
+            <p className="eyebrow">Local Ollama Harness</p>
+            <h2>{activeTab.label}</h2>
+          </div>
+          <button className="primary" type="button" onClick={refreshAll} disabled={busy}>
+            Refresh
           </button>
-        ))}
-      </nav>
+        </header>
 
-      {error ? <div className="notice error">{error}</div> : null}
+        {error ? <div className="notice error">{error}</div> : null}
 
-      <main>
-        {tab === "dashboard" ? (
-          <Dashboard
-            health={health}
-            runs={runs}
-            recentErrors={recentErrors}
-            prompt={prompt}
-            setPrompt={setPrompt}
-            testModel={testModel}
-            setTestModel={setTestModel}
-            testResult={testResult}
-            onSubmit={runModelTest}
-            busy={busy}
-          />
-        ) : null}
+        <main>
+          {tab === "dashboard" ? (
+            <Dashboard
+              health={health}
+              runs={runs}
+              recentErrors={recentErrors}
+              prompt={prompt}
+              setPrompt={setPrompt}
+              testModel={testModel}
+              setTestModel={setTestModel}
+              testResult={testResult}
+              onSubmit={runModelTest}
+              busy={busy}
+            />
+          ) : null}
 
-        {tab === "models" ? (
-          <Models
-            models={models?.models || []}
-            defaultModel={models?.default_model || settings?.default_model || null}
-            onSelect={selectDefaultModel}
-            testModel={testModel}
-            setTestModel={setTestModel}
-            prompt={prompt}
-            setPrompt={setPrompt}
-            testResult={testResult}
-            onSubmit={runModelTest}
-            busy={busy}
-          />
-        ) : null}
+          {tab === "models" ? (
+            <Models
+              models={models?.models || []}
+              defaultModel={models?.default_model || settings?.default_model || null}
+              onSelect={selectDefaultModel}
+              testModel={testModel}
+              setTestModel={setTestModel}
+              prompt={prompt}
+              setPrompt={setPrompt}
+              testResult={testResult}
+              onSubmit={runModelTest}
+              busy={busy}
+            />
+          ) : null}
 
-        {tab === "runs" ? <Runs runs={runs} /> : null}
-        {tab === "tools" ? <Tools /> : null}
-        {tab === "settings" && settings ? (
-          <SettingsView
-            settings={settings}
-            setSettings={setSettings}
-            apiBaseInput={apiBaseInput}
-            setApiBaseInput={setApiBaseInput}
-            onSubmit={saveSettings}
-            busy={busy}
-          />
-        ) : null}
-      </main>
+          {tab === "runs" ? <Runs runs={runs} /> : null}
+          {tab === "instructions" && settings ? (
+            <InstructionsView settings={settings} setSettings={setSettings} onSubmit={saveSettings} busy={busy} />
+          ) : null}
+          {tab === "tools" ? <Tools /> : null}
+          {tab === "settings" && settings ? (
+            <SettingsView
+              settings={settings}
+              setSettings={setSettings}
+              apiBaseInput={apiBaseInput}
+              setApiBaseInput={setApiBaseInput}
+              onSubmit={saveSettings}
+              busy={busy}
+            />
+          ) : null}
+        </main>
+      </section>
     </div>
   );
 }
@@ -369,6 +390,64 @@ function Tools() {
   );
 }
 
+function InstructionsView(props: {
+  settings: Settings;
+  setSettings: (settings: Settings) => void;
+  onSubmit: (event: FormEvent) => void;
+  busy: boolean;
+}) {
+  const { settings, setSettings } = props;
+
+  function updateInstructions(next: Partial<Settings["instructions"]>) {
+    setSettings({
+      ...settings,
+      instructions: {
+        ...settings.instructions,
+        ...next,
+      },
+    });
+  }
+
+  return (
+    <section className="panel">
+      <div className="section-header">
+        <h2>Global Instructions</h2>
+        <label className="switch-row">
+          <input
+            type="checkbox"
+            checked={settings.instructions.enabled}
+            onChange={(event) => updateInstructions({ enabled: event.target.checked })}
+          />
+          Apply to every run
+        </label>
+      </div>
+      <form className="settings-form" onSubmit={props.onSubmit}>
+        <label>
+          System instructions
+          <textarea
+            value={settings.instructions.system_prompt}
+            onChange={(event) => updateInstructions({ system_prompt: event.target.value })}
+            placeholder="You are a careful local assistant. Follow the user's instructions exactly."
+            rows={8}
+          />
+        </label>
+        <label>
+          Tool instructions
+          <textarea
+            value={settings.instructions.tool_context}
+            onChange={(event) => updateInstructions({ tool_context: event.target.value })}
+            placeholder="summarize_note: summarize note text&#10;extract_actions: return action items from note content"
+            rows={8}
+          />
+        </label>
+        <button className="primary" type="submit" disabled={props.busy}>
+          Save instructions
+        </button>
+      </form>
+    </section>
+  );
+}
+
 function SettingsView(props: {
   settings: Settings;
   setSettings: (settings: Settings) => void;
@@ -455,6 +534,7 @@ function SettingsView(props: {
         <label>
           Theme
           <select value={settings.theme} onChange={(event) => setSettings({ ...settings, theme: event.target.value })}>
+            <option value="dark">dark</option>
             <option value="light">light</option>
           </select>
         </label>
@@ -573,4 +653,3 @@ function formatBytes(value?: number | null): string {
   }
   return `${size.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
-
