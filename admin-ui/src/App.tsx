@@ -1226,7 +1226,16 @@ function ModelsPage(props: {
   busy: boolean;
 }) {
   const routes = props.settings?.model_routes || [];
+  const [editingRouteId, setEditingRouteId] = useState<string | null>(null);
+  const selectedRoute = editingRouteId ? routes.find((route) => route.id === editingRouteId) || null : null;
   const litellmStatus = props.providerStatuses.find((provider) => provider.id === "litellm");
+  const ollamaStatus = props.providerStatuses.find((provider) => provider.id === "ollama");
+  const defaultProvider = props.settings?.default_provider || "ollama";
+  const defaultModel =
+    defaultProvider === "litellm"
+      ? props.settings?.litellm.default_model || props.settings?.default_model || props.defaultModel
+      : props.defaultModel || props.settings?.default_model;
+  const enabledRoutes = routes.filter((route) => route.enabled).length;
 
   function setRoutes(modelRoutes: ModelRoute[]) {
     if (!props.settings) {
@@ -1236,7 +1245,9 @@ function ModelsPage(props: {
   }
 
   function addRoute() {
-    setRoutes([...routes, createModelRoute("openai")]);
+    const route = createModelRoute("openai");
+    setRoutes([...routes, route]);
+    setEditingRouteId(route.id);
   }
 
   function updateRoute(id: string, patch: Partial<ModelRoute>) {
@@ -1245,123 +1256,114 @@ function ModelsPage(props: {
 
   function removeRoute(id: string) {
     setRoutes(routes.filter((route) => route.id !== id));
+    if (editingRouteId === id) {
+      setEditingRouteId(null);
+    }
   }
 
   return (
     <div className="stack">
+      <section className="model-summary-strip">
+        <div className="model-summary-tile">
+          <span>Default provider</span>
+          <strong>{labelize(defaultProvider)}</strong>
+          <small>{defaultModel || "not set"}</small>
+        </div>
+        <div className="model-summary-tile">
+          <span>LiteLLM gateway</span>
+          <div className="summary-status">
+            <StatusBadge status={litellmStatus?.healthy ? "online" : props.settings?.litellm.enabled ? "offline" : "neutral"} />
+          </div>
+          <small>{props.settings?.litellm.base_url || "not configured"}</small>
+        </div>
+        <div className="model-summary-tile">
+          <span>Routes</span>
+          <strong>{enabledRoutes}/{routes.length}</strong>
+          <small>enabled</small>
+        </div>
+        <div className="model-summary-tile">
+          <span>Ollama</span>
+          <div className="summary-status">
+            <StatusBadge status={ollamaStatus?.healthy ? "online" : "offline"} />
+          </div>
+          <small>{props.models.length} local models</small>
+        </div>
+      </section>
+
       {props.settings ? (
         <section className="panel">
           <div className="section-header">
             <div>
-              <h2>LiteLLM Model Routes</h2>
-              <p>{routes.length} configured routes</p>
+              <h2>LiteLLM Routes</h2>
+              <p>{enabledRoutes} enabled / {routes.length} total</p>
             </div>
             <div className="button-row">
               <StatusBadge status={litellmStatus?.healthy ? "online" : props.settings.litellm.enabled ? "offline" : "neutral"} />
+              <button type="button" onClick={props.generateLiteLlmConfig} disabled={props.busy || !routes.length}>
+                Generate config.yaml
+              </button>
               <button type="button" onClick={addRoute} disabled={props.busy}>
                 Add route
               </button>
             </div>
           </div>
 
-          <div className="example-grid">
-            <code>openai/&lt;model&gt;</code>
-            <code>anthropic/&lt;model&gt;</code>
-            <code>openrouter/&lt;provider&gt;/&lt;model&gt;</code>
-            <code>gemini/&lt;model&gt;</code>
+          <div className="table-scroll">
+            <table className="model-table">
+              <thead>
+                <tr>
+                  <th>Route</th>
+                  <th>Alias</th>
+                  <th>LiteLLM model</th>
+                  <th>Credentials</th>
+                  <th>Status</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {routes.map((route) => (
+                  <tr key={route.id}>
+                    <td data-label="Route">
+                      <strong>{route.display_name || "Untitled route"}</strong>
+                      <code>{route.provider_family}</code>
+                    </td>
+                    <td data-label="Alias">
+                      <code>{route.model_alias || "-"}</code>
+                    </td>
+                    <td data-label="LiteLLM model">
+                      <code>{route.litellm_model || "-"}</code>
+                      {route.api_base ? <p>{route.api_base}</p> : null}
+                    </td>
+                    <td data-label="Credentials">{route.api_key_env_var || "-"}</td>
+                    <td data-label="Status">
+                      <StatusBadge status={route.enabled ? "active" : "neutral"} />
+                    </td>
+                    <td data-label="Action">
+                      <div className="button-row table-actions">
+                        <button type="button" onClick={() => setEditingRouteId(route.id)} disabled={props.busy}>
+                          Edit
+                        </button>
+                        <button className="danger-outline" type="button" onClick={() => removeRoute(route.id)} disabled={props.busy}>
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+                {!routes.length ? (
+                  <tr>
+                    <td colSpan={6} className="empty-cell">
+                      No LiteLLM routes configured.
+                    </td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
           </div>
 
-          <div className="route-grid">
-            {routes.map((route) => (
-              <div className="route-card" key={route.id}>
-                <div className="section-header">
-                  <div>
-                    <code>{route.id}</code>
-                    <h3>{route.display_name || "Untitled route"}</h3>
-                    <p>{route.model_alias || "model alias required"}</p>
-                  </div>
-                  <div className="button-row">
-                    <label className="toggle-row inline">
-                      <input
-                        type="checkbox"
-                        checked={route.enabled}
-                        onChange={(event) => updateRoute(route.id, { enabled: event.target.checked })}
-                      />
-                      Enabled
-                    </label>
-                    <button className="danger-outline" type="button" onClick={() => removeRoute(route.id)} disabled={props.busy}>
-                      Delete
-                    </button>
-                  </div>
-                </div>
-                <div className="settings-form">
-                  <div className="field-row three">
-                    <label>
-                      Provider family
-                      <select
-                        value={route.provider_family}
-                        onChange={(event) => {
-                          const family = event.target.value;
-                          updateRoute(route.id, {
-                            provider_family: family,
-                            api_key_env_var: route.api_key_env_var || envVarForFamily(family),
-                          });
-                        }}
-                      >
-                        {litellmFamilies.map((family) => (
-                          <option key={family} value={family}>
-                            {family}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
-                      Display name
-                      <input value={route.display_name} onChange={(event) => updateRoute(route.id, { display_name: event.target.value })} />
-                    </label>
-                    <label>
-                      Model alias
-                      <input
-                        value={route.model_alias}
-                        onChange={(event) => updateRoute(route.id, { model_alias: event.target.value })}
-                        placeholder={`${route.provider_family}:model`}
-                      />
-                    </label>
-                  </div>
-                  <div className="field-row three">
-                    <label>
-                      LiteLLM model
-                      <input
-                        value={route.litellm_model}
-                        onChange={(event) => updateRoute(route.id, { litellm_model: event.target.value })}
-                        placeholder={litellmModelPlaceholder(route.provider_family)}
-                      />
-                    </label>
-                    <label>
-                      API key env var
-                      <input value={route.api_key_env_var} onChange={(event) => updateRoute(route.id, { api_key_env_var: event.target.value })} />
-                    </label>
-                    <label>
-                      API base
-                      <input value={route.api_base || ""} onChange={(event) => updateRoute(route.id, { api_base: event.target.value || null })} />
-                    </label>
-                  </div>
-                  <label>
-                    Notes
-                    <input value={route.notes || ""} onChange={(event) => updateRoute(route.id, { notes: event.target.value || null })} />
-                  </label>
-                </div>
-              </div>
-            ))}
-            {!routes.length ? <p className="empty">No LiteLLM routes configured.</p> : null}
-          </div>
-
-          <div className="form-actions">
-            <button type="button" onClick={props.generateLiteLlmConfig} disabled={props.busy}>
-              Generate config.yaml
-            </button>
+          <div className="form-actions route-save-row">
             <button className="primary" type="button" onClick={props.saveSettings} disabled={props.busy}>
-              Save model routes
+              Save routes
             </button>
           </div>
           {props.litellmConfigResult ? (
@@ -1370,70 +1372,135 @@ function ModelsPage(props: {
         </section>
       ) : null}
 
-      <section className="panel">
-        <div className="section-header">
-          <h2>Ollama Models</h2>
-          <p>Backed by the existing llama-harness API.</p>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Family</th>
-              <th>Size</th>
-              <th>Quantization</th>
-              <th>Default</th>
-              <th>Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {props.models.map((model) => (
-              <tr key={model.name}>
-                <td>{model.name}</td>
-                <td>{model.details?.family || "-"}</td>
-                <td>{formatBytes(model.size)}</td>
-                <td>{model.details?.quantization_level || "-"}</td>
-                <td>{props.defaultModel === model.name ? "yes" : "no"}</td>
-                <td>
-                  <button type="button" onClick={() => props.selectDefaultModel(model.name)} disabled={props.busy}>
-                    Set default
-                  </button>
-                </td>
-              </tr>
-            ))}
-            {!props.models.length ? (
-              <tr>
-                <td colSpan={6} className="empty-cell">
-                  No models returned by Ollama.
-                </td>
-              </tr>
-            ) : null}
-          </tbody>
-        </table>
-      </section>
-
-      {props.settings ? (
-        <section className="panel">
+      {selectedRoute ? (
+        <section className="panel route-editor-panel">
           <div className="section-header">
-            <h2>Default Model Per Environment</h2>
-          </div>
-          <div className="settings-form">
-            {["Planner", "Browser sandbox", "Computer-use sandbox", "Local desktop"].map((environment, index) => (
-              <label key={environment}>
-                {environment}
+            <div>
+              <h2>Edit Route</h2>
+              <p>{selectedRoute.model_alias || selectedRoute.id}</p>
+            </div>
+            <div className="button-row">
+              <label className="toggle-row inline">
                 <input
-                  value={index === 3 ? props.settings?.default_model || "" : defaultEnvironmentModel(environment)}
+                  type="checkbox"
+                  checked={selectedRoute.enabled}
+                  onChange={(event) => updateRoute(selectedRoute.id, { enabled: event.target.checked })}
+                />
+                Enabled
+              </label>
+              <button type="button" onClick={() => setEditingRouteId(null)}>
+                Close
+              </button>
+            </div>
+          </div>
+          <div className="settings-form compact-form">
+            <div className="field-row three">
+              <label>
+                Provider family
+                <select
+                  value={selectedRoute.provider_family}
                   onChange={(event) => {
-                    if (index === 3 && props.settings) {
-                      props.setSettings({ ...props.settings, default_model: event.target.value || null });
-                    }
+                    const family = event.target.value;
+                    updateRoute(selectedRoute.id, {
+                      provider_family: family,
+                      api_key_env_var: selectedRoute.api_key_env_var || envVarForFamily(family),
+                    });
                   }}
+                >
+                  {litellmFamilies.map((family) => (
+                    <option key={family} value={family}>
+                      {family}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Display name
+                <input value={selectedRoute.display_name} onChange={(event) => updateRoute(selectedRoute.id, { display_name: event.target.value })} />
+              </label>
+              <label>
+                Model alias
+                <input
+                  value={selectedRoute.model_alias}
+                  onChange={(event) => updateRoute(selectedRoute.id, { model_alias: event.target.value })}
+                  placeholder={`${selectedRoute.provider_family}:model`}
                 />
               </label>
-            ))}
+            </div>
+            <div className="field-row three">
+              <label>
+                LiteLLM model
+                <input
+                  value={selectedRoute.litellm_model}
+                  onChange={(event) => updateRoute(selectedRoute.id, { litellm_model: event.target.value })}
+                  placeholder={litellmModelPlaceholder(selectedRoute.provider_family)}
+                />
+              </label>
+              <label>
+                API key env var
+                <input
+                  value={selectedRoute.api_key_env_var}
+                  onChange={(event) => updateRoute(selectedRoute.id, { api_key_env_var: event.target.value })}
+                />
+              </label>
+              <label>
+                API base
+                <input value={selectedRoute.api_base || ""} onChange={(event) => updateRoute(selectedRoute.id, { api_base: event.target.value || null })} />
+              </label>
+            </div>
+            <label>
+              Notes
+              <input value={selectedRoute.notes || ""} onChange={(event) => updateRoute(selectedRoute.id, { notes: event.target.value || null })} />
+            </label>
           </div>
         </section>
       ) : null}
+
+      <section className="panel">
+        <div className="section-header">
+          <div>
+            <h2>Local Ollama Inventory</h2>
+            <p>{props.models.length} models returned by Ollama</p>
+          </div>
+        </div>
+        <div className="table-scroll">
+          <table className="model-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Family</th>
+                <th>Size</th>
+                <th>Quantization</th>
+                <th>Default</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {props.models.map((model) => (
+                <tr key={model.name}>
+                  <td data-label="Name">{model.name}</td>
+                  <td data-label="Family">{model.details?.family || "-"}</td>
+                  <td data-label="Size">{formatBytes(model.size)}</td>
+                  <td data-label="Quantization">{model.details?.quantization_level || "-"}</td>
+                  <td data-label="Default">{props.defaultModel === model.name ? "yes" : "no"}</td>
+                  <td data-label="Action">
+                    <button type="button" onClick={() => props.selectDefaultModel(model.name)} disabled={props.busy}>
+                      Set default
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {!props.models.length ? (
+                <tr>
+                  <td colSpan={6} className="empty-cell">
+                    No models returned by Ollama.
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+      </section>
 
       <section className="panel">
         <div className="section-header">
@@ -2107,19 +2174,6 @@ function environmentDescription(environment: Environment): string {
       return "Trusted local desktop. Highest risk.";
     default:
       return "";
-  }
-}
-
-function defaultEnvironmentModel(environment: string): string {
-  switch (environment) {
-    case "Planner":
-      return "claude-sonnet-4.5";
-    case "Browser sandbox":
-      return "gpt-5";
-    case "Computer-use sandbox":
-      return "claude-opus-4";
-    default:
-      return "llama3.3:70b";
   }
 }
 

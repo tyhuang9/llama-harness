@@ -440,12 +440,28 @@ tr:last-child td {
   gap: 10px;
 }
 
+.model-summary-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .stat-card {
   min-height: 104px;
   padding: 14px;
 }
 
-.stat-card span {
+.model-summary-tile {
+  min-width: 0;
+  min-height: 104px;
+  border: 1px solid #252923;
+  border-radius: 8px;
+  padding: 14px;
+  background: #111310;
+}
+
+.stat-card span,
+.model-summary-tile span {
   display: block;
   color: #999589;
   font-size: 12px;
@@ -453,7 +469,8 @@ tr:last-child td {
   text-transform: uppercase;
 }
 
-.stat-card strong {
+.stat-card strong,
+.model-summary-tile strong {
   display: block;
   margin-top: 10px;
   color: #fffaf0;
@@ -461,10 +478,24 @@ tr:last-child td {
   line-height: 1;
 }
 
-.stat-card small {
+.model-summary-tile strong {
+  overflow-wrap: anywhere;
+  font-size: 23px;
+}
+
+.stat-card small,
+.model-summary-tile small {
   display: block;
   margin-top: 7px;
+  overflow-wrap: anywhere;
   color: #817d73;
+}
+
+.summary-status {
+  display: flex;
+  align-items: center;
+  min-height: 33px;
+  margin-top: 6px;
 }
 
 .status-grid {
@@ -719,42 +750,31 @@ button.chip.active {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
-.example-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
-  margin-bottom: 14px;
+.table-scroll {
+  overflow-x: auto;
+  margin: 0 -16px -16px;
+  scrollbar-gutter: stable;
 }
 
-.example-grid code,
-.route-card {
-  border: 1px solid #282e28;
-  border-radius: 8px;
-  background: #0f110f;
+.table-scroll table {
+  min-width: 780px;
 }
 
-.example-grid code {
-  display: block;
-  min-width: 0;
-  padding: 9px 10px;
-  overflow-wrap: anywhere;
-  color: #a7d7ba;
-  font-size: 12px;
+.table-actions {
+  flex-wrap: nowrap;
 }
 
-.route-grid {
-  display: grid;
+.route-save-row {
+  margin-top: 12px;
+}
+
+.route-editor-panel {
+  border-color: #343932;
+  background: #121511;
+}
+
+.compact-form {
   gap: 12px;
-  margin-bottom: 14px;
-}
-
-.route-card {
-  padding: 14px;
-}
-
-.route-card h3 {
-  color: #f0ece4;
-  font-size: 15px;
 }
 
 .permission-list {
@@ -967,6 +987,10 @@ button.chip.active {
   .metric-strip {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+
+  .model-summary-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 700px) {
@@ -994,13 +1018,68 @@ button.chip.active {
   }
 
   .metric-strip,
+  .model-summary-strip,
   .status-grid,
-  .example-grid,
   .field-row,
   .field-row.three,
   .tabs,
   .timeline {
     grid-template-columns: 1fr;
+  }
+
+  .table-actions {
+    flex-wrap: wrap;
+  }
+
+  .table-scroll {
+    overflow-x: visible;
+  }
+
+  .table-scroll .model-table {
+    min-width: 0;
+  }
+
+  .model-table thead {
+    display: none;
+  }
+
+  .model-table tbody,
+  .model-table tr,
+  .model-table td {
+    display: block;
+  }
+
+  .model-table tr {
+    border-bottom: 1px solid #252923;
+    padding: 12px 14px;
+  }
+
+  .model-table tr:last-child {
+    border-bottom: 0;
+  }
+
+  .model-table td {
+    border-bottom: 0;
+    padding: 6px 0;
+  }
+
+  .model-table td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 4px;
+    color: #918d82;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .model-table td.empty-cell::before {
+    display: none;
+    content: "";
+  }
+
+  .model-table .table-actions {
+    justify-content: flex-start;
   }
 
   th,
