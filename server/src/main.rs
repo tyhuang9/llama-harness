@@ -1,4 +1,5 @@
 mod config;
+mod litellm;
 mod ollama;
 mod providers;
 mod routes;

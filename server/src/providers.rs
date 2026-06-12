@@ -1,5 +1,6 @@
 use crate::{
     config::{AppConfig, GenerationSettings},
+    litellm::LiteLlmProvider,
     ollama::{OllamaClient, OllamaModel, OllamaProvider},
 };
 use anyhow::Result;
@@ -38,6 +39,10 @@ impl ProviderRegistry {
                 self.ollama_client.clone(),
                 config.ollama_endpoint.clone(),
             ))),
+            "litellm" => Some(Arc::new(LiteLlmProvider::new(
+                config.litellm.clone(),
+                config.model_routes.clone(),
+            ))),
             _ => None,
         }
     }
@@ -45,6 +50,12 @@ impl ProviderRegistry {
     pub async fn list_ollama_models(&self, config: &AppConfig) -> Result<Vec<OllamaModel>> {
         self.ollama_client
             .list_models(&config.ollama_endpoint)
+            .await
+    }
+
+    pub async fn litellm_healthy(&self, config: &AppConfig) -> bool {
+        LiteLlmProvider::new(config.litellm.clone(), config.model_routes.clone())
+            .health()
             .await
     }
 }
@@ -115,7 +126,7 @@ impl ProviderChatRequest {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
@@ -167,6 +178,7 @@ mod tests {
         let config = AppConfig::default();
 
         assert!(registry.get("ollama", &config).is_some());
+        assert!(registry.get("litellm", &config).is_some());
         assert!(registry.get("missing", &config).is_none());
     }
 }
