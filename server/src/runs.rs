@@ -1,3 +1,4 @@
+use crate::providers::TokenUsage;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,8 @@ use tokio::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunRecord {
     pub id: String,
+    #[serde(default = "default_provider")]
+    pub provider: String,
     pub model: String,
     pub source_app: Option<String>,
     pub prompt_summary: String,
@@ -19,6 +22,8 @@ pub struct RunRecord {
     pub ended_at: DateTime<Utc>,
     pub duration_ms: u64,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26,6 +31,10 @@ pub struct RunRecord {
 pub enum RunStatus {
     Completed,
     Failed,
+}
+
+fn default_provider() -> String {
+    "ollama".to_string()
 }
 
 pub async fn load_runs(path: &Path, max_records: usize) -> Result<VecDeque<RunRecord>> {

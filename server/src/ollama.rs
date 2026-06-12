@@ -1,5 +1,13 @@
-use crate::config::GenerationSettings;
+use crate::{
+    config::GenerationSettings,
+    providers::{
+        ChatMessage, ModelProvider, ProviderChatRequest, ProviderChatResponse, ProviderEventStream,
+        ProviderStreamEvent, TokenUsage,
+    },
+};
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -9,18 +17,24 @@ pub struct OllamaClient {
     http: Client,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
+#[derive(Clone)]
+pub struct OllamaProvider {
+    client: OllamaClient,
+    endpoint: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct OllamaChatRequest {
     pub model: String,
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<OllamaWireMessage>,
     pub stream: bool,
     pub options: OllamaOptions,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OllamaWireMessage {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,7 +119,7 @@ impl OllamaClient {
     ) -> Result<OllamaChatResponse> {
         let request = OllamaChatRequest {
             model,
-            messages,
+            messages: to_ollama_messages(&messages),
             stream: false,
             options: generation.into(),
         };
@@ -134,7 +148,7 @@ impl OllamaClient {
     ) -> Result<Response> {
         let request = OllamaChatRequest {
             model,
-            messages,
+            messages: to_ollama_messages(&messages),
             stream: true,
             options: generation.into(),
         };
@@ -151,6 +165,74 @@ impl OllamaClient {
     }
 }
 
+impl OllamaProvider {
+    pub fn new(client: OllamaClient, endpoint: String) -> Self {
+        Self { client, endpoint }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OllamaProvider {
+    fn id(&self) -> &'static str {
+        "ollama"
+    }
+
+    async fn chat_completion(&self, request: ProviderChatRequest) -> Result<ProviderChatResponse> {
+        let _ = (
+            &request.provider,
+            &request.tools,
+            &request.tool_choice,
+            request.stream,
+            &request.metadata,
+        );
+        let generation = request.generation_settings();
+        let response = self
+            .client
+            .chat(
+                &self.endpoint,
+                request.model.clone(),
+                request.messages,
+                generation,
+            )
+            .await?;
+
+        let content = response
+            .message
+            .as_ref()
+            .map(ChatMessage::content_text)
+            .unwrap_or_default();
+
+        Ok(ProviderChatResponse {
+            content,
+            tool_calls: None,
+            usage: usage_from_ollama_response(&response),
+            model: response.model.or(Some(request.model)),
+            provider: Some(self.id().to_string()),
+            raw_response: None,
+        })
+    }
+
+    async fn stream_chat_completion(
+        &self,
+        request: ProviderChatRequest,
+    ) -> Result<ProviderEventStream> {
+        let _ = (
+            &request.provider,
+            &request.tools,
+            &request.tool_choice,
+            request.stream,
+            &request.metadata,
+        );
+        let generation = request.generation_settings();
+        let response = self
+            .client
+            .chat_stream(&self.endpoint, request.model, request.messages, generation)
+            .await?;
+
+        Ok(parse_ollama_stream(response))
+    }
+}
+
 impl From<GenerationSettings> for OllamaOptions {
     fn from(settings: GenerationSettings) -> Self {
         Self {
@@ -158,6 +240,108 @@ impl From<GenerationSettings> for OllamaOptions {
             top_p: settings.top_p,
             num_predict: settings.max_tokens,
         }
+    }
+}
+
+fn to_ollama_messages(messages: &[ChatMessage]) -> Vec<OllamaWireMessage> {
+    messages
+        .iter()
+        .map(|message| OllamaWireMessage {
+            role: message.role.clone(),
+            content: message.content_text(),
+        })
+        .collect()
+}
+
+fn parse_ollama_stream(response: Response) -> ProviderEventStream {
+    Box::pin(async_stream::stream! {
+        let mut bytes = response.bytes_stream();
+        let mut buffer = String::new();
+
+        while let Some(chunk) = bytes.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(index) = buffer.find('\n') {
+                        let line = buffer[..index].trim().to_string();
+                        buffer.drain(..=index);
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        match serde_json::from_str::<serde_json::Value>(&line) {
+                            Ok(value) => {
+                                if let Some(content) = value
+                                    .pointer("/message/content")
+                                    .and_then(|value| value.as_str())
+                                    .filter(|content| !content.is_empty()) {
+                                    yield ProviderStreamEvent::Token {
+                                        content: content.to_string(),
+                                    };
+                                }
+
+                                if value
+                                    .get("done")
+                                    .and_then(|value| value.as_bool())
+                                    .unwrap_or(false) {
+                                    yield ProviderStreamEvent::Done {
+                                        usage: usage_from_ollama_value(&value),
+                                        raw: None,
+                                    };
+                                }
+                            }
+                            Err(_) => {
+                                yield ProviderStreamEvent::Raw { data: line };
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    yield ProviderStreamEvent::Error {
+                        error: err.to_string(),
+                    };
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn usage_from_ollama_response(response: &OllamaChatResponse) -> Option<TokenUsage> {
+    let usage = TokenUsage {
+        input_tokens: response.prompt_eval_count,
+        output_tokens: response.eval_count,
+        total_tokens: sum_tokens(response.prompt_eval_count, response.eval_count),
+    };
+    usage_if_present(usage)
+}
+
+fn usage_from_ollama_value(value: &serde_json::Value) -> Option<TokenUsage> {
+    let input_tokens = value
+        .get("prompt_eval_count")
+        .and_then(|value| value.as_u64());
+    let output_tokens = value.get("eval_count").and_then(|value| value.as_u64());
+    let usage = TokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens: sum_tokens(input_tokens, output_tokens),
+    };
+    usage_if_present(usage)
+}
+
+fn usage_if_present(usage: TokenUsage) -> Option<TokenUsage> {
+    if usage.input_tokens.is_some() || usage.output_tokens.is_some() || usage.total_tokens.is_some()
+    {
+        Some(usage)
+    } else {
+        None
+    }
+}
+
+fn sum_tokens(input_tokens: Option<u64>, output_tokens: Option<u64>) -> Option<u64> {
+    match (input_tokens, output_tokens) {
+        (Some(input), Some(output)) => Some(input + output),
+        _ => None,
     }
 }
 

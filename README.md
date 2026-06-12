@@ -1,13 +1,13 @@
 # llama-harness
 
-llama-harness is a lightweight local AI harness service for managing local LLM usage through a stable HTTP/SSE API. It connects to a locally running Ollama instance and gives other local apps a small control plane for model selection, request execution, run visibility, and settings.
+llama-harness is a lightweight local AI harness service for managing local and gateway-backed LLM usage through a stable HTTP/SSE API. It connects directly to a locally running Ollama instance and can route cloud-provider models through a local LiteLLM Proxy.
 
 The API is the product. The admin UI is only a local configuration and inspection dashboard.
 
 ## Project Goals
 
 - Local-first operation.
-- Ollama-only model provider for the MVP.
+- Direct Ollama support plus LiteLLM gateway routing for cloud providers.
 - Minimal resource usage.
 - API-first integration surface for other local apps.
 - JSON config and optional JSONL logs instead of a database.
@@ -19,6 +19,7 @@ Implemented MVP capabilities:
 
 - Rust Axum server with health, model, chat, settings, runs, and tools-placeholder endpoints.
 - Ollama HTTP API integration using `http://localhost:11434` by default.
+- LiteLLM Proxy integration using `http://127.0.0.1:4000` by default.
 - Config persistence in `config.json`.
 - Global instruction settings that can be prepended to every LLM run.
 - In-memory recent run history with optional append-only `runs.jsonl`.
@@ -27,7 +28,6 @@ Implemented MVP capabilities:
 
 Out of scope for the MVP:
 
-- Cloud model providers such as OpenAI, Anthropic, Gemini, or hosted inference APIs.
 - OAuth, users, teams, billing, cloud sync, and remote deployment.
 - SQLite or any other database.
 - Complex auth, plugin marketplace, MCP gateway, full agent framework, or complex eval framework.
@@ -106,6 +106,91 @@ curl -X PUT http://127.0.0.1:8787/api/settings \
   -H 'content-type: application/json' \
   -d '{"ollama_endpoint":"http://localhost:11434","default_model":"llama3.2"}'
 ```
+
+## Configure LiteLLM
+
+LiteLLM mode keeps llama-harness focused on one internal model-provider abstraction while letting LiteLLM handle OpenAI, Anthropic, OpenRouter, Gemini, and future cloud providers. Ollama remains the local direct provider; cloud services should usually be added as LiteLLM routes rather than as separate Rust clients.
+
+Run a LiteLLM Proxy locally and pin the image or package version for durable setups. The default proxy URL is:
+
+```text
+http://127.0.0.1:4000
+```
+
+Typical environment variables:
+
+```bash
+LITELLM_MASTER_KEY=...
+OPENAI_API_KEY=...
+ANTHROPIC_API_KEY=...
+OPENROUTER_API_KEY=...
+GEMINI_API_KEY=...
+```
+
+In the admin UI, open Settings to enable LiteLLM, set the proxy base URL, set an optional LiteLLM master key, and choose a default LiteLLM model alias. Open Models to add model routes. Route examples:
+
+```text
+openai:gpt-4o        -> openai/gpt-4o
+anthropic:claude     -> anthropic/<model>
+openrouter:claude    -> openrouter/<provider>/<model>
+gemini:flash         -> gemini/<model>
+```
+
+Keep the LiteLLM proxy checkout separate from this repository. A sibling folder works well:
+
+```bash
+git clone https://github.com/BerriAI/litellm.git ../litellm
+```
+
+When `managed_config_path` is relative, llama-harness resolves it relative to `config.json`, so `../litellm/llama-harness-litellm.local.yaml` keeps proxy config with the LiteLLM checkout.
+
+Generate a LiteLLM config from configured routes:
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/litellm/config/generate \
+  -H 'content-type: application/json' \
+  -d '{"output_path":"litellm.config.yaml"}'
+```
+
+Generated configs reference environment variables, not raw provider keys:
+
+```yaml
+model_list:
+  - model_name: openai:gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+```
+
+Test a LiteLLM model route:
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/providers/litellm/test \
+  -H 'content-type: application/json' \
+  -d '{"model":"openai:gpt-4o","message":"Say hello from llama-harness."}'
+```
+
+Call chat through LiteLLM:
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/chat \
+  -H 'content-type: application/json' \
+  -d '{
+    "provider": "litellm",
+    "model": "openai:gpt-4o",
+    "messages": [
+      { "role": "user", "content": "Write a quick project summary." }
+    ],
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "max_tokens": 2048
+  }'
+```
+
+Ollama still works the same way for local models. Existing clients that omit `provider` continue to use `default_provider`, which defaults to `ollama`.
 
 ## Configure Global Instructions
 
@@ -201,9 +286,10 @@ const result = await harness.chat({
 ## Current Limitations
 
 - Ollama must already be installed and running locally.
+- LiteLLM Proxy must already be running locally for gateway models.
 - No default model is selected until one is configured.
 - API token storage exists in settings, but request enforcement is not implemented in the MVP.
 - Instruction settings steer model behavior, but they do not implement real tool execution.
 - Run history is intentionally lightweight and capped in memory.
-- Streaming is a direct SSE bridge over Ollama chat chunks and should be treated as an MVP interface.
+- Streaming is an SSE bridge over provider chat chunks and should be treated as an MVP interface.
 - The admin UI is a local developer dashboard, not an embeddable product surface.

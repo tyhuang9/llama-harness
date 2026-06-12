@@ -1,6 +1,14 @@
 use crate::{
-    config::{self, AppConfig, GenerationSettings, InstructionSettings},
-    ollama::{ChatMessage, OllamaClient, OllamaModel},
+    config::{
+        self, AppConfig, GenerationSettings, InstructionSettings, LiteLlmSettings, ModelRoute,
+        REDACTED_SECRET,
+    },
+    litellm::generate_litellm_config,
+    ollama::OllamaModel,
+    providers::{
+        ChatMessage, ModelProvider, ProviderChatRequest, ProviderRegistry, ProviderStreamEvent,
+        TokenUsage,
+    },
     runs::{self, RunRecord, RunStatus},
 };
 use axum::{
@@ -16,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     convert::Infallible,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -31,7 +39,7 @@ pub struct AppState {
     pub config_path: PathBuf,
     pub runs_path: PathBuf,
     pub runs: Arc<RwLock<VecDeque<RunRecord>>>,
-    pub ollama: OllamaClient,
+    pub providers: ProviderRegistry,
     pub started_at: DateTime<Utc>,
 }
 
@@ -48,6 +56,7 @@ struct HealthResponse {
     running: bool,
     ollama_reachable: bool,
     ollama_endpoint: String,
+    default_provider: String,
     default_model: Option<String>,
     model_count: Option<usize>,
     started_at: DateTime<Utc>,
@@ -68,22 +77,64 @@ struct SetDefaultModelRequest {
 
 #[derive(Deserialize)]
 struct ChatRequest {
+    provider: Option<String>,
     model: Option<String>,
     source_app: Option<String>,
     messages: Option<Vec<ChatMessage>>,
     prompt: Option<String>,
     instructions: Option<String>,
     generation: Option<GenerationSettings>,
+    tools: Option<serde_json::Value>,
+    tool_choice: Option<serde_json::Value>,
+    stream: Option<bool>,
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
 struct ChatResponse {
     run_id: String,
+    provider: String,
     model: String,
     message: ChatMessage,
+    usage: Option<TokenUsage>,
     started_at: DateTime<Utc>,
     ended_at: DateTime<Utc>,
     duration_ms: u64,
+}
+
+#[derive(Serialize)]
+struct ProviderStatus {
+    id: String,
+    name: String,
+    kind: String,
+    enabled: bool,
+    healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LiteLlmProviderTestRequest {
+    model: String,
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LiteLlmProviderTestResponse {
+    ok: bool,
+    content: String,
+    usage: Option<TokenUsage>,
+}
+
+#[derive(Deserialize)]
+struct GenerateLiteLlmConfigRequest {
+    output_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GenerateLiteLlmConfigResponse {
+    path: String,
+    routes_written: usize,
 }
 
 #[derive(Deserialize)]
@@ -99,12 +150,15 @@ struct RunsResponse {
 #[derive(Deserialize)]
 struct SettingsPatch {
     ollama_endpoint: Option<String>,
+    default_provider: Option<String>,
     default_model: Option<String>,
     generation: Option<GenerationSettings>,
     instructions: Option<InstructionSettings>,
     logging_enabled: Option<bool>,
     api_token: Option<String>,
     theme: Option<String>,
+    litellm: Option<LiteLlmSettings>,
+    model_routes: Option<Vec<ModelRoute>>,
 }
 
 #[derive(Serialize)]
@@ -128,6 +182,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/models", get(list_models))
         .route("/api/models/default", post(set_default_model))
         .route("/api/models/test", post(test_model))
+        .route("/api/providers", get(list_providers))
+        .route("/api/providers/litellm/test", post(test_litellm_provider))
+        .route(
+            "/api/litellm/config/generate",
+            post(generate_litellm_config_endpoint),
+        )
         .route("/api/chat", post(chat))
         .route("/api/chat/stream", post(stream_chat))
         .route("/api/runs", get(list_runs))
@@ -148,13 +208,14 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let started_at = state.started_at;
     let checked_at = Utc::now();
     let config = state.config.read().await.clone();
-    let models = state.ollama.list_models(&config.ollama_endpoint).await;
+    let models = state.providers.list_ollama_models(&config).await;
 
     Json(HealthResponse {
         service: "llama-harness".to_string(),
         running: true,
         ollama_reachable: models.is_ok(),
         ollama_endpoint: config.ollama_endpoint,
+        default_provider: config.default_provider,
         default_model: config.default_model,
         model_count: models.ok().map(|models| models.len()),
         started_at,
@@ -166,8 +227,8 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 async fn list_models(State(state): State<AppState>) -> ApiResult<Json<ModelsResponse>> {
     let config = state.config.read().await.clone();
     let models = state
-        .ollama
-        .list_models(&config.ollama_endpoint)
+        .providers
+        .list_ollama_models(&config)
         .await
         .map_err(|err| api_error(StatusCode::BAD_GATEWAY, err.to_string()))?;
 
@@ -192,7 +253,7 @@ async fn set_default_model(
         config::save_config(&state.config_path, &config)
             .await
             .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-        config.clone()
+        config.redacted_for_response()
     };
 
     Ok(Json(config))
@@ -212,6 +273,113 @@ async fn test_model(
     chat_with_payload(state, payload).await
 }
 
+async fn list_providers(State(state): State<AppState>) -> Json<Vec<ProviderStatus>> {
+    let config = state.config.read().await.clone();
+    let ollama_healthy = state.providers.list_ollama_models(&config).await.is_ok();
+    let litellm_healthy = state.providers.litellm_healthy(&config).await;
+
+    Json(vec![
+        ProviderStatus {
+            id: "ollama".to_string(),
+            name: "Ollama".to_string(),
+            kind: "local".to_string(),
+            enabled: true,
+            healthy: ollama_healthy,
+            base_url: None,
+        },
+        ProviderStatus {
+            id: "litellm".to_string(),
+            name: "LiteLLM".to_string(),
+            kind: "gateway".to_string(),
+            enabled: config.litellm.enabled,
+            healthy: litellm_healthy,
+            base_url: Some(config.litellm.base_url),
+        },
+    ])
+}
+
+async fn test_litellm_provider(
+    State(state): State<AppState>,
+    Json(payload): Json<LiteLlmProviderTestRequest>,
+) -> ApiResult<Json<LiteLlmProviderTestResponse>> {
+    let model = payload.model.trim();
+    if model.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "model is required"));
+    }
+
+    let config = state.config.read().await.clone();
+    let provider = state
+        .providers
+        .get("litellm", &config)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "unknown model provider: litellm"))?;
+    let request = ProviderChatRequest {
+        provider: "litellm".to_string(),
+        model: model.to_string(),
+        messages: vec![ChatMessage::text(
+            "user",
+            payload
+                .message
+                .unwrap_or_else(|| "Say hello from llama-harness.".to_string()),
+        )],
+        temperature: Some(config.generation.temperature),
+        top_p: Some(config.generation.top_p),
+        max_tokens: Some(config.generation.max_tokens),
+        tools: None,
+        tool_choice: None,
+        stream: false,
+        metadata: Some(
+            serde_json::json!({ "source_app": "admin-ui", "operation": "provider.test" }),
+        ),
+    };
+
+    match provider.chat_completion(request).await {
+        Ok(response) => {
+            audit_hook(
+                "provider.tested",
+                serde_json::json!({ "provider": "litellm", "model": model }),
+            );
+            Ok(Json(LiteLlmProviderTestResponse {
+                ok: true,
+                content: response.content,
+                usage: response.usage,
+            }))
+        }
+        Err(err) => {
+            let error = err.to_string();
+            audit_hook(
+                "provider.test_failed",
+                serde_json::json!({ "provider": "litellm", "model": model }),
+            );
+            Err(api_error(StatusCode::BAD_GATEWAY, error))
+        }
+    }
+}
+
+async fn generate_litellm_config_endpoint(
+    State(state): State<AppState>,
+    Json(payload): Json<GenerateLiteLlmConfigRequest>,
+) -> ApiResult<Json<GenerateLiteLlmConfigResponse>> {
+    let config = state.config.read().await.clone();
+    let output_path =
+        resolve_litellm_config_path(&state.config_path, &config, payload.output_path.as_deref());
+    let generation = generate_litellm_config(&config.model_routes, &output_path)
+        .await
+        .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    audit_hook(
+        "litellm.config.generated",
+        serde_json::json!({
+            "path": output_path.display().to_string(),
+            "routes_written": generation.routes_written
+        }),
+    );
+
+    Ok(Json(GenerateLiteLlmConfigResponse {
+        path: output_path.display().to_string(),
+        routes_written: generation.routes_written,
+    }))
+}
+
 async fn chat(
     State(state): State<AppState>,
     Json(payload): Json<ChatRequest>,
@@ -224,27 +392,24 @@ async fn stream_chat(
     Json(payload): Json<ChatRequest>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let resolved = resolve_chat(&state, payload).await?;
+    let provider_request = resolved.provider_request(true);
     let run_id = Uuid::new_v4().to_string();
     let started_at = Utc::now();
     let started_timer = Instant::now();
     let prompt_summary = summarize_messages(&resolved.messages);
 
-    let response = state
-        .ollama
-        .chat_stream(
-            &resolved.ollama_endpoint,
-            resolved.model.clone(),
-            resolved.messages.clone(),
-            resolved.generation.clone(),
-        )
-        .await;
-
-    let response = match response {
-        Ok(response) => response,
+    let provider_stream = match resolved
+        .provider
+        .stream_chat_completion(provider_request)
+        .await
+    {
+        Ok(provider_stream) => provider_stream,
         Err(err) => {
+            let error = err.to_string();
             let ended_at = Utc::now();
             let record = RunRecord {
                 id: run_id,
+                provider: resolved.provider_id,
                 model: resolved.model,
                 source_app: resolved.source_app,
                 prompt_summary,
@@ -253,61 +418,43 @@ async fn stream_chat(
                 started_at,
                 ended_at,
                 duration_ms: duration_ms(started_timer.elapsed()),
-                error: Some(err.to_string()),
+                error: Some(error.clone()),
+                usage: None,
             };
             record_run(&state, record).await;
-            return Err(api_error(StatusCode::BAD_GATEWAY, err.to_string()));
+            return Err(api_error(StatusCode::BAD_GATEWAY, error));
         }
     };
 
     let stream_state = state.clone();
     let stream = async_stream::stream! {
-        let mut bytes = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut provider_stream = provider_stream;
         let mut response_summary = String::new();
         let mut error: Option<String> = None;
+        let mut usage: Option<TokenUsage> = None;
 
-        while let Some(chunk) = bytes.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    while let Some(index) = buffer.find('\n') {
-                        let line = buffer[..index].trim().to_string();
-                        buffer.drain(..=index);
-                        if line.is_empty() {
-                            continue;
-                        }
-
-                        match serde_json::from_str::<serde_json::Value>(&line) {
-                            Ok(value) => {
-                                if let Some(content) = value.pointer("/message/content").and_then(|value| value.as_str()) {
-                                    response_summary.push_str(content);
-                                    if let Ok(event) = Event::default()
-                                        .event("token")
-                                        .json_data(StreamEvent {
-                                            run_id: &run_id,
-                                            content,
-                                        }) {
-                                        yield Ok(event);
-                                    }
-                                }
-
-                                if value.get("done").and_then(|value| value.as_bool()).unwrap_or(false) {
-                                    if let Ok(event) = Event::default()
-                                        .event("done")
-                                        .json_data(serde_json::json!({ "run_id": run_id })) {
-                                        yield Ok(event);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                yield Ok(Event::default().event("raw").data(line));
-                            }
-                        }
+        while let Some(event) = provider_stream.next().await {
+            match event {
+                ProviderStreamEvent::Token { content } => {
+                    response_summary.push_str(&content);
+                    if let Ok(event) = Event::default()
+                        .event("token")
+                        .json_data(StreamEvent {
+                            run_id: &run_id,
+                            content: &content,
+                        }) {
+                        yield Ok(event);
                     }
                 }
-                Err(err) => {
-                    let message = err.to_string();
+                ProviderStreamEvent::Done { usage: event_usage, raw } => {
+                    usage = event_usage;
+                    if let Ok(event) = Event::default()
+                        .event("done")
+                        .json_data(serde_json::json!({ "run_id": run_id, "usage": usage, "raw": raw })) {
+                        yield Ok(event);
+                    }
+                }
+                ProviderStreamEvent::Error { error: message } => {
                     error = Some(message.clone());
                     if let Ok(event) = Event::default()
                         .event("error")
@@ -316,12 +463,16 @@ async fn stream_chat(
                     }
                     break;
                 }
+                ProviderStreamEvent::Raw { data } => {
+                    yield Ok(Event::default().event("raw").data(data));
+                }
             }
         }
 
         let ended_at = Utc::now();
         let record = RunRecord {
             id: run_id,
+            provider: resolved.provider_id,
             model: resolved.model,
             source_app: resolved.source_app,
             prompt_summary,
@@ -331,6 +482,7 @@ async fn stream_chat(
             ended_at,
             duration_ms: duration_ms(started_timer.elapsed()),
             error,
+            usage,
         };
         record_run(&stream_state, record).await;
     };
@@ -355,7 +507,7 @@ async fn list_runs(
 }
 
 async fn get_settings(State(state): State<AppState>) -> Json<AppConfig> {
-    Json(state.config.read().await.clone())
+    Json(state.config.read().await.redacted_for_response())
 }
 
 async fn update_settings(
@@ -374,6 +526,16 @@ async fn update_settings(
                 ));
             }
             config.ollama_endpoint = endpoint.to_string();
+        }
+        if let Some(provider) = patch.default_provider {
+            let provider = provider.trim().to_ascii_lowercase();
+            if provider.is_empty() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "default_provider cannot be empty",
+                ));
+            }
+            config.default_provider = provider;
         }
         if let Some(model) = patch.default_model {
             config.default_model = if model.trim().is_empty() {
@@ -401,11 +563,25 @@ async fn update_settings(
         if let Some(theme) = patch.theme {
             config.theme = theme;
         }
+        if let Some(litellm) = patch.litellm {
+            let existing_api_key = config.litellm.api_key.clone();
+            let mut litellm = litellm;
+            litellm.api_key = match litellm.api_key {
+                Some(value) if value == REDACTED_SECRET => existing_api_key,
+                Some(value) if value.trim().is_empty() => None,
+                Some(value) => Some(value),
+                None => None,
+            };
+            config.litellm = litellm;
+        }
+        if let Some(model_routes) = patch.model_routes {
+            config.model_routes = model_routes;
+        }
 
         config::save_config(&state.config_path, &config)
             .await
             .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-        config.clone()
+        config.redacted_for_response()
     };
 
     Ok(Json(config))
@@ -431,48 +607,43 @@ async fn tools_placeholder() -> Json<ToolsResponse> {
 
 async fn chat_with_payload(state: AppState, payload: ChatRequest) -> ApiResult<Json<ChatResponse>> {
     let resolved = resolve_chat(&state, payload).await?;
+    let provider_request = resolved.provider_request(false);
     let run_id = Uuid::new_v4().to_string();
     let started_at = Utc::now();
     let started_timer = Instant::now();
     let prompt_summary = summarize_messages(&resolved.messages);
 
-    let result = state
-        .ollama
-        .chat(
-            &resolved.ollama_endpoint,
-            resolved.model.clone(),
-            resolved.messages.clone(),
-            resolved.generation,
-        )
-        .await;
+    let result = resolved.provider.chat_completion(provider_request).await;
 
     let ended_at = Utc::now();
     let duration_ms = duration_ms(started_timer.elapsed());
 
     match result {
         Ok(response) => {
-            let message = response.message.unwrap_or(ChatMessage {
-                role: "assistant".to_string(),
-                content: String::new(),
-            });
+            let message = ChatMessage::text("assistant", response.content);
+            let model = response.model.unwrap_or_else(|| resolved.model.clone());
             let record = RunRecord {
                 id: run_id.clone(),
-                model: resolved.model.clone(),
+                provider: resolved.provider_id.clone(),
+                model: model.clone(),
                 source_app: resolved.source_app,
                 prompt_summary,
-                response_summary: Some(truncate(&message.content, 500)),
+                response_summary: Some(truncate(&message.content_text(), 500)),
                 status: RunStatus::Completed,
                 started_at,
                 ended_at,
                 duration_ms,
                 error: None,
+                usage: response.usage.clone(),
             };
             record_run(&state, record).await;
 
             Ok(Json(ChatResponse {
                 run_id,
-                model: resolved.model,
+                provider: resolved.provider_id,
+                model,
                 message,
+                usage: response.usage,
                 started_at,
                 ended_at,
                 duration_ms,
@@ -482,6 +653,7 @@ async fn chat_with_payload(state: AppState, payload: ChatRequest) -> ApiResult<J
             let error = err.to_string();
             let record = RunRecord {
                 id: run_id,
+                provider: resolved.provider_id,
                 model: resolved.model,
                 source_app: resolved.source_app,
                 prompt_summary,
@@ -491,6 +663,7 @@ async fn chat_with_payload(state: AppState, payload: ChatRequest) -> ApiResult<J
                 ended_at,
                 duration_ms,
                 error: Some(error.clone()),
+                usage: None,
             };
             record_run(&state, record).await;
             Err(api_error(StatusCode::BAD_GATEWAY, error))
@@ -500,34 +673,75 @@ async fn chat_with_payload(state: AppState, payload: ChatRequest) -> ApiResult<J
 
 #[derive(Clone)]
 struct ResolvedChat {
-    ollama_endpoint: String,
+    provider_id: String,
+    provider: Arc<dyn ModelProvider>,
     model: String,
     source_app: Option<String>,
     messages: Vec<ChatMessage>,
     generation: GenerationSettings,
+    tools: Option<serde_json::Value>,
+    tool_choice: Option<serde_json::Value>,
+    stream_requested: bool,
+    metadata: Option<serde_json::Value>,
+}
+
+impl ResolvedChat {
+    fn provider_request(&self, stream: bool) -> ProviderChatRequest {
+        ProviderChatRequest {
+            provider: self.provider_id.clone(),
+            model: self.model.clone(),
+            messages: self.messages.clone(),
+            temperature: Some(self.generation.temperature),
+            top_p: Some(self.generation.top_p),
+            max_tokens: Some(self.generation.max_tokens),
+            tools: self.tools.clone(),
+            tool_choice: self.tool_choice.clone(),
+            stream: stream || self.stream_requested,
+            metadata: self.metadata.clone(),
+        }
+    }
 }
 
 async fn resolve_chat(state: &AppState, payload: ChatRequest) -> ApiResult<ResolvedChat> {
     let config = state.config.read().await.clone();
+    let provider_id = payload
+        .provider
+        .filter(|provider| !provider.trim().is_empty())
+        .unwrap_or_else(|| config.default_provider.clone())
+        .trim()
+        .to_ascii_lowercase();
     let messages = normalize_messages(payload.messages, payload.prompt)?;
     let messages = apply_instructions(&config.instructions, payload.instructions, messages);
     let model = payload
         .model
         .filter(|model| !model.trim().is_empty())
-        .or(config.default_model.clone())
+        .or_else(|| config.default_model_for_provider(&provider_id))
         .ok_or_else(|| {
             api_error(
                 StatusCode::BAD_REQUEST,
-                "model is required because no default model is configured",
+                format!(
+                    "model is required because no default model is configured for provider {provider_id}",
+                ),
             )
         })?;
+    let provider = state.providers.get(&provider_id, &config).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("unknown model provider: {provider_id}"),
+        )
+    })?;
 
     Ok(ResolvedChat {
-        ollama_endpoint: config.ollama_endpoint,
+        provider_id,
+        provider,
         model,
         source_app: payload.source_app,
         messages,
         generation: payload.generation.unwrap_or(config.generation),
+        tools: payload.tools,
+        tool_choice: payload.tool_choice,
+        stream_requested: payload.stream.unwrap_or(false),
+        metadata: payload.metadata,
     })
 }
 
@@ -544,10 +758,7 @@ fn normalize_messages(
     if let Some(prompt) = prompt {
         let prompt = prompt.trim();
         if !prompt.is_empty() {
-            return Ok(vec![ChatMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }]);
+            return Ok(vec![ChatMessage::text("user", prompt)]);
         }
     }
 
@@ -583,13 +794,7 @@ fn apply_instructions(
     }
 
     if !parts.is_empty() {
-        messages.insert(
-            0,
-            ChatMessage {
-                role: "system".to_string(),
-                content: parts.join("\n\n"),
-            },
-        );
+        messages.insert(0, ChatMessage::text("system", parts.join("\n\n")));
     }
 
     messages
@@ -616,6 +821,33 @@ async fn record_run(state: &AppState, record: RunRecord) {
     }
 }
 
+fn resolve_litellm_config_path(
+    config_path: &Path,
+    config: &AppConfig,
+    requested_path: Option<&str>,
+) -> PathBuf {
+    let raw_path = requested_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| config.litellm.managed_config_path.clone())
+        .unwrap_or_else(|| "litellm.config.yaml".to_string());
+    let path = PathBuf::from(raw_path);
+    if path.is_absolute() {
+        return path;
+    }
+
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(path)
+}
+
+fn audit_hook(event: &str, metadata: serde_json::Value) {
+    tracing::debug!(event, metadata = %metadata, "audit hook");
+}
+
 fn summarize_messages(messages: &[ChatMessage]) -> String {
     let joined = messages
         .iter()
@@ -623,7 +855,11 @@ fn summarize_messages(messages: &[ChatMessage]) -> String {
             if message.role == "system" {
                 "system: [instructions applied]".to_string()
             } else {
-                format!("{}: {}", message.role, message.content.replace('\n', " "))
+                format!(
+                    "{}: {}",
+                    message.role,
+                    message.content_text().replace('\n', " ")
+                )
             }
         })
         .collect::<Vec<_>>()
@@ -662,21 +898,20 @@ mod tests {
         let messages = apply_instructions(
             &settings,
             Some("Prefer concise answers.".to_string()),
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: "Summarize this note.".to_string(),
-            }],
+            vec![ChatMessage::text("user", "Summarize this note.")],
         );
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
         assert!(messages[0]
-            .content
+            .content_text()
             .contains("You are a local automation assistant."));
         assert!(messages[0]
-            .content
+            .content_text()
             .contains("Available tools and tool instructions"));
-        assert!(messages[0].content.contains("Prefer concise answers."));
+        assert!(messages[0]
+            .content_text()
+            .contains("Prefer concise answers."));
         assert_eq!(messages[1].role, "user");
     }
 
@@ -690,29 +925,20 @@ mod tests {
         let messages = apply_instructions(
             &settings,
             Some("Use bullet points.".to_string()),
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: "List tasks.".to_string(),
-            }],
+            vec![ChatMessage::text("user", "List tasks.")],
         );
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
-        assert!(messages[0].content.contains("Use bullet points."));
-        assert!(!messages[0].content.contains("Ignored"));
+        assert!(messages[0].content_text().contains("Use bullet points."));
+        assert!(!messages[0].content_text().contains("Ignored"));
     }
 
     #[test]
     fn run_summary_masks_instruction_text() {
         let summary = summarize_messages(&[
-            ChatMessage {
-                role: "system".to_string(),
-                content: "Do not leak this instruction.".to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: "Hello".to_string(),
-            },
+            ChatMessage::text("system", "Do not leak this instruction."),
+            ChatMessage::text("user", "Hello"),
         ]);
 
         assert_eq!(summary, "system: [instructions applied] | user: Hello");

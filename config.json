@@ -1,6 +1,7 @@
 {
   "ollama_endpoint": "http://localhost:11434",
-  "default_model": "hf.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF:Q4_K_M",
+  "default_provider": "litellm",
+  "default_model": "ollama:lfm2-local",
   "generation": {
     "temperature": 0.2,
     "top_p": 0.9,
@@ -13,5 +14,28 @@
   },
   "logging_enabled": true,
   "api_token": null,
-  "theme": "dark"
+  "theme": "dark",
+  "litellm": {
+    "enabled": true,
+    "base_url": "http://127.0.0.1:4000",
+    "api_key": null,
+    "timeout_ms": 120000,
+    "default_model": "ollama:lfm2-local",
+    "managed_config_path": "../litellm/llama-harness-litellm.local.yaml",
+    "allow_unconfigured_models": false
+  },
+  "model_routes": [
+    {
+      "id": "route_ollama_lfm2_local",
+      "enabled": true,
+      "display_name": "Ollama LFM2 via LiteLLM",
+      "provider": "litellm",
+      "provider_family": "custom",
+      "model_alias": "ollama:lfm2-local",
+      "litellm_model": "ollama_chat/hf.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF:Q4_K_M",
+      "api_key_env_var": "",
+      "api_base": "http://localhost:11434",
+      "notes": "Local smoke-test route for LiteLLM proxy"
+    }
+  ]
 }
