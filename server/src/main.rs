@@ -1,9 +1,12 @@
 mod config;
 mod ollama;
+mod providers;
 mod routes;
 mod runs;
 
-use crate::{config::AppConfig, ollama::OllamaClient, routes::AppState};
+use crate::{
+    config::AppConfig, ollama::OllamaClient, providers::ProviderRegistry, routes::AppState,
+};
 use anyhow::Context;
 use axum::Router;
 use chrono::Utc;
@@ -37,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
         config_path,
         runs_path,
         runs: Arc::new(RwLock::new(run_history)),
-        ollama: OllamaClient::new(),
+        providers: ProviderRegistry::new(OllamaClient::new()),
         started_at: Utc::now(),
     };
 

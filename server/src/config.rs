@@ -296,7 +296,10 @@ mod tests {
         .expect("litellm config should deserialize");
 
         assert_eq!(config.default_provider, "litellm");
-        assert_eq!(config.litellm.default_model.as_deref(), Some("openai:gpt-4o"));
+        assert_eq!(
+            config.litellm.default_model.as_deref(),
+            Some("openai:gpt-4o")
+        );
         assert_eq!(config.model_routes[0].provider_family, "openai");
     }
 }
