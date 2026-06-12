@@ -10,24 +10,59 @@ export type InstructionSettings = {
   tool_context: string;
 };
 
+export type LiteLlmSettings = {
+  enabled: boolean;
+  base_url: string;
+  api_key: string | null;
+  default_model: string | null;
+  timeout_ms: number;
+  managed_config_path: string | null;
+  allow_unconfigured_models: boolean;
+};
+
+export type ModelRoute = {
+  id: string;
+  enabled: boolean;
+  display_name: string;
+  provider: string;
+  provider_family: "openai" | "anthropic" | "openrouter" | "gemini" | "custom" | string;
+  model_alias: string;
+  litellm_model: string;
+  api_key_env_var: string;
+  api_base: string | null;
+  notes: string | null;
+};
+
 export type ChatMessage = {
   role: "system" | "user" | "assistant" | string;
-  content: string;
+  content: string | Record<string, unknown> | unknown[];
 };
 
 export type ChatRequest = {
+  provider?: string;
   model?: string;
   source_app?: string;
   messages?: ChatMessage[];
   prompt?: string;
   instructions?: string;
   generation?: GenerationSettings;
+  tools?: unknown;
+  tool_choice?: unknown;
+  metadata?: unknown;
+};
+
+export type TokenUsage = {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
 };
 
 export type ChatResponse = {
   run_id: string;
+  provider: string;
   model: string;
   message: ChatMessage;
+  usage?: TokenUsage | null;
   started_at: string;
   ended_at: string;
   duration_ms: number;
@@ -38,6 +73,7 @@ export type HealthResponse = {
   running: boolean;
   ollama_reachable: boolean;
   ollama_endpoint: string;
+  default_provider: string;
   default_model: string | null;
   model_count: number | null;
   started_at: string;
@@ -69,6 +105,7 @@ export type ModelsResponse = {
 
 export type RunRecord = {
   id: string;
+  provider: string;
   model: string;
   source_app: string | null;
   prompt_summary: string;
@@ -78,16 +115,45 @@ export type RunRecord = {
   ended_at: string;
   duration_ms: number;
   error: string | null;
+  usage?: TokenUsage | null;
 };
 
 export type Settings = {
   ollama_endpoint: string;
+  default_provider: string;
   default_model: string | null;
   generation: GenerationSettings;
   instructions: InstructionSettings;
   logging_enabled: boolean;
   api_token: string | null;
   theme: string;
+  litellm: LiteLlmSettings;
+  model_routes: ModelRoute[];
+};
+
+export type ProviderStatus = {
+  id: string;
+  name: string;
+  kind: string;
+  enabled: boolean;
+  healthy: boolean;
+  base_url?: string;
+};
+
+export type LiteLlmProviderTestRequest = {
+  model: string;
+  message?: string;
+};
+
+export type LiteLlmProviderTestResponse = {
+  ok: boolean;
+  content: string;
+  usage?: TokenUsage | null;
+};
+
+export type GenerateLiteLlmConfigResponse = {
+  path: string;
+  routes_written: number;
 };
 
 export type StreamEvent = {
@@ -120,6 +186,10 @@ export class LlamaHarnessClient {
     return this.request("/api/models");
   }
 
+  listProviders(): Promise<ProviderStatus[]> {
+    return this.request("/api/providers");
+  }
+
   chat(request: ChatRequest): Promise<ChatResponse> {
     return this.request("/api/chat", {
       method: "POST",
@@ -139,6 +209,20 @@ export class LlamaHarnessClient {
     return this.request("/api/settings", {
       method: "PUT",
       body: JSON.stringify(settings),
+    });
+  }
+
+  testLiteLLMProvider(request: LiteLlmProviderTestRequest): Promise<LiteLlmProviderTestResponse> {
+    return this.request("/api/providers/litellm/test", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  generateLiteLLMConfig(outputPath?: string | null): Promise<GenerateLiteLlmConfigResponse> {
+    return this.request("/api/litellm/config/generate", {
+      method: "POST",
+      body: JSON.stringify({ output_path: outputPath || undefined }),
     });
   }
 

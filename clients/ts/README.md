@@ -16,6 +16,25 @@ const response = await harness.chat({
 });
 ```
 
+Provider routes:
+
+```ts
+const providers = await harness.listProviders();
+
+const litellm = await harness.testLiteLLMProvider({
+  model: "openai:gpt-4o",
+  message: "Say hello from llama-harness.",
+});
+
+await harness.generateLiteLLMConfig("litellm.config.yaml");
+
+const cloudResponse = await harness.chat({
+  provider: "litellm",
+  model: "openai:gpt-4o",
+  messages: [{ role: "user", content: "Write a quick project summary." }],
+});
+```
+
 Streaming uses the harness `POST /api/chat/stream` SSE endpoint:
 
 ```ts
