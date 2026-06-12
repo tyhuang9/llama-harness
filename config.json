@@ -1,5 +1,6 @@
 {
   "ollama_endpoint": "http://localhost:11434",
+  "default_provider": "ollama",
   "default_model": "qwen2.5:7b",
   "generation": {
     "temperature": 0.2,
@@ -13,5 +14,15 @@
   },
   "logging_enabled": true,
   "api_token": null,
-  "theme": "dark"
+  "theme": "dark",
+  "litellm": {
+    "enabled": false,
+    "base_url": "http://127.0.0.1:4000",
+    "api_key": null,
+    "default_model": null,
+    "timeout_ms": 120000,
+    "managed_config_path": null,
+    "allow_unconfigured_models": false
+  },
+  "model_routes": []
 }
