@@ -136,6 +136,14 @@ openrouter:claude    -> openrouter/<provider>/<model>
 gemini:flash         -> gemini/<model>
 ```
 
+Keep the LiteLLM proxy checkout separate from this repository. A sibling folder works well:
+
+```bash
+git clone https://github.com/BerriAI/litellm.git ../litellm
+```
+
+When `managed_config_path` is relative, llama-harness resolves it relative to `config.json`, so `../litellm/llama-harness-litellm.local.yaml` keeps proxy config with the LiteLLM checkout.
+
 Generate a LiteLLM config from configured routes:
 
 ```bash
