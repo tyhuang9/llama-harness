@@ -2,10 +2,14 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   api,
   ChatResponse,
+  GenerateLiteLlmConfigResponse,
   getApiBase,
   Health,
+  LiteLlmTestResponse,
+  ModelRoute,
   ModelsResponse,
   OllamaModel,
+  ProviderStatus,
   RunRecord,
   setApiBase,
   Settings,
@@ -67,6 +71,8 @@ const taskFilters: Array<TaskStatus | "all"> = [
 ];
 
 const providers: ModelProvider[] = ["Gemini", "OpenAI", "Anthropic", "OpenRouter", "Ollama"];
+const litellmFamilies = ["openai", "anthropic", "openrouter", "gemini", "custom"];
+const REDACTED_SECRET = "__configured__";
 const environments: Environment[] = ["planner", "browser", "computer-use", "local-desktop"];
 const autonomyLevels: Agent["autonomy"][] = ["observe", "ask", "low-risk", "autonomous"];
 
@@ -95,12 +101,15 @@ export default function App() {
   const [selectedTaskId, setSelectedTaskId] = useState(seedTasks[0]?.id || "");
   const [health, setHealth] = useState<Health | null>(null);
   const [models, setModels] = useState<ModelsResponse | null>(null);
+  const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([]);
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [apiBaseInput, setApiBaseInput] = useState(getApiBase());
   const [prompt, setPrompt] = useState("Summarize the current agent task queue in one sentence.");
   const [testModel, setTestModel] = useState("");
   const [testResult, setTestResult] = useState<ChatResponse | null>(null);
+  const [litellmTestResult, setLiteLlmTestResult] = useState<LiteLlmTestResponse | null>(null);
+  const [litellmConfigResult, setLiteLlmConfigResult] = useState<GenerateLiteLlmConfigResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -119,10 +128,11 @@ export default function App() {
 
   async function refreshAll() {
     setError(null);
-    const [healthResult, settingsResult, runsResult] = await Promise.allSettled([
+    const [healthResult, settingsResult, runsResult, providersResult] = await Promise.allSettled([
       api.health(),
       api.settings(),
       api.runs(50),
+      api.providers(),
     ]);
 
     if (healthResult.status === "fulfilled") {
@@ -138,6 +148,10 @@ export default function App() {
 
     if (runsResult.status === "fulfilled") {
       setRuns(runsResult.value.runs);
+    }
+
+    if (providersResult.status === "fulfilled") {
+      setProviderStatuses(providersResult.value);
     }
 
     try {
@@ -191,6 +205,13 @@ export default function App() {
     }
   }
 
+  async function persistSettings(nextSettings: Settings) {
+    setApiBase(apiBaseInput);
+    const updated = await api.updateSettings(nextSettings);
+    setSettings(updated);
+    return updated;
+  }
+
   async function saveSettings(event?: FormEvent) {
     event?.preventDefault();
     if (!settings) {
@@ -200,10 +221,47 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      setApiBase(apiBaseInput);
-      const updated = await api.updateSettings(settings);
-      setSettings(updated);
+      await persistSettings(settings);
       await refreshAll();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function testLiteLlmConnection() {
+    if (!settings) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setLiteLlmTestResult(null);
+    try {
+      const updated = await persistSettings(settings);
+      const model = updated.litellm.default_model || "";
+      const result = await api.testLiteLLMProvider(model, "Say hello from llama-harness.");
+      setLiteLlmTestResult(result);
+      setProviderStatuses(await api.providers());
+    } catch (err) {
+      setError((err as Error).message);
+      setProviderStatuses(await api.providers().catch(() => providerStatuses));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function generateLiteLlmConfig() {
+    if (!settings) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setLiteLlmConfigResult(null);
+    try {
+      const updated = await persistSettings(settings);
+      const result = await api.generateLiteLLMConfig(updated.litellm.managed_config_path);
+      setLiteLlmConfigResult(result);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -420,7 +478,11 @@ export default function App() {
               defaultModel={models?.default_model || settings?.default_model || null}
               settings={settings}
               setSettings={setSettings}
+              providerStatuses={providerStatuses}
               selectDefaultModel={selectDefaultModel}
+              saveSettings={() => saveSettings()}
+              generateLiteLlmConfig={generateLiteLlmConfig}
+              litellmConfigResult={litellmConfigResult}
               testModel={testModel}
               setTestModel={setTestModel}
               prompt={prompt}
@@ -439,9 +501,14 @@ export default function App() {
             <SettingsView
               settings={settings}
               setSettings={setSettings}
+              providerStatuses={providerStatuses}
               apiBaseInput={apiBaseInput}
               setApiBaseInput={setApiBaseInput}
               onSubmit={saveSettings}
+              testLiteLlmConnection={testLiteLlmConnection}
+              generateLiteLlmConfig={generateLiteLlmConfig}
+              litellmTestResult={litellmTestResult}
+              litellmConfigResult={litellmConfigResult}
               busy={busy}
             />
           ) : null}
@@ -1145,7 +1212,11 @@ function ModelsPage(props: {
   defaultModel: string | null;
   settings: Settings | null;
   setSettings: (settings: Settings) => void;
+  providerStatuses: ProviderStatus[];
   selectDefaultModel: (model: string) => void;
+  saveSettings: () => void;
+  generateLiteLlmConfig: () => void;
+  litellmConfigResult: GenerateLiteLlmConfigResponse | null;
   testModel: string;
   setTestModel: (value: string) => void;
   prompt: string;
@@ -1154,35 +1225,150 @@ function ModelsPage(props: {
   onSubmit: (event: FormEvent) => void;
   busy: boolean;
 }) {
-  const [byok, setByok] = useState(true);
+  const routes = props.settings?.model_routes || [];
+  const litellmStatus = props.providerStatuses.find((provider) => provider.id === "litellm");
+
+  function setRoutes(modelRoutes: ModelRoute[]) {
+    if (!props.settings) {
+      return;
+    }
+    props.setSettings({ ...props.settings, model_routes: modelRoutes });
+  }
+
+  function addRoute() {
+    setRoutes([...routes, createModelRoute("openai")]);
+  }
+
+  function updateRoute(id: string, patch: Partial<ModelRoute>) {
+    setRoutes(routes.map((route) => (route.id === id ? { ...route, ...patch } : route)));
+  }
+
+  function removeRoute(id: string) {
+    setRoutes(routes.filter((route) => route.id !== id));
+  }
 
   return (
     <div className="stack">
-      <section className="panel">
-        <div className="section-header">
-          <h2>Provider Keys</h2>
-          <p>Bring-your-own-key configuration for external model providers. Keys stay local in this UI until backend storage exists.</p>
-        </div>
-        <div className="settings-form">
-          <div className="field-row two">
-            {[
-              ["Gemini", "AIza..."],
-              ["OpenAI", "sk-..."],
-              ["Anthropic", "sk-ant-..."],
-              ["OpenRouter", "sk-or-..."],
-            ].map(([label, placeholder]) => (
-              <label key={label}>
-                {label}
-                <input type="password" placeholder={placeholder} />
-              </label>
-            ))}
+      {props.settings ? (
+        <section className="panel">
+          <div className="section-header">
+            <div>
+              <h2>LiteLLM Model Routes</h2>
+              <p>{routes.length} configured routes</p>
+            </div>
+            <div className="button-row">
+              <StatusBadge status={litellmStatus?.healthy ? "online" : props.settings.litellm.enabled ? "offline" : "neutral"} />
+              <button type="button" onClick={addRoute} disabled={props.busy}>
+                Add route
+              </button>
+            </div>
           </div>
-          <label className="toggle-row">
-            <span>Users bring their own API key</span>
-            <input type="checkbox" checked={byok} onChange={(event) => setByok(event.target.checked)} />
-          </label>
-        </div>
-      </section>
+
+          <div className="example-grid">
+            <code>openai/&lt;model&gt;</code>
+            <code>anthropic/&lt;model&gt;</code>
+            <code>openrouter/&lt;provider&gt;/&lt;model&gt;</code>
+            <code>gemini/&lt;model&gt;</code>
+          </div>
+
+          <div className="route-grid">
+            {routes.map((route) => (
+              <div className="route-card" key={route.id}>
+                <div className="section-header">
+                  <div>
+                    <code>{route.id}</code>
+                    <h3>{route.display_name || "Untitled route"}</h3>
+                    <p>{route.model_alias || "model alias required"}</p>
+                  </div>
+                  <div className="button-row">
+                    <label className="toggle-row inline">
+                      <input
+                        type="checkbox"
+                        checked={route.enabled}
+                        onChange={(event) => updateRoute(route.id, { enabled: event.target.checked })}
+                      />
+                      Enabled
+                    </label>
+                    <button className="danger-outline" type="button" onClick={() => removeRoute(route.id)} disabled={props.busy}>
+                      Delete
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-form">
+                  <div className="field-row three">
+                    <label>
+                      Provider family
+                      <select
+                        value={route.provider_family}
+                        onChange={(event) => {
+                          const family = event.target.value;
+                          updateRoute(route.id, {
+                            provider_family: family,
+                            api_key_env_var: route.api_key_env_var || envVarForFamily(family),
+                          });
+                        }}
+                      >
+                        {litellmFamilies.map((family) => (
+                          <option key={family} value={family}>
+                            {family}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Display name
+                      <input value={route.display_name} onChange={(event) => updateRoute(route.id, { display_name: event.target.value })} />
+                    </label>
+                    <label>
+                      Model alias
+                      <input
+                        value={route.model_alias}
+                        onChange={(event) => updateRoute(route.id, { model_alias: event.target.value })}
+                        placeholder={`${route.provider_family}:model`}
+                      />
+                    </label>
+                  </div>
+                  <div className="field-row three">
+                    <label>
+                      LiteLLM model
+                      <input
+                        value={route.litellm_model}
+                        onChange={(event) => updateRoute(route.id, { litellm_model: event.target.value })}
+                        placeholder={litellmModelPlaceholder(route.provider_family)}
+                      />
+                    </label>
+                    <label>
+                      API key env var
+                      <input value={route.api_key_env_var} onChange={(event) => updateRoute(route.id, { api_key_env_var: event.target.value })} />
+                    </label>
+                    <label>
+                      API base
+                      <input value={route.api_base || ""} onChange={(event) => updateRoute(route.id, { api_base: event.target.value || null })} />
+                    </label>
+                  </div>
+                  <label>
+                    Notes
+                    <input value={route.notes || ""} onChange={(event) => updateRoute(route.id, { notes: event.target.value || null })} />
+                  </label>
+                </div>
+              </div>
+            ))}
+            {!routes.length ? <p className="empty">No LiteLLM routes configured.</p> : null}
+          </div>
+
+          <div className="form-actions">
+            <button type="button" onClick={props.generateLiteLlmConfig} disabled={props.busy}>
+              Generate config.yaml
+            </button>
+            <button className="primary" type="button" onClick={props.saveSettings} disabled={props.busy}>
+              Save model routes
+            </button>
+          </div>
+          {props.litellmConfigResult ? (
+            <pre className="result">{`${props.litellmConfigResult.routes_written} routes written\n${props.litellmConfigResult.path}`}</pre>
+          ) : null}
+        </section>
+      ) : null}
 
       <section className="panel">
         <div className="section-header">
@@ -1265,6 +1451,52 @@ function ModelsPage(props: {
       </section>
     </div>
   );
+}
+
+function createModelRoute(family: string): ModelRoute {
+  const id = `route_${family}_${Date.now().toString(36)}`;
+  return {
+    id,
+    enabled: true,
+    display_name: `${labelize(family)} route`,
+    provider: "litellm",
+    provider_family: family,
+    model_alias: `${family}:model`,
+    litellm_model: litellmModelPlaceholder(family).replace("<model>", "model").replace("<provider>", "provider"),
+    api_key_env_var: envVarForFamily(family),
+    api_base: null,
+    notes: null,
+  };
+}
+
+function envVarForFamily(family: string): string {
+  switch (family) {
+    case "openai":
+      return "OPENAI_API_KEY";
+    case "anthropic":
+      return "ANTHROPIC_API_KEY";
+    case "openrouter":
+      return "OPENROUTER_API_KEY";
+    case "gemini":
+      return "GEMINI_API_KEY";
+    default:
+      return "PROVIDER_API_KEY";
+  }
+}
+
+function litellmModelPlaceholder(family: string): string {
+  switch (family) {
+    case "openai":
+      return "openai/<model>";
+    case "anthropic":
+      return "anthropic/<model>";
+    case "openrouter":
+      return "openrouter/<provider>/<model>";
+    case "gemini":
+      return "gemini/<model>";
+    default:
+      return "provider/<model>";
+  }
 }
 
 function PermissionsPage({
@@ -1450,12 +1682,20 @@ function InstructionsView(props: {
 function SettingsView(props: {
   settings: Settings;
   setSettings: (settings: Settings) => void;
+  providerStatuses: ProviderStatus[];
   apiBaseInput: string;
   setApiBaseInput: (value: string) => void;
   onSubmit: (event: FormEvent) => void;
+  testLiteLlmConnection: () => void;
+  generateLiteLlmConfig: () => void;
+  litellmTestResult: LiteLlmTestResponse | null;
+  litellmConfigResult: GenerateLiteLlmConfigResponse | null;
   busy: boolean;
 }) {
   const { settings, setSettings } = props;
+  const litellmStatus = props.providerStatuses.find((provider) => provider.id === "litellm");
+  const apiKeyConfigured = settings.litellm.api_key === REDACTED_SECRET;
+  const apiKeyValue = apiKeyConfigured ? "" : settings.litellm.api_key || "";
 
   function updateGeneration<K extends keyof Settings["generation"]>(key: K, value: number) {
     setSettings({
@@ -1467,91 +1707,191 @@ function SettingsView(props: {
     });
   }
 
+  function updateLiteLlm(next: Partial<Settings["litellm"]>) {
+    setSettings({
+      ...settings,
+      litellm: {
+        ...settings.litellm,
+        ...next,
+      },
+    });
+  }
+
   return (
-    <section className="panel">
-      <div className="section-header">
-        <h2>Settings</h2>
-      </div>
-      <form className="settings-form" onSubmit={props.onSubmit}>
-        <label>
-          API base URL
-          <input value={props.apiBaseInput} onChange={(event) => props.setApiBaseInput(event.target.value)} />
-        </label>
-        <label>
-          Ollama endpoint
-          <input
-            value={settings.ollama_endpoint}
-            onChange={(event) => setSettings({ ...settings, ollama_endpoint: event.target.value })}
-          />
-        </label>
-        <label>
-          Default model
-          <input
-            value={settings.default_model || ""}
-            onChange={(event) => setSettings({ ...settings, default_model: event.target.value || null })}
-          />
-        </label>
-        <div className="field-row three">
-          <label>
-            Temperature
-            <input
-              type="number"
-              min="0"
-              max="2"
-              step="0.1"
-              value={settings.generation.temperature}
-              onChange={(event) => updateGeneration("temperature", Number(event.target.value))}
-            />
-          </label>
-          <label>
-            Top P
-            <input
-              type="number"
-              min="0"
-              max="1"
-              step="0.05"
-              value={settings.generation.top_p}
-              onChange={(event) => updateGeneration("top_p", Number(event.target.value))}
-            />
-          </label>
-          <label>
-            Max tokens
-            <input
-              type="number"
-              min="1"
-              step="1"
-              value={settings.generation.max_tokens}
-              onChange={(event) => updateGeneration("max_tokens", Number(event.target.value))}
-            />
-          </label>
+    <div className="stack">
+      <section className="panel">
+        <div className="section-header">
+          <h2>Settings</h2>
         </div>
-        <label>
-          API token
-          <input
-            value={settings.api_token || ""}
-            onChange={(event) => setSettings({ ...settings, api_token: event.target.value || null })}
-          />
-        </label>
-        <label>
-          Theme
-          <select value={settings.theme} onChange={(event) => setSettings({ ...settings, theme: event.target.value })}>
-            <option value="dark">dark</option>
-            <option value="light">light</option>
-          </select>
-        </label>
-        <label className="toggle-row inline">
-          <input
-            type="checkbox"
-            checked={settings.logging_enabled}
-            onChange={(event) => setSettings({ ...settings, logging_enabled: event.target.checked })}
-          />
-          JSONL run logging
-        </label>
-        <button className="primary" type="submit" disabled={props.busy}>
-          Save settings
-        </button>
-      </form>
-    </section>
+        <form className="settings-form" onSubmit={props.onSubmit}>
+          <label>
+            API base URL
+            <input value={props.apiBaseInput} onChange={(event) => props.setApiBaseInput(event.target.value)} />
+          </label>
+          <div className="field-row three">
+            <label>
+              Default provider
+              <select value={settings.default_provider} onChange={(event) => setSettings({ ...settings, default_provider: event.target.value })}>
+                <option value="ollama">ollama</option>
+                <option value="litellm">litellm</option>
+              </select>
+            </label>
+            <label>
+              Ollama endpoint
+              <input
+                value={settings.ollama_endpoint}
+                onChange={(event) => setSettings({ ...settings, ollama_endpoint: event.target.value })}
+              />
+            </label>
+            <label>
+              Default Ollama model
+              <input
+                value={settings.default_model || ""}
+                onChange={(event) => setSettings({ ...settings, default_model: event.target.value || null })}
+              />
+            </label>
+          </div>
+          <div className="field-row three">
+            <label>
+              Temperature
+              <input
+                type="number"
+                min="0"
+                max="2"
+                step="0.1"
+                value={settings.generation.temperature}
+                onChange={(event) => updateGeneration("temperature", Number(event.target.value))}
+              />
+            </label>
+            <label>
+              Top P
+              <input
+                type="number"
+                min="0"
+                max="1"
+                step="0.05"
+                value={settings.generation.top_p}
+                onChange={(event) => updateGeneration("top_p", Number(event.target.value))}
+              />
+            </label>
+            <label>
+              Max tokens
+              <input
+                type="number"
+                min="1"
+                step="1"
+                value={settings.generation.max_tokens}
+                onChange={(event) => updateGeneration("max_tokens", Number(event.target.value))}
+              />
+            </label>
+          </div>
+          <label>
+            API token
+            <input value={settings.api_token || ""} onChange={(event) => setSettings({ ...settings, api_token: event.target.value || null })} />
+          </label>
+          <label>
+            Theme
+            <select value={settings.theme} onChange={(event) => setSettings({ ...settings, theme: event.target.value })}>
+              <option value="dark">dark</option>
+              <option value="light">light</option>
+            </select>
+          </label>
+          <label className="toggle-row inline">
+            <input
+              type="checkbox"
+              checked={settings.logging_enabled}
+              onChange={(event) => setSettings({ ...settings, logging_enabled: event.target.checked })}
+            />
+            JSONL run logging
+          </label>
+          <button className="primary" type="submit" disabled={props.busy}>
+            Save settings
+          </button>
+        </form>
+      </section>
+
+      <section className="panel">
+        <div className="section-header">
+          <div>
+            <h2>LiteLLM Gateway</h2>
+            <p>{litellmStatus?.base_url || settings.litellm.base_url}</p>
+          </div>
+          <StatusBadge status={litellmStatus?.healthy ? "online" : settings.litellm.enabled ? "offline" : "neutral"} />
+        </div>
+        <form className="settings-form" onSubmit={props.onSubmit}>
+          <label className="toggle-row">
+            <span>Enable LiteLLM</span>
+            <input type="checkbox" checked={settings.litellm.enabled} onChange={(event) => updateLiteLlm({ enabled: event.target.checked })} />
+          </label>
+          <div className="field-row three">
+            <label>
+              Base URL
+              <input value={settings.litellm.base_url} onChange={(event) => updateLiteLlm({ base_url: event.target.value })} />
+            </label>
+            <label>
+              API key / master key
+              <input
+                type="password"
+                value={apiKeyValue}
+                onChange={(event) => updateLiteLlm({ api_key: event.target.value || (apiKeyConfigured ? REDACTED_SECRET : null) })}
+                placeholder={apiKeyConfigured ? "configured" : "optional"}
+              />
+            </label>
+            <label>
+              Default LiteLLM model
+              <input
+                value={settings.litellm.default_model || ""}
+                onChange={(event) => updateLiteLlm({ default_model: event.target.value || null })}
+                placeholder="openai:gpt-4o"
+              />
+            </label>
+          </div>
+          <div className="field-row three">
+            <label>
+              Timeout ms
+              <input
+                type="number"
+                min="1000"
+                step="1000"
+                value={settings.litellm.timeout_ms}
+                onChange={(event) => updateLiteLlm({ timeout_ms: Number(event.target.value) })}
+              />
+            </label>
+            <label>
+              Managed config path
+              <input
+                value={settings.litellm.managed_config_path || ""}
+                onChange={(event) => updateLiteLlm({ managed_config_path: event.target.value || null })}
+                placeholder="litellm.config.yaml"
+              />
+            </label>
+            <label className="toggle-row">
+              <span>Allow raw models</span>
+              <input
+                type="checkbox"
+                checked={settings.litellm.allow_unconfigured_models}
+                onChange={(event) => updateLiteLlm({ allow_unconfigured_models: event.target.checked })}
+              />
+            </label>
+          </div>
+          <div className="button-row">
+            <button type="button" onClick={props.testLiteLlmConnection} disabled={props.busy || !settings.litellm.default_model}>
+              Test connection
+            </button>
+            <button type="button" onClick={props.generateLiteLlmConfig} disabled={props.busy}>
+              Generate config.yaml
+            </button>
+            <button className="primary" type="submit" disabled={props.busy}>
+              Save LiteLLM
+            </button>
+          </div>
+          {props.litellmTestResult ? <pre className="result">{props.litellmTestResult.content || "(empty response)"}</pre> : null}
+          {props.litellmConfigResult ? (
+            <pre className="result">{`${props.litellmConfigResult.routes_written} routes written\n${props.litellmConfigResult.path}`}</pre>
+          ) : null}
+        </form>
+      </section>
+    </div>
   );
 }
 
@@ -1594,10 +1934,12 @@ function RunsTable({ runs }: { runs: RunRecord[] }) {
       <thead>
         <tr>
           <th>Time</th>
+          <th>Provider</th>
           <th>Model</th>
           <th>Status</th>
           <th>Source</th>
           <th>Duration</th>
+          <th>Usage</th>
           <th>Summary</th>
         </tr>
       </thead>
@@ -1605,18 +1947,20 @@ function RunsTable({ runs }: { runs: RunRecord[] }) {
         {runs.map((run) => (
           <tr key={run.id}>
             <td>{formatTime(run.started_at)}</td>
+            <td>{run.provider || "ollama"}</td>
             <td>{run.model}</td>
             <td>
               <StatusBadge status={run.status} />
             </td>
             <td>{run.source_app || "-"}</td>
             <td>{run.duration_ms}ms</td>
+            <td>{formatUsage(run.usage)}</td>
             <td>{run.error || run.prompt_summary}</td>
           </tr>
         ))}
         {!runs.length ? (
           <tr>
-            <td colSpan={6} className="empty-cell">
+            <td colSpan={8} className="empty-cell">
               No runs recorded.
             </td>
           </tr>
@@ -1799,6 +2143,17 @@ function formatBytes(value?: number | null): string {
     index += 1;
   }
   return `${size.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function formatUsage(usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number } | null): string {
+  if (!usage) {
+    return "-";
+  }
+  if (usage.total_tokens) {
+    return usage.total_tokens.toString();
+  }
+  const parts = [usage.input_tokens ? `in ${usage.input_tokens}` : "", usage.output_tokens ? `out ${usage.output_tokens}` : ""].filter(Boolean);
+  return parts.join(" / ") || "-";
 }
 
 function timestampNow(): string {

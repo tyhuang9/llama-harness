@@ -719,6 +719,44 @@ button.chip.active {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.example-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.example-grid code,
+.route-card {
+  border: 1px solid #282e28;
+  border-radius: 8px;
+  background: #0f110f;
+}
+
+.example-grid code {
+  display: block;
+  min-width: 0;
+  padding: 9px 10px;
+  overflow-wrap: anywhere;
+  color: #a7d7ba;
+  font-size: 12px;
+}
+
+.route-grid {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.route-card {
+  padding: 14px;
+}
+
+.route-card h3 {
+  color: #f0ece4;
+  font-size: 15px;
+}
+
 .permission-list {
   display: grid;
   gap: 8px;
@@ -957,6 +995,7 @@ button.chip.active {
 
   .metric-strip,
   .status-grid,
+  .example-grid,
   .field-row,
   .field-row.three,
   .tabs,
