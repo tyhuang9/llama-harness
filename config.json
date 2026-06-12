@@ -1,6 +1,6 @@
 {
   "ollama_endpoint": "http://localhost:11434",
-  "default_model": "qwen2.5:7b",
+  "default_model": "hf.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF:Q4_K_M",
   "generation": {
     "temperature": 0.2,
     "top_p": 0.9,
