@@ -6,6 +6,8 @@ use std::{
 };
 use tokio::fs;
 
+pub const REDACTED_SECRET: &str = "__configured__";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -138,6 +140,14 @@ impl AppConfig {
             "litellm" => self.litellm.default_model.clone(),
             _ => self.default_model.clone(),
         }
+    }
+
+    pub fn redacted_for_response(&self) -> Self {
+        let mut config = self.clone();
+        if config.litellm.api_key.is_some() {
+            config.litellm.api_key = Some(REDACTED_SECRET.to_string());
+        }
+        config
     }
 }
 

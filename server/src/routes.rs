@@ -1,7 +1,9 @@
 use crate::{
     config::{
         self, AppConfig, GenerationSettings, InstructionSettings, LiteLlmSettings, ModelRoute,
+        REDACTED_SECRET,
     },
+    litellm::generate_litellm_config,
     ollama::OllamaModel,
     providers::{
         ChatMessage, ModelProvider, ProviderChatRequest, ProviderRegistry, ProviderStreamEvent,
@@ -22,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     convert::Infallible,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -100,6 +102,41 @@ struct ChatResponse {
     duration_ms: u64,
 }
 
+#[derive(Serialize)]
+struct ProviderStatus {
+    id: String,
+    name: String,
+    kind: String,
+    enabled: bool,
+    healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LiteLlmProviderTestRequest {
+    model: String,
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LiteLlmProviderTestResponse {
+    ok: bool,
+    content: String,
+    usage: Option<TokenUsage>,
+}
+
+#[derive(Deserialize)]
+struct GenerateLiteLlmConfigRequest {
+    output_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GenerateLiteLlmConfigResponse {
+    path: String,
+    routes_written: usize,
+}
+
 #[derive(Deserialize)]
 struct RunsQuery {
     limit: Option<usize>,
@@ -145,6 +182,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/models", get(list_models))
         .route("/api/models/default", post(set_default_model))
         .route("/api/models/test", post(test_model))
+        .route("/api/providers", get(list_providers))
+        .route("/api/providers/litellm/test", post(test_litellm_provider))
+        .route(
+            "/api/litellm/config/generate",
+            post(generate_litellm_config_endpoint),
+        )
         .route("/api/chat", post(chat))
         .route("/api/chat/stream", post(stream_chat))
         .route("/api/runs", get(list_runs))
@@ -210,7 +253,7 @@ async fn set_default_model(
         config::save_config(&state.config_path, &config)
             .await
             .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-        config.clone()
+        config.redacted_for_response()
     };
 
     Ok(Json(config))
@@ -228,6 +271,113 @@ async fn test_model(
         payload.source_app = Some("admin-ui".to_string());
     }
     chat_with_payload(state, payload).await
+}
+
+async fn list_providers(State(state): State<AppState>) -> Json<Vec<ProviderStatus>> {
+    let config = state.config.read().await.clone();
+    let ollama_healthy = state.providers.list_ollama_models(&config).await.is_ok();
+    let litellm_healthy = state.providers.litellm_healthy(&config).await;
+
+    Json(vec![
+        ProviderStatus {
+            id: "ollama".to_string(),
+            name: "Ollama".to_string(),
+            kind: "local".to_string(),
+            enabled: true,
+            healthy: ollama_healthy,
+            base_url: None,
+        },
+        ProviderStatus {
+            id: "litellm".to_string(),
+            name: "LiteLLM".to_string(),
+            kind: "gateway".to_string(),
+            enabled: config.litellm.enabled,
+            healthy: litellm_healthy,
+            base_url: Some(config.litellm.base_url),
+        },
+    ])
+}
+
+async fn test_litellm_provider(
+    State(state): State<AppState>,
+    Json(payload): Json<LiteLlmProviderTestRequest>,
+) -> ApiResult<Json<LiteLlmProviderTestResponse>> {
+    let model = payload.model.trim();
+    if model.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "model is required"));
+    }
+
+    let config = state.config.read().await.clone();
+    let provider = state
+        .providers
+        .get("litellm", &config)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "unknown model provider: litellm"))?;
+    let request = ProviderChatRequest {
+        provider: "litellm".to_string(),
+        model: model.to_string(),
+        messages: vec![ChatMessage::text(
+            "user",
+            payload
+                .message
+                .unwrap_or_else(|| "Say hello from llama-harness.".to_string()),
+        )],
+        temperature: Some(config.generation.temperature),
+        top_p: Some(config.generation.top_p),
+        max_tokens: Some(config.generation.max_tokens),
+        tools: None,
+        tool_choice: None,
+        stream: false,
+        metadata: Some(
+            serde_json::json!({ "source_app": "admin-ui", "operation": "provider.test" }),
+        ),
+    };
+
+    match provider.chat_completion(request).await {
+        Ok(response) => {
+            audit_hook(
+                "provider.tested",
+                serde_json::json!({ "provider": "litellm", "model": model }),
+            );
+            Ok(Json(LiteLlmProviderTestResponse {
+                ok: true,
+                content: response.content,
+                usage: response.usage,
+            }))
+        }
+        Err(err) => {
+            let error = err.to_string();
+            audit_hook(
+                "provider.test_failed",
+                serde_json::json!({ "provider": "litellm", "model": model }),
+            );
+            Err(api_error(StatusCode::BAD_GATEWAY, error))
+        }
+    }
+}
+
+async fn generate_litellm_config_endpoint(
+    State(state): State<AppState>,
+    Json(payload): Json<GenerateLiteLlmConfigRequest>,
+) -> ApiResult<Json<GenerateLiteLlmConfigResponse>> {
+    let config = state.config.read().await.clone();
+    let output_path =
+        resolve_litellm_config_path(&state.config_path, &config, payload.output_path.as_deref());
+    let generation = generate_litellm_config(&config.model_routes, &output_path)
+        .await
+        .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    audit_hook(
+        "litellm.config.generated",
+        serde_json::json!({
+            "path": output_path.display().to_string(),
+            "routes_written": generation.routes_written
+        }),
+    );
+
+    Ok(Json(GenerateLiteLlmConfigResponse {
+        path: output_path.display().to_string(),
+        routes_written: generation.routes_written,
+    }))
 }
 
 async fn chat(
@@ -357,7 +507,7 @@ async fn list_runs(
 }
 
 async fn get_settings(State(state): State<AppState>) -> Json<AppConfig> {
-    Json(state.config.read().await.clone())
+    Json(state.config.read().await.redacted_for_response())
 }
 
 async fn update_settings(
@@ -414,6 +564,14 @@ async fn update_settings(
             config.theme = theme;
         }
         if let Some(litellm) = patch.litellm {
+            let existing_api_key = config.litellm.api_key.clone();
+            let mut litellm = litellm;
+            litellm.api_key = match litellm.api_key {
+                Some(value) if value == REDACTED_SECRET => existing_api_key,
+                Some(value) if value.trim().is_empty() => None,
+                Some(value) => Some(value),
+                None => None,
+            };
             config.litellm = litellm;
         }
         if let Some(model_routes) = patch.model_routes {
@@ -423,7 +581,7 @@ async fn update_settings(
         config::save_config(&state.config_path, &config)
             .await
             .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-        config.clone()
+        config.redacted_for_response()
     };
 
     Ok(Json(config))
@@ -661,6 +819,33 @@ async fn record_run(state: &AppState, record: RunRecord) {
             tracing::warn!(error = %err, "failed to append run log");
         }
     }
+}
+
+fn resolve_litellm_config_path(
+    config_path: &Path,
+    config: &AppConfig,
+    requested_path: Option<&str>,
+) -> PathBuf {
+    let raw_path = requested_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| config.litellm.managed_config_path.clone())
+        .unwrap_or_else(|| "litellm.config.yaml".to_string());
+    let path = PathBuf::from(raw_path);
+    if path.is_absolute() {
+        return path;
+    }
+
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(path)
+}
+
+fn audit_hook(event: &str, metadata: serde_json::Value) {
+    tracing::debug!(event, metadata = %metadata, "audit hook");
 }
 
 fn summarize_messages(messages: &[ChatMessage]) -> String {
