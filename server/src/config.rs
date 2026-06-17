@@ -20,6 +20,7 @@ pub struct AppConfig {
     pub api_token: Option<String>,
     pub theme: String,
     pub litellm: LiteLlmSettings,
+    pub litellm_providers: Vec<LiteLlmProviderConfig>,
     pub model_routes: Vec<ModelRoute>,
 }
 
@@ -53,6 +54,18 @@ pub struct LiteLlmSettings {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct LiteLlmProviderConfig {
+    pub id: String,
+    pub enabled: bool,
+    pub provider_type: String,
+    pub display_name: String,
+    pub api_key_env_var: String,
+    pub api_key: Option<String>,
+    pub api_base: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ModelRoute {
     pub id: String,
     pub enabled: bool,
@@ -78,6 +91,7 @@ impl Default for AppConfig {
             api_token: None,
             theme: "dark".to_string(),
             litellm: LiteLlmSettings::default(),
+            litellm_providers: Vec::new(),
             model_routes: Vec::new(),
         }
     }
@@ -117,6 +131,20 @@ impl Default for LiteLlmSettings {
     }
 }
 
+impl Default for LiteLlmProviderConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            enabled: true,
+            provider_type: "openai".to_string(),
+            display_name: String::new(),
+            api_key_env_var: "OPENAI_API_KEY".to_string(),
+            api_key: None,
+            api_base: None,
+        }
+    }
+}
+
 impl Default for ModelRoute {
     fn default() -> Self {
         Self {
@@ -146,6 +174,11 @@ impl AppConfig {
         let mut config = self.clone();
         if config.litellm.api_key.is_some() {
             config.litellm.api_key = Some(REDACTED_SECRET.to_string());
+        }
+        for provider in &mut config.litellm_providers {
+            if provider.api_key.is_some() {
+                provider.api_key = Some(REDACTED_SECRET.to_string());
+            }
         }
         config
     }
@@ -255,6 +288,7 @@ mod tests {
         assert_eq!(config.default_provider, "ollama");
         assert_eq!(config.litellm.base_url, "http://127.0.0.1:4000");
         assert!(!config.litellm.enabled);
+        assert!(config.litellm_providers.is_empty());
         assert!(config.model_routes.is_empty());
     }
 
@@ -287,6 +321,17 @@ mod tests {
                 "managed_config_path": "litellm.yaml",
                 "allow_unconfigured_models": false
               },
+              "litellm_providers": [
+                {
+                  "id": "openai_main",
+                  "enabled": true,
+                  "provider_type": "openai",
+                  "display_name": "OpenAI",
+                  "api_key_env_var": "OPENAI_API_KEY",
+                  "api_key": null,
+                  "api_base": null
+                }
+              ],
               "model_routes": [
                 {
                   "id": "route_openai_gpt4o",
@@ -311,5 +356,27 @@ mod tests {
             Some("openai:gpt-4o")
         );
         assert_eq!(config.model_routes[0].provider_family, "openai");
+        assert_eq!(config.litellm_providers[0].provider_type, "openai");
+    }
+
+    #[test]
+    fn redacted_response_masks_provider_api_keys() {
+        let mut config = AppConfig::default();
+        config.litellm_providers.push(LiteLlmProviderConfig {
+            id: "openai_main".to_string(),
+            enabled: true,
+            provider_type: "openai".to_string(),
+            display_name: "OpenAI".to_string(),
+            api_key_env_var: "OPENAI_API_KEY".to_string(),
+            api_key: Some("sk-secret".to_string()),
+            api_base: None,
+        });
+
+        let redacted = config.redacted_for_response();
+
+        assert_eq!(
+            redacted.litellm_providers[0].api_key.as_deref(),
+            Some(REDACTED_SECRET)
+        );
     }
 }

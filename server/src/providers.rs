@@ -41,6 +41,7 @@ impl ProviderRegistry {
             ))),
             "litellm" => Some(Arc::new(LiteLlmProvider::new(
                 config.litellm.clone(),
+                config.litellm_providers.clone(),
                 config.model_routes.clone(),
             ))),
             _ => None,
@@ -54,9 +55,13 @@ impl ProviderRegistry {
     }
 
     pub async fn litellm_healthy(&self, config: &AppConfig) -> bool {
-        LiteLlmProvider::new(config.litellm.clone(), config.model_routes.clone())
-            .health()
-            .await
+        LiteLlmProvider::new(
+            config.litellm.clone(),
+            config.litellm_providers.clone(),
+            config.model_routes.clone(),
+        )
+        .health()
+        .await
     }
 }
 

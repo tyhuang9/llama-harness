@@ -20,6 +20,16 @@ export type LiteLlmSettings = {
   allow_unconfigured_models: boolean;
 };
 
+export type LiteLlmProviderConfig = {
+  id: string;
+  enabled: boolean;
+  provider_type: string;
+  display_name: string;
+  api_key_env_var: string;
+  api_key: string | null;
+  api_base: string | null;
+};
+
 export type ModelRoute = {
   id: string;
   enabled: boolean;
@@ -128,6 +138,7 @@ export type Settings = {
   api_token: string | null;
   theme: string;
   litellm: LiteLlmSettings;
+  litellm_providers: LiteLlmProviderConfig[];
   model_routes: ModelRoute[];
 };
 
@@ -137,10 +148,14 @@ export type ProviderStatus = {
   kind: string;
   enabled: boolean;
   healthy: boolean;
+  provider_type?: string | null;
+  api_key_configured?: boolean | null;
+  api_key_env_var?: string | null;
   base_url?: string;
 };
 
 export type LiteLlmProviderTestRequest = {
+  provider_id?: string;
   model: string;
   message?: string;
 };
@@ -154,6 +169,28 @@ export type LiteLlmProviderTestResponse = {
 export type GenerateLiteLlmConfigResponse = {
   path: string;
   routes_written: number;
+  providers_written: number;
+  entries_written: number;
+};
+
+export type LiteLlmServiceStartResponse = {
+  status: string;
+  base_url: string;
+  config_path: string;
+  command: string;
+  pid: number | null;
+};
+
+export type ProviderModelOption = {
+  name: string;
+  litellm_model: string;
+  source: string;
+};
+
+export type ProviderModelsResponse = {
+  provider_id: string;
+  provider_type: string;
+  models: ProviderModelOption[];
 };
 
 export type StreamEvent = {
@@ -190,6 +227,10 @@ export class LlamaHarnessClient {
     return this.request("/api/providers");
   }
 
+  listProviderModels(providerId: string): Promise<ProviderModelsResponse> {
+    return this.request(`/api/providers/${encodeURIComponent(providerId)}/models`);
+  }
+
   chat(request: ChatRequest): Promise<ChatResponse> {
     return this.request("/api/chat", {
       method: "POST",
@@ -223,6 +264,12 @@ export class LlamaHarnessClient {
     return this.request("/api/litellm/config/generate", {
       method: "POST",
       body: JSON.stringify({ output_path: outputPath || undefined }),
+    });
+  }
+
+  startLiteLLMService(): Promise<LiteLlmServiceStartResponse> {
+    return this.request("/api/litellm/service/start", {
+      method: "POST",
     });
   }
 
