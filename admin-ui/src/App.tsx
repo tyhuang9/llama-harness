@@ -1,4 +1,5 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   api,
   ChatResponse,
@@ -1777,9 +1778,18 @@ function ModelsPage(props: {
   );
 }
 
+type ComboboxMenuPlacement = {
+  top: number;
+  left: number;
+  width: number;
+  maxHeight: number;
+};
+
 function ProviderTypeCombobox({ value, onChange }: { value: string; onChange: (value: string) => void }) {
   const [open, setOpen] = useState(false);
+  const [menuPlacement, setMenuPlacement] = useState<ComboboxMenuPlacement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!open) {
@@ -1791,28 +1801,68 @@ function ProviderTypeCombobox({ value, onChange }: { value: string; onChange: (v
       if (target instanceof Node && rootRef.current?.contains(target)) {
         return;
       }
+      if (target instanceof Node && menuRef.current?.contains(target)) {
+        return;
+      }
       setOpen(false);
     }
 
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setOpen(false);
+      }
+    }
+
     document.addEventListener("pointerdown", closeOnOutsidePointer, true);
-    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
   }, [open]);
 
-  return (
-    <div className={open ? "combobox open" : "combobox"} ref={rootRef}>
-      <button
-        className="combobox-trigger"
-        type="button"
-        onClick={() => setOpen((current) => !current)}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        title="Show provider types"
-      >
-        <span>{value ? providerTypeLabel(value) : "Select provider"}</span>
-        <span className="combobox-caret" aria-hidden="true">v</span>
-      </button>
-      {open ? (
-        <div className="combobox-menu" role="listbox">
+  useLayoutEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    function updateMenuPlacement() {
+      const rect = rootRef.current?.getBoundingClientRect();
+      if (!rect) {
+        return;
+      }
+
+      const viewportPadding = 12;
+      const menuGap = 6;
+      const availableBelow = window.innerHeight - rect.bottom - viewportPadding - menuGap;
+      const availableAbove = rect.top - viewportPadding - menuGap;
+      const openAbove = availableBelow < 220 && availableAbove > availableBelow;
+      const rawAvailableHeight = openAbove ? availableAbove : availableBelow;
+      const maxHeight = Math.max(120, Math.min(560, rawAvailableHeight));
+      const width = Math.min(rect.width, window.innerWidth - viewportPadding * 2);
+      const left = Math.min(
+        Math.max(viewportPadding, rect.left),
+        Math.max(viewportPadding, window.innerWidth - width - viewportPadding),
+      );
+      const top = openAbove
+        ? Math.max(viewportPadding, rect.top - menuGap - maxHeight)
+        : Math.min(rect.bottom + menuGap, window.innerHeight - viewportPadding - maxHeight);
+
+      setMenuPlacement({ top, left, width, maxHeight });
+    }
+
+    updateMenuPlacement();
+    window.addEventListener("resize", updateMenuPlacement);
+    window.addEventListener("scroll", updateMenuPlacement, true);
+    return () => {
+      window.removeEventListener("resize", updateMenuPlacement);
+      window.removeEventListener("scroll", updateMenuPlacement, true);
+    };
+  }, [open]);
+
+  const menu = open && menuPlacement
+    ? createPortal(
+        <div className="combobox-menu" ref={menuRef} role="listbox" style={menuPlacement}>
           {litellmProviderTypes.map((providerType) => (
             <button
               key={providerType}
@@ -1828,8 +1878,25 @@ function ProviderTypeCombobox({ value, onChange }: { value: string; onChange: (v
               <span>{providerTypeLabel(providerType)}</span>
             </button>
           ))}
-        </div>
-      ) : null}
+        </div>,
+        document.body,
+      )
+    : null;
+
+  return (
+    <div className={open ? "combobox open" : "combobox"} ref={rootRef}>
+      <button
+        className="combobox-trigger"
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        title="Show provider types"
+      >
+        <span>{value ? providerTypeLabel(value) : "Select provider"}</span>
+        <span className="combobox-caret" aria-hidden="true">v</span>
+      </button>
+      {menu}
     </div>
   );
 }

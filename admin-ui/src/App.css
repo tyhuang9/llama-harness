@@ -954,14 +954,11 @@ button.chip.active {
 }
 
 .combobox-menu {
-  position: absolute;
-  z-index: 20;
-  top: calc(100% + 6px);
-  left: 0;
-  right: 0;
+  position: fixed;
+  z-index: 1000;
   display: grid;
-  max-height: 310px;
   overflow: auto;
+  overscroll-behavior: contain;
   border: 1px solid #3c433b;
   border-radius: 8px;
   background: #171917;
