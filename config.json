@@ -16,7 +16,7 @@
   "api_token": null,
   "theme": "dark",
   "litellm": {
-    "enabled": false,
+    "enabled": true,
     "base_url": "http://127.0.0.1:4000",
     "api_key": null,
     "timeout_ms": 120000,
@@ -33,6 +33,15 @@
       "api_key_env_var": "",
       "api_key": null,
       "api_base": "http://localhost:11434"
+    },
+    {
+      "id": "openai",
+      "enabled": true,
+      "provider_type": "openai",
+      "display_name": "OpenAI",
+      "api_key_env_var": "OPENAI_API_KEY",
+      "api_key": null,
+      "api_base": null
     }
   ],
   "model_routes": []

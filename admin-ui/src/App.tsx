@@ -1425,24 +1425,24 @@ function ModelsPage(props: {
     setEditingProviderId(provider.id);
   }
 
-	  function updateProvider(id: string, patch: Partial<LiteLlmProviderConfig>) {
-	    setProviderVerifications((results) => {
-	      const next = { ...results };
-	      delete next[id];
-	      return next;
-	    });
-	    setProviderSaveError(null);
-	    setProviderSaveMessage(null);
-	    setDeleteArmedId(null);
-	    setLiteLlmProviders(
-	      litellmProviders.map((provider) => {
-	        if (provider.id !== id) {
-	          return provider;
-	        }
-	        return { ...provider, ...patch };
-	      }),
-	    );
-	  }
+  function updateProvider(id: string, patch: Partial<LiteLlmProviderConfig>) {
+    setProviderVerifications((results) => {
+      const next = { ...results };
+      delete next[id];
+      return next;
+    });
+    setProviderSaveError(null);
+    setProviderSaveMessage(null);
+    setDeleteArmedId(null);
+    setLiteLlmProviders(
+      litellmProviders.map((provider) => {
+        if (provider.id !== id) {
+          return provider;
+        }
+        return { ...provider, ...patch };
+      }),
+    );
+  }
 
   function removeProvider(id: string) {
     if (!isDraftProviderId(id) && deleteArmedId !== id) {
@@ -1668,58 +1668,83 @@ function ModelsPage(props: {
                         </label>
                         <label>
                           Provider type
-                          <ProviderTypeCombobox
-                            value={provider.provider_type}
-                            onChange={(value) => updateProvider(provider.id, { provider_type: value })}
-                          />
+                          {providerIsDraft ? (
+                            <ProviderTypeCombobox
+                              value={provider.provider_type}
+                              onChange={(value) => {
+                                updateProvider(provider.id, {
+                                  provider_type: value,
+                                  api_key: normalizeProviderType(value) === "ollama" ? null : provider.api_key,
+                                });
+                              }}
+                            />
+                          ) : (
+                            <div className="readonly-field">{provider.provider_type ? providerTypeLabel(provider.provider_type) : "Provider type not set"}</div>
+                          )}
                         </label>
                         <label>
                           <span className="field-label">
-                            API key
-                            <FieldHelp text="Saved to the Llama Harness app data directory and passed to LiteLLM through environment variables." />
+                            {providerIsDraft ? "API key" : "API Base"}
+                            {providerIsDraft ? (
+                              <FieldHelp text="Saved to the Llama Harness app data directory and passed to LiteLLM through environment variables." />
+                            ) : (
+                              <FieldHelp text="Optional provider-specific endpoint. Use it for Ollama behind LiteLLM, self-hosted providers, or a custom proxy; leave it blank for normal hosted provider defaults." />
+                            )}
                           </span>
-                          <input
-                            type="password"
-                            value={apiKeyValue}
-                            onChange={(event) => {
-                              const value = event.target.value;
-                              updateProvider(provider.id, {
-                                api_key: value || (keyConfigured ? REDACTED_SECRET : null),
-                                api_key_env_var: provider.api_key_env_var || envVarForFamily(provider.provider_type),
-                              });
-                            }}
-                            placeholder={apiKeyPlaceholder}
-                            disabled={providerType === "ollama"}
-                          />
+                          {providerIsDraft ? (
+                            <input
+                              type="password"
+                              value={apiKeyValue}
+                              onChange={(event) => updateProvider(provider.id, { api_key: event.target.value || null })}
+                              placeholder={providerType === "ollama" ? "not required" : keyConfigured ? "configured" : "Paste API key"}
+                              disabled={providerType === "ollama"}
+                            />
+                          ) : (
+                            <input
+                              value={provider.api_base || ""}
+                              onChange={(event) => updateProvider(provider.id, { api_base: event.target.value || null })}
+                              placeholder={normalizeProviderType(provider.provider_type) === "ollama" ? "http://localhost:11434" : "Optional"}
+                            />
+                          )}
                         </label>
                       </div>
-                      <details className="advanced-provider-settings">
-                        <summary>Advanced</summary>
-                        <label>
-                          <span className="field-label">
-                            Environment variable
-                            <FieldHelp text="The variable name written to the app-data env file and referenced by generated LiteLLM config." />
-                          </span>
-                          <input
-                            value={provider.api_key_env_var}
-                            onChange={(event) => updateProvider(provider.id, { api_key_env_var: event.target.value })}
-                            placeholder={envVarForFamily(provider.provider_type)}
-                            disabled={providerType === "ollama"}
-                          />
-                        </label>
-                      </details>
+                      {!providerIsDraft && providerType !== "ollama" && replacingProviderKey ? (
+                        <div className="provider-key-replacement">
+                          <label>
+                            New API key
+                            <input
+                              type="password"
+                              value={replacementApiKey}
+                              onChange={(event) => setReplacementApiKey(event.target.value)}
+                              placeholder="Paste replacement API key"
+                            />
+                          </label>
+                          <div className="field-actions">
+                            <button type="button" onClick={() => applyReplacementProviderKey(provider.id)} disabled={props.busy}>
+                              Use new key
+                            </button>
+                            <button type="button" onClick={cancelReplacingProviderKey} disabled={props.busy}>
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
                       <div className="field-row three">
-                        <label>
-                          <span className="field-label">
-                            API Base
-                            <FieldHelp text="Optional provider-specific endpoint. Use it for Ollama behind LiteLLM, self-hosted providers, or a custom proxy; leave it blank for normal hosted provider defaults." />
-                          </span>
-                          <input
-                            value={provider.api_base || ""}
-                            onChange={(event) => updateProvider(provider.id, { api_base: event.target.value || null })}
-                            placeholder={normalizeProviderType(provider.provider_type) === "ollama" ? "http://localhost:11434" : "Optional"}
-                          />
-                        </label>
+                        {providerIsDraft ? (
+                          <label>
+                            <span className="field-label">
+                              API Base
+                              <FieldHelp text="Optional provider-specific endpoint. Use it for Ollama behind LiteLLM, self-hosted providers, or a custom proxy; leave it blank for normal hosted provider defaults." />
+                            </span>
+                            <input
+                              value={provider.api_base || ""}
+                              onChange={(event) => updateProvider(provider.id, { api_base: event.target.value || null })}
+                              placeholder={normalizeProviderType(provider.provider_type) === "ollama" ? "http://localhost:11434" : "Optional"}
+                            />
+                          </label>
+                        ) : (
+                          <div />
+                        )}
                         <label className="switch-row provider-enabled-toggle" title="Disabled providers stay saved but are omitted from generated LiteLLM config and agent choices.">
                           <input
                             type="checkbox"
@@ -1732,6 +1757,11 @@ function ModelsPage(props: {
                           <span>{provider.enabled ? "Enabled" : "Disabled"}</span>
                         </label>
                         <div className="field-actions">
+                          {!providerIsDraft && providerType !== "ollama" && !replacingProviderKey ? (
+                            <button type="button" onClick={() => startReplacingProviderKey(provider.id)} disabled={props.busy}>
+                              {apiKeyValue ? "Edit pending key" : "Replace API key"}
+                            </button>
+                          ) : null}
                           <button
                             type="button"
                             onClick={() => verifyProvider(provider)}
@@ -1747,7 +1777,7 @@ function ModelsPage(props: {
                             disabled={props.busy}
                             title="Requires a second click before this provider is removed."
                           >
-                            {deleteArmedId === provider.id ? "Confirm delete" : "Delete provider"}
+                            {deleteLabel}
                           </button>
                         </div>
                       </div>
@@ -2001,43 +2031,6 @@ function createLiteLlmProvider(): LiteLlmProviderConfig {
   };
 }
 
-function envVarForFamily(family: string): string {
-  switch (normalizeProviderType(family)) {
-    case "ollama":
-      return "";
-    case "openai":
-      return "OPENAI_API_KEY";
-    case "anthropic":
-      return "ANTHROPIC_API_KEY";
-    case "openrouter":
-      return "OPENROUTER_API_KEY";
-    case "gemini":
-      return "GEMINI_API_KEY";
-    case "cohere":
-      return "COHERE_API_KEY";
-    case "mistral":
-      return "MISTRAL_API_KEY";
-    case "groq":
-      return "GROQ_API_KEY";
-    case "deepseek":
-      return "DEEPSEEK_API_KEY";
-    case "xai":
-      return "XAI_API_KEY";
-    case "perplexity":
-      return "PERPLEXITY_API_KEY";
-    case "together_ai":
-      return "TOGETHER_API_KEY";
-    case "fireworks_ai":
-      return "FIREWORKS_API_KEY";
-    case "huggingface":
-      return "HUGGINGFACE_API_KEY";
-    case "replicate":
-      return "REPLICATE_API_TOKEN";
-    default:
-      return "PROVIDER_API_KEY";
-  }
-}
-
 function generatedLiteLlmModel(provider: LiteLlmProviderConfig, model: string): string {
   const providerType = litellmModelPrefix(provider.provider_type);
   const trimmedModel = model.trim();
@@ -2058,13 +2051,12 @@ function litellmModelPrefix(providerType: string): string {
 function prepareProvidersForSave(providers: LiteLlmProviderConfig[]): { providers: LiteLlmProviderConfig[] } | { error: string } {
   const usedNames = new Set<string>();
   const usedIds = new Set<string>();
-  const usedEnabledTypes = new Set<string>();
+  const usedEnvVars = new Set<string>();
   const prepared: LiteLlmProviderConfig[] = [];
 
   for (const provider of providers) {
     const displayName = provider.display_name.trim();
     const providerType = normalizeProviderType(provider.provider_type);
-    const apiKeyEnvVar = provider.api_key_env_var.trim() || (providerType && providerType !== "ollama" ? envVarForFamily(providerType) : "");
 
     if (!displayName) {
       return { error: "Provider name is required." };
@@ -2076,9 +2068,6 @@ function prepareProvidersForSave(providers: LiteLlmProviderConfig[]): { provider
     if (!providerType) {
       return { error: `Provider type is required for "${displayName}".` };
     }
-    if (providerType !== "ollama" && !apiKeyEnvVar) {
-      return { error: `API Key Environment Variable Name is required for "${displayName}".` };
-    }
     if (providerType !== "ollama" && provider.enabled) {
       const rawApiKey = provider.api_key && provider.api_key !== REDACTED_SECRET ? provider.api_key.trim() : "";
       const configuredApiKey = provider.api_key === REDACTED_SECRET;
@@ -2086,16 +2075,20 @@ function prepareProvidersForSave(providers: LiteLlmProviderConfig[]): { provider
         return { error: `API key is required for "${displayName}".` };
       }
     }
-    if (provider.enabled) {
-      if (usedEnabledTypes.has(providerType)) {
-        return { error: `Only one enabled ${providerTypeLabel(providerType)} provider is supported.` };
-      }
-      usedEnabledTypes.add(providerType);
-    }
 
     usedNames.add(nameKey);
     const currentId = normalizeProviderId(provider.id);
     const id = currentId && !currentId.startsWith("draft_") ? currentId : uniqueProviderId(displayName, usedIds);
+    if (usedIds.has(id)) {
+      return { error: `Provider id "${id}" is already used.` };
+    }
+    const apiKeyEnvVar = providerType === "ollama" ? "" : provider.api_key_env_var.trim() || apiKeyEnvVarForProviderId(id);
+    if (apiKeyEnvVar) {
+      if (usedEnvVars.has(apiKeyEnvVar)) {
+        return { error: `Provider API key environment variable "${apiKeyEnvVar}" is already used.` };
+      }
+      usedEnvVars.add(apiKeyEnvVar);
+    }
     usedIds.add(id);
     prepared.push({
       ...provider,
@@ -2121,6 +2114,23 @@ function uniqueProviderId(displayName: string, usedIds: Set<string>): string {
       return candidate;
     }
   }
+}
+
+function apiKeyEnvVarForProviderId(providerId: string): string {
+  const slug = providerId
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return `${slug || "PROVIDER"}_API_KEY`;
+}
+
+function isDraftProvider(provider: LiteLlmProviderConfig): boolean {
+  return isDraftProviderId(provider.id);
+}
+
+function isDraftProviderId(id: string): boolean {
+  return normalizeProviderId(id).startsWith("draft_");
 }
 
 function localProviderModelCatalog(provider: LiteLlmProviderConfig): ProviderModelsResponse {

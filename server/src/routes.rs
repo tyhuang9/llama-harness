@@ -1786,6 +1786,14 @@ fn normalize_litellm_provider_config(
     if provider.id.is_empty() || provider.id.starts_with("draft_") {
         provider.id = provider_id_from_display_name(&provider.display_name, used_ids);
     }
+    if let Some(existing_type) = existing_providers
+        .iter()
+        .find(|existing| normalize_provider_id(&existing.id) == provider.id)
+        .map(|existing| normalize_provider_type(&existing.provider_type))
+        .filter(|provider_type| !provider_type.is_empty())
+    {
+        provider.provider_type = existing_type;
+    }
 
     provider.display_name = provider.display_name.trim().to_string();
 
@@ -2190,6 +2198,31 @@ mod tests {
         };
 
         assert_eq!(normalized[0].id, "openai_main");
+        assert_eq!(normalized[0].api_key_env_var, "OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn existing_provider_type_is_preserved_by_id() {
+        let existing = vec![LiteLlmProviderConfig {
+            id: "openai_main".to_string(),
+            enabled: true,
+            provider_type: "openai".to_string(),
+            display_name: "OpenAI".to_string(),
+            api_key_env_var: "OPENAI_API_KEY".to_string(),
+            api_key: Some(REDACTED_SECRET.to_string()),
+            api_base: None,
+        }];
+        let providers = vec![LiteLlmProviderConfig {
+            provider_type: "ollama".to_string(),
+            ..existing[0].clone()
+        }];
+
+        let normalized = match normalize_litellm_provider_configs(providers, &existing) {
+            Ok(providers) => providers,
+            Err(_) => panic!("existing provider type should be preserved"),
+        };
+
+        assert_eq!(normalized[0].provider_type, "openai");
         assert_eq!(normalized[0].api_key_env_var, "OPENAI_API_KEY");
     }
 

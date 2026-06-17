@@ -913,26 +913,6 @@ button.chip.active {
   border-top: 1px solid #252923;
 }
 
-.advanced-provider-settings {
-  border: 1px solid #252923;
-  border-radius: 7px;
-  background: #101310;
-  padding: 10px 12px;
-}
-
-.advanced-provider-settings summary {
-  cursor: pointer;
-  color: #bdb5a7;
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.advanced-provider-settings label {
-  display: grid;
-  gap: 6px;
-  margin-top: 10px;
-}
-
 .provider-list > .empty {
   margin: 0;
   padding: 14px;
@@ -941,6 +921,33 @@ button.chip.active {
 
 .provider-enabled-toggle {
   align-self: end;
+}
+
+.readonly-field {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  border: 1px solid #252923;
+  border-radius: 7px;
+  background: #101310;
+  color: #d8d2c7;
+  padding: 8px 10px;
+}
+
+.provider-key-replacement {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+  border: 1px solid #252923;
+  border-radius: 7px;
+  background: #101310;
+  padding: 12px;
+}
+
+.provider-key-replacement label {
+  display: grid;
+  gap: 6px;
 }
 
 .combobox {
