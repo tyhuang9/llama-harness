@@ -4,6 +4,7 @@ mod ollama;
 mod providers;
 mod routes;
 mod runs;
+mod secrets;
 
 use crate::{
     config::AppConfig, ollama::OllamaClient, providers::ProviderRegistry, routes::AppState,
@@ -42,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         runs_path,
         runs: Arc::new(RwLock::new(run_history)),
         providers: ProviderRegistry::new(OllamaClient::new()),
+        litellm_process: Arc::new(RwLock::new(None)),
         started_at: Utc::now(),
     };
 

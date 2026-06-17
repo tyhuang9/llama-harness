@@ -172,6 +172,15 @@ export type LiteLlmServiceStartResponse = {
   pid: number | null;
 };
 
+export type ApplyLiteLlmProvidersResponse = {
+  settings: Settings;
+  provider_statuses: ProviderStatus[];
+  env_file_path: string;
+  config_path: string;
+  litellm_ready: boolean;
+  warning?: string | null;
+};
+
 const API_BASE_KEY = "llama-harness-api-base";
 
 export function getApiBase(): string {
@@ -228,6 +237,11 @@ export const api = {
     request<LiteLlmTestResponse>("/api/providers/litellm/test", {
       method: "POST",
       body: JSON.stringify({ model, message, provider_id: providerId || undefined, draft_provider: draft?.provider }),
+    }),
+  applyLiteLLMProviders: (providers: LiteLlmProviderConfig[]) =>
+    request<ApplyLiteLlmProvidersResponse>("/api/litellm/providers/apply", {
+      method: "POST",
+      body: JSON.stringify({ providers }),
     }),
   generateLiteLLMConfig: (outputPath?: string | null) =>
     request<GenerateLiteLlmConfigResponse>("/api/litellm/config/generate", {

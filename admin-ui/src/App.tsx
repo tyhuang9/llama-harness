@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from
 import { createPortal } from "react-dom";
 import {
   api,
+  ApplyLiteLlmProvidersResponse,
   ChatResponse,
   GenerateLiteLlmConfigResponse,
   getApiBase,
@@ -341,6 +342,15 @@ export default function App() {
     }
   }
 
+  async function applyLiteLlmProviders(providers: LiteLlmProviderConfig[]): Promise<ApplyLiteLlmProvidersResponse> {
+    setApiBase(apiBaseInput);
+    const result = await api.applyLiteLLMProviders(providers);
+    setSettings(result.settings);
+    setProviderStatuses(result.provider_statuses);
+    await refreshAll();
+    return result;
+  }
+
   function openTask(taskId: string) {
     setSelectedTaskId(taskId);
     setPage("task-detail");
@@ -565,6 +575,7 @@ export default function App() {
               providerStatuses={providerStatuses}
               selectDefaultModel={selectDefaultModel}
               saveSettings={saveSettings}
+              applyLiteLlmProviders={applyLiteLlmProviders}
               testModel={testModel}
               setTestModel={setTestModel}
               prompt={prompt}
@@ -1372,6 +1383,7 @@ function ModelsPage(props: {
   providerStatuses: ProviderStatus[];
   selectDefaultModel: (model: string) => void;
   saveSettings: (settings?: Settings) => Promise<Settings | void> | void;
+  applyLiteLlmProviders: (providers: LiteLlmProviderConfig[]) => Promise<ApplyLiteLlmProvidersResponse>;
   testModel: string;
   setTestModel: (value: string) => void;
   prompt: string;
@@ -1389,6 +1401,8 @@ function ModelsPage(props: {
   const [providerVerifyBusyId, setProviderVerifyBusyId] = useState<string | null>(null);
   const [providerVerifications, setProviderVerifications] = useState<Record<string, ProviderVerification>>({});
   const [deleteArmedId, setDeleteArmedId] = useState<string | null>(null);
+  const [replacingProviderKeyId, setReplacingProviderKeyId] = useState<string | null>(null);
+  const [replacementApiKey, setReplacementApiKey] = useState("");
   const litellmStatus = props.providerStatuses.find((provider) => provider.id === "litellm");
   const ollamaStatus = props.providerStatuses.find((provider) => provider.id === "ollama");
   const defaultProvider = props.settings?.default_provider || "ollama";
@@ -1411,33 +1425,27 @@ function ModelsPage(props: {
     setEditingProviderId(provider.id);
   }
 
-  function updateProvider(id: string, patch: Partial<LiteLlmProviderConfig>) {
-    setProviderVerifications((results) => {
-      const next = { ...results };
-      delete next[id];
-      return next;
-    });
-    setProviderSaveMessage(null);
-    setDeleteArmedId(null);
-    setLiteLlmProviders(
-      litellmProviders.map((provider) => {
-        if (provider.id !== id) {
-          return provider;
-        }
-        const next = { ...provider, ...patch };
-        if (patch.provider_type && !patch.api_key_env_var) {
-          const oldDefault = envVarForFamily(provider.provider_type);
-          if (!provider.api_key_env_var || provider.api_key_env_var === oldDefault) {
-            next.api_key_env_var = envVarForFamily(patch.provider_type);
-          }
-        }
-        return next;
-      }),
-    );
-  }
+	  function updateProvider(id: string, patch: Partial<LiteLlmProviderConfig>) {
+	    setProviderVerifications((results) => {
+	      const next = { ...results };
+	      delete next[id];
+	      return next;
+	    });
+	    setProviderSaveError(null);
+	    setProviderSaveMessage(null);
+	    setDeleteArmedId(null);
+	    setLiteLlmProviders(
+	      litellmProviders.map((provider) => {
+	        if (provider.id !== id) {
+	          return provider;
+	        }
+	        return { ...provider, ...patch };
+	      }),
+	    );
+	  }
 
   function removeProvider(id: string) {
-    if (deleteArmedId !== id) {
+    if (!isDraftProviderId(id) && deleteArmedId !== id) {
       setDeleteArmedId(id);
       return;
     }
@@ -1451,6 +1459,33 @@ function ModelsPage(props: {
     if (editingProviderId === id) {
       setEditingProviderId(null);
     }
+    if (replacingProviderKeyId === id) {
+      setReplacingProviderKeyId(null);
+      setReplacementApiKey("");
+    }
+  }
+
+  function startReplacingProviderKey(id: string) {
+    setProviderSaveError(null);
+    setDeleteArmedId(null);
+    setReplacingProviderKeyId(id);
+    setReplacementApiKey("");
+  }
+
+  function cancelReplacingProviderKey() {
+    setReplacingProviderKeyId(null);
+    setReplacementApiKey("");
+  }
+
+  function applyReplacementProviderKey(id: string) {
+    const value = replacementApiKey.trim();
+    if (!value) {
+      setProviderSaveError("Enter a replacement API key before applying it.");
+      return;
+    }
+    updateProvider(id, { api_key: value });
+    setReplacingProviderKeyId(null);
+    setReplacementApiKey("");
   }
 
   async function verifyProvider(provider: LiteLlmProviderConfig) {
@@ -1525,23 +1560,20 @@ function ModelsPage(props: {
       return;
     }
 
-    const nextSettings = { ...props.settings, litellm_providers: prepared.providers };
     setProviderSaveBusy(true);
     setProviderSaveError(null);
     setProviderSaveMessage(null);
     setConfigWarning(null);
     try {
-      await props.saveSettings(nextSettings);
-      if (nextSettings.litellm.enabled && nextSettings.litellm.managed_config_path) {
-        try {
-          await api.generateLiteLLMConfig(nextSettings.litellm.managed_config_path);
-          setProviderSaveMessage("Providers saved and LiteLLM config generated. Refresh or restart LiteLLM before expecting these provider changes at runtime.");
-        } catch (err) {
-          setConfigWarning((err as Error).message);
-        }
+      const result = await props.applyLiteLlmProviders(prepared.providers);
+      if (result.litellm_ready) {
+        setProviderSaveMessage("Providers saved. LiteLLM is ready.");
       } else {
-        setProviderSaveMessage("Providers saved. Generate a LiteLLM config and refresh or restart LiteLLM before expecting these provider changes at runtime.");
+        setProviderSaveMessage("Providers saved. LiteLLM is not ready yet.");
       }
+      setConfigWarning(result.warning || null);
+      setReplacingProviderKeyId(null);
+      setReplacementApiKey("");
     } catch (err) {
       setProviderSaveError((err as Error).message);
     } finally {
@@ -1584,7 +1616,7 @@ function ModelsPage(props: {
             <div>
               <h2>
                 LiteLLM Providers
-                <FieldHelp text="Provider changes do not apply to the running LiteLLM proxy until you save providers and refresh or restart LiteLLM." />
+                <FieldHelp text="Save writes provider secrets, regenerates LiteLLM config, and starts the app-managed gateway when needed." />
               </h2>
               <p>{enabledProviders} enabled / {litellmProviders.length} total</p>
             </div>
@@ -1606,6 +1638,12 @@ function ModelsPage(props: {
               const expanded = editingProviderId === provider.id;
               const status = props.providerStatuses.find((item) => item.id === provider.id);
               const verification = providerVerifications[provider.id];
+              const providerType = normalizeProviderType(provider.provider_type);
+              const providerIsDraft = isDraftProvider(provider);
+              const keyConfigured = provider.api_key === REDACTED_SECRET || Boolean(status?.api_key_configured);
+              const apiKeyValue = provider.api_key && provider.api_key !== REDACTED_SECRET ? provider.api_key : "";
+              const replacingProviderKey = replacingProviderKeyId === provider.id;
+              const deleteLabel = providerIsDraft ? "Cancel provider" : deleteArmedId === provider.id ? "Confirm delete" : "Delete provider";
               return (
                 <article key={provider.id} className={expanded ? "provider-row expanded" : "provider-row"}>
                   <button type="button" className="provider-row-summary" onClick={() => setEditingProviderId(expanded ? null : provider.id)}>
@@ -1637,16 +1675,39 @@ function ModelsPage(props: {
                         </label>
                         <label>
                           <span className="field-label">
-                            API Key Environment Variable Name
-                            <FieldHelp text="The environment variable name available to the LiteLLM process, such as OPENAI_API_KEY. The app stores this name, not the secret value." />
+                            API key
+                            <FieldHelp text="Saved to the Llama Harness app data directory and passed to LiteLLM through environment variables." />
+                          </span>
+                          <input
+                            type="password"
+                            value={apiKeyValue}
+                            onChange={(event) => {
+                              const value = event.target.value;
+                              updateProvider(provider.id, {
+                                api_key: value || (keyConfigured ? REDACTED_SECRET : null),
+                                api_key_env_var: provider.api_key_env_var || envVarForFamily(provider.provider_type),
+                              });
+                            }}
+                            placeholder={apiKeyPlaceholder}
+                            disabled={providerType === "ollama"}
+                          />
+                        </label>
+                      </div>
+                      <details className="advanced-provider-settings">
+                        <summary>Advanced</summary>
+                        <label>
+                          <span className="field-label">
+                            Environment variable
+                            <FieldHelp text="The variable name written to the app-data env file and referenced by generated LiteLLM config." />
                           </span>
                           <input
                             value={provider.api_key_env_var}
                             onChange={(event) => updateProvider(provider.id, { api_key_env_var: event.target.value })}
                             placeholder={envVarForFamily(provider.provider_type)}
+                            disabled={providerType === "ollama"}
                           />
                         </label>
-                      </div>
+                      </details>
                       <div className="field-row three">
                         <label>
                           <span className="field-label">
@@ -1677,7 +1738,7 @@ function ModelsPage(props: {
                             disabled={props.busy || providerVerifyBusyId === provider.id}
                             title="Calls the LiteLLM gateway with the current provider values and a small test prompt."
                           >
-                            {providerVerifyBusyId === provider.id ? "Verifying..." : "Verify credentials"}
+                            {providerVerifyBusyId === provider.id ? "Testing..." : "Test Connection"}
                           </button>
                           <button
                             className={deleteArmedId === provider.id ? "danger" : "danger-outline"}
@@ -1997,6 +2058,7 @@ function litellmModelPrefix(providerType: string): string {
 function prepareProvidersForSave(providers: LiteLlmProviderConfig[]): { providers: LiteLlmProviderConfig[] } | { error: string } {
   const usedNames = new Set<string>();
   const usedIds = new Set<string>();
+  const usedEnabledTypes = new Set<string>();
   const prepared: LiteLlmProviderConfig[] = [];
 
   for (const provider of providers) {
@@ -2016,6 +2078,19 @@ function prepareProvidersForSave(providers: LiteLlmProviderConfig[]): { provider
     }
     if (providerType !== "ollama" && !apiKeyEnvVar) {
       return { error: `API Key Environment Variable Name is required for "${displayName}".` };
+    }
+    if (providerType !== "ollama" && provider.enabled) {
+      const rawApiKey = provider.api_key && provider.api_key !== REDACTED_SECRET ? provider.api_key.trim() : "";
+      const configuredApiKey = provider.api_key === REDACTED_SECRET;
+      if (!rawApiKey && !configuredApiKey) {
+        return { error: `API key is required for "${displayName}".` };
+      }
+    }
+    if (provider.enabled) {
+      if (usedEnabledTypes.has(providerType)) {
+        return { error: `Only one enabled ${providerTypeLabel(providerType)} provider is supported.` };
+      }
+      usedEnabledTypes.add(providerType);
     }
 
     usedNames.add(nameKey);
@@ -2105,13 +2180,16 @@ function preferredVerificationModel(providerType: string): string {
 }
 
 function providerCredentialLabel(provider: LiteLlmProviderConfig, status?: ProviderStatus): string {
+  if (normalizeProviderType(provider.provider_type) === "ollama") {
+    return "not required";
+  }
   if (provider.api_key && provider.api_key !== REDACTED_SECRET) {
-    return `pending save / ${provider.api_key_env_var || "env var"}`;
+    return "pending save";
   }
   if (provider.api_key === REDACTED_SECRET || status?.api_key_configured) {
-    return `configured / ${provider.api_key_env_var || status?.api_key_env_var || "env var"}`;
+    return "configured";
   }
-  return provider.api_key_env_var || "not set";
+  return "not configured";
 }
 
 function providerTypeLabel(providerType: string): string {
