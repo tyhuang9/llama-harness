@@ -198,6 +198,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    document.documentElement.dataset.theme = settings?.theme || "dark";
+  }, [settings?.theme]);
+
+  useEffect(() => {
     function blurEditableOnOutsidePointer(event: PointerEvent) {
       const active = document.activeElement;
       const target = event.target;
@@ -274,6 +278,28 @@ export default function App() {
       await refreshAll();
       return updated;
     } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleTheme() {
+    if (!settings || busy) {
+      return;
+    }
+    const nextSettings = {
+      ...settings,
+      theme: settings.theme === "light" ? "dark" : "light",
+    };
+
+    setBusy(true);
+    setError(null);
+    setSettings(nextSettings);
+    try {
+      await persistSettings(nextSettings);
+    } catch (err) {
+      setSettings(settings);
       setError((err as Error).message);
     } finally {
       setBusy(false);
@@ -489,6 +515,16 @@ export default function App() {
             <h2>{page === "new-task" ? "New Task" : page === "task-detail" ? selectedTask?.name || "Task" : activeNav.label}</h2>
           </div>
           <div className="topbar-actions">
+            <button
+              className="theme-toggle"
+              type="button"
+              onClick={toggleTheme}
+              disabled={!settings || busy}
+              aria-label={`Switch to ${settings?.theme === "light" ? "dark" : "light"} theme`}
+              title={`Switch to ${settings?.theme === "light" ? "dark" : "light"} theme`}
+            >
+              {settings?.theme === "light" ? "☾" : "☀"}
+            </button>
             <button className="danger-outline" type="button" onClick={() => setEstopOpen((value) => !value)}>
               Emergency Stop All
             </button>
@@ -2619,20 +2655,13 @@ function SettingsView(props: {
               <h3>App connection</h3>
               <p>Agent model selection lives on Agents. Provider credentials live on Providers.</p>
             </div>
-            <div className="field-row three">
+            <div className="field-row">
               <label>
                 <span className="field-label">
                   API base URL
                   <FieldHelp text="The llama-harness API endpoint used by this admin UI." />
                 </span>
                 <input value={props.apiBaseInput} onChange={(event) => props.setApiBaseInput(event.target.value)} />
-              </label>
-              <label>
-                Theme
-                <select value={settings.theme} onChange={(event) => setSettings({ ...settings, theme: event.target.value })}>
-                  <option value="dark">dark</option>
-                  <option value="light">light</option>
-                </select>
               </label>
               <label className="switch-row settings-switch">
                 <input
@@ -2730,7 +2759,7 @@ function SettingsView(props: {
                 <input value={settings.litellm.base_url} onChange={(event) => updateLiteLlm({ base_url: event.target.value })} />
               </label>
             </div>
-            <div className="button-row">
+            <div className="button-row gateway-actions">
               <button type="button" onClick={props.testLiteLlmConnection} disabled={props.busy}>
                 Test connection
               </button>
