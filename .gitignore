@@ -5,4 +5,5 @@ dist/
 .DS_Store
 *.log
 runs.jsonl
+litellm.config.yaml
 admin-ui/src/sentinelData.local.ts

@@ -20,6 +20,16 @@ export type LiteLlmSettings = {
   allow_unconfigured_models: boolean;
 };
 
+export type LiteLlmProviderConfig = {
+  id: string;
+  enabled: boolean;
+  provider_type: string;
+  display_name: string;
+  api_key_env_var: string;
+  api_key: string | null;
+  api_base: string | null;
+};
+
 export type ModelRoute = {
   id: string;
   enabled: boolean;
@@ -43,6 +53,7 @@ export type Settings = {
   api_token: string | null;
   theme: string;
   litellm: LiteLlmSettings;
+  litellm_providers: LiteLlmProviderConfig[];
   model_routes: ModelRoute[];
 };
 
@@ -118,6 +129,9 @@ export type ProviderStatus = {
   kind: string;
   enabled: boolean;
   healthy: boolean;
+  provider_type?: string | null;
+  api_key_configured?: boolean | null;
+  api_key_env_var?: string | null;
   base_url?: string;
 };
 
@@ -127,9 +141,35 @@ export type LiteLlmTestResponse = {
   usage?: TokenUsage | null;
 };
 
+export type LiteLlmProviderTestDraft = {
+  provider: LiteLlmProviderConfig;
+};
+
+export type ProviderModelOption = {
+  name: string;
+  litellm_model: string;
+  source: string;
+};
+
+export type ProviderModelsResponse = {
+  provider_id: string;
+  provider_type: string;
+  models: ProviderModelOption[];
+};
+
 export type GenerateLiteLlmConfigResponse = {
   path: string;
   routes_written: number;
+  providers_written: number;
+  entries_written: number;
+};
+
+export type LiteLlmServiceStartResponse = {
+  status: string;
+  base_url: string;
+  config_path: string;
+  command: string;
+  pid: number | null;
 };
 
 const API_BASE_KEY = "llama-harness-api-base";
@@ -162,6 +202,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<Health>("/health"),
   providers: () => request<ProviderStatus[]>("/api/providers"),
+  providerModels: (providerId: string) => request<ProviderModelsResponse>(`/api/providers/${encodeURIComponent(providerId)}/models`),
   models: () => request<ModelsResponse>("/api/models"),
   settings: () => request<Settings>("/api/settings"),
   updateSettings: (settings: Partial<Settings>) =>
@@ -183,15 +224,19 @@ export const api = {
         source_app: "admin-ui",
       }),
     }),
-  testLiteLLMProvider: (model: string, message: string) =>
+  testLiteLLMProvider: (model: string, message: string, providerId?: string | null, draft?: LiteLlmProviderTestDraft) =>
     request<LiteLlmTestResponse>("/api/providers/litellm/test", {
       method: "POST",
-      body: JSON.stringify({ model, message }),
+      body: JSON.stringify({ model, message, provider_id: providerId || undefined, draft_provider: draft?.provider }),
     }),
   generateLiteLLMConfig: (outputPath?: string | null) =>
     request<GenerateLiteLlmConfigResponse>("/api/litellm/config/generate", {
       method: "POST",
       body: JSON.stringify({ output_path: outputPath || undefined }),
+    }),
+  startLiteLLMService: () =>
+    request<LiteLlmServiceStartResponse>("/api/litellm/service/start", {
+      method: "POST",
     }),
   chat: (prompt: string, model?: string, instructions?: string) =>
     request<ChatResponse>("/api/chat", {

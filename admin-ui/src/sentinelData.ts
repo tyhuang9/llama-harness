@@ -1,6 +1,6 @@
 export type TaskStatus = "queued" | "planning" | "running" | "waiting_approval" | "completed" | "failed";
 export type Environment = "planner" | "browser" | "computer-use" | "local-desktop";
-export type ModelProvider = "Gemini" | "OpenAI" | "Anthropic" | "OpenRouter" | "Ollama";
+export type ModelProvider = string;
 
 export type AgentPermissions = {
   browser: boolean;
@@ -14,6 +14,7 @@ export type Task = {
   name: string;
   status: TaskStatus;
   environment: Environment;
+  providerId?: string;
   provider: ModelProvider;
   model: string;
   createdAt: string;
@@ -30,7 +31,8 @@ export type Agent = {
   role: string;
   description: string;
   systemPrompt: string;
-  defaultProvider: ModelProvider;
+  defaultProviderId: string;
+  defaultProvider?: ModelProvider;
   defaultModel: string;
   defaultEnvironment: Environment;
   autonomy: "observe" | "ask" | "low-risk" | "autonomous";

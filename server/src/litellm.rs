@@ -1,5 +1,5 @@
 use crate::{
-    config::{LiteLlmSettings, ModelRoute},
+    config::{LiteLlmProviderConfig, LiteLlmSettings, ModelRoute},
     providers::{
         ProviderChatRequest, ProviderChatResponse, ProviderEventStream, ProviderStreamEvent,
         TokenUsage,
@@ -18,6 +18,7 @@ use crate::providers::ModelProvider;
 #[derive(Clone)]
 pub struct LiteLlmProvider {
     settings: LiteLlmSettings,
+    providers: Vec<LiteLlmProviderConfig>,
     routes: Vec<ModelRoute>,
     http: Client,
 }
@@ -33,6 +34,7 @@ struct LiteLlmStreamUpdate {
 #[derive(Debug, Serialize)]
 struct LiteLlmConfig {
     model_list: Vec<LiteLlmConfigModel>,
+    litellm_settings: LiteLlmRuntimeSettings,
     general_settings: LiteLlmGeneralSettings,
 }
 
@@ -52,16 +54,27 @@ struct LiteLlmConfigParams {
 }
 
 #[derive(Debug, Serialize)]
+struct LiteLlmRuntimeSettings {
+    check_provider_endpoint: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct LiteLlmGeneralSettings {
     master_key: String,
 }
 
 pub struct LiteLlmConfigGeneration {
     pub routes_written: usize,
+    pub providers_written: usize,
+    pub entries_written: usize,
 }
 
 impl LiteLlmProvider {
-    pub fn new(settings: LiteLlmSettings, routes: Vec<ModelRoute>) -> Self {
+    pub fn new(
+        settings: LiteLlmSettings,
+        providers: Vec<LiteLlmProviderConfig>,
+        routes: Vec<ModelRoute>,
+    ) -> Self {
         let timeout = Duration::from_millis(settings.timeout_ms.max(1));
         let http = Client::builder()
             .timeout(timeout)
@@ -70,6 +83,7 @@ impl LiteLlmProvider {
 
         Self {
             settings,
+            providers,
             routes,
             http,
         }
@@ -90,12 +104,15 @@ impl LiteLlmProvider {
         if model.trim().is_empty() {
             return Err(anyhow!("model is required for LiteLLM requests"));
         }
-        if self.settings.allow_unconfigured_models || self.has_model_route(model) {
+        if self.settings.allow_unconfigured_models
+            || self.has_model_route(model)
+            || self.has_provider_for_model(model)
+        {
             return Ok(());
         }
 
         Err(anyhow!(
-            "LiteLLM model '{model}' is not configured. Add a model route or enable allow_unconfigured_models."
+            "LiteLLM model '{model}' is not configured. Add a provider, add an advanced route, or enable allow_unconfigured_models."
         ))
     }
 
@@ -103,6 +120,12 @@ impl LiteLlmProvider {
         self.routes
             .iter()
             .any(|route| route.enabled && route.model_alias == model)
+    }
+
+    fn has_provider_for_model(&self, model: &str) -> bool {
+        self.providers
+            .iter()
+            .any(|provider| provider.enabled && model_belongs_to_provider(provider, model))
     }
 
     async fn health_request(&self, path: &str) -> bool {
@@ -176,10 +199,28 @@ impl ModelProvider for LiteLlmProvider {
 }
 
 pub async fn generate_litellm_config(
+    providers: &[LiteLlmProviderConfig],
     routes: &[ModelRoute],
     output_path: &Path,
+    ollama_endpoint: &str,
 ) -> Result<LiteLlmConfigGeneration> {
-    let enabled_routes = routes
+    let provider_entries = providers
+        .iter()
+        .filter(|provider| provider.enabled)
+        .filter_map(|provider| {
+            let model_name = provider_wildcard_model(provider)?;
+            Some(LiteLlmConfigModel {
+                model_name: model_name.clone(),
+                litellm_params: LiteLlmConfigParams {
+                    model: model_name,
+                    api_key: env_reference(&provider.api_key_env_var),
+                    api_base: provider_api_base(provider, ollama_endpoint),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let route_entries = routes
         .iter()
         .filter(|route| {
             route.enabled
@@ -200,13 +241,19 @@ pub async fn generate_litellm_config(
         })
         .collect::<Vec<_>>();
 
+    let providers_written = provider_entries.len();
+    let routes_written = route_entries.len();
+
     let config = LiteLlmConfig {
-        model_list: enabled_routes,
+        model_list: provider_entries.into_iter().chain(route_entries).collect(),
+        litellm_settings: LiteLlmRuntimeSettings {
+            check_provider_endpoint: true,
+        },
         general_settings: LiteLlmGeneralSettings {
             master_key: "os.environ/LITELLM_MASTER_KEY".to_string(),
         },
     };
-    let routes_written = config.model_list.len();
+    let entries_written = config.model_list.len();
     let contents = serde_yaml::to_string(&config).context("failed to encode LiteLLM config")?;
 
     if let Some(parent) = output_path.parent() {
@@ -221,7 +268,73 @@ pub async fn generate_litellm_config(
         .await
         .with_context(|| format!("failed to write {}", output_path.display()))?;
 
-    Ok(LiteLlmConfigGeneration { routes_written })
+    Ok(LiteLlmConfigGeneration {
+        routes_written,
+        providers_written,
+        entries_written,
+    })
+}
+
+pub fn litellm_model_for_provider(provider: &LiteLlmProviderConfig, model: &str) -> String {
+    let model = model.trim();
+    let model_prefix = litellm_model_prefix(provider);
+    if model.is_empty() || model_prefix.is_empty() {
+        return model.to_string();
+    }
+
+    let prefix = format!("{model_prefix}/");
+    if model.starts_with(&prefix) {
+        return model.to_string();
+    }
+
+    format!("{prefix}{model}")
+}
+
+fn model_belongs_to_provider(provider: &LiteLlmProviderConfig, model: &str) -> bool {
+    let model_prefix = litellm_model_prefix(provider);
+    if model_prefix.is_empty() {
+        return false;
+    }
+
+    let model = model.trim();
+    model.starts_with(&format!("{model_prefix}/"))
+}
+
+fn provider_wildcard_model(provider: &LiteLlmProviderConfig) -> Option<String> {
+    let model_prefix = litellm_model_prefix(provider);
+    if model_prefix.is_empty() {
+        return None;
+    }
+    Some(format!("{model_prefix}/*"))
+}
+
+fn litellm_model_prefix(provider: &LiteLlmProviderConfig) -> String {
+    match normalize_provider_type(&provider.provider_type).as_str() {
+        "ollama" => "ollama_chat".to_string(),
+        provider_type => provider_type.to_string(),
+    }
+}
+
+fn provider_api_base(provider: &LiteLlmProviderConfig, ollama_endpoint: &str) -> Option<String> {
+    provider
+        .api_base
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            if normalize_provider_type(&provider.provider_type) == "ollama" {
+                Some(ollama_endpoint.trim().to_string()).filter(|value| !value.is_empty())
+            } else {
+                None
+            }
+        })
+}
+
+fn normalize_provider_type(provider_type: &str) -> String {
+    provider_type
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_")
 }
 
 fn build_litellm_chat_body(request: &ProviderChatRequest) -> Value {
@@ -549,6 +662,15 @@ mod tests {
 
     #[test]
     fn generated_config_uses_env_references() {
+        let providers = vec![LiteLlmProviderConfig {
+            id: "openai_main".to_string(),
+            enabled: true,
+            provider_type: "openai".to_string(),
+            display_name: "OpenAI".to_string(),
+            api_key_env_var: "OPENAI_API_KEY".to_string(),
+            api_key: Some("sk-secret".to_string()),
+            api_base: None,
+        }];
         let routes = vec![ModelRoute {
             id: "route_openai".to_string(),
             enabled: true,
@@ -562,17 +684,31 @@ mod tests {
             notes: None,
         }];
         let config = LiteLlmConfig {
-            model_list: routes
+            model_list: providers
                 .iter()
-                .map(|route| LiteLlmConfigModel {
+                .map(|provider| {
+                    let model_name = provider_wildcard_model(provider).expect("wildcard");
+                    LiteLlmConfigModel {
+                        model_name: model_name.clone(),
+                        litellm_params: LiteLlmConfigParams {
+                            model: model_name,
+                            api_key: env_reference(&provider.api_key_env_var),
+                            api_base: None,
+                        },
+                    }
+                })
+                .chain(routes.iter().map(|route| LiteLlmConfigModel {
                     model_name: route.model_alias.clone(),
                     litellm_params: LiteLlmConfigParams {
                         model: route.litellm_model.clone(),
                         api_key: env_reference(&route.api_key_env_var),
                         api_base: None,
                     },
-                })
+                }))
                 .collect(),
+            litellm_settings: LiteLlmRuntimeSettings {
+                check_provider_endpoint: true,
+            },
             general_settings: LiteLlmGeneralSettings {
                 master_key: "os.environ/LITELLM_MASTER_KEY".to_string(),
             },
@@ -580,8 +716,37 @@ mod tests {
 
         let yaml = serde_yaml::to_string(&config).expect("yaml");
 
+        assert!(yaml.contains("model_name: openai/*"));
+        assert!(yaml.contains("model: openai/*"));
+        assert!(yaml.contains("check_provider_endpoint: true"));
         assert!(yaml.contains("api_key: os.environ/OPENAI_API_KEY"));
         assert!(yaml.contains("master_key: os.environ/LITELLM_MASTER_KEY"));
         assert!(!yaml.contains("sk-"));
+    }
+
+    #[test]
+    fn ollama_provider_uses_chat_prefix_and_api_base() {
+        let provider = LiteLlmProviderConfig {
+            id: "local_ollama".to_string(),
+            enabled: true,
+            provider_type: "ollama".to_string(),
+            display_name: "Ollama".to_string(),
+            api_key_env_var: String::new(),
+            api_key: None,
+            api_base: None,
+        };
+
+        assert_eq!(
+            litellm_model_for_provider(&provider, "llama3.2"),
+            "ollama_chat/llama3.2"
+        );
+        assert_eq!(
+            provider_wildcard_model(&provider).as_deref(),
+            Some("ollama_chat/*")
+        );
+        assert_eq!(
+            provider_api_base(&provider, "http://localhost:11434").as_deref(),
+            Some("http://localhost:11434")
+        );
     }
 }

@@ -52,6 +52,18 @@ llama-harness/
   TODO.md
 ```
 
+The repository tracks a safe baseline `config.json` so new checkouts have LiteLLM settings and a local Ollama-through-LiteLLM provider. Treat your working `config.json` as local runtime state after that. To hide future local edits from normal Git status:
+
+```bash
+git update-index --skip-worktree config.json
+```
+
+To intentionally change the committed baseline later:
+
+```bash
+git update-index --no-skip-worktree config.json
+```
+
 ## Run the Rust Server
 
 From the repo root:
@@ -109,7 +121,7 @@ curl -X PUT http://127.0.0.1:8787/api/settings \
 
 ## Configure LiteLLM
 
-LiteLLM mode keeps llama-harness focused on one internal model-provider abstraction while letting LiteLLM handle OpenAI, Anthropic, OpenRouter, Gemini, and future cloud providers. Ollama remains the local direct provider; cloud services should usually be added as LiteLLM routes rather than as separate Rust clients.
+LiteLLM mode keeps llama-harness focused on one internal model-provider abstraction while letting LiteLLM handle OpenAI, Anthropic, OpenRouter, Gemini, and future cloud providers. Ollama remains the local direct provider. Cloud services should usually be added as LiteLLM provider records, not one route per model.
 
 Run a LiteLLM Proxy locally and pin the image or package version for durable setups. The default proxy URL is:
 
@@ -127,14 +139,19 @@ OPENROUTER_API_KEY=...
 GEMINI_API_KEY=...
 ```
 
-In the admin UI, open Settings to enable LiteLLM, set the proxy base URL, set an optional LiteLLM master key, and choose a default LiteLLM model alias. Open Models to add model routes. Route examples:
+In the admin UI, open Settings to enable LiteLLM, set the proxy base URL, and set an optional LiteLLM master key. Open Providers to add providers. A provider has a user-facing unique name, a LiteLLM provider type, and the environment variable that contains the provider API key:
 
-```text
-openai:gpt-4o        -> openai/gpt-4o
-anthropic:claude     -> anthropic/<model>
-openrouter:claude    -> openrouter/<provider>/<model>
-gemini:flash         -> gemini/<model>
+```json
+{
+  "provider_type": "openai",
+  "display_name": "OpenAI work",
+  "api_key_env_var": "OPENAI_API_KEY",
+  "api_base": null,
+  "enabled": true
+}
 ```
+
+The provider type field can use the LiteLLM provider prefix, such as `openai`, `anthropic`, `gemini`, `openrouter`, `groq`, `mistral`, `bedrock`, `vertex_ai`, or `ollama`. Provider ids are generated internally from provider names and preserved for agents/API calls. API keys are not edited in the normal UI; users configure env vars such as `OPENAI_API_KEY`. Settings responses still mask any saved raw key as `__configured__` for compatibility.
 
 Keep the LiteLLM proxy checkout separate from this repository. A sibling folder works well:
 
@@ -144,7 +161,7 @@ git clone https://github.com/BerriAI/litellm.git ../litellm
 
 When `managed_config_path` is relative, llama-harness resolves it relative to `config.json`, so `../litellm/llama-harness-litellm.local.yaml` keeps proxy config with the LiteLLM checkout.
 
-Generate a LiteLLM config from configured routes:
+Generate a LiteLLM config from configured providers. The app automatically calls this endpoint after saving providers when LiteLLM is enabled and `managed_config_path` is configured; it can also be called directly:
 
 ```bash
 curl -X POST http://127.0.0.1:8787/api/litellm/config/generate \
@@ -152,35 +169,65 @@ curl -X POST http://127.0.0.1:8787/api/litellm/config/generate \
   -d '{"output_path":"litellm.config.yaml"}'
 ```
 
-Generated configs reference environment variables, not raw provider keys:
+Generated configs use wildcard routes so every model supported by a configured provider is available without creating a route per model. Generated configs reference environment variables, not raw provider keys:
 
 ```yaml
 model_list:
-  - model_name: openai:gpt-4o
+  - model_name: openai/*
     litellm_params:
-      model: openai/gpt-4o
+      model: openai/*
       api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: anthropic/*
+    litellm_params:
+      model: anthropic/*
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: gemini/*
+    litellm_params:
+      model: gemini/*
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: ollama_chat/*
+    litellm_params:
+      model: ollama_chat/*
+      api_base: http://localhost:11434
+
+litellm_settings:
+  check_provider_endpoint: true
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
 ```
 
-Test a LiteLLM model route:
+Saving providers writes llama-harness settings and generates the LiteLLM config, but it does not hot-reload an already running LiteLLM process. Refresh or restart LiteLLM after provider changes before expecting the running proxy to pick them up.
+
+To put local Ollama behind LiteLLM for gateway behavior such as proxy-level limits, add an enabled provider with `provider_type: "ollama"` and set API Base to your Ollama endpoint if it is not `http://localhost:11434`. llama-harness emits `ollama_chat/*` routes for that provider.
+
+Start LiteLLM from the app or API. The server writes the managed config first, then runs `litellm --config <path> --host <host> --port <port>`. Override the executable with `LLAMA_HARNESS_LITELLM_COMMAND` when needed:
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/litellm/service/start
+```
+
+Explicit LiteLLM routes remain supported in config and API responses for legacy or advanced cases such as aliases, fallbacks, load balancing, rate limits, or custom model rewrites. They are intentionally not part of the normal app UI because provider-level wildcard routing covers the common case.
+
+Test a LiteLLM provider with a model name:
 
 ```bash
 curl -X POST http://127.0.0.1:8787/api/providers/litellm/test \
   -H 'content-type: application/json' \
-  -d '{"model":"openai:gpt-4o","message":"Say hello from llama-harness."}'
+  -d '{"provider_id":"openai_main","model":"gpt-4o","message":"Say hello from llama-harness."}'
 ```
 
-Call chat through LiteLLM:
+Call chat through a configured provider. The UI shows provider names, while the agent or caller stores the internal provider id and a plain model name; llama-harness converts that to the LiteLLM model string, such as `openai/gpt-4o` or `anthropic/claude-sonnet-4-0`:
 
 ```bash
 curl -X POST http://127.0.0.1:8787/api/chat \
   -H 'content-type: application/json' \
   -d '{
-    "provider": "litellm",
-    "model": "openai:gpt-4o",
+    "provider": "openai_main",
+    "model": "gpt-4o",
     "messages": [
       { "role": "user", "content": "Write a quick project summary." }
     ],
@@ -189,6 +236,8 @@ curl -X POST http://127.0.0.1:8787/api/chat \
     "max_tokens": 2048
   }'
 ```
+
+The agent model field shows suggested models for each provider and still allows a free-form model string. Existing clients can continue to call `provider: "litellm"` with an explicit LiteLLM model string or route alias.
 
 Ollama still works the same way for local models. Existing clients that omit `provider` continue to use `default_provider`, which defaults to `ollama`.
 
