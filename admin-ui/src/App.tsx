@@ -1,14 +1,16 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   ChatResponse,
   GenerateLiteLlmConfigResponse,
   getApiBase,
   Health,
+  LiteLlmProviderConfig,
+  LiteLlmServiceStartResponse,
   LiteLlmTestResponse,
-  ModelRoute,
   ModelsResponse,
   OllamaModel,
+  ProviderModelsResponse,
   ProviderStatus,
   RunRecord,
   setApiBase,
@@ -47,13 +49,17 @@ type Page =
 type Approval = (typeof seedApprovals)[number] & { state?: "pending" | "approved" | "rejected" };
 
 type PermissionPolicy = Record<string, { allowed: boolean; approval: boolean }>;
+type ProviderVerification = {
+  state: "success" | "error";
+  message: string;
+};
 
 const nav: Array<{ id: Page; label: string; detail?: string }> = [
   { id: "dashboard", label: "Dashboard", detail: "Live operations" },
   { id: "agents", label: "Agents", detail: "Prompts and defaults" },
   { id: "tasks", label: "Tasks", detail: "Queue and details" },
   { id: "sandboxes", label: "Sandboxes", detail: "Execution contexts" },
-  { id: "models", label: "Models", detail: "Providers and Ollama" },
+  { id: "models", label: "Providers", detail: "LiteLLM and Ollama" },
   { id: "permissions", label: "Permissions", detail: "Human approval gates" },
   { id: "logs", label: "Audit Log", detail: "Actions and runs" },
   { id: "instructions", label: "Instructions", detail: "Global prompts" },
@@ -70,8 +76,27 @@ const taskFilters: Array<TaskStatus | "all"> = [
   "failed",
 ];
 
-const providers: ModelProvider[] = ["Gemini", "OpenAI", "Anthropic", "OpenRouter", "Ollama"];
-const litellmFamilies = ["openai", "anthropic", "openrouter", "gemini", "custom"];
+const litellmProviderTypes = [
+  "openai",
+  "anthropic",
+  "gemini",
+  "openrouter",
+  "ollama",
+  "azure",
+  "bedrock",
+  "vertex_ai",
+  "cohere",
+  "mistral",
+  "groq",
+  "deepseek",
+  "xai",
+  "perplexity",
+  "together_ai",
+  "fireworks_ai",
+  "huggingface",
+  "replicate",
+  "custom",
+];
 const REDACTED_SECRET = "__configured__";
 const environments: Environment[] = ["planner", "browser", "computer-use", "local-desktop"];
 const autonomyLevels: Agent["autonomy"][] = ["observe", "ask", "low-risk", "autonomous"];
@@ -108,8 +133,10 @@ export default function App() {
   const [prompt, setPrompt] = useState("Summarize the current agent task queue in one sentence.");
   const [testModel, setTestModel] = useState("");
   const [testResult, setTestResult] = useState<ChatResponse | null>(null);
+  const localModels = useMemo(() => models?.models || [], [models]);
   const [litellmTestResult, setLiteLlmTestResult] = useState<LiteLlmTestResponse | null>(null);
   const [litellmConfigResult, setLiteLlmConfigResult] = useState<GenerateLiteLlmConfigResponse | null>(null);
+  const [litellmServiceResult, setLiteLlmServiceResult] = useState<LiteLlmServiceStartResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -168,6 +195,23 @@ export default function App() {
     refreshAll();
   }, []);
 
+  useEffect(() => {
+    function blurEditableOnOutsidePointer(event: PointerEvent) {
+      const active = document.activeElement;
+      const target = event.target;
+      if (!isEditableElement(active) || !(target instanceof Element)) {
+        return;
+      }
+      if (active.contains(target) || target.closest("input, textarea, select, [contenteditable='true'], .combobox")) {
+        return;
+      }
+      active.blur();
+    }
+
+    document.addEventListener("pointerdown", blurEditableOnOutsidePointer, true);
+    return () => document.removeEventListener("pointerdown", blurEditableOnOutsidePointer, true);
+  }, []);
+
   async function refreshRunsOnly() {
     const result = await api.runs(50);
     setRuns(result.runs);
@@ -212,17 +256,21 @@ export default function App() {
     return updated;
   }
 
-  async function saveSettings(event?: FormEvent) {
-    event?.preventDefault();
-    if (!settings) {
+  async function saveSettings(eventOrSettings?: FormEvent | Settings) {
+    if (eventOrSettings && "preventDefault" in eventOrSettings) {
+      eventOrSettings.preventDefault();
+    }
+    const settingsToSave = eventOrSettings && !("preventDefault" in eventOrSettings) ? eventOrSettings : settings;
+    if (!settingsToSave) {
       return;
     }
 
     setBusy(true);
     setError(null);
     try {
-      await persistSettings(settings);
+      const updated = await persistSettings(settingsToSave);
       await refreshAll();
+      return updated;
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -269,6 +317,29 @@ export default function App() {
     }
   }
 
+  async function startLiteLlmService() {
+    if (!settings) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setLiteLlmServiceResult(null);
+    try {
+      const updated = await persistSettings(settings);
+      if (updated.litellm.managed_config_path) {
+        const configResult = await api.generateLiteLLMConfig(updated.litellm.managed_config_path);
+        setLiteLlmConfigResult(configResult);
+      }
+      const result = await api.startLiteLLMService();
+      setLiteLlmServiceResult(result);
+      await refreshAll();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function openTask(taskId: string) {
     setSelectedTaskId(taskId);
     setPage("task-detail");
@@ -294,6 +365,7 @@ export default function App() {
     title: string;
     instructions: string;
     agentId: string;
+    providerId: string;
     provider: ModelProvider;
     model: string;
     environment: Environment;
@@ -305,6 +377,7 @@ export default function App() {
       name: input.title,
       status: "planning",
       environment: input.environment,
+      providerId: input.providerId,
       provider: input.provider,
       model: input.model || agent?.defaultModel || settings?.default_model || "default",
       createdAt,
@@ -446,7 +519,15 @@ export default function App() {
           ) : null}
 
           {page === "tasks" ? <TasksPage tasks={tasks} openTask={openTask} goNew={() => setPage("new-task")} /> : null}
-          {page === "new-task" ? <NewTaskPage agents={agents} settings={settings} createTask={createTask} cancel={() => setPage("tasks")} /> : null}
+          {page === "new-task" ? (
+            <NewTaskPage
+              agents={agents}
+              settings={settings}
+              localModels={localModels}
+              createTask={createTask}
+              cancel={() => setPage("tasks")}
+            />
+          ) : null}
           {page === "task-detail" && selectedTask ? (
             <TaskDetailPage
               task={selectedTask}
@@ -470,7 +551,9 @@ export default function App() {
             />
           ) : null}
 
-          {page === "agents" ? <AgentsPage agents={agents} setAgents={setAgents} /> : null}
+          {page === "agents" ? (
+            <AgentsPage agents={agents} setAgents={setAgents} settings={settings} localModels={localModels} />
+          ) : null}
           {page === "sandboxes" ? <SandboxesPage sandboxes={sandboxes} setSandboxes={setSandboxes} /> : null}
           {page === "models" ? (
             <ModelsPage
@@ -480,9 +563,7 @@ export default function App() {
               setSettings={setSettings}
               providerStatuses={providerStatuses}
               selectDefaultModel={selectDefaultModel}
-              saveSettings={() => saveSettings()}
-              generateLiteLlmConfig={generateLiteLlmConfig}
-              litellmConfigResult={litellmConfigResult}
+              saveSettings={saveSettings}
               testModel={testModel}
               setTestModel={setTestModel}
               prompt={prompt}
@@ -507,8 +588,10 @@ export default function App() {
               onSubmit={saveSettings}
               testLiteLlmConnection={testLiteLlmConnection}
               generateLiteLlmConfig={generateLiteLlmConfig}
+              startLiteLlmService={startLiteLlmService}
               litellmTestResult={litellmTestResult}
               litellmConfigResult={litellmConfigResult}
+              litellmServiceResult={litellmServiceResult}
               busy={busy}
             />
           ) : null}
@@ -541,8 +624,8 @@ function Dashboard(props: {
   const runningSandboxes = props.sandboxes.filter((sandbox) => sandbox.status === "running").length;
 
   return (
-    <div className="stack">
-      <section className="hero-panel">
+    <div className="dashboard-grid">
+      <section className="hero-panel dashboard-hero">
         <div>
           <p className="eyebrow">Local Agent Operations</p>
           <h3>Tasks, agents, approvals, models, and live Ollama status in one console.</h3>
@@ -555,7 +638,7 @@ function Dashboard(props: {
         </dl>
       </section>
 
-      <section className="metric-strip">
+      <section className="metric-strip dashboard-metrics">
         <StatCard label="Active agents" value={props.agents.filter((agent) => agent.status === "active").length} hint="configured locally" />
         <StatCard label="Running tasks" value={runningTasks} hint="agent queue" />
         <StatCard label="Running sandboxes" value={runningSandboxes} hint="execution contexts" />
@@ -564,7 +647,7 @@ function Dashboard(props: {
         <StatCard label="Failed" value={failedTasks} hint="local task state" />
       </section>
 
-      <section className="two-column wide-left">
+      <section className="two-column wide-left dashboard-secondary">
         <div className="panel">
           <div className="section-header">
             <h2>Recent Activity</h2>
@@ -589,14 +672,14 @@ function Dashboard(props: {
         </div>
       </section>
 
-      <section className="panel">
+      <section className="panel dashboard-tasks">
         <div className="section-header">
           <h2>Recent Tasks</h2>
         </div>
         <TaskTable tasks={props.tasks.slice(0, 6)} openTask={props.openTask} />
       </section>
 
-      <section className="panel">
+      <section className="panel dashboard-test">
         <div className="section-header">
           <h2>Quick Model Test</h2>
         </div>
@@ -711,15 +794,18 @@ function TaskTable({ tasks, openTask }: { tasks: Task[]; openTask: (taskId: stri
 function NewTaskPage({
   agents,
   settings,
+  localModels,
   createTask,
   cancel,
 }: {
   agents: Agent[];
   settings: Settings | null;
+  localModels: OllamaModel[];
   createTask: (input: {
     title: string;
     instructions: string;
     agentId: string;
+    providerId: string;
     provider: ModelProvider;
     model: string;
     environment: Environment;
@@ -728,10 +814,13 @@ function NewTaskPage({
 }) {
   const [agentId, setAgentId] = useState(agents[0]?.id || "");
   const agent = agents.find((item) => item.id === agentId) || agents[0];
+  const providerOptions = modelProviderOptions(settings);
+  const defaultProviderId = agentProviderId(agent, settings);
   const [title, setTitle] = useState("");
   const [instructions, setInstructions] = useState("");
-  const [provider, setProvider] = useState<ModelProvider>(agent?.defaultProvider || "Ollama");
+  const [providerId, setProviderId] = useState(defaultProviderId);
   const [model, setModel] = useState(agent?.defaultModel || settings?.default_model || "");
+  const modelOptions = useProviderModelOptions(providerId, settings, localModels);
   const [environment, setEnvironment] = useState<Environment>(agent?.defaultEnvironment || "planner");
   const [autonomy, setAutonomy] = useState<Agent["autonomy"]>(agent?.autonomy || "ask");
   const [permissions, setPermissions] = useState<AgentPermissions>(
@@ -744,12 +833,21 @@ function NewTaskPage({
       return;
     }
     setAgentId(next.id);
-    setProvider(next.defaultProvider);
+    setProviderId(agentProviderId(next, settings));
     setModel(next.defaultModel);
     setEnvironment(next.defaultEnvironment);
     setAutonomy(next.autonomy);
     setPermissions(next.permissions);
   }
+
+  useEffect(() => {
+    if (!modelOptions.length) {
+      return;
+    }
+    if (!modelOptions.includes(model)) {
+      setModel(modelOptions[0]);
+    }
+  }, [model, modelOptions]);
 
   function updatePermission(key: keyof AgentPermissions, value: boolean) {
     setPermissions((current) => ({ ...current, [key]: value }));
@@ -760,7 +858,16 @@ function NewTaskPage({
       className="stack"
       onSubmit={(event) => {
         event.preventDefault();
-        createTask({ title, instructions, agentId, provider, model, environment });
+        const selectedProvider = providerOptions.find((option) => option.id === providerId) || providerOptions[0];
+        createTask({
+          title,
+          instructions,
+          agentId,
+          providerId: selectedProvider.id,
+          provider: selectedProvider.label,
+          model,
+          environment,
+        });
       }}
     >
       <section className="panel">
@@ -804,15 +911,26 @@ function NewTaskPage({
             <h2>Model Provider</h2>
           </div>
           <div className="chip-row wrap">
-            {providers.map((item) => (
-              <button key={item} type="button" className={provider === item ? "chip active" : "chip"} onClick={() => setProvider(item)}>
-                {item}
+            {providerOptions.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={providerId === item.id ? "chip active" : "chip"}
+                onClick={() => setProviderId(item.id)}
+              >
+                {item.label}
               </button>
             ))}
           </div>
           <label className="field-block">
             Model
-            <input value={model} onChange={(event) => setModel(event.target.value)} placeholder={settings?.default_model || "default"} />
+            <ProviderModelSelect
+              value={model}
+              models={modelOptions}
+              onChange={setModel}
+              emptyLabel={providerId === "ollama" ? "No local Ollama models loaded" : "No catalog models for this provider"}
+              title="Models are loaded from the selected provider."
+            />
           </label>
         </div>
 
@@ -998,11 +1116,24 @@ function TaskDetailPage(props: {
   );
 }
 
-function AgentsPage({ agents, setAgents }: { agents: Agent[]; setAgents: (agents: Agent[] | ((agents: Agent[]) => Agent[])) => void }) {
+function AgentsPage({
+  agents,
+  setAgents,
+  settings,
+  localModels,
+}: {
+  agents: Agent[];
+  setAgents: (agents: Agent[] | ((agents: Agent[]) => Agent[])) => void;
+  settings: Settings | null;
+  localModels: OllamaModel[];
+}) {
   const [activeId, setActiveId] = useState(agents[0]?.id || "");
   const [query, setQuery] = useState("");
+  const providerOptions = modelProviderOptions(settings);
   const filtered = agents.filter((agent) => [agent.name, agent.role, agent.description].join(" ").toLowerCase().includes(query.toLowerCase()));
   const active = agents.find((agent) => agent.id === activeId) || agents[0];
+  const activeProviderId = agentProviderId(active, settings);
+  const activeModelOptions = useProviderModelOptions(activeProviderId, settings, localModels);
 
   function updateAgent(patch: Partial<Agent>) {
     if (!active) {
@@ -1012,13 +1143,16 @@ function AgentsPage({ agents, setAgents }: { agents: Agent[]; setAgents: (agents
   }
 
   function createAgent() {
+    const defaultProviderId = agentProviderId(undefined, settings);
+    const defaultProvider = providerOptions.find((option) => option.id === defaultProviderId) || providerOptions[0];
     const agent: Agent = {
       id: `ag_${Math.random().toString(36).slice(2, 7)}`,
       name: "New agent",
       role: "Draft role",
       description: "",
       systemPrompt: "",
-      defaultProvider: "Ollama",
+      defaultProviderId: defaultProvider.id,
+      defaultProvider: defaultProvider.label,
       defaultModel: "default",
       defaultEnvironment: "planner",
       autonomy: "ask",
@@ -1037,6 +1171,15 @@ function AgentsPage({ agents, setAgents }: { agents: Agent[]; setAgents: (agents
       setActiveId(agents.find((agent) => agent.id !== id)?.id || "");
     }
   }
+
+  useEffect(() => {
+    if (!active || !activeModelOptions.length) {
+      return;
+    }
+    if (!activeModelOptions.includes(active.defaultModel)) {
+      updateAgent({ defaultModel: activeModelOptions[0] });
+    }
+  }, [active?.id, activeProviderId, active?.defaultModel, activeModelOptions]);
 
   return (
     <div className="agents-layout">
@@ -1102,15 +1245,28 @@ function AgentsPage({ agents, setAgents }: { agents: Agent[]; setAgents: (agents
             <div className="field-row three">
               <label>
                 Provider
-                <select value={active.defaultProvider} onChange={(event) => updateAgent({ defaultProvider: event.target.value as ModelProvider })}>
-                  {providers.map((item) => (
-                    <option key={item} value={item}>{item}</option>
+                <select
+                  title="Choose Ollama for the direct local provider, or a saved LiteLLM provider for gateway-routed models."
+                  value={activeProviderId}
+                  onChange={(event) => {
+                    const selected = providerOptions.find((option) => option.id === event.target.value) || providerOptions[0];
+                    updateAgent({ defaultProviderId: selected.id, defaultProvider: selected.label });
+                  }}
+                >
+                  {providerOptions.map((item) => (
+                    <option key={item.id} value={item.id}>{item.label}</option>
                   ))}
                 </select>
               </label>
               <label>
                 Model
-                <input value={active.defaultModel} onChange={(event) => updateAgent({ defaultModel: event.target.value })} />
+                <ProviderModelSelect
+                  title="Model used by this agent by default. Ollama choices come from your local Ollama inventory."
+                  value={active.defaultModel}
+                  models={activeModelOptions}
+                  onChange={(value) => updateAgent({ defaultModel: value })}
+                  emptyLabel={activeProviderId === "ollama" ? "No local Ollama models loaded" : "No catalog models for this provider"}
+                />
               </label>
               <label>
                 Environment
@@ -1214,9 +1370,7 @@ function ModelsPage(props: {
   setSettings: (settings: Settings) => void;
   providerStatuses: ProviderStatus[];
   selectDefaultModel: (model: string) => void;
-  saveSettings: () => void;
-  generateLiteLlmConfig: () => void;
-  litellmConfigResult: GenerateLiteLlmConfigResponse | null;
+  saveSettings: (settings?: Settings) => Promise<Settings | void> | void;
   testModel: string;
   setTestModel: (value: string) => void;
   prompt: string;
@@ -1225,9 +1379,15 @@ function ModelsPage(props: {
   onSubmit: (event: FormEvent) => void;
   busy: boolean;
 }) {
-  const routes = props.settings?.model_routes || [];
-  const [editingRouteId, setEditingRouteId] = useState<string | null>(null);
-  const selectedRoute = editingRouteId ? routes.find((route) => route.id === editingRouteId) || null : null;
+  const litellmProviders = props.settings?.litellm_providers || [];
+  const [editingProviderId, setEditingProviderId] = useState<string | null>(null);
+  const [providerSaveError, setProviderSaveError] = useState<string | null>(null);
+  const [providerSaveMessage, setProviderSaveMessage] = useState<string | null>(null);
+  const [configWarning, setConfigWarning] = useState<string | null>(null);
+  const [providerSaveBusy, setProviderSaveBusy] = useState(false);
+  const [providerVerifyBusyId, setProviderVerifyBusyId] = useState<string | null>(null);
+  const [providerVerifications, setProviderVerifications] = useState<Record<string, ProviderVerification>>({});
+  const [deleteArmedId, setDeleteArmedId] = useState<string | null>(null);
   const litellmStatus = props.providerStatuses.find((provider) => provider.id === "litellm");
   const ollamaStatus = props.providerStatuses.find((provider) => provider.id === "ollama");
   const defaultProvider = props.settings?.default_provider || "ollama";
@@ -1235,29 +1395,156 @@ function ModelsPage(props: {
     defaultProvider === "litellm"
       ? props.settings?.litellm.default_model || props.settings?.default_model || props.defaultModel
       : props.defaultModel || props.settings?.default_model;
-  const enabledRoutes = routes.filter((route) => route.enabled).length;
+  const enabledProviders = litellmProviders.filter((provider) => provider.enabled).length;
 
-  function setRoutes(modelRoutes: ModelRoute[]) {
+  function setLiteLlmProviders(providers: LiteLlmProviderConfig[]) {
     if (!props.settings) {
       return;
     }
-    props.setSettings({ ...props.settings, model_routes: modelRoutes });
+    props.setSettings({ ...props.settings, litellm_providers: providers });
   }
 
-  function addRoute() {
-    const route = createModelRoute("openai");
-    setRoutes([...routes, route]);
-    setEditingRouteId(route.id);
+  function addProvider() {
+    const provider = createLiteLlmProvider();
+    setLiteLlmProviders([...litellmProviders, provider]);
+    setEditingProviderId(provider.id);
   }
 
-  function updateRoute(id: string, patch: Partial<ModelRoute>) {
-    setRoutes(routes.map((route) => (route.id === id ? { ...route, ...patch } : route)));
+  function updateProvider(id: string, patch: Partial<LiteLlmProviderConfig>) {
+    setProviderVerifications((results) => {
+      const next = { ...results };
+      delete next[id];
+      return next;
+    });
+    setProviderSaveMessage(null);
+    setDeleteArmedId(null);
+    setLiteLlmProviders(
+      litellmProviders.map((provider) => {
+        if (provider.id !== id) {
+          return provider;
+        }
+        const next = { ...provider, ...patch };
+        if (patch.provider_type && !patch.api_key_env_var) {
+          const oldDefault = envVarForFamily(provider.provider_type);
+          if (!provider.api_key_env_var || provider.api_key_env_var === oldDefault) {
+            next.api_key_env_var = envVarForFamily(patch.provider_type);
+          }
+        }
+        return next;
+      }),
+    );
   }
 
-  function removeRoute(id: string) {
-    setRoutes(routes.filter((route) => route.id !== id));
-    if (editingRouteId === id) {
-      setEditingRouteId(null);
+  function removeProvider(id: string) {
+    if (deleteArmedId !== id) {
+      setDeleteArmedId(id);
+      return;
+    }
+    setLiteLlmProviders(litellmProviders.filter((provider) => provider.id !== id));
+    setProviderVerifications((results) => {
+      const next = { ...results };
+      delete next[id];
+      return next;
+    });
+    setDeleteArmedId(null);
+    if (editingProviderId === id) {
+      setEditingProviderId(null);
+    }
+  }
+
+  async function verifyProvider(provider: LiteLlmProviderConfig) {
+    const providerType = normalizeProviderType(provider.provider_type);
+    if (!providerType) {
+      setProviderVerifications((results) => ({
+        ...results,
+        [provider.id]: { state: "error", message: "Choose a provider type before verifying." },
+      }));
+      return;
+    }
+    const model = defaultProviderVerificationModel(
+      providerType,
+      props.models.map((model) => model.name),
+    );
+    if (!model) {
+      setProviderVerifications((results) => ({
+        ...results,
+        [provider.id]: { state: "error", message: "No default test model is known for this provider type." },
+      }));
+      return;
+    }
+
+    const prepared = prepareProvidersForSave([provider]);
+    if ("error" in prepared) {
+      setProviderVerifications((results) => ({
+        ...results,
+        [provider.id]: { state: "error", message: prepared.error },
+      }));
+      return;
+    }
+
+    const draftProvider = prepared.providers[0];
+    setProviderVerifyBusyId(provider.id);
+    setProviderVerifications((results) => {
+      const next = { ...results };
+      delete next[provider.id];
+      return next;
+    });
+    try {
+      const result = await api.testLiteLLMProvider(
+        model,
+        "Reply with only OK.",
+        draftProvider.id,
+        { provider: draftProvider },
+      );
+      setProviderVerifications((results) => ({
+        ...results,
+        [provider.id]: {
+          state: "success",
+          message: result.content.trim() || `Verified with ${generatedLiteLlmModel(draftProvider, model)}.`,
+        },
+      }));
+    } catch (err) {
+      setProviderVerifications((results) => ({
+        ...results,
+        [provider.id]: { state: "error", message: (err as Error).message },
+      }));
+    } finally {
+      setProviderVerifyBusyId(null);
+    }
+  }
+
+  async function saveProviders() {
+    if (!props.settings) {
+      return;
+    }
+
+    const prepared = prepareProvidersForSave(litellmProviders);
+    if ("error" in prepared) {
+      setProviderSaveError(prepared.error);
+      return;
+    }
+
+    const nextSettings = { ...props.settings, litellm_providers: prepared.providers };
+    setProviderSaveBusy(true);
+    setProviderSaveError(null);
+    setProviderSaveMessage(null);
+    setConfigWarning(null);
+    try {
+      await props.saveSettings(nextSettings);
+      if (nextSettings.litellm.enabled && nextSettings.litellm.managed_config_path) {
+        try {
+          await api.generateLiteLLMConfig(nextSettings.litellm.managed_config_path);
+          setProviderSaveMessage("Providers saved and LiteLLM config generated. Refresh or restart LiteLLM before expecting these provider changes at runtime.");
+        } catch (err) {
+          setConfigWarning((err as Error).message);
+        }
+      } else {
+        setProviderSaveMessage("Providers saved. Generate a LiteLLM config and refresh or restart LiteLLM before expecting these provider changes at runtime.");
+      }
+    } catch (err) {
+      setProviderSaveError((err as Error).message);
+    } finally {
+      setProviderSaveBusy(false);
     }
   }
 
@@ -1266,7 +1553,7 @@ function ModelsPage(props: {
       <section className="model-summary-strip">
         <div className="model-summary-tile">
           <span>Default provider</span>
-          <strong>{labelize(defaultProvider)}</strong>
+          <strong>{defaultProviderLabel(defaultProvider, props.settings)}</strong>
           <small>{defaultModel || "not set"}</small>
         </div>
         <div className="model-summary-tile">
@@ -1277,8 +1564,8 @@ function ModelsPage(props: {
           <small>{props.settings?.litellm.base_url || "not configured"}</small>
         </div>
         <div className="model-summary-tile">
-          <span>Routes</span>
-          <strong>{enabledRoutes}/{routes.length}</strong>
+          <span>Providers</span>
+          <strong>{enabledProviders}/{litellmProviders.length}</strong>
           <small>enabled</small>
         </div>
         <div className="model-summary-tile">
@@ -1294,165 +1581,130 @@ function ModelsPage(props: {
         <section className="panel">
           <div className="section-header">
             <div>
-              <h2>LiteLLM Routes</h2>
-              <p>{enabledRoutes} enabled / {routes.length} total</p>
+              <h2>
+                LiteLLM Providers
+                <FieldHelp text="Provider changes do not apply to the running LiteLLM proxy until you save providers and refresh or restart LiteLLM." />
+              </h2>
+              <p>{enabledProviders} enabled / {litellmProviders.length} total</p>
             </div>
             <div className="button-row">
               <StatusBadge status={litellmStatus?.healthy ? "online" : props.settings.litellm.enabled ? "offline" : "neutral"} />
-              <button type="button" onClick={props.generateLiteLlmConfig} disabled={props.busy || !routes.length}>
-                Generate config.yaml
-              </button>
-              <button type="button" onClick={addRoute} disabled={props.busy}>
-                Add route
+              <button type="button" onClick={addProvider} disabled={props.busy}>
+                Add provider
               </button>
             </div>
           </div>
 
-          <div className="table-scroll">
-            <table className="model-table">
-              <thead>
-                <tr>
-                  <th>Route</th>
-                  <th>Alias</th>
-                  <th>LiteLLM model</th>
-                  <th>Credentials</th>
-                  <th>Status</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {routes.map((route) => (
-                  <tr key={route.id}>
-                    <td data-label="Route">
-                      <strong>{route.display_name || "Untitled route"}</strong>
-                      <code>{route.provider_family}</code>
-                    </td>
-                    <td data-label="Alias">
-                      <code>{route.model_alias || "-"}</code>
-                    </td>
-                    <td data-label="LiteLLM model">
-                      <code>{route.litellm_model || "-"}</code>
-                      {route.api_base ? <p>{route.api_base}</p> : null}
-                    </td>
-                    <td data-label="Credentials">{route.api_key_env_var || "-"}</td>
-                    <td data-label="Status">
-                      <StatusBadge status={route.enabled ? "active" : "neutral"} />
-                    </td>
-                    <td data-label="Action">
-                      <div className="button-row table-actions">
-                        <button type="button" onClick={() => setEditingRouteId(route.id)} disabled={props.busy}>
-                          Edit
-                        </button>
-                        <button className="danger-outline" type="button" onClick={() => removeRoute(route.id)} disabled={props.busy}>
-                          Delete
-                        </button>
+          <div className="provider-list">
+            {litellmProviders.map((provider) => {
+              const expanded = editingProviderId === provider.id;
+              const status = props.providerStatuses.find((item) => item.id === provider.id);
+              const verification = providerVerifications[provider.id];
+              return (
+                <article key={provider.id} className={expanded ? "provider-row expanded" : "provider-row"}>
+                  <button type="button" className="provider-row-summary" onClick={() => setEditingProviderId(expanded ? null : provider.id)}>
+                    <span>
+                      <strong>{provider.display_name || "Unnamed provider"}</strong>
+                      <small>{provider.provider_type ? providerTypeLabel(provider.provider_type) : "Provider type not set"}</small>
+                    </span>
+                    <span>{providerCredentialLabel(provider, status)}</span>
+                    <StatusBadge status={provider.enabled ? "active" : "neutral"} />
+                  </button>
+                  {expanded ? (
+                    <div className="provider-row-editor">
+                      <div className="field-row three">
+                        <label>
+                          Name
+                          <input
+                            title="A human-readable label used in provider lists and agent defaults."
+                            value={provider.display_name}
+                            onChange={(event) => updateProvider(provider.id, { display_name: event.target.value })}
+                            placeholder="OpenAI work"
+                          />
+                        </label>
+                        <label>
+                          Provider type
+                          <ProviderTypeCombobox
+                            value={provider.provider_type}
+                            onChange={(value) => updateProvider(provider.id, { provider_type: value })}
+                          />
+                        </label>
+                        <label>
+                          <span className="field-label">
+                            API Key Environment Variable Name
+                            <FieldHelp text="The environment variable name available to the LiteLLM process, such as OPENAI_API_KEY. The app stores this name, not the secret value." />
+                          </span>
+                          <input
+                            value={provider.api_key_env_var}
+                            onChange={(event) => updateProvider(provider.id, { api_key_env_var: event.target.value })}
+                            placeholder={envVarForFamily(provider.provider_type)}
+                          />
+                        </label>
                       </div>
-                    </td>
-                  </tr>
-                ))}
-                {!routes.length ? (
-                  <tr>
-                    <td colSpan={6} className="empty-cell">
-                      No LiteLLM routes configured.
-                    </td>
-                  </tr>
-                ) : null}
-              </tbody>
-            </table>
+                      <div className="field-row three">
+                        <label>
+                          <span className="field-label">
+                            API Base
+                            <FieldHelp text="Optional provider-specific endpoint. Use it for Ollama behind LiteLLM, self-hosted providers, or a custom proxy; leave it blank for normal hosted provider defaults." />
+                          </span>
+                          <input
+                            value={provider.api_base || ""}
+                            onChange={(event) => updateProvider(provider.id, { api_base: event.target.value || null })}
+                            placeholder={normalizeProviderType(provider.provider_type) === "ollama" ? "http://localhost:11434" : "Optional"}
+                          />
+                        </label>
+                        <label className="switch-row provider-enabled-toggle" title="Disabled providers stay saved but are omitted from generated LiteLLM config and agent choices.">
+                          <input
+                            type="checkbox"
+                            checked={provider.enabled}
+                            onChange={(event) => updateProvider(provider.id, { enabled: event.target.checked })}
+                          />
+                          <span className="switch-track" aria-hidden="true">
+                            <span className="switch-thumb" />
+                          </span>
+                          <span>{provider.enabled ? "Enabled" : "Disabled"}</span>
+                        </label>
+                        <div className="field-actions">
+                          <button
+                            type="button"
+                            onClick={() => verifyProvider(provider)}
+                            disabled={props.busy || providerVerifyBusyId === provider.id}
+                            title="Calls the LiteLLM gateway with the current provider values and a small test prompt."
+                          >
+                            {providerVerifyBusyId === provider.id ? "Verifying..." : "Verify credentials"}
+                          </button>
+                          <button
+                            className={deleteArmedId === provider.id ? "danger" : "danger-outline"}
+                            type="button"
+                            onClick={() => removeProvider(provider.id)}
+                            disabled={props.busy}
+                            title="Requires a second click before this provider is removed."
+                          >
+                            {deleteArmedId === provider.id ? "Confirm delete" : "Delete provider"}
+                          </button>
+                        </div>
+                      </div>
+                      {verification ? (
+                        <pre className={verification.state === "success" ? "result success-result" : "result error-result"}>
+                          {verification.message}
+                        </pre>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </article>
+              );
+            })}
+            {!litellmProviders.length ? <p className="empty">No providers configured.</p> : null}
           </div>
 
           <div className="form-actions route-save-row">
-            <button className="primary" type="button" onClick={props.saveSettings} disabled={props.busy}>
-              Save routes
+            <button className="primary" type="button" onClick={saveProviders} disabled={props.busy || providerSaveBusy}>
+              Save providers
             </button>
           </div>
-          {props.litellmConfigResult ? (
-            <pre className="result">{`${props.litellmConfigResult.routes_written} routes written\n${props.litellmConfigResult.path}`}</pre>
-          ) : null}
-        </section>
-      ) : null}
-
-      {selectedRoute ? (
-        <section className="panel route-editor-panel">
-          <div className="section-header">
-            <div>
-              <h2>Edit Route</h2>
-              <p>{selectedRoute.model_alias || selectedRoute.id}</p>
-            </div>
-            <div className="button-row">
-              <label className="toggle-row inline">
-                <input
-                  type="checkbox"
-                  checked={selectedRoute.enabled}
-                  onChange={(event) => updateRoute(selectedRoute.id, { enabled: event.target.checked })}
-                />
-                Enabled
-              </label>
-              <button type="button" onClick={() => setEditingRouteId(null)}>
-                Close
-              </button>
-            </div>
-          </div>
-          <div className="settings-form compact-form">
-            <div className="field-row three">
-              <label>
-                Provider family
-                <select
-                  value={selectedRoute.provider_family}
-                  onChange={(event) => {
-                    const family = event.target.value;
-                    updateRoute(selectedRoute.id, {
-                      provider_family: family,
-                      api_key_env_var: selectedRoute.api_key_env_var || envVarForFamily(family),
-                    });
-                  }}
-                >
-                  {litellmFamilies.map((family) => (
-                    <option key={family} value={family}>
-                      {family}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Display name
-                <input value={selectedRoute.display_name} onChange={(event) => updateRoute(selectedRoute.id, { display_name: event.target.value })} />
-              </label>
-              <label>
-                Model alias
-                <input
-                  value={selectedRoute.model_alias}
-                  onChange={(event) => updateRoute(selectedRoute.id, { model_alias: event.target.value })}
-                  placeholder={`${selectedRoute.provider_family}:model`}
-                />
-              </label>
-            </div>
-            <div className="field-row three">
-              <label>
-                LiteLLM model
-                <input
-                  value={selectedRoute.litellm_model}
-                  onChange={(event) => updateRoute(selectedRoute.id, { litellm_model: event.target.value })}
-                  placeholder={litellmModelPlaceholder(selectedRoute.provider_family)}
-                />
-              </label>
-              <label>
-                API key env var
-                <input
-                  value={selectedRoute.api_key_env_var}
-                  onChange={(event) => updateRoute(selectedRoute.id, { api_key_env_var: event.target.value })}
-                />
-              </label>
-              <label>
-                API base
-                <input value={selectedRoute.api_base || ""} onChange={(event) => updateRoute(selectedRoute.id, { api_base: event.target.value || null })} />
-              </label>
-            </div>
-            <label>
-              Notes
-              <input value={selectedRoute.notes || ""} onChange={(event) => updateRoute(selectedRoute.id, { notes: event.target.value || null })} />
-            </label>
-          </div>
+          {providerSaveError ? <pre className="result error-result">{providerSaveError}</pre> : null}
+          {providerSaveMessage ? <pre className="result success-result">{providerSaveMessage}</pre> : null}
+          {configWarning ? <pre className="result warning-result">Saved providers, but config generation failed: {configWarning}</pre> : null}
         </section>
       ) : null}
 
@@ -1520,24 +1772,106 @@ function ModelsPage(props: {
   );
 }
 
-function createModelRoute(family: string): ModelRoute {
-  const id = `route_${family}_${Date.now().toString(36)}`;
+function ProviderTypeCombobox({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    function closeOnOutsidePointer(event: PointerEvent) {
+      const target = event.target;
+      if (target instanceof Node && rootRef.current?.contains(target)) {
+        return;
+      }
+      setOpen(false);
+    }
+
+    document.addEventListener("pointerdown", closeOnOutsidePointer, true);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+  }, [open]);
+
+  return (
+    <div className={open ? "combobox open" : "combobox"} ref={rootRef}>
+      <button
+        className="combobox-trigger"
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        title="Show provider types"
+      >
+        <span>{value ? providerTypeLabel(value) : "Select provider"}</span>
+        <span className="combobox-caret" aria-hidden="true">v</span>
+      </button>
+      {open ? (
+        <div className="combobox-menu" role="listbox">
+          {litellmProviderTypes.map((providerType) => (
+            <button
+              key={providerType}
+              type="button"
+              className={normalizeProviderType(value) === providerType ? "active" : ""}
+              onClick={() => {
+                onChange(providerType);
+                setOpen(false);
+              }}
+              role="option"
+              aria-selected={normalizeProviderType(value) === providerType}
+            >
+              <span>{providerTypeLabel(providerType)}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ProviderModelSelect({
+  value,
+  models,
+  onChange,
+  emptyLabel,
+  title,
+}: {
+  value: string;
+  models: string[];
+  onChange: (value: string) => void;
+  emptyLabel: string;
+  title?: string;
+}) {
+  return (
+    <select value={value && models.includes(value) ? value : ""} onChange={(event) => onChange(event.target.value)} disabled={!models.length} title={title}>
+      <option value="" disabled>
+        {models.length ? "Select model" : emptyLabel}
+      </option>
+      {models.map((model) => (
+        <option key={model} value={model}>
+          {model}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function createLiteLlmProvider(): LiteLlmProviderConfig {
   return {
-    id,
+    id: `draft_${Date.now().toString(36)}`,
     enabled: true,
-    display_name: `${labelize(family)} route`,
-    provider: "litellm",
-    provider_family: family,
-    model_alias: `${family}:model`,
-    litellm_model: litellmModelPlaceholder(family).replace("<model>", "model").replace("<provider>", "provider"),
-    api_key_env_var: envVarForFamily(family),
+    provider_type: "",
+    display_name: "",
+    api_key_env_var: "",
+    api_key: null,
     api_base: null,
-    notes: null,
   };
 }
 
 function envVarForFamily(family: string): string {
-  switch (family) {
+  switch (normalizeProviderType(family)) {
+    case "ollama":
+      return "";
     case "openai":
       return "OPENAI_API_KEY";
     case "anthropic":
@@ -1546,24 +1880,336 @@ function envVarForFamily(family: string): string {
       return "OPENROUTER_API_KEY";
     case "gemini":
       return "GEMINI_API_KEY";
+    case "cohere":
+      return "COHERE_API_KEY";
+    case "mistral":
+      return "MISTRAL_API_KEY";
+    case "groq":
+      return "GROQ_API_KEY";
+    case "deepseek":
+      return "DEEPSEEK_API_KEY";
+    case "xai":
+      return "XAI_API_KEY";
+    case "perplexity":
+      return "PERPLEXITY_API_KEY";
+    case "together_ai":
+      return "TOGETHER_API_KEY";
+    case "fireworks_ai":
+      return "FIREWORKS_API_KEY";
+    case "huggingface":
+      return "HUGGINGFACE_API_KEY";
+    case "replicate":
+      return "REPLICATE_API_TOKEN";
     default:
       return "PROVIDER_API_KEY";
   }
 }
 
-function litellmModelPlaceholder(family: string): string {
-  switch (family) {
-    case "openai":
-      return "openai/<model>";
-    case "anthropic":
-      return "anthropic/<model>";
-    case "openrouter":
-      return "openrouter/<provider>/<model>";
-    case "gemini":
-      return "gemini/<model>";
-    default:
-      return "provider/<model>";
+function generatedLiteLlmModel(provider: LiteLlmProviderConfig, model: string): string {
+  const providerType = litellmModelPrefix(provider.provider_type);
+  const trimmedModel = model.trim();
+  if (!providerType || !trimmedModel) {
+    return "";
   }
+  if (trimmedModel.startsWith(`${providerType}/`)) {
+    return trimmedModel;
+  }
+  return `${providerType}/${trimmedModel}`;
+}
+
+function litellmModelPrefix(providerType: string): string {
+  const normalized = normalizeProviderType(providerType);
+  return normalized === "ollama" ? "ollama_chat" : normalized;
+}
+
+function prepareProvidersForSave(providers: LiteLlmProviderConfig[]): { providers: LiteLlmProviderConfig[] } | { error: string } {
+  const usedNames = new Set<string>();
+  const usedIds = new Set<string>();
+  const prepared: LiteLlmProviderConfig[] = [];
+
+  for (const provider of providers) {
+    const displayName = provider.display_name.trim();
+    const providerType = normalizeProviderType(provider.provider_type);
+    const apiKeyEnvVar = provider.api_key_env_var.trim() || (providerType && providerType !== "ollama" ? envVarForFamily(providerType) : "");
+
+    if (!displayName) {
+      return { error: "Provider name is required." };
+    }
+    const nameKey = displayName.toLowerCase();
+    if (usedNames.has(nameKey)) {
+      return { error: `Provider name "${displayName}" is already used.` };
+    }
+    if (!providerType) {
+      return { error: `Provider type is required for "${displayName}".` };
+    }
+    if (providerType !== "ollama" && !apiKeyEnvVar) {
+      return { error: `API Key Environment Variable Name is required for "${displayName}".` };
+    }
+
+    usedNames.add(nameKey);
+    const currentId = normalizeProviderId(provider.id);
+    const id = currentId && !currentId.startsWith("draft_") ? currentId : uniqueProviderId(displayName, usedIds);
+    usedIds.add(id);
+    prepared.push({
+      ...provider,
+      id,
+      provider_type: providerType,
+      display_name: displayName,
+      api_key_env_var: apiKeyEnvVar,
+      api_base: provider.api_base?.trim() || null,
+    });
+  }
+
+  return { providers: prepared };
+}
+
+function uniqueProviderId(displayName: string, usedIds: Set<string>): string {
+  const base = normalizeProviderId(displayName) || `provider_${Date.now().toString(36)}`;
+  if (!usedIds.has(base)) {
+    return base;
+  }
+  for (let index = 2; ; index += 1) {
+    const candidate = `${base}_${index}`;
+    if (!usedIds.has(candidate)) {
+      return candidate;
+    }
+  }
+}
+
+function localProviderModelCatalog(provider: LiteLlmProviderConfig): ProviderModelsResponse {
+  const providerType = normalizeProviderType(provider.provider_type);
+  const names = suggestedModelNames(providerType);
+  return {
+    provider_id: provider.id,
+    provider_type: providerType,
+    models: names.map((name) => ({
+      name,
+      litellm_model: generatedLiteLlmModel(provider, name),
+      source: "catalog",
+    })),
+  };
+}
+
+function suggestedModelNames(providerType: string): string[] {
+  switch (normalizeProviderType(providerType)) {
+    case "openai":
+      return ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o3-mini"];
+    case "anthropic":
+      return ["claude-sonnet-4-0", "claude-opus-4-0", "claude-3-5-haiku-latest"];
+    case "gemini":
+      return ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-1.5-pro"];
+    case "openrouter":
+      return ["openai/gpt-4o", "openai/gpt-4o-mini", "anthropic/claude-sonnet-4-0", "google/gemini-2.5-pro"];
+    case "ollama":
+      return ["llama3.2", "qwen2.5:7b", "mistral"];
+    default:
+      return [];
+  }
+}
+
+function defaultProviderVerificationModel(providerType: string, localModelNames: string[] = []): string {
+  const normalized = normalizeProviderType(providerType);
+  const catalog = normalized === "ollama" && localModelNames.length ? localModelNames : suggestedModelNames(normalized);
+  const preferred = preferredVerificationModel(normalized);
+  if (preferred && catalog.includes(preferred)) {
+    return preferred;
+  }
+  return [...catalog].sort((left, right) => left.localeCompare(right))[0] || "";
+}
+
+function preferredVerificationModel(providerType: string): string {
+  switch (normalizeProviderType(providerType)) {
+    case "openai":
+      return "gpt-4o-mini";
+    case "anthropic":
+      return "claude-3-5-haiku-latest";
+    case "gemini":
+      return "gemini-2.5-flash";
+    case "openrouter":
+      return "openai/gpt-4o-mini";
+    default:
+      return "";
+  }
+}
+
+function providerCredentialLabel(provider: LiteLlmProviderConfig, status?: ProviderStatus): string {
+  if (provider.api_key && provider.api_key !== REDACTED_SECRET) {
+    return `pending save / ${provider.api_key_env_var || "env var"}`;
+  }
+  if (provider.api_key === REDACTED_SECRET || status?.api_key_configured) {
+    return `configured / ${provider.api_key_env_var || status?.api_key_env_var || "env var"}`;
+  }
+  return provider.api_key_env_var || "not set";
+}
+
+function providerTypeLabel(providerType: string): string {
+  const normalized = normalizeProviderType(providerType);
+  switch (normalized) {
+    case "openai":
+      return "OpenAI";
+    case "anthropic":
+      return "Anthropic";
+    case "gemini":
+      return "Gemini";
+    case "openrouter":
+      return "OpenRouter";
+    case "ollama":
+      return "Ollama";
+    case "azure":
+      return "Azure";
+    case "bedrock":
+      return "Bedrock";
+    case "vertex_ai":
+      return "Vertex AI";
+    case "cohere":
+      return "Cohere";
+    case "mistral":
+      return "Mistral";
+    case "groq":
+      return "Groq";
+    case "deepseek":
+      return "DeepSeek";
+    case "xai":
+      return "xAI";
+    case "perplexity":
+      return "Perplexity";
+    case "together_ai":
+      return "Together AI";
+    case "fireworks_ai":
+      return "Fireworks AI";
+    case "huggingface":
+      return "Hugging Face";
+    case "replicate":
+      return "Replicate";
+    case "custom":
+      return "Custom";
+    default:
+      return labelize(normalized);
+  }
+}
+
+function defaultProviderLabel(providerId: string, settings: Settings | null): string {
+  if (providerId === "ollama") {
+    return "Ollama";
+  }
+  if (providerId === "litellm") {
+    return "LiteLLM";
+  }
+  const provider = settings?.litellm_providers.find((item) => item.id === providerId);
+  return provider?.display_name || providerTypeLabel(provider?.provider_type || providerId);
+}
+
+function normalizeProviderType(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function normalizeProviderId(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function isEditableElement(element: Element | null): element is HTMLElement {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+  if (element.isContentEditable) {
+    return true;
+  }
+  return ["INPUT", "TEXTAREA", "SELECT"].includes(element.tagName);
+}
+
+function useProviderModelOptions(providerId: string, settings: Settings | null, localModels: OllamaModel[] = []): string[] {
+  const [modelState, setModelState] = useState<{ providerId: string; models: string[] }>({ providerId: "", models: [] });
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!providerId) {
+      setModelState({ providerId: "", models: [] });
+      return;
+    }
+
+    const provider = settings?.litellm_providers.find((item) => item.id === providerId);
+    const fallback =
+      providerId === "ollama"
+        ? localModels.map((model) => model.name).filter(Boolean)
+        : provider
+          ? localProviderModelCatalog(provider).models.map((model) => model.name)
+          : [];
+    setModelState({ providerId, models: fallback });
+
+    api
+      .providerModels(providerId)
+      .then((response) => {
+        if (!cancelled) {
+          setModelState({ providerId, models: response.models.map((model) => model.name) });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setModelState({ providerId, models: fallback });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [providerId, settings?.litellm_providers, localModels]);
+
+  return modelState.providerId === providerId ? modelState.models : [];
+}
+
+function modelProviderOptions(settings: Settings | null): Array<{ id: string; label: string; providerType: string }> {
+  const options = [{ id: "ollama", label: "Ollama", providerType: "ollama" }];
+  if (!settings) {
+    return options;
+  }
+  const reservedProviderIds = new Set(options.map((option) => option.id).concat("litellm"));
+
+  return [
+    ...options,
+    ...settings.litellm_providers
+      .filter((provider) => provider.enabled)
+      .filter((provider) => !reservedProviderIds.has(provider.id))
+      .map((provider) => ({
+        id: provider.id,
+        label: provider.display_name || providerTypeLabel(provider.provider_type),
+        providerType: provider.provider_type,
+      })),
+  ];
+}
+
+function agentProviderId(agent: Agent | undefined, settings: Settings | null): string {
+  const options = modelProviderOptions(settings);
+  const isValidProviderId = (providerId: string) => options.some((option) => option.id === providerId);
+  const fallback = isValidProviderId(settings?.default_provider || "") ? settings?.default_provider || "ollama" : "ollama";
+
+  if (agent?.defaultProviderId) {
+    return isValidProviderId(agent.defaultProviderId) ? agent.defaultProviderId : fallback;
+  }
+  if (agent?.defaultProvider) {
+    const legacyProvider = normalizeProviderType(agent.defaultProvider);
+    const configuredProvider = settings?.litellm_providers.find(
+      (provider) => normalizeProviderType(provider.provider_type) === legacyProvider,
+    );
+    const providerId = configuredProvider?.id || (legacyProvider === "ollama" ? "ollama" : fallback);
+    return isValidProviderId(providerId) ? providerId : fallback;
+  }
+  return fallback;
+}
+
+function modelPlaceholderForProvider(providerId: string, settings: Settings | null): string {
+  if (!settings || providerId === "ollama") {
+    return settings?.default_model || "default";
+  }
+  const provider = settings.litellm_providers.find((item) => item.id === providerId);
+  if (!provider) {
+    return settings.default_model || "default";
+  }
+  const suggestions = suggestedModelNames(provider.provider_type);
+  return suggestions[0] || "model name";
 }
 
 function PermissionsPage({
@@ -1755,8 +2401,10 @@ function SettingsView(props: {
   onSubmit: (event: FormEvent) => void;
   testLiteLlmConnection: () => void;
   generateLiteLlmConfig: () => void;
+  startLiteLlmService: () => void;
   litellmTestResult: LiteLlmTestResponse | null;
   litellmConfigResult: GenerateLiteLlmConfigResponse | null;
+  litellmServiceResult: LiteLlmServiceStartResponse | null;
   busy: boolean;
 }) {
   const { settings, setSettings } = props;
@@ -1792,15 +2440,23 @@ function SettingsView(props: {
         </div>
         <form className="settings-form" onSubmit={props.onSubmit}>
           <label>
-            API base URL
+            <span className="field-label">
+              API base URL
+              <FieldHelp text="The llama-harness API endpoint used by this admin UI. This is separate from provider API Base values used by LiteLLM." />
+            </span>
             <input value={props.apiBaseInput} onChange={(event) => props.setApiBaseInput(event.target.value)} />
           </label>
           <div className="field-row three">
             <label>
               Default provider
               <select value={settings.default_provider} onChange={(event) => setSettings({ ...settings, default_provider: event.target.value })}>
-                <option value="ollama">ollama</option>
-                <option value="litellm">litellm</option>
+                <option value="ollama">Ollama</option>
+                <option value="litellm">LiteLLM</option>
+                {settings.litellm_providers.map((provider) => (
+                  <option key={provider.id} value={provider.id}>
+                    {provider.display_name || provider.id}
+                  </option>
+                ))}
               </select>
             </label>
             <label>
@@ -1948,13 +2604,19 @@ function SettingsView(props: {
             <button type="button" onClick={props.generateLiteLlmConfig} disabled={props.busy}>
               Generate config.yaml
             </button>
+            <button type="button" onClick={props.startLiteLlmService} disabled={props.busy}>
+              Start LiteLLM
+            </button>
             <button className="primary" type="submit" disabled={props.busy}>
               Save LiteLLM
             </button>
           </div>
           {props.litellmTestResult ? <pre className="result">{props.litellmTestResult.content || "(empty response)"}</pre> : null}
           {props.litellmConfigResult ? (
-            <pre className="result">{`${props.litellmConfigResult.routes_written} routes written\n${props.litellmConfigResult.path}`}</pre>
+            <pre className="result">{`${props.litellmConfigResult.providers_written || 0} providers written\n${props.litellmConfigResult.entries_written || props.litellmConfigResult.routes_written} total entries\n${props.litellmConfigResult.path}`}</pre>
+          ) : null}
+          {props.litellmServiceResult ? (
+            <pre className="result success-result">{`${labelize(props.litellmServiceResult.status)}\n${props.litellmServiceResult.base_url}\n${props.litellmServiceResult.config_path}`}</pre>
           ) : null}
         </form>
       </section>
@@ -2083,6 +2745,14 @@ function AuditTable({ entries, compact = false }: { entries: AuditEntry[]; compa
 
 function StatusBadge({ status }: { status: string }) {
   return <span className={`status-badge ${statusClass(status)}`}>{labelize(status)}</span>;
+}
+
+function FieldHelp({ text }: { text: string }) {
+  return (
+    <span className="help-dot" title={text} aria-label={text} tabIndex={0}>
+      ?
+    </span>
+  );
 }
 
 function StatCard({ label, value, hint }: { label: string; value: number | string; hint?: string }) {

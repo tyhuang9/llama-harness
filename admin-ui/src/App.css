@@ -63,6 +63,14 @@ select {
   font: inherit;
 }
 
+body,
+button,
+.panel,
+.provider-row-summary,
+.combobox-trigger {
+  caret-color: transparent;
+}
+
 button {
   min-height: 34px;
   border: 1px solid #303331;
@@ -139,6 +147,11 @@ input:focus,
 textarea:focus,
 select:focus {
   border-color: #a69b88;
+}
+
+input,
+textarea {
+  caret-color: auto;
 }
 
 textarea {
@@ -311,9 +324,10 @@ tr:last-child td {
 }
 
 .workspace {
-  width: min(1240px, calc(100vw - 304px));
+  width: 100%;
+  max-width: 1880px;
   margin: 0 auto;
-  padding: 28px 24px 48px;
+  padding: 24px clamp(18px, 1.7vw, 34px) 42px;
 }
 
 .topbar {
@@ -379,6 +393,11 @@ tr:last-child td {
 }
 
 .stack {
+  display: grid;
+  gap: 16px;
+}
+
+.dashboard-grid {
   display: grid;
   gap: 16px;
 }
@@ -740,6 +759,33 @@ button.chip.active {
   font-size: 13px;
 }
 
+.field-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.help-dot {
+  display: inline-grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  border: 1px solid #52574f;
+  border-radius: 999px;
+  color: #cfc7b8;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: help;
+}
+
+.help-dot:focus-visible {
+  outline: 2px solid rgba(229, 218, 197, 0.35);
+  outline-offset: 2px;
+}
+
 .field-row {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -773,8 +819,150 @@ button.chip.active {
   background: #121511;
 }
 
+.provider-list {
+  position: relative;
+  display: grid;
+  gap: 8px;
+}
+
+.provider-row {
+  border: 1px solid #282e28;
+  border-radius: 8px;
+  background: #0f110f;
+  overflow: hidden;
+}
+
+.provider-row.expanded {
+  position: relative;
+  z-index: 4;
+  border-color: #3f4a3d;
+  background: #111610;
+  overflow: visible;
+}
+
+.provider-row-summary {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(140px, 0.8fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  text-align: left;
+  border: 0;
+  background: transparent;
+}
+
+.provider-row-summary span:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.provider-row-summary small {
+  color: #8f8a7e;
+}
+
+.provider-row-editor {
+  display: grid;
+  gap: 12px;
+  padding: 0 14px 14px;
+}
+
+.provider-enabled-toggle {
+  align-self: end;
+}
+
+.combobox {
+  position: relative;
+}
+
+.combobox-trigger {
+  width: 100%;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid #2f332f;
+  border-radius: 7px;
+  background: #101210;
+  color: #f5f0e8;
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.combobox.open .combobox-trigger {
+  border-color: #c3b79f;
+  background: #141713;
+  box-shadow: 0 0 0 2px rgba(229, 218, 197, 0.08);
+}
+
+.combobox-caret {
+  color: #d2cabe;
+  font-size: 12px;
+}
+
+.combobox-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  display: grid;
+  max-height: 310px;
+  overflow: auto;
+  border: 1px solid #3c433b;
+  border-radius: 8px;
+  background: #171917;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.42);
+}
+
+.combobox-menu button {
+  display: grid;
+  min-height: 38px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.combobox-menu button.active,
+.combobox-menu button:hover:not(:disabled) {
+  background: #252416;
+  color: #fffaf0;
+}
+
 .compact-form {
   gap: 12px;
+}
+
+.field-actions {
+  display: flex;
+  align-items: end;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.model-suggestion-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.error-result {
+  border-color: #6d3d3a;
+  color: #ffc9c4;
+}
+
+.warning-result {
+  border-color: #5f5231;
+  color: #f1dca0;
+}
+
+.success-result {
+  border-color: #315f42;
+  color: #b7efc9;
 }
 
 .permission-list {
@@ -798,6 +986,65 @@ button.chip.active {
   border: 0;
   padding: 0;
   background: transparent;
+}
+
+.switch-row {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 36px;
+  gap: 9px;
+  color: #d6d0c4;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.switch-row input {
+  position: absolute;
+  width: 1px;
+  min-height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.switch-track {
+  position: relative;
+  width: 42px;
+  height: 24px;
+  border: 1px solid #3b4039;
+  border-radius: 999px;
+  background: #222620;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease;
+}
+
+.switch-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: #b9b2a4;
+  transition:
+    background 120ms ease,
+    transform 120ms ease;
+}
+
+.switch-row input:checked + .switch-track {
+  border-color: #3f865a;
+  background: #14311f;
+}
+
+.switch-row input:checked + .switch-track .switch-thumb {
+  background: #a2e6b9;
+  transform: translateX(18px);
+}
+
+.switch-row input:focus-visible + .switch-track {
+  outline: 2px solid #a69b88;
+  outline-offset: 2px;
 }
 
 .form-actions {
@@ -958,6 +1205,41 @@ button.chip.active {
   text-align: center;
 }
 
+@media (min-width: 1420px) {
+  .dashboard-grid {
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    align-items: start;
+  }
+
+  .dashboard-hero {
+    grid-column: span 7;
+    height: 100%;
+  }
+
+  .dashboard-metrics {
+    grid-column: span 5;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .dashboard-secondary {
+    grid-column: span 5;
+    grid-template-columns: 1fr;
+    height: 100%;
+  }
+
+  .dashboard-secondary > .panel {
+    min-height: 0;
+  }
+
+  .dashboard-tasks {
+    grid-column: span 7;
+  }
+
+  .dashboard-test {
+    grid-column: 1 / -1;
+  }
+}
+
 @media (max-width: 980px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -971,10 +1253,6 @@ button.chip.active {
 
   .tabs {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .workspace {
-    width: min(100%, 980px);
   }
 
   .hero-panel,
@@ -1029,6 +1307,10 @@ button.chip.active {
 
   .table-actions {
     flex-wrap: wrap;
+  }
+
+  .provider-row-summary {
+    grid-template-columns: 1fr;
   }
 
   .table-scroll {
