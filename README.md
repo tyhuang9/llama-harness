@@ -52,6 +52,18 @@ llama-harness/
   TODO.md
 ```
 
+The repository tracks a safe baseline `config.json` so new checkouts have LiteLLM settings and a local Ollama-through-LiteLLM provider. Treat your working `config.json` as local runtime state after that. To hide future local edits from normal Git status:
+
+```bash
+git update-index --skip-worktree config.json
+```
+
+To intentionally change the committed baseline later:
+
+```bash
+git update-index --no-skip-worktree config.json
+```
+
 ## Run the Rust Server
 
 From the repo root:
