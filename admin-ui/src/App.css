@@ -825,6 +825,17 @@ button.chip.active {
   gap: 8px;
 }
 
+.provider-list-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(140px, 0.8fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 0 14px 2px;
+  color: #aaa597;
+  font-size: 12px;
+  font-weight: 650;
+}
+
 .provider-row {
   border: 1px solid #282e28;
   border-radius: 8px;
@@ -1311,6 +1322,10 @@ button.chip.active {
 
   .provider-row-summary {
     grid-template-columns: 1fr;
+  }
+
+  .provider-list-header {
+    display: none;
   }
 
   .table-scroll {

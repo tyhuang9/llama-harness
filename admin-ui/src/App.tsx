@@ -1596,6 +1596,11 @@ function ModelsPage(props: {
           </div>
 
           <div className="provider-list">
+            <div className="provider-list-header" aria-hidden="true">
+              <span>Provider</span>
+              <span>Credential</span>
+              <span>Status</span>
+            </div>
             {litellmProviders.map((provider) => {
               const expanded = editingProviderId === provider.id;
               const status = props.providerStatuses.find((item) => item.id === provider.id);
