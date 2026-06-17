@@ -290,9 +290,21 @@ export default function App() {
     try {
       const updated = await persistSettings(settings);
       const model = updated.litellm.default_model || "";
-      const result = await api.testLiteLLMProvider(model, "Say hello from llama-harness.");
-      setLiteLlmTestResult(result);
-      setProviderStatuses(await api.providers());
+      if (model) {
+        const result = await api.testLiteLLMProvider(model, "Say hello from llama-harness.");
+        setLiteLlmTestResult(result);
+        setProviderStatuses(await api.providers());
+      } else {
+        const statuses = await api.providers();
+        const litellm = statuses.find((provider) => provider.id === "litellm");
+        setProviderStatuses(statuses);
+        setLiteLlmTestResult({
+          ok: Boolean(litellm?.healthy),
+          content: litellm?.healthy
+            ? `LiteLLM gateway is reachable at ${litellm.base_url || updated.litellm.base_url}.`
+            : `LiteLLM gateway is not reachable at ${litellm?.base_url || updated.litellm.base_url}.`,
+        });
+      }
     } catch (err) {
       setError((err as Error).message);
       setProviderStatuses(await api.providers().catch(() => providerStatuses));
@@ -2596,181 +2608,201 @@ function SettingsView(props: {
     <div className="stack">
       <section className="panel">
         <div className="section-header">
-          <h2>Settings</h2>
+          <div>
+            <h2>App Runtime</h2>
+            <p>Connection, display, logging, and fallback generation behavior.</p>
+          </div>
         </div>
         <form className="settings-form" onSubmit={props.onSubmit}>
-          <label>
-            <span className="field-label">
-              API base URL
-              <FieldHelp text="The llama-harness API endpoint used by this admin UI. This is separate from provider API Base values used by LiteLLM." />
-            </span>
-            <input value={props.apiBaseInput} onChange={(event) => props.setApiBaseInput(event.target.value)} />
-          </label>
-          <div className="field-row three">
-            <label>
-              Default provider
-              <select value={settings.default_provider} onChange={(event) => setSettings({ ...settings, default_provider: event.target.value })}>
-                <option value="ollama">Ollama</option>
-                <option value="litellm">LiteLLM</option>
-                {settings.litellm_providers.map((provider) => (
-                  <option key={provider.id} value={provider.id}>
-                    {provider.display_name || provider.id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Ollama endpoint
-              <input
-                value={settings.ollama_endpoint}
-                onChange={(event) => setSettings({ ...settings, ollama_endpoint: event.target.value })}
-              />
-            </label>
-            <label>
-              Default Ollama model
-              <input
-                value={settings.default_model || ""}
-                onChange={(event) => setSettings({ ...settings, default_model: event.target.value || null })}
-              />
-            </label>
+          <div className="settings-section">
+            <div>
+              <h3>App connection</h3>
+              <p>Agent model selection lives on Agents. Provider credentials live on Providers.</p>
+            </div>
+            <div className="field-row three">
+              <label>
+                <span className="field-label">
+                  API base URL
+                  <FieldHelp text="The llama-harness API endpoint used by this admin UI." />
+                </span>
+                <input value={props.apiBaseInput} onChange={(event) => props.setApiBaseInput(event.target.value)} />
+              </label>
+              <label>
+                Theme
+                <select value={settings.theme} onChange={(event) => setSettings({ ...settings, theme: event.target.value })}>
+                  <option value="dark">dark</option>
+                  <option value="light">light</option>
+                </select>
+              </label>
+              <label className="switch-row settings-switch">
+                <input
+                  type="checkbox"
+                  checked={settings.logging_enabled}
+                  onChange={(event) => setSettings({ ...settings, logging_enabled: event.target.checked })}
+                />
+                <span className="switch-track" aria-hidden="true">
+                  <span className="switch-thumb" />
+                </span>
+                <span className="settings-switch-copy">
+                  JSONL run logging
+                  <small>Append local run history when enabled.</small>
+                </span>
+              </label>
+            </div>
           </div>
-          <div className="field-row three">
-            <label>
-              Temperature
-              <input
-                type="number"
-                min="0"
-                max="2"
-                step="0.1"
-                value={settings.generation.temperature}
-                onChange={(event) => updateGeneration("temperature", Number(event.target.value))}
-              />
-            </label>
-            <label>
-              Top P
-              <input
-                type="number"
-                min="0"
-                max="1"
-                step="0.05"
-                value={settings.generation.top_p}
-                onChange={(event) => updateGeneration("top_p", Number(event.target.value))}
-              />
-            </label>
-            <label>
-              Max tokens
-              <input
-                type="number"
-                min="1"
-                step="1"
-                value={settings.generation.max_tokens}
-                onChange={(event) => updateGeneration("max_tokens", Number(event.target.value))}
-              />
-            </label>
+
+          <div className="settings-section">
+            <div>
+              <h3>Generation fallback</h3>
+              <p>Used only when a request or agent does not provide its own generation settings.</p>
+            </div>
+            <div className="field-row three">
+              <label>
+                Temperature
+                <input
+                  type="number"
+                  min="0"
+                  max="2"
+                  step="0.1"
+                  value={settings.generation.temperature}
+                  onChange={(event) => updateGeneration("temperature", Number(event.target.value))}
+                />
+              </label>
+              <label>
+                Top P
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={settings.generation.top_p}
+                  onChange={(event) => updateGeneration("top_p", Number(event.target.value))}
+                />
+              </label>
+              <label>
+                Max tokens
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={settings.generation.max_tokens}
+                  onChange={(event) => updateGeneration("max_tokens", Number(event.target.value))}
+                />
+              </label>
+            </div>
           </div>
-          <label>
-            API token
-            <input value={settings.api_token || ""} onChange={(event) => setSettings({ ...settings, api_token: event.target.value || null })} />
-          </label>
-          <label>
-            Theme
-            <select value={settings.theme} onChange={(event) => setSettings({ ...settings, theme: event.target.value })}>
-              <option value="dark">dark</option>
-              <option value="light">light</option>
-            </select>
-          </label>
-          <label className="toggle-row inline">
-            <input
-              type="checkbox"
-              checked={settings.logging_enabled}
-              onChange={(event) => setSettings({ ...settings, logging_enabled: event.target.checked })}
-            />
-            JSONL run logging
-          </label>
-          <button className="primary" type="submit" disabled={props.busy}>
-            Save settings
-          </button>
+
+          <div className="form-actions">
+            <button className="primary" type="submit" disabled={props.busy}>
+              Save runtime settings
+            </button>
+          </div>
         </form>
       </section>
 
       <section className="panel">
         <div className="section-header">
           <div>
-            <h2>LiteLLM Gateway</h2>
+            <h2>LiteLLM Gateway Runtime</h2>
             <p>{litellmStatus?.base_url || settings.litellm.base_url}</p>
           </div>
           <StatusBadge status={litellmStatus?.healthy ? "online" : settings.litellm.enabled ? "offline" : "neutral"} />
         </div>
         <form className="settings-form" onSubmit={props.onSubmit}>
-          <label className="toggle-row">
-            <span>Enable LiteLLM</span>
-            <input type="checkbox" checked={settings.litellm.enabled} onChange={(event) => updateLiteLlm({ enabled: event.target.checked })} />
-          </label>
-          <div className="field-row three">
-            <label>
-              Base URL
-              <input value={settings.litellm.base_url} onChange={(event) => updateLiteLlm({ base_url: event.target.value })} />
-            </label>
-            <label>
-              API key / master key
-              <input
-                type="password"
-                value={apiKeyValue}
-                onChange={(event) => updateLiteLlm({ api_key: event.target.value || (apiKeyConfigured ? REDACTED_SECRET : null) })}
-                placeholder={apiKeyConfigured ? "configured" : "optional"}
-              />
-            </label>
-            <label>
-              Default LiteLLM model
-              <input
-                value={settings.litellm.default_model || ""}
-                onChange={(event) => updateLiteLlm({ default_model: event.target.value || null })}
-                placeholder="openai:gpt-4o"
-              />
-            </label>
+          <div className="settings-section">
+            <div>
+              <h3>Gateway controls</h3>
+              <p>Provider API keys are configured on Providers. Local Ollama routes do not require provider keys.</p>
+            </div>
+            <div className="field-row">
+              <label className="switch-row settings-switch">
+                <input type="checkbox" checked={settings.litellm.enabled} onChange={(event) => updateLiteLlm({ enabled: event.target.checked })} />
+                <span className="switch-track" aria-hidden="true">
+                  <span className="switch-thumb" />
+                </span>
+                <span className="settings-switch-copy">
+                  Enable LiteLLM
+                  <small>Route configured gateway providers through the local proxy.</small>
+                </span>
+              </label>
+              <label>
+                Base URL
+                <input value={settings.litellm.base_url} onChange={(event) => updateLiteLlm({ base_url: event.target.value })} />
+              </label>
+            </div>
+            <div className="button-row">
+              <button type="button" onClick={props.testLiteLlmConnection} disabled={props.busy}>
+                Test connection
+              </button>
+              <button type="button" onClick={props.generateLiteLlmConfig} disabled={props.busy}>
+                Generate config.yaml
+              </button>
+              <button type="button" onClick={props.startLiteLlmService} disabled={props.busy}>
+                Start LiteLLM
+              </button>
+              <button className="primary" type="submit" disabled={props.busy}>
+                Save gateway
+              </button>
+            </div>
           </div>
-          <div className="field-row three">
-            <label>
-              Timeout ms
-              <input
-                type="number"
-                min="1000"
-                step="1000"
-                value={settings.litellm.timeout_ms}
-                onChange={(event) => updateLiteLlm({ timeout_ms: Number(event.target.value) })}
-              />
-            </label>
-            <label>
-              Managed config path
-              <input
-                value={settings.litellm.managed_config_path || ""}
-                onChange={(event) => updateLiteLlm({ managed_config_path: event.target.value || null })}
-                placeholder="litellm.config.yaml"
-              />
-            </label>
-            <label className="toggle-row">
-              <span>Allow raw models</span>
-              <input
-                type="checkbox"
-                checked={settings.litellm.allow_unconfigured_models}
-                onChange={(event) => updateLiteLlm({ allow_unconfigured_models: event.target.checked })}
-              />
-            </label>
-          </div>
-          <div className="button-row">
-            <button type="button" onClick={props.testLiteLlmConnection} disabled={props.busy || !settings.litellm.default_model}>
-              Test connection
-            </button>
-            <button type="button" onClick={props.generateLiteLlmConfig} disabled={props.busy}>
-              Generate config.yaml
-            </button>
-            <button type="button" onClick={props.startLiteLlmService} disabled={props.busy}>
-              Start LiteLLM
-            </button>
-            <button className="primary" type="submit" disabled={props.busy}>
-              Save LiteLLM
-            </button>
-          </div>
+
+          <details className="advanced-settings">
+            <summary>
+              <span>
+                Advanced LiteLLM
+                <small>Proxy auth, process config, timeout, and raw model routing.</small>
+              </span>
+            </summary>
+            <div className="advanced-settings-body">
+              <div className="field-row three">
+                <label>
+                  <span className="field-label">
+                    Proxy master key
+                    <FieldHelp text="Optional auth for the local LiteLLM proxy. This is separate from provider API keys managed on Providers." />
+                  </span>
+                  <input
+                    type="password"
+                    value={apiKeyValue}
+                    onChange={(event) => updateLiteLlm({ api_key: event.target.value || (apiKeyConfigured ? REDACTED_SECRET : null) })}
+                    placeholder={apiKeyConfigured ? "configured" : "auto-managed"}
+                  />
+                </label>
+                <label>
+                  Timeout ms
+                  <input
+                    type="number"
+                    min="1000"
+                    step="1000"
+                    value={settings.litellm.timeout_ms}
+                    onChange={(event) => updateLiteLlm({ timeout_ms: Number(event.target.value) })}
+                  />
+                </label>
+                <label className="switch-row settings-switch">
+                  <input
+                    type="checkbox"
+                    checked={settings.litellm.allow_unconfigured_models}
+                    onChange={(event) => updateLiteLlm({ allow_unconfigured_models: event.target.checked })}
+                  />
+                  <span className="switch-track" aria-hidden="true">
+                    <span className="switch-thumb" />
+                  </span>
+                  <span className="settings-switch-copy">
+                    Allow raw models
+                    <small>Permit model names not covered by saved providers or routes.</small>
+                  </span>
+                </label>
+              </div>
+              <label>
+                Managed config path
+                <input
+                  value={settings.litellm.managed_config_path || ""}
+                  onChange={(event) => updateLiteLlm({ managed_config_path: event.target.value || null })}
+                  placeholder="litellm.config.yaml"
+                />
+              </label>
+            </div>
+          </details>
+
           {props.litellmTestResult ? <pre className="result">{props.litellmTestResult.content || "(empty response)"}</pre> : null}
           {props.litellmConfigResult ? (
             <pre className="result">{`${props.litellmConfigResult.providers_written || 0} providers written\n${props.litellmConfigResult.entries_written || props.litellmConfigResult.routes_written} total entries\n${props.litellmConfigResult.path}`}</pre>

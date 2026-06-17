@@ -759,6 +759,34 @@ button.chip.active {
   font-size: 13px;
 }
 
+.settings-section {
+  display: grid;
+  gap: 12px;
+  padding-top: 2px;
+}
+
+.settings-section + .settings-section,
+.advanced-settings {
+  border-top: 1px solid #252923;
+  padding-top: 14px;
+}
+
+.settings-section h3 {
+  margin: 0;
+  color: #eee8dd;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.settings-section p,
+.advanced-settings small,
+.settings-switch-copy small {
+  margin: 3px 0 0;
+  color: #918d82;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .field-label {
   display: inline-flex;
   align-items: center;
@@ -1057,11 +1085,58 @@ button.chip.active {
   background: #0f110f;
 }
 
+.advanced-settings summary > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
 .toggle-row.inline {
   width: fit-content;
   border: 0;
   padding: 0;
   background: transparent;
+}
+
+.advanced-settings {
+  display: grid;
+}
+
+.advanced-settings summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #eee8dd;
+  cursor: pointer;
+  list-style: none;
+}
+
+.advanced-settings summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-settings summary::after {
+  content: "+";
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border: 1px solid #343932;
+  border-radius: 999px;
+  color: #cfc7b8;
+  font-weight: 700;
+}
+
+.advanced-settings[open] summary::after {
+  content: "-";
+}
+
+.advanced-settings-body {
+  display: grid;
+  gap: 12px;
+  padding-top: 12px;
 }
 
 .switch-row {
@@ -1073,6 +1148,16 @@ button.chip.active {
   color: #d6d0c4;
   font-size: 13px;
   cursor: pointer;
+}
+
+.settings-switch {
+  width: 100%;
+}
+
+.settings-switch-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
 }
 
 .switch-row input {
