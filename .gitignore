@@ -1,9 +1,15 @@
 target/
 node_modules/
 dist/
+.venv-litellm/
+bundled/litellm-runtime/
 .env
 .DS_Store
 *.log
 runs.jsonl
 litellm.config.yaml
+litellm.*.config.yaml
+litellm.*.config.yml
+litellm*.local.yaml
+litellm*.local.yml
 admin-ui/src/sentinelData.local.ts

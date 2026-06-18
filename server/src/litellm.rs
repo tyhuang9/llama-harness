@@ -94,7 +94,9 @@ impl LiteLlmProvider {
             return false;
         }
 
-        self.health_request("/health").await || self.health_request("/v1/models").await
+        self.health_request("/health/readiness").await
+            || self.health_request("/health").await
+            || self.health_request("/v1/models").await
     }
 
     fn ensure_ready(&self, model: &str) -> Result<()> {
@@ -244,8 +246,12 @@ pub async fn generate_litellm_config(
     let providers_written = provider_entries.len();
     let routes_written = route_entries.len();
 
+    let mut model_list: Vec<LiteLlmConfigModel> =
+        provider_entries.into_iter().chain(route_entries).collect();
+    append_default_example_routes(&mut model_list, ollama_endpoint);
+
     let config = LiteLlmConfig {
-        model_list: provider_entries.into_iter().chain(route_entries).collect(),
+        model_list,
         litellm_settings: LiteLlmRuntimeSettings {
             check_provider_endpoint: true,
         },
@@ -273,6 +279,38 @@ pub async fn generate_litellm_config(
         providers_written,
         entries_written,
     })
+}
+
+fn append_default_example_routes(entries: &mut Vec<LiteLlmConfigModel>, ollama_endpoint: &str) {
+    if !entries
+        .iter()
+        .any(|entry| entry.model_name == "gpt-4o-mini")
+    {
+        entries.push(LiteLlmConfigModel {
+            model_name: "gpt-4o-mini".to_string(),
+            litellm_params: LiteLlmConfigParams {
+                model: "openai/gpt-4o-mini".to_string(),
+                api_key: env_reference("OPENAI_API_KEY"),
+                api_base: None,
+            },
+        });
+    }
+
+    if !entries
+        .iter()
+        .any(|entry| entry.model_name == "local-llama")
+    {
+        entries.push(LiteLlmConfigModel {
+            model_name: "local-llama".to_string(),
+            litellm_params: LiteLlmConfigParams {
+                model: "ollama/llama3.1".to_string(),
+                api_key: String::new(),
+                api_base: Some(ollama_endpoint.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| Some("http://127.0.0.1:11434".to_string())),
+            },
+        });
+    }
 }
 
 pub fn litellm_model_for_provider(provider: &LiteLlmProviderConfig, model: &str) -> String {

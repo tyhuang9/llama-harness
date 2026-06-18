@@ -1,53 +1,51 @@
 # llama-harness
 
-llama-harness is a lightweight local AI harness service for managing local and gateway-backed LLM usage through a stable HTTP/SSE API. It connects directly to a locally running Ollama instance and can route cloud-provider models through a local LiteLLM Proxy.
+llama-harness is a local AI harness for routing chat requests through a stable Rust HTTP/SSE API. It talks directly to a locally running Ollama instance and can manage a local LiteLLM Proxy sidecar for OpenAI-compatible cloud or gateway providers.
 
 The API is the product. The admin UI is only a local configuration and inspection dashboard.
 
-## Project Goals
+## What It Offers
 
-- Local-first operation.
-- Direct Ollama support plus LiteLLM gateway routing for cloud providers.
-- Minimal resource usage.
-- API-first integration surface for other local apps.
-- JSON config and optional JSONL logs instead of a database.
-- Soft, low-noise admin UI for local control.
+- Stable local API endpoints for health, model inventory, chat, streaming chat, settings, providers, and recent runs.
+- Direct local Ollama support with `http://localhost:11434` as the default endpoint.
+- App-managed LiteLLM runtime for gateway-backed models without vendoring LiteLLM into this repo.
+- Provider-scoped agent defaults so Agents can use local Ollama or a saved LiteLLM provider.
+- Local admin UI for settings, providers, agents, permissions, logs, and model testing.
+- Tauri desktop shell for running the local dashboard as a desktop app.
+- TypeScript client SDK for other local apps.
+- JSON config, app-data `.env` secrets, and optional JSONL logs instead of a database.
 
-## MVP Scope
+## Current Boundaries
 
-Implemented MVP capabilities:
-
-- Rust Axum server with health, model, chat, settings, runs, and tools-placeholder endpoints.
-- Ollama HTTP API integration using `http://localhost:11434` by default.
-- LiteLLM Proxy integration using `http://127.0.0.1:4000` by default.
-- Config persistence in `config.json`.
-- Global instruction settings that can be prepended to every LLM run.
-- In-memory recent run history with optional append-only `runs.jsonl`.
-- Minimal React + TypeScript admin UI.
-- TypeScript client SDK for external apps.
-
-Out of scope for the MVP:
-
-- OAuth, users, teams, billing, cloud sync, and remote deployment.
-- SQLite or any other database.
-- Complex auth, plugin marketplace, MCP gateway, full agent framework, or complex eval framework.
+- This is local-first infrastructure, not a hosted multi-user SaaS.
+- Ollama must already be installed and running for direct local models.
+- LiteLLM is downloaded into ignored/generated Python environments; LiteLLM source, virtualenvs, `site-packages`, and generated runtime files are not committed.
+- No OAuth, users, teams, billing, cloud sync, database, plugin marketplace, MCP gateway, or full eval framework is included.
+- Agent/task screens are local operator workflows; they do not yet run a full autonomous task runner.
 
 ## Tech Stack
 
 - Backend: Rust, Axum, Tokio, Serde, Reqwest.
 - Frontend: React, TypeScript, Vite.
+- Desktop: Tauri.
+- Local model provider: Ollama.
+- Gateway provider: LiteLLM Proxy installed from `requirements-litellm.txt`.
 - Client SDK: TypeScript.
-- Persistence: `config.json`, optional `runs.jsonl`, and in-memory state.
+- Persistence: `config.json`, OS app-data `.env` and LiteLLM YAML files, optional `runs.jsonl`, and in-memory recent run state.
 
 ## Repo Structure
 
 ```text
 llama-harness/
   server/        Rust backend service
-  admin-ui/      Minimal local control dashboard
+  admin-ui/      Local admin dashboard
   clients/ts/    TypeScript client SDK for external apps
+  desktop/       Tauri desktop shell
   docs/          Milestone tracking
+  scripts/       Dev and deployment helpers
+  bundled/       Ignored generated deployment runtime output
   config.json    Local service settings
+  requirements-litellm.txt
   README.md
   TODO.md
 ```
@@ -64,13 +62,23 @@ To intentionally change the committed baseline later:
 git update-index --no-skip-worktree config.json
 ```
 
-## Run the Rust Server
+## Run the App
+
+The normal development flow starts the Tauri desktop shell, the Vite admin UI,
+and the Axum backend from the repo root:
+
+```bash
+npm run dev
+```
+
+Use the focused commands below when you only need one part of the stack.
+
+### Rust Server
 
 From the repo root:
 
 ```bash
-cd server
-cargo run
+npm run api:dev
 ```
 
 The server listens on `127.0.0.1:8787` by default.
@@ -79,21 +87,68 @@ Optional environment variables:
 
 ```bash
 LLAMA_HARNESS_ADDR=127.0.0.1:8787
-LLAMA_HARNESS_CONFIG=../config.json
-LLAMA_HARNESS_RUNS_LOG=../runs.jsonl
+LLAMA_HARNESS_CONFIG=config.json
+LLAMA_HARNESS_RUNS_LOG=runs.jsonl
 ```
 
-## Run the Admin UI
+### Admin UI
 
 From the repo root:
 
 ```bash
-cd admin-ui
 npm install
-npm run dev
+npm run web:dev
 ```
 
 Open the Vite URL shown in the terminal. The UI defaults to `http://127.0.0.1:8787` for the API base URL and lets you change it in Settings.
+
+## LiteLLM Runtime Setup
+
+LiteLLM is managed as a local sidecar process by the Rust backend. The repository
+does not vendor LiteLLM source, Python virtualenvs, `site-packages`, or generated
+runtime files. Developers create a local ignored venv, and release builds create
+an ignored bundled runtime that Tauri includes in the installer. The pinned
+runtime dependency is `litellm[proxy]==1.89.1`.
+
+Install Python 3.10 through 3.13 first. For development on Linux or macOS:
+
+```bash
+cd /home/tyhuang/Projects/llama-harness
+./scripts/setup-litellm-dev.sh
+npm run dev
+```
+
+For development on Windows PowerShell:
+
+```powershell
+cd path\to\llama-harness
+.\scripts\setup-litellm-dev.ps1
+npm run dev
+```
+
+The setup script creates `.venv-litellm/`, installs `requirements-litellm.txt`,
+prints the resolved Python path, and verifies the installed LiteLLM version.
+
+For deployment builds on Linux or macOS:
+
+```bash
+cd /home/tyhuang/Projects/llama-harness
+./scripts/build-litellm-runtime.sh
+npm run tauri:build
+```
+
+For deployment builds on Windows PowerShell:
+
+```powershell
+cd path\to\llama-harness
+.\scripts\build-litellm-runtime.ps1
+npm run tauri:build
+```
+
+The runtime build script recreates `bundled/litellm-runtime/`, installs
+LiteLLM from `requirements-litellm.txt`, verifies the import, and leaves the
+runtime for Tauri to bundle. Both `.venv-litellm/` and
+`bundled/litellm-runtime/` are ignored.
 
 ## Configure Ollama
 
@@ -123,7 +178,7 @@ curl -X PUT http://127.0.0.1:8787/api/settings \
 
 LiteLLM mode keeps llama-harness focused on one internal model-provider abstraction while letting LiteLLM handle OpenAI, Anthropic, OpenRouter, Gemini, and future cloud providers. Ollama remains the local direct provider. Cloud services should usually be added as LiteLLM provider records, not one route per model.
 
-Run a LiteLLM Proxy locally and pin the image or package version for durable setups. The default proxy URL is:
+The Rust backend starts LiteLLM as an internal sidecar and talks to it over localhost. The default proxy URL is:
 
 ```text
 http://127.0.0.1:4000
@@ -139,7 +194,13 @@ OPENROUTER_API_KEY=...
 GEMINI_API_KEY=...
 ```
 
-In the admin UI, open Settings to enable LiteLLM, set the proxy base URL, and set an optional LiteLLM master key. Open Providers to add providers. A provider has a user-facing unique name, a LiteLLM provider type, and the environment variable that contains the provider API key:
+API keys can be provided through the process environment or the app-data `.env`
+file managed by llama-harness. The app-data directory is controlled by
+`LLAMA_HARNESS_DATA_DIR` when set; otherwise it uses the OS app-data location
+for `llama-harness`. Generated LiteLLM YAML files and saved `.env` secrets live
+there, outside the repository.
+
+In the admin UI, open Settings to enable LiteLLM and set the proxy base URL. Open Providers to add providers. A provider has a user-facing unique name, a LiteLLM provider type, and the environment variable that contains the provider API key:
 
 ```json
 {
@@ -151,15 +212,7 @@ In the admin UI, open Settings to enable LiteLLM, set the proxy base URL, and se
 }
 ```
 
-The provider type field can use the LiteLLM provider prefix, such as `openai`, `anthropic`, `gemini`, `openrouter`, `groq`, `mistral`, `bedrock`, `vertex_ai`, or `ollama`. Provider ids are generated internally from provider names and preserved for agents/API calls. API keys are not edited in the normal UI; users configure env vars such as `OPENAI_API_KEY`. Settings responses still mask any saved raw key as `__configured__` for compatibility.
-
-Keep the LiteLLM proxy checkout separate from this repository. A sibling folder works well:
-
-```bash
-git clone https://github.com/BerriAI/litellm.git ../litellm
-```
-
-When `managed_config_path` is relative, llama-harness resolves it relative to `config.json`, so `../litellm/llama-harness-litellm.local.yaml` keeps proxy config with the LiteLLM checkout.
+The provider type field can use the LiteLLM provider prefix, such as `openai`, `anthropic`, `gemini`, `openrouter`, `groq`, `mistral`, `bedrock`, `vertex_ai`, or `ollama`. Provider ids are generated internally from provider names and preserved for agents/API calls. Settings responses mask saved raw keys as `__configured__`.
 
 Generate a LiteLLM config from configured providers. The app automatically calls this endpoint after saving providers when LiteLLM is enabled and `managed_config_path` is configured; it can also be called directly:
 
@@ -169,10 +222,24 @@ curl -X POST http://127.0.0.1:8787/api/litellm/config/generate \
   -d '{"output_path":"litellm.config.yaml"}'
 ```
 
-Generated configs use wildcard routes so every model supported by a configured provider is available without creating a route per model. Generated configs reference environment variables, not raw provider keys:
+Relative config paths are resolved inside the app-data directory, not the repo.
+Generated configs use wildcard routes so every model supported by a configured
+provider is available without creating a route per model. They also include
+default example aliases and reference environment variables, not raw provider
+keys:
 
 ```yaml
 model_list:
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: local-llama
+    litellm_params:
+      model: ollama/llama3.1
+      api_base: http://localhost:11434
+
   - model_name: openai/*
     litellm_params:
       model: openai/*
@@ -200,14 +267,30 @@ general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
 ```
 
-Saving providers writes llama-harness settings and generates the LiteLLM config, but it does not hot-reload an already running LiteLLM process. Refresh or restart LiteLLM after provider changes before expecting the running proxy to pick them up.
+Saving providers writes llama-harness settings, writes app-data secrets, generates the LiteLLM config, and restarts the managed LiteLLM process when llama-harness owns it. If another process already owns the LiteLLM port, llama-harness will not stop it.
 
 To put local Ollama behind LiteLLM for gateway behavior such as proxy-level limits, add an enabled provider with `provider_type: "ollama"` and set API Base to your Ollama endpoint if it is not `http://localhost:11434`. llama-harness emits `ollama_chat/*` routes for that provider.
 
-Start LiteLLM from the app or API. The server writes the managed config first, then runs `litellm --config <path> --host <host> --port <port>`. Override the executable with `LLAMA_HARNESS_LITELLM_COMMAND` when needed:
+Start LiteLLM from the app or API. The server writes the managed config first,
+resolves Python from `LLAMA_HARNESS_LITELLM_PYTHON`,
+`LLAMA_HARNESS_LITELLM_RUNTIME_DIR`, or `.venv-litellm/`, then runs the
+runtime's `litellm` console entrypoint with
+`--config <path> --host <host> --port <port>`. Startup readiness is checked at
+`/health/readiness` with safe fallbacks and uses the configured LiteLLM
+`timeout_ms` window:
 
 ```bash
 curl -X POST http://127.0.0.1:8787/api/litellm/service/start
+```
+
+External apps should call the Rust backend, not LiteLLM directly. The stable
+chat endpoint is `/api/chat`; OpenAI-compatible callers can use the forwarding
+endpoint:
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hello."}]}'
 ```
 
 Explicit LiteLLM routes remain supported in config and API responses for legacy or advanced cases such as aliases, fallbacks, load balancing, rate limits, or custom model rewrites. They are intentionally not part of the normal app UI because provider-level wildcard routing covers the common case.
@@ -231,13 +314,18 @@ curl -X POST http://127.0.0.1:8787/api/chat \
     "messages": [
       { "role": "user", "content": "Write a quick project summary." }
     ],
-    "temperature": 0.7,
-    "top_p": 0.9,
-    "max_tokens": 2048
+    "generation": {
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "max_tokens": 2048
+    }
   }'
 ```
 
-The agent model field shows suggested models for each provider and still allows a free-form model string. Existing clients can continue to call `provider: "litellm"` with an explicit LiteLLM model string or route alias.
+The agent model field shows provider-scoped model choices. Ollama choices come
+from the local inventory; saved LiteLLM providers use provider-specific
+suggestions. Existing API clients can continue to call `provider: "litellm"`
+with an explicit LiteLLM model string or route alias.
 
 Ollama still works the same way for local models. Existing clients that omit `provider` continue to use `default_provider`, which defaults to `ollama`.
 
@@ -335,10 +423,10 @@ const result = await harness.chat({
 ## Current Limitations
 
 - Ollama must already be installed and running locally.
-- LiteLLM Proxy must already be running locally for gateway models.
+- LiteLLM setup requires either the dev venv from `scripts/setup-litellm-dev.*` or the bundled runtime from `scripts/build-litellm-runtime.*`.
 - No default model is selected until one is configured.
-- API token storage exists in settings, but request enforcement is not implemented in the MVP.
+- API token storage exists in settings, but request enforcement is not implemented yet.
 - Instruction settings steer model behavior, but they do not implement real tool execution.
 - Run history is intentionally lightweight and capped in memory.
-- Streaming is an SSE bridge over provider chat chunks and should be treated as an MVP interface.
+- Streaming is an SSE bridge over provider chat chunks.
 - The admin UI is a local developer dashboard, not an embeddable product surface.

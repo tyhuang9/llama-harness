@@ -4,6 +4,7 @@ use crate::{
         LiteLlmSettings, ModelRoute, REDACTED_SECRET,
     },
     litellm::{generate_litellm_config, litellm_model_for_provider},
+    litellm_runtime::{litellm_start_command_summary, LiteLlmRuntimeManager},
     ollama::OllamaModel,
     providers::{
         ChatMessage, ModelProvider, ProviderChatRequest, ProviderRegistry, ProviderStreamEvent,
@@ -27,14 +28,10 @@ use std::{
     convert::Infallible,
     env,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::net::TcpStream;
-use tokio::process::Command;
 use tokio::sync::RwLock;
-use tokio::time::sleep;
 use uuid::Uuid;
 
 const MAX_RECENT_RUNS: usize = 100;
@@ -46,12 +43,8 @@ pub struct AppState {
     pub runs_path: PathBuf,
     pub runs: Arc<RwLock<VecDeque<RunRecord>>>,
     pub providers: ProviderRegistry,
-    pub litellm_process: Arc<RwLock<Option<ManagedLiteLlmProcess>>>,
+    pub litellm_runtime: LiteLlmRuntimeManager,
     pub started_at: DateTime<Utc>,
-}
-
-pub struct ManagedLiteLlmProcess {
-    child: tokio::process::Child,
 }
 
 #[derive(Serialize)]
@@ -257,6 +250,7 @@ pub fn router(state: AppState) -> Router {
             post(generate_litellm_config_endpoint),
         )
         .route("/api/litellm/service/start", post(start_litellm_service))
+        .route("/api/chat/completions", post(chat_completions))
         .route("/api/chat", post(chat))
         .route("/api/chat/stream", post(stream_chat))
         .route("/api/runs", get(list_runs))
@@ -705,11 +699,12 @@ async fn generate_litellm_config_endpoint(
 async fn start_litellm_service(
     State(state): State<AppState>,
 ) -> ApiResult<Json<LiteLlmServiceStartResponse>> {
-    let app_env = load_app_env().await?;
+    let mut app_env = load_app_env().await?;
+    ensure_litellm_master_key_for_runtime(&mut app_env);
     let config = hydrate_config_secrets(state.config.read().await.clone(), &app_env);
     let output_path = resolve_litellm_config_path(&state.config_path, &config, None);
 
-    if state.providers.litellm_healthy(&config).await {
+    if state.litellm_runtime.readiness_healthy(&config).await {
         return Ok(Json(LiteLlmServiceStartResponse {
             status: "already_running".to_string(),
             base_url: config.litellm.base_url.clone(),
@@ -728,33 +723,74 @@ async fn start_litellm_service(
     .await
     .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-    if managed_litellm_is_running(&state).await {
-        stop_managed_litellm(&state).await?;
-    } else if litellm_port_open(&config.litellm.base_url).await {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "a process is already using the LiteLLM port; Llama Harness will not stop an external process",
-        ));
-    }
-
-    let pid = start_managed_litellm(&state, &config, &output_path, &app_env).await?;
+    let start = state
+        .litellm_runtime
+        .ensure_started(&config, &output_path, &app_env)
+        .await
+        .map_err(runtime_start_api_error)?;
 
     audit_hook(
         "litellm.service.started",
         serde_json::json!({
             "path": output_path.display().to_string(),
             "base_url": config.litellm.base_url,
-            "pid": pid
+            "pid": start.as_ref().map(|start| start.pid)
         }),
     );
 
     Ok(Json(LiteLlmServiceStartResponse {
-        status: "started".to_string(),
+        status: if start.is_some() {
+            "started".to_string()
+        } else {
+            "already_running".to_string()
+        },
         base_url: config.litellm.base_url.clone(),
         config_path: output_path.display().to_string(),
-        command: litellm_start_command_summary(&config, &output_path),
-        pid: Some(pid),
+        command: start
+            .as_ref()
+            .map(|start| start.command.clone())
+            .unwrap_or_else(|| litellm_start_command_summary(&config, &output_path)),
+        pid: start.map(|start| start.pid),
     }))
+}
+
+async fn chat_completions(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut app_env = load_app_env().await?;
+    ensure_litellm_master_key_for_runtime(&mut app_env);
+    let config = hydrate_config_secrets(state.config.read().await.clone(), &app_env);
+    if !config.litellm.enabled {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "LiteLLM is disabled in settings.",
+        ));
+    }
+
+    let output_path = resolve_litellm_config_path(&state.config_path, &config, None);
+    generate_litellm_config(
+        &config.litellm_providers,
+        &config.model_routes,
+        &output_path,
+        &config.ollama_endpoint,
+    )
+    .await
+    .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    state
+        .litellm_runtime
+        .ensure_started(&config, &output_path, &app_env)
+        .await
+        .map_err(runtime_start_api_error)?;
+
+    let response = state
+        .litellm_runtime
+        .forward_chat_completions(&config, body)
+        .await
+        .map_err(|err| api_error(StatusCode::BAD_GATEWAY, err.to_string()))?;
+
+    Ok(Json(response))
 }
 
 async fn chat(
@@ -1264,7 +1300,7 @@ async fn record_run(state: &AppState, record: RunRecord) {
 }
 
 fn resolve_litellm_config_path(
-    config_path: &Path,
+    _config_path: &Path,
     config: &AppConfig,
     requested_path: Option<&str>,
 ) -> PathBuf {
@@ -1279,71 +1315,7 @@ fn resolve_litellm_config_path(
         return path;
     }
 
-    config_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .join(path)
-}
-
-fn litellm_start_command_summary(config: &AppConfig, config_path: &Path) -> String {
-    let command =
-        env::var("LLAMA_HARNESS_LITELLM_COMMAND").unwrap_or_else(|_| "litellm".to_string());
-    let (host, port) = litellm_host_port(&config.litellm.base_url);
-    format!(
-        "{} --config {} --host {} --port {}",
-        command,
-        config_path.display(),
-        host,
-        port
-    )
-}
-
-fn litellm_child_env(
-    config: &AppConfig,
-    app_env: &HashMap<String, String>,
-) -> HashMap<String, String> {
-    let mut child_env = app_env.clone();
-    if let Some(api_key) = config
-        .litellm
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != REDACTED_SECRET)
-    {
-        child_env.insert(LITELLM_MASTER_KEY_ENV.to_string(), api_key.to_string());
-    }
-    child_env
-}
-
-fn litellm_host_port(base_url: &str) -> (String, String) {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    let without_scheme = trimmed
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(trimmed);
-    let authority = without_scheme
-        .split('/')
-        .next()
-        .unwrap_or(without_scheme)
-        .rsplit('@')
-        .next()
-        .unwrap_or(without_scheme);
-
-    if let Some(rest) = authority.strip_prefix('[') {
-        if let Some((host, after_host)) = rest.split_once(']') {
-            let port = after_host.strip_prefix(':').unwrap_or("4000");
-            return (host.to_string(), port.to_string());
-        }
-    }
-
-    let (host, port) = authority
-        .rsplit_once(':')
-        .map(|(host, port)| (host, port))
-        .unwrap_or((authority, "4000"));
-    let host = if host.is_empty() { "127.0.0.1" } else { host };
-    let port = if port.is_empty() { "4000" } else { port };
-    (host.to_string(), port.to_string())
+    secrets::app_data_dir().join(path)
 }
 
 fn audit_hook(event: &str, metadata: serde_json::Value) {
@@ -1577,130 +1549,11 @@ async fn ensure_litellm_runtime_after_apply(
     output_path: &Path,
     app_env: &HashMap<String, String>,
 ) -> ApiResult<(bool, Option<String>)> {
-    if managed_litellm_is_running(state).await {
-        stop_managed_litellm(state).await?;
-        let _pid = start_managed_litellm(state, config, output_path, app_env).await?;
-        let ready = wait_for_litellm_ready(state, config).await;
-        return Ok((
-            ready,
-            (!ready).then(|| {
-                "LiteLLM was restarted, but it did not become ready before the health check timed out.".to_string()
-            }),
-        ));
-    }
-
-    if litellm_port_open(&config.litellm.base_url).await {
-        let ready = wait_for_litellm_ready(state, config).await;
-        return Ok((
-            ready,
-            Some(if ready {
-                "LiteLLM is already running outside Llama Harness. Saved keys and config are ready, but restart that proxy if new providers do not appear.".to_string()
-            } else {
-                "A process is already using the LiteLLM port, and it did not respond as a ready LiteLLM proxy. Llama Harness did not stop it.".to_string()
-            }),
-        ));
-    }
-
-    let _pid = start_managed_litellm(state, config, output_path, app_env).await?;
-    let ready = wait_for_litellm_ready(state, config).await;
-    Ok((
-        ready,
-        (!ready).then(|| {
-            "LiteLLM started, but it did not become ready before the health check timed out."
-                .to_string()
-        }),
-    ))
-}
-
-async fn managed_litellm_is_running(state: &AppState) -> bool {
-    let mut process = state.litellm_process.write().await;
-    let should_clear = match process.as_mut() {
-        Some(managed) => match managed.child.try_wait() {
-            Ok(Some(_status)) => true,
-            Ok(None) => false,
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to inspect managed LiteLLM process");
-                true
-            }
-        },
-        None => return false,
-    };
-
-    if should_clear {
-        *process = None;
-        false
-    } else {
-        true
-    }
-}
-
-async fn stop_managed_litellm(state: &AppState) -> ApiResult<()> {
-    let mut managed = {
-        let mut process = state.litellm_process.write().await;
-        process.take()
-    };
-
-    if let Some(mut process) = managed.take() {
-        process
-            .child
-            .kill()
-            .await
-            .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-        let _ = process.child.wait().await;
-    }
-
-    Ok(())
-}
-
-async fn start_managed_litellm(
-    state: &AppState,
-    config: &AppConfig,
-    output_path: &Path,
-    app_env: &HashMap<String, String>,
-) -> ApiResult<u32> {
-    let command =
-        env::var("LLAMA_HARNESS_LITELLM_COMMAND").unwrap_or_else(|_| "litellm".to_string());
-    let (host, port) = litellm_host_port(&config.litellm.base_url);
-    let child = Command::new(&command)
-        .arg("--config")
-        .arg(output_path)
-        .arg("--host")
-        .arg(&host)
-        .arg("--port")
-        .arg(&port)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .envs(litellm_child_env(config, app_env))
-        .spawn()
-        .map_err(|err| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to start LiteLLM using '{command}': {err}"),
-            )
-        })?;
-    let pid = child.id().unwrap_or(0);
-    let mut process = state.litellm_process.write().await;
-    *process = Some(ManagedLiteLlmProcess { child });
-    Ok(pid)
-}
-
-async fn wait_for_litellm_ready(state: &AppState, config: &AppConfig) -> bool {
-    for _ in 0..20 {
-        if state.providers.litellm_healthy(config).await {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
-}
-
-async fn litellm_port_open(base_url: &str) -> bool {
-    let (host, port) = litellm_host_port(base_url);
-    let Ok(port) = port.parse::<u16>() else {
-        return false;
-    };
-    TcpStream::connect((host.as_str(), port)).await.is_ok()
+    state
+        .litellm_runtime
+        .ensure_after_apply(config, output_path, app_env)
+        .await
+        .map_err(runtime_start_api_error)
 }
 
 fn find_litellm_provider(config: &AppConfig, provider_id: &str) -> Option<LiteLlmProviderConfig> {
@@ -1973,6 +1826,21 @@ fn suggested_provider_models(provider: &LiteLlmProviderConfig) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn runtime_start_api_error(error: anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    let message = error.to_string();
+    let status = if message.contains("already using the LiteLLM port") {
+        StatusCode::CONFLICT
+    } else if message.contains("LiteLLM Python was not found")
+        || message.contains("runtime Python does not exist")
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+
+    api_error(status, message)
 }
 
 fn api_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ApiError>) {
@@ -2353,7 +2221,7 @@ mod tests {
         app_env.insert("OPENAI_API_KEY".to_string(), "sk-secret".to_string());
         app_env.insert(LITELLM_MASTER_KEY_ENV.to_string(), "sk-master".to_string());
 
-        let child_env = litellm_child_env(&config, &app_env);
+        let child_env = crate::litellm_runtime::litellm_child_env(&config, &app_env);
 
         assert_eq!(
             child_env.get("OPENAI_API_KEY").map(String::as_str),
