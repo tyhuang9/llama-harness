@@ -220,3 +220,43 @@ Global instructions are stored in `config.json` under `instructions`. When enabl
 
 ### Commit / PR
 Local implementation commit: `33050fa`. PR not created yet.
+
+## Milestone 7 - App-Agent Policy Model
+
+### Status
+Completed
+
+### Summary
+Added first-class local Models, Agents, Apps, Tools, Runs, and Audit concepts so external apps can connect with an app id and let llama-harness resolve the assigned agent, tools, model, and run policy.
+
+### Files Changed
+- `server/src/app_policy.rs`
+- `server/src/config.rs`
+- `server/src/routes.rs`
+- `server/src/runs.rs`
+- `config/models.json`
+- `config/agents.json`
+- `config/apps.json`
+- `config/tools.json`
+- `admin-ui/src/App.tsx`
+- `admin-ui/src/api.ts`
+- `clients/ts/src/index.ts`
+- `README.md`
+- `.gitignore`
+
+### Implementation Notes
+Agents are reusable top-level records and are not nested under apps. Apps define `defaultAgentId`, `allowedAgentIds`, optional `allowedToolIds`, and enabled state. `/apps/:appId/capabilities` resolves the default agent and visible capabilities for external apps such as Note. `/runs` and `/runs/stream` create app-policy runs and append lightweight run/audit JSONL records. Existing `/api/*` routes remain available for the admin UI and client SDK. No database was added.
+
+### Manual Test Steps
+1. Run `cargo fmt --check --manifest-path server/Cargo.toml`.
+2. Run `cargo test --manifest-path server/Cargo.toml`.
+3. Run `npm --prefix admin-ui run build`.
+4. Run `npm --prefix clients/ts run build`.
+5. Start a temporary server and verify `GET /health`, `GET /models`, `GET /apps`, `GET /apps/note/capabilities`, `POST /runs`, `GET /runs`, and `GET /audit`.
+
+### Known Issues / Follow-ups
+- Tool execution remains out of scope; tool records are visible planned capabilities unless explicitly enabled and implemented later.
+- If no default or local Ollama model is available, app runs return a model-selection error while capabilities show warnings.
+
+### Commit / PR
+Local implementation commit: `84494e3`. PR not created yet.

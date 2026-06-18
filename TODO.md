@@ -23,6 +23,10 @@ None.
 
 ## Completed
 
+- [x] ~~Implement app-agent policy model.~~
+  - Completed in: `84494e3`
+  - Notes: Added top-level app/agent/tool/model catalog files, app capability resolution, app-policy run endpoints, backend audit JSONL, admin UI Apps/Tools/Audit updates, and TypeScript client helpers.
+
 - [x] ~~Create initial project structure.~~
   - Completed in: `8336012`
   - Notes: Added `server/`, `admin-ui/`, `clients/ts/`, and `docs/`.
@@ -63,7 +67,7 @@ None.
 
 - [ ] Add a richer local tool registry after the API contract settles.
   - Priority: Low
-  - Notes: Tool calling is intentionally only a placeholder in the MVP.
+  - Notes: Tool records are now first-class visible capabilities, but real local tool execution is still intentionally out of scope.
 
 - [ ] Add integration tests with a fake Ollama server.
   - Priority: Medium
