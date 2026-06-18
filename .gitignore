@@ -1,3 +1,7 @@
+graphify-out/
+.graphify/
+.graphifyignore
+.graphifyinclude
 target/
 node_modules/
 dist/
