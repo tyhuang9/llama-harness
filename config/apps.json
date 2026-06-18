@@ -1,0 +1,17 @@
+[
+  {
+    "id": "note",
+    "name": "Note",
+    "description": "Local Note app integration",
+    "defaultAgentId": "note-assistant",
+    "allowedAgentIds": [
+      "note-assistant"
+    ],
+    "allowedToolIds": [
+      "notes.read",
+      "notes.search",
+      "reminders.create"
+    ],
+    "enabled": true
+  }
+]

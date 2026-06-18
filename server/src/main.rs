@@ -1,3 +1,4 @@
+mod app_policy;
 mod config;
 mod litellm;
 mod litellm_runtime;
@@ -31,19 +32,32 @@ async fn main() -> anyhow::Result<()> {
 
     let config_path = config::default_config_path();
     let runs_path = config::default_runs_path();
+    let audit_path = config::default_audit_path();
     let config: AppConfig = config::load_config(&config_path).await?;
+    let catalog_dir = config::default_catalog_dir(&config_path);
+    let catalog = app_policy::load_domain_catalog(&catalog_dir, &config).await?;
     let run_history = runs::load_runs(&runs_path, 100)
         .await
         .unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to load run history");
             VecDeque::new()
         });
+    let audit_history = runs::load_audit(&audit_path, 100)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to load audit history");
+            VecDeque::new()
+        });
 
     let state = AppState {
         config: Arc::new(RwLock::new(config)),
         config_path,
+        catalog: Arc::new(RwLock::new(catalog)),
+        catalog_dir,
         runs_path,
         runs: Arc::new(RwLock::new(run_history)),
+        audit_path,
+        audit: Arc::new(RwLock::new(audit_history)),
         providers: ProviderRegistry::new(OllamaClient::new()),
         litellm_runtime: LiteLlmRuntimeManager::new(),
         started_at: Utc::now(),

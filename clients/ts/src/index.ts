@@ -43,6 +43,53 @@ export type ModelRoute = {
   notes: string | null;
 };
 
+export type AgentPermissions = {
+  browser: boolean;
+  file_read: boolean;
+  file_write: boolean;
+  terminal: boolean;
+};
+
+export type AgentRecord = {
+  id: string;
+  name: string;
+  role: string;
+  description: string;
+  system_prompt: string;
+  default_model_id: string | null;
+  default_provider_id: string;
+  default_model: string;
+  default_environment: string;
+  autonomy: "observe" | "ask" | "low-risk" | "autonomous" | string;
+  permissions: AgentPermissions;
+  allowed_tool_ids: string[];
+  temperature: number | null;
+  max_tokens: number | null;
+  enabled: boolean;
+  status: "active" | "paused" | "draft";
+  tasks_run: number;
+  updated_at: string;
+};
+
+export type AgentCreateRequest = Partial<AgentRecord>;
+
+export type AgentPatch = Partial<
+  Pick<
+    AgentRecord,
+    | "name"
+    | "description"
+    | "system_prompt"
+    | "default_model_id"
+    | "default_provider_id"
+    | "default_model"
+    | "allowed_tool_ids"
+    | "temperature"
+    | "max_tokens"
+    | "enabled"
+    | "status"
+  >
+>;
+
 export type ChatMessage = {
   role: "system" | "user" | "assistant" | string;
   content: string | Record<string, unknown> | unknown[];
@@ -78,6 +125,40 @@ export type ChatResponse = {
   duration_ms: number;
 };
 
+export type ToolCall = {
+  id: string;
+  type: "function" | string;
+  function: {
+    name: string;
+    arguments: string | Record<string, unknown>;
+  };
+};
+
+export type AgentChatRequest = {
+  messages?: ChatMessage[];
+  prompt?: string;
+  instructions?: string;
+  app_context?: unknown;
+  generation?: GenerationSettings;
+  tools?: unknown;
+  tool_choice?: unknown;
+  source_app?: string;
+  metadata?: unknown;
+};
+
+export type AgentChatResponse = {
+  run_id: string;
+  agent_id: string;
+  provider: string;
+  model: string;
+  message: ChatMessage;
+  tool_calls?: ToolCall[] | unknown[] | null;
+  usage?: TokenUsage | null;
+  started_at: string;
+  ended_at: string;
+  duration_ms: number;
+};
+
 export type HealthResponse = {
   service: string;
   running: boolean;
@@ -89,6 +170,17 @@ export type HealthResponse = {
   started_at: string;
   checked_at: string;
   uptime_seconds: number;
+};
+
+export type SetupStatus = {
+  litellm_enabled: boolean;
+  litellm_ready: boolean;
+  usable_provider_count: number;
+  usable_model_count: number;
+  active_agent_count: number;
+  ready: boolean;
+  next_step: "start_litellm" | "add_provider" | "select_model" | "create_agent" | "ready";
+  missing_steps: Array<"start_litellm" | "add_provider" | "select_model" | "create_agent" | "ready">;
 };
 
 export type ModelDetails = {
@@ -115,6 +207,10 @@ export type ModelsResponse = {
 
 export type RunRecord = {
   id: string;
+  app_id?: string | null;
+  agent_id?: string | null;
+  model_id?: string | null;
+  resolved_tool_ids?: string[];
   provider: string;
   model: string;
   source_app: string | null;
@@ -126,6 +222,89 @@ export type RunRecord = {
   duration_ms: number;
   error: string | null;
   usage?: TokenUsage | null;
+};
+
+export type AppRecord = {
+  id: string;
+  name: string;
+  description: string | null;
+  defaultAgentId: string;
+  allowedAgentIds: string[];
+  allowedToolIds: string[] | null;
+  enabled: boolean;
+};
+
+export type AppCapabilities = {
+  appId: string;
+  appName: string;
+  defaultAgent: {
+    id: string;
+    name: string;
+    description: string;
+  };
+  allowedAgents: Array<{
+    id: string;
+    name: string;
+    description: string;
+  }>;
+  tools: Array<{
+    id: string;
+    name: string;
+    description: string;
+    riskLevel: string;
+    enabled: boolean;
+  }>;
+  model: {
+    id: string;
+    name: string;
+    provider: string;
+    modelName: string;
+    status: string;
+  };
+  warnings?: string[];
+};
+
+export type ToolRecord = {
+  id: string;
+  name: string;
+  description: string;
+  riskLevel: "low" | "medium" | "high" | string;
+  enabled: boolean;
+  inputSchema: unknown | null;
+  outputSchema: unknown | null;
+};
+
+export type AuditRecord = {
+  id: string;
+  event: string;
+  level: "info" | "warn" | "denied" | "error";
+  message: string;
+  app_id?: string | null;
+  agent_id?: string | null;
+  run_id?: string | null;
+  metadata?: unknown | null;
+  created_at: string;
+};
+
+export type RunCreateRequest = {
+  appId: string;
+  agentId?: string | null;
+  input?: string;
+  messages?: ChatMessage[];
+  instructions?: string;
+  context?: unknown;
+  generation?: GenerationSettings;
+  metadata?: unknown;
+};
+
+export type RunCreateResponse = {
+  runId: string;
+  status: "completed" | "failed";
+  appId: string;
+  agentId: string;
+  modelId: string;
+  output: string;
+  durationMs: number;
 };
 
 export type Settings = {
@@ -140,6 +319,7 @@ export type Settings = {
   litellm: LiteLlmSettings;
   litellm_providers: LiteLlmProviderConfig[];
   model_routes: ModelRoute[];
+  agents: AgentRecord[];
 };
 
 export type ProviderStatus = {
@@ -227,6 +407,51 @@ export class LlamaHarnessClient {
     return this.request("/api/providers");
   }
 
+  setupStatus(): Promise<SetupStatus> {
+    return this.request("/api/setup/status");
+  }
+
+  listAgents(): Promise<AgentRecord[]> {
+    return this.request("/api/agents");
+  }
+
+  listApps(): Promise<AppRecord[]> {
+    return this.request("/api/apps");
+  }
+
+  appCapabilities(appId: string): Promise<AppCapabilities> {
+    return this.request(`/api/apps/${encodeURIComponent(appId)}/capabilities`);
+  }
+
+  listTools(): Promise<ToolRecord[]> {
+    return this.request("/api/tools");
+  }
+
+  createAgent(agent: AgentCreateRequest): Promise<AgentRecord> {
+    return this.request("/api/agents", {
+      method: "POST",
+      body: JSON.stringify(agent),
+    });
+  }
+
+  getAgent(agentId: string): Promise<AgentRecord> {
+    return this.request(`/api/agents/${encodeURIComponent(agentId)}`);
+  }
+
+  patchAgent(agentId: string, patch: AgentPatch): Promise<AgentRecord> {
+    return this.request(`/api/agents/${encodeURIComponent(agentId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    });
+  }
+
+  chatWithAgent(agentId: string, request: AgentChatRequest): Promise<AgentChatResponse> {
+    return this.request(`/api/agents/${encodeURIComponent(agentId)}/chat`, {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
   listProviderModels(providerId: string): Promise<ProviderModelsResponse> {
     return this.request(`/api/providers/${encodeURIComponent(providerId)}/models`);
   }
@@ -240,6 +465,17 @@ export class LlamaHarnessClient {
 
   runs(limit = 50): Promise<{ runs: RunRecord[] }> {
     return this.request(`/api/runs?limit=${limit}`);
+  }
+
+  run(request: RunCreateRequest): Promise<RunCreateResponse> {
+    return this.request("/api/runs", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  listAudit(limit = 50): Promise<{ audit: AuditRecord[] }> {
+    return this.request(`/api/audit?limit=${limit}`);
   }
 
   settings(): Promise<Settings> {
@@ -275,6 +511,49 @@ export class LlamaHarnessClient {
 
   async *streamChat(request: ChatRequest): AsyncGenerator<StreamEvent> {
     const response = await this.fetchImpl(`${this.baseUrl}/api/chat/stream`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify(request),
+    });
+
+    if (!response.ok) {
+      throw new Error(await errorMessage(response));
+    }
+    if (!response.body) {
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const chunk = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const event = parseSseChunk(chunk);
+        if (event) {
+          yield event;
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+    }
+
+    const trailing = parseSseChunk(buffer.trim());
+    if (trailing) {
+      yield trailing;
+    }
+  }
+
+  async *streamRun(request: RunCreateRequest): AsyncGenerator<StreamEvent> {
+    const response = await this.fetchImpl(`${this.baseUrl}/api/runs/stream`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(request),

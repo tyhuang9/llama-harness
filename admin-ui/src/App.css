@@ -396,6 +396,27 @@ button.theme-toggle {
   line-height: 1;
 }
 
+.fake-data-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid #343932;
+  border-radius: 999px;
+  background: #121511;
+  color: #d8d1c3;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.fake-data-toggle input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #c7953a;
+}
+
 .eyebrow {
   margin: 0 0 6px;
   color: #89877d;
@@ -709,6 +730,10 @@ button.chip.active {
 
 .activity-list li:last-child {
   border-bottom: 0;
+}
+
+.activity-list li.empty {
+  justify-content: center;
 }
 
 .activity-list code {
@@ -1554,6 +1579,7 @@ button.chip.active {
 .app-shell[data-theme="light"] .status-grid div,
 .app-shell[data-theme="light"] .resource-row,
 .app-shell[data-theme="light"] .toggle-row,
+.app-shell[data-theme="light"] .fake-data-toggle,
 .app-shell[data-theme="light"] .prompt-preview,
 .app-shell[data-theme="light"] .result,
 .app-shell[data-theme="light"] .readonly-field,

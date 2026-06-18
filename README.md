@@ -6,14 +6,14 @@ The API is the product. The admin UI is only a local configuration and inspectio
 
 ## What It Offers
 
-- Stable local API endpoints for health, model inventory, chat, streaming chat, settings, providers, and recent runs.
+- Stable local API endpoints for health, model inventory, app capabilities, runs, streaming runs, settings, providers, and audit.
 - Direct local Ollama support with `http://localhost:11434` as the default endpoint.
 - App-managed LiteLLM runtime for gateway-backed models without vendoring LiteLLM into this repo.
 - Provider-scoped agent defaults so Agents can use local Ollama or a saved LiteLLM provider.
-- Local admin UI for settings, providers, agents, permissions, logs, and model testing.
+- Local admin UI for settings, providers, apps, agents, tools, permissions, runs, audit, and model testing.
 - Tauri desktop shell for running the local dashboard as a desktop app.
 - TypeScript client SDK for other local apps.
-- JSON config, app-data `.env` secrets, and optional JSONL logs instead of a database.
+- JSON config, app-data `.env` secrets, and JSONL logs instead of a database.
 
 ## Current Boundaries
 
@@ -31,7 +31,7 @@ The API is the product. The admin UI is only a local configuration and inspectio
 - Local model provider: Ollama.
 - Gateway provider: LiteLLM Proxy installed from `requirements-litellm.txt`.
 - Client SDK: TypeScript.
-- Persistence: `config.json`, OS app-data `.env` and LiteLLM YAML files, optional `runs.jsonl`, and in-memory recent run state.
+- Persistence: `config.json`, `config/*.json`, OS app-data `.env` and LiteLLM YAML files, optional JSONL run/audit logs, and in-memory recent state.
 
 ## Repo Structure
 
@@ -44,6 +44,7 @@ llama-harness/
   docs/          Milestone tracking
   scripts/       Dev and deployment helpers
   bundled/       Ignored generated deployment runtime output
+  config/        Local model, agent, app, and tool catalog JSON
   config.json    Local service settings
   requirements-litellm.txt
   README.md
@@ -88,7 +89,9 @@ Optional environment variables:
 ```bash
 LLAMA_HARNESS_ADDR=127.0.0.1:8787
 LLAMA_HARNESS_CONFIG=config.json
+LLAMA_HARNESS_CONFIG_DIR=config
 LLAMA_HARNESS_RUNS_LOG=runs.jsonl
+LLAMA_HARNESS_AUDIT_LOG=logs/audit.jsonl
 ```
 
 ### Admin UI
@@ -329,6 +332,105 @@ with an explicit LiteLLM model string or route alias.
 
 Ollama still works the same way for local models. Existing clients that omit `provider` continue to use `default_provider`, which defaults to `ollama`.
 
+## App-Agent Policy Model
+
+The harness owns model selection, agent routing, tool permissions, and run policy. External apps should identify themselves with an app id and let llama-harness resolve what they are allowed to use.
+
+Top-level concepts are separate:
+
+- Models: local Ollama model records in `config/models.json`.
+- Agents: reusable behavior profiles in `config/agents.json`.
+- Apps: external client applications and their allowed agents/tools in `config/apps.json`.
+- Tools: visible local capabilities in `config/tools.json`; execution remains out of scope for now.
+- Runs: model execution records in `runs.jsonl`.
+- Audit: policy decisions and denied requests in `logs/audit.jsonl`.
+
+Agents are not nested under apps. An agent can be reused by multiple apps. An app chooses which agents it may use and which one is the default.
+
+The seeded Note policy is:
+
+```json
+{
+  "id": "note",
+  "name": "Note",
+  "defaultAgentId": "note-assistant",
+  "allowedAgentIds": ["note-assistant"],
+  "allowedToolIds": ["notes.read", "notes.search", "reminders.create"],
+  "enabled": true
+}
+```
+
+Note should connect with:
+
+```json
+{
+  "appId": "note"
+}
+```
+
+Then discover its resolved assignment:
+
+```bash
+curl http://127.0.0.1:8787/apps/note/capabilities
+```
+
+Example response:
+
+```json
+{
+  "appId": "note",
+  "appName": "Note",
+  "defaultAgent": {
+    "id": "note-assistant",
+    "name": "Note Assistant",
+    "description": "Helps summarize, analyze, and reason about notes."
+  },
+  "allowedAgents": [
+    {
+      "id": "note-assistant",
+      "name": "Note Assistant",
+      "description": "Helps summarize, analyze, and reason about notes."
+    }
+  ],
+  "tools": [
+    {
+      "id": "notes.read",
+      "name": "Read Notes",
+      "description": "Read note content supplied by the Note app.",
+      "riskLevel": "low",
+      "enabled": false
+    }
+  ],
+  "model": {
+    "id": "ollama-default",
+    "name": "llama3.2",
+    "provider": "ollama",
+    "modelName": "llama3.2",
+    "status": "available"
+  }
+}
+```
+
+If no `agentId` is supplied when creating a run, llama-harness uses the app's default agent:
+
+```bash
+curl -X POST http://127.0.0.1:8787/runs \
+  -H 'content-type: application/json' \
+  -d '{
+    "appId": "note",
+    "agentId": null,
+    "input": "Summarize the current page.",
+    "context": {
+      "pageId": "page_123",
+      "pageTitle": "Meeting Notes",
+      "selectedText": "",
+      "blocks": []
+    }
+  }'
+```
+
+The response includes the resolved app, agent, model, output, and duration. `POST /runs/stream` provides the same app policy flow over SSE. `/api/apps`, `/api/apps/:appId/capabilities`, `/api/runs`, `/api/runs/stream`, and `/api/audit` are equivalent API-prefixed routes for existing clients.
+
 ## Configure Global Instructions
 
 Global instructions are saved in `config.json` and prepended as a system message for every chat, model test, and streaming chat request when enabled.
@@ -404,6 +506,12 @@ Read recent runs:
 curl http://127.0.0.1:8787/api/runs
 ```
 
+Read recent audit decisions:
+
+```bash
+curl http://127.0.0.1:8787/api/audit
+```
+
 ## TypeScript Client
 
 ```ts
@@ -413,10 +521,11 @@ const harness = new LlamaHarnessClient({ baseUrl: "http://127.0.0.1:8787" });
 
 const health = await harness.health();
 const models = await harness.listModels();
-const result = await harness.chat({
-  source_app: "note",
-  prompt: "Summarize these notes.",
-  instructions: "Use terse bullet points.",
+const capabilities = await harness.appCapabilities("note");
+const result = await harness.run({
+  appId: "note",
+  input: "Summarize these notes.",
+  context: { pageId: "page_123" },
 });
 ```
 
@@ -426,7 +535,8 @@ const result = await harness.chat({
 - LiteLLM setup requires either the dev venv from `scripts/setup-litellm-dev.*` or the bundled runtime from `scripts/build-litellm-runtime.*`.
 - No default model is selected until one is configured.
 - API token storage exists in settings, but request enforcement is not implemented yet.
-- Instruction settings steer model behavior, but they do not implement real tool execution.
+- Instruction settings and tool capability records steer model behavior, but they do not implement real tool execution.
 - Run history is intentionally lightweight and capped in memory.
+- Audit is intentionally lightweight and omits full prompts, secrets, and full app context.
 - Streaming is an SSE bridge over provider chat chunks.
 - The admin UI is a local developer dashboard, not an embeddable product surface.

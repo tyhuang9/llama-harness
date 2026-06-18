@@ -2,7 +2,13 @@ import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from
 import { createPortal } from "react-dom";
 import {
   api,
+  AgentCreateRequest,
+  AgentPatch,
+  AgentRecord,
+  AppCapabilities,
+  AppRecord,
   ApplyLiteLlmProvidersResponse,
+  AuditRecord as ServerAuditRecord,
   ChatResponse,
   GenerateLiteLlmConfigResponse,
   getApiBase,
@@ -17,6 +23,7 @@ import {
   RunRecord,
   setApiBase,
   Settings,
+  ToolRecord,
 } from "./api";
 import {
   Agent,
@@ -41,8 +48,10 @@ type Page =
   | "new-task"
   | "task-detail"
   | "agents"
+  | "apps"
   | "sandboxes"
   | "models"
+  | "tools"
   | "permissions"
   | "logs"
   | "instructions"
@@ -58,10 +67,12 @@ type ProviderVerification = {
 
 const nav: Array<{ id: Page; label: string; detail?: string }> = [
   { id: "dashboard", label: "Dashboard", detail: "Live operations" },
+  { id: "apps", label: "Apps", detail: "Client policy" },
   { id: "agents", label: "Agents", detail: "Prompts and defaults" },
   { id: "tasks", label: "Tasks", detail: "Queue and details" },
   { id: "sandboxes", label: "Sandboxes", detail: "Execution contexts" },
   { id: "models", label: "Providers", detail: "LiteLLM and Ollama" },
+  { id: "tools", label: "Tools", detail: "Capabilities" },
   { id: "permissions", label: "Permissions", detail: "Human approval gates" },
   { id: "logs", label: "Audit Log", detail: "Actions and runs" },
   { id: "instructions", label: "Instructions", detail: "Global prompts" },
@@ -100,6 +111,7 @@ const litellmProviderTypes = [
   "custom",
 ];
 const REDACTED_SECRET = "__configured__";
+const FAKE_DATA_STORAGE_KEY = "llama-harness-fake-data-enabled";
 const environments: Environment[] = ["planner", "browser", "computer-use", "local-desktop"];
 const autonomyLevels: Agent["autonomy"][] = ["observe", "ask", "low-risk", "autonomous"];
 
@@ -123,13 +135,174 @@ const initialPolicy: PermissionPolicy = {
   submissions: { allowed: false, approval: true },
 };
 
+const hasLocalFakeData = Boolean(
+  seedTasks.length ||
+    seedAgents.length ||
+    seedSandboxes.length ||
+    seedAuditLog.length ||
+    seedApprovals.length ||
+    seedActivityFeed.length,
+);
+const seedTaskIds = new Set(seedTasks.map((task) => task.id));
+const seedSandboxIds = new Set(seedSandboxes.map((sandbox) => sandbox.id));
+const seedAuditIds = new Set(seedAuditLog.map((entry) => entry.id));
+const seedApprovalIds = new Set(seedApprovals.map((approval) => approval.id));
+
+function initialFakeDataEnabled(): boolean {
+  if (!hasLocalFakeData) {
+    return false;
+  }
+  const stored = localStorage.getItem(FAKE_DATA_STORAGE_KEY);
+  return stored === null ? true : stored === "true";
+}
+
+function seededApprovals(): Approval[] {
+  return seedApprovals.map((approval) => ({ ...approval, state: "pending" }));
+}
+
+function mergeSeedItems<T extends { id: string }>(items: T[], seeds: T[]): T[] {
+  const existingIds = new Set(items.map((item) => item.id));
+  return [...seeds.filter((seed) => !existingIds.has(seed.id)), ...items];
+}
+
+async function seedBackendAgentsIfNeeded(records: AgentRecord[], settings: Settings | null, fakeDataEnabled: boolean): Promise<AgentRecord[]> {
+  if (!fakeDataEnabled || records.length || !seedAgents.length) {
+    return records;
+  }
+
+  const created: AgentRecord[] = [];
+  for (const seedAgent of seedAgents) {
+    created.push(await api.createAgent(seedAgentCreateRequest(seedAgent, settings)));
+  }
+  return created;
+}
+
+function apiAgentToAgent(agent: AgentRecord, settings: Settings | null): Agent {
+  return {
+    id: agent.id,
+    name: agent.name,
+    role: agent.role,
+    description: agent.description,
+    systemPrompt: agent.system_prompt,
+    defaultModelId: agent.default_model_id,
+    defaultProviderId: agent.default_provider_id,
+    defaultProvider: defaultProviderLabel(agent.default_provider_id, settings),
+    defaultModel: agent.default_model,
+    defaultEnvironment: normalizeEnvironment(agent.default_environment),
+    autonomy: normalizeAutonomy(agent.autonomy),
+    permissions: {
+      browser: agent.permissions.browser,
+      fileRead: agent.permissions.file_read,
+      fileWrite: agent.permissions.file_write,
+      terminal: agent.permissions.terminal,
+    },
+    allowedToolIds: agent.allowed_tool_ids || [],
+    temperature: agent.temperature,
+    maxTokens: agent.max_tokens,
+    enabled: agent.enabled,
+    status: agent.status,
+    tasksRun: agent.tasks_run,
+    updatedAt: agent.updated_at,
+  };
+}
+
+function seedAgentCreateRequest(agent: Agent, settings: Settings | null): AgentCreateRequest {
+  return {
+    id: agent.id,
+    name: agent.name,
+    role: agent.role,
+    description: agent.description,
+    system_prompt: agent.systemPrompt,
+    default_model_id: agent.defaultModelId || null,
+    default_provider_id: agentProviderId(agent, settings),
+    default_model: "",
+    default_environment: agent.defaultEnvironment,
+    autonomy: agent.autonomy,
+    permissions: {
+      browser: agent.permissions.browser,
+      file_read: agent.permissions.fileRead,
+      file_write: agent.permissions.fileWrite,
+      terminal: agent.permissions.terminal,
+    },
+    allowed_tool_ids: agent.allowedToolIds || [],
+    temperature: agent.temperature ?? null,
+    max_tokens: agent.maxTokens ?? null,
+    enabled: agent.enabled ?? true,
+    status: "draft",
+  };
+}
+
+function agentPatchToApi(patch: Partial<Agent>): AgentPatch {
+  const payload: AgentPatch = {};
+  if (patch.name !== undefined) {
+    payload.name = patch.name;
+  }
+  if (patch.description !== undefined) {
+    payload.description = patch.description;
+  }
+  if (patch.systemPrompt !== undefined) {
+    payload.system_prompt = patch.systemPrompt;
+  }
+  if (patch.defaultProviderId !== undefined) {
+    payload.default_provider_id = patch.defaultProviderId;
+  }
+  if (patch.defaultModelId !== undefined) {
+    payload.default_model_id = patch.defaultModelId || null;
+  }
+  if (patch.defaultModel !== undefined) {
+    payload.default_model = patch.defaultModel;
+  }
+  if (patch.allowedToolIds !== undefined) {
+    payload.allowed_tool_ids = patch.allowedToolIds;
+  }
+  if (patch.temperature !== undefined) {
+    payload.temperature = patch.temperature;
+  }
+  if (patch.maxTokens !== undefined) {
+    payload.max_tokens = patch.maxTokens;
+  }
+  if (patch.enabled !== undefined) {
+    payload.enabled = patch.enabled;
+  }
+  if (patch.status !== undefined) {
+    payload.status = patch.status;
+  }
+  return payload;
+}
+
+function mergeAgentPatchResponse(current: Agent, updated: Agent, patch: Partial<Agent>): Agent {
+  return {
+    ...updated,
+    name: patch.name === undefined ? current.name : updated.name,
+    description: patch.description === undefined ? current.description : updated.description,
+    systemPrompt: patch.systemPrompt === undefined ? current.systemPrompt : updated.systemPrompt,
+    defaultProviderId: patch.defaultProviderId === undefined ? current.defaultProviderId : updated.defaultProviderId,
+    defaultProvider: patch.defaultProviderId === undefined ? current.defaultProvider : updated.defaultProvider,
+    defaultModel: patch.defaultModel === undefined ? current.defaultModel : updated.defaultModel,
+    status: patch.status === undefined ? current.status : updated.status,
+  };
+}
+
+function normalizeEnvironment(value: string): Environment {
+  return environments.includes(value as Environment) ? (value as Environment) : "planner";
+}
+
+function normalizeAutonomy(value: string): Agent["autonomy"] {
+  return autonomyLevels.includes(value as Agent["autonomy"]) ? (value as Agent["autonomy"]) : "ask";
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>("dashboard");
-  const [selectedTaskId, setSelectedTaskId] = useState(seedTasks[0]?.id || "");
+  const [fakeDataEnabled, setFakeDataEnabled] = useState(() => initialFakeDataEnabled());
+  const [selectedTaskId, setSelectedTaskId] = useState(() => (initialFakeDataEnabled() ? seedTasks[0]?.id || "" : ""));
   const [health, setHealth] = useState<Health | null>(null);
   const [models, setModels] = useState<ModelsResponse | null>(null);
   const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([]);
   const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [apps, setApps] = useState<AppRecord[]>([]);
+  const [tools, setTools] = useState<ToolRecord[]>([]);
+  const [appCapabilities, setAppCapabilities] = useState<Record<string, AppCapabilities>>({});
+  const [serverAudit, setServerAudit] = useState<ServerAuditRecord[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [apiBaseInput, setApiBaseInput] = useState(getApiBase());
   const [prompt, setPrompt] = useState("Summarize the current agent task queue in one sentence.");
@@ -142,11 +315,11 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const [tasks, setTasks] = useState<Task[]>(seedTasks);
-  const [agents, setAgents] = useState<Agent[]>(seedAgents);
-  const [sandboxes, setSandboxes] = useState<Sandbox[]>(seedSandboxes);
-  const [auditLog, setAuditLog] = useState<AuditEntry[]>(seedAuditLog);
-  const [approvals, setApprovals] = useState<Approval[]>(seedApprovals.map((approval) => ({ ...approval, state: "pending" })));
+  const [tasks, setTasks] = useState<Task[]>(() => (initialFakeDataEnabled() ? seedTasks : []));
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [sandboxes, setSandboxes] = useState<Sandbox[]>(() => (initialFakeDataEnabled() ? seedSandboxes : []));
+  const [auditLog, setAuditLog] = useState<AuditEntry[]>(() => (initialFakeDataEnabled() ? seedAuditLog : []));
+  const [approvals, setApprovals] = useState<Approval[]>(() => (initialFakeDataEnabled() ? seededApprovals() : []));
   const [policy, setPolicy] = useState<PermissionPolicy>(initialPolicy);
   const [estopOpen, setEstopOpen] = useState(false);
 
@@ -155,13 +328,17 @@ export default function App() {
   const activePage = page === "task-detail" ? "tasks" : page === "new-task" ? "tasks" : page;
   const activeNav = nav.find((item) => item.id === activePage) || nav[0];
 
-  async function refreshAll() {
+  async function refreshAll(fakeDataOverride = fakeDataEnabled) {
     setError(null);
-    const [healthResult, settingsResult, runsResult, providersResult] = await Promise.allSettled([
+    const [healthResult, settingsResult, runsResult, providersResult, agentsResult, appsResult, toolsResult, auditResult] = await Promise.allSettled([
       api.health(),
       api.settings(),
       api.runs(50),
       api.providers(),
+      api.agents(),
+      api.apps(),
+      api.tools(),
+      api.audit(50),
     ]);
 
     if (healthResult.status === "fulfilled") {
@@ -183,6 +360,32 @@ export default function App() {
       setProviderStatuses(providersResult.value);
     }
 
+    if (agentsResult.status === "fulfilled") {
+      const nextSettings = settingsResult.status === "fulfilled" ? settingsResult.value : settings;
+      const agentRecords = await seedBackendAgentsIfNeeded(agentsResult.value, nextSettings, fakeDataOverride);
+      setAgents(agentRecords.map((agent) => apiAgentToAgent(agent, nextSettings)));
+    }
+
+    if (appsResult.status === "fulfilled") {
+      setApps(appsResult.value);
+      const capabilityEntries = await Promise.allSettled(appsResult.value.map((app) => api.appCapabilities(app.id)));
+      const nextCapabilities: Record<string, AppCapabilities> = {};
+      capabilityEntries.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          nextCapabilities[appsResult.value[index].id] = result.value;
+        }
+      });
+      setAppCapabilities(nextCapabilities);
+    }
+
+    if (toolsResult.status === "fulfilled") {
+      setTools(toolsResult.value);
+    }
+
+    if (auditResult.status === "fulfilled") {
+      setServerAudit(auditResult.value.audit);
+    }
+
     try {
       setModels(await api.models());
     } catch (err) {
@@ -196,6 +399,17 @@ export default function App() {
   useEffect(() => {
     refreshAll();
   }, []);
+
+  useEffect(() => {
+    if (selectedTaskId && tasks.some((task) => task.id === selectedTaskId)) {
+      return;
+    }
+    const nextTaskId = tasks[0]?.id || "";
+    setSelectedTaskId(nextTaskId);
+    if (!nextTaskId && page === "task-detail") {
+      setPage("tasks");
+    }
+  }, [page, selectedTaskId, tasks]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings?.theme || "dark";
@@ -219,8 +433,9 @@ export default function App() {
   }, []);
 
   async function refreshRunsOnly() {
-    const result = await api.runs(50);
-    setRuns(result.runs);
+    const [runsResult, auditResult] = await Promise.all([api.runs(50), api.audit(50)]);
+    setRuns(runsResult.runs);
+    setServerAudit(auditResult.audit);
   }
 
   async function runModelTest(event: FormEvent) {
@@ -306,6 +521,26 @@ export default function App() {
     }
   }
 
+  function setFakeDataPreference(enabled: boolean) {
+    localStorage.setItem(FAKE_DATA_STORAGE_KEY, String(enabled));
+    setFakeDataEnabled(enabled);
+
+    if (enabled) {
+      setTasks((list) => mergeSeedItems(list, seedTasks));
+      setSandboxes((list) => mergeSeedItems(list, seedSandboxes));
+      setAuditLog((list) => mergeSeedItems(list, seedAuditLog));
+      setApprovals((list) => mergeSeedItems(list, seededApprovals()));
+      setSelectedTaskId((current) => current || seedTasks[0]?.id || "");
+      void refreshAll(true);
+      return;
+    }
+
+    setTasks((list) => list.filter((task) => !seedTaskIds.has(task.id)));
+    setSandboxes((list) => list.filter((sandbox) => !seedSandboxIds.has(sandbox.id)));
+    setAuditLog((list) => list.filter((entry) => !seedAuditIds.has(entry.id)));
+    setApprovals((list) => list.filter((approval) => !seedApprovalIds.has(approval.id)));
+  }
+
   async function testLiteLlmConnection() {
     if (!settings) {
       return;
@@ -387,6 +622,75 @@ export default function App() {
     setProviderStatuses(result.provider_statuses);
     await refreshAll();
     return result;
+  }
+
+  async function createBackendAgent() {
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await api.createAgent({
+        name: "New agent",
+        role: "General assistant",
+        default_provider_id: agentProviderId(undefined, settings),
+        default_model: "",
+        status: "draft",
+      });
+      const agent = apiAgentToAgent(created, settings);
+      setAgents((list) => [agent, ...list]);
+      return agent;
+    } catch (err) {
+      setError((err as Error).message);
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function patchBackendAgent(agentId: string, patch: Partial<Agent>) {
+    const payload = agentPatchToApi(patch);
+    if (!Object.keys(payload).length) {
+      return;
+    }
+    try {
+      const updated = await api.patchAgent(agentId, payload);
+      const updatedAgent = apiAgentToAgent(updated, settings);
+      setAgents((list) =>
+        list.map((agent) => (agent.id === agentId ? mergeAgentPatchResponse(agent, updatedAgent, patch) : agent)),
+      );
+    } catch (err) {
+      setError((err as Error).message);
+      await refreshAll().catch(() => undefined);
+    }
+  }
+
+  async function patchAppRecord(appId: string, patch: Partial<AppRecord>) {
+    try {
+      const updated = await api.patchApp(appId, patch);
+      setApps((list) => list.map((app) => (app.id === appId ? updated : app)));
+      const capabilities = await api.appCapabilities(appId);
+      setAppCapabilities((current) => ({ ...current, [appId]: capabilities }));
+    } catch (err) {
+      setError((err as Error).message);
+      await refreshAll().catch(() => undefined);
+    }
+  }
+
+  async function patchToolRecord(toolId: string, patch: Partial<ToolRecord>) {
+    try {
+      const updated = await api.patchTool(toolId, patch);
+      setTools((list) => list.map((tool) => (tool.id === toolId ? updated : tool)));
+      const capabilityEntries = await Promise.allSettled(apps.map((app) => api.appCapabilities(app.id)));
+      const nextCapabilities: Record<string, AppCapabilities> = {};
+      capabilityEntries.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          nextCapabilities[apps[index].id] = result.value;
+        }
+      });
+      setAppCapabilities(nextCapabilities);
+    } catch (err) {
+      setError((err as Error).message);
+      await refreshAll().catch(() => undefined);
+    }
   }
 
   function openTask(taskId: string) {
@@ -515,6 +819,16 @@ export default function App() {
             <h2>{page === "new-task" ? "New Task" : page === "task-detail" ? selectedTask?.name || "Task" : activeNav.label}</h2>
           </div>
           <div className="topbar-actions">
+            {hasLocalFakeData ? (
+              <label className="fake-data-toggle" title="Show ignored local fixture records from sentinelData.local.ts">
+                <span>Fake data</span>
+                <input
+                  type="checkbox"
+                  checked={fakeDataEnabled}
+                  onChange={(event) => setFakeDataPreference(event.target.checked)}
+                />
+              </label>
+            ) : null}
             <button
               className="theme-toggle"
               type="button"
@@ -528,7 +842,7 @@ export default function App() {
             <button className="danger-outline" type="button" onClick={() => setEstopOpen((value) => !value)}>
               Emergency Stop All
             </button>
-            <button className="secondary" type="button" onClick={refreshAll} disabled={busy}>
+            <button className="secondary" type="button" onClick={() => refreshAll()} disabled={busy}>
               Refresh
             </button>
             <button className="primary" type="button" onClick={() => setPage("new-task")}>
@@ -565,7 +879,7 @@ export default function App() {
               agents={agents}
               sandboxes={sandboxes}
               approvals={pendingApprovals}
-              activityFeed={seedActivityFeed}
+              activityFeed={fakeDataEnabled ? seedActivityFeed : []}
               prompt={prompt}
               setPrompt={setPrompt}
               testModel={testModel}
@@ -610,8 +924,25 @@ export default function App() {
             />
           ) : null}
 
+          {page === "apps" ? (
+            <AppsPage
+              apps={apps}
+              agents={agents}
+              tools={tools}
+              capabilities={appCapabilities}
+              onPatchApp={patchAppRecord}
+            />
+          ) : null}
           {page === "agents" ? (
-            <AgentsPage agents={agents} setAgents={setAgents} settings={settings} localModels={localModels} />
+            <AgentsPage
+              agents={agents}
+              setAgents={setAgents}
+              settings={settings}
+              localModels={localModels}
+              tools={tools}
+              onCreateAgent={createBackendAgent}
+              onPatchAgent={patchBackendAgent}
+            />
           ) : null}
           {page === "sandboxes" ? <SandboxesPage sandboxes={sandboxes} setSandboxes={setSandboxes} /> : null}
           {page === "models" ? (
@@ -633,8 +964,9 @@ export default function App() {
               busy={busy}
             />
           ) : null}
+          {page === "tools" ? <ToolsPage tools={tools} onPatchTool={patchToolRecord} /> : null}
           {page === "permissions" ? <PermissionsPage policy={policy} setPolicy={setPolicy} /> : null}
-          {page === "logs" ? <LogsPage auditLog={auditLog} runs={runs} /> : null}
+          {page === "logs" ? <LogsPage auditLog={auditLog} serverAudit={serverAudit} runs={runs} /> : null}
           {page === "instructions" && settings ? (
             <InstructionsView settings={settings} setSettings={setSettings} onSubmit={saveSettings} busy={busy} />
           ) : null}
@@ -713,12 +1045,16 @@ function Dashboard(props: {
             <h2>Recent Activity</h2>
           </div>
           <ul className="activity-list">
-            {props.activityFeed.map((item) => (
-              <li key={item.id}>
-                <span>{item.text}</span>
-                <code>{item.time}</code>
-              </li>
-            ))}
+            {props.activityFeed.length ? (
+              props.activityFeed.map((item) => (
+                <li key={item.id}>
+                  <span>{item.text}</span>
+                  <code>{item.time}</code>
+                </li>
+              ))
+            ) : (
+              <li className="empty">No local activity records yet.</li>
+            )}
           </ul>
         </div>
         <div className="panel">
@@ -1176,59 +1512,227 @@ function TaskDetailPage(props: {
   );
 }
 
+function AppsPage({
+  apps,
+  agents,
+  tools,
+  capabilities,
+  onPatchApp,
+}: {
+  apps: AppRecord[];
+  agents: Agent[];
+  tools: ToolRecord[];
+  capabilities: Record<string, AppCapabilities>;
+  onPatchApp: (appId: string, patch: Partial<AppRecord>) => Promise<void>;
+}) {
+  const [activeId, setActiveId] = useState(apps[0]?.id || "");
+  const active = apps.find((app) => app.id === activeId) || apps[0];
+  const preview = active ? capabilities[active.id] : null;
+
+  useEffect(() => {
+    if (!activeId && apps[0]) {
+      setActiveId(apps[0].id);
+    }
+  }, [activeId, apps]);
+
+  function updateApp(patch: Partial<AppRecord>) {
+    if (!active) {
+      return;
+    }
+    void onPatchApp(active.id, patch);
+  }
+
+  return (
+    <div className="agents-layout">
+      <aside className="agent-list">
+        <div className="section-header">
+          <div>
+            <h2>Apps</h2>
+            <p>{apps.length} registered</p>
+          </div>
+        </div>
+        <div className="agent-buttons">
+          {apps.map((app) => (
+            <button key={app.id} type="button" className={app.id === active?.id ? "active" : ""} onClick={() => setActiveId(app.id)}>
+              <strong>{app.name}</strong>
+              <span>{app.id}</span>
+              <StatusBadge status={app.enabled ? "online" : "offline"} />
+            </button>
+          ))}
+        </div>
+      </aside>
+
+      {active ? (
+        <section className="panel agent-editor">
+          <div className="section-header">
+            <div>
+              <code>{active.id}</code>
+              <h2>{active.name || "Untitled app"}</h2>
+              <p>Default agent {active.defaultAgentId || "-"}</p>
+            </div>
+            <button type="button" onClick={() => updateApp({ enabled: !active.enabled })}>
+              {active.enabled ? "Disable" : "Enable"}
+            </button>
+          </div>
+
+          <div className="settings-form">
+            <label>
+              Name
+              <input value={active.name} onChange={(event) => updateApp({ name: event.target.value })} />
+            </label>
+            <label>
+              Description
+              <input value={active.description || ""} onChange={(event) => updateApp({ description: event.target.value || null })} />
+            </label>
+            <div className="field-row">
+              <label>
+                Default agent
+                <select value={active.defaultAgentId} onChange={(event) => updateApp({ defaultAgentId: event.target.value })}>
+                  {agents.map((agent) => (
+                    <option key={agent.id} value={agent.id}>{agent.name}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Allowed agents
+                <select
+                  multiple
+                  value={active.allowedAgentIds}
+                  onChange={(event) => updateApp({ allowedAgentIds: selectedOptions(event.currentTarget) })}
+                >
+                  {agents.map((agent) => (
+                    <option key={agent.id} value={agent.id}>{agent.name}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="settings-section">
+              <h3>Allowed tools</h3>
+              <div className="permission-list">
+                {tools.map((tool) => {
+                  const ids = active.allowedToolIds || [];
+                  const checked = ids.some((id) => id === tool.id);
+                  return (
+                    <label key={tool.id} className="toggle-row">
+                      <span>
+                        {tool.name}
+                        <small>{tool.id}</small>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={(event) =>
+                          updateApp({
+                            allowedToolIds: event.target.checked
+                              ? Array.from(new Set([...ids, tool.id]))
+                              : ids.filter((id) => id !== tool.id),
+                          })
+                        }
+                      />
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          <div className="settings-section">
+            <div className="section-header">
+              <div>
+                <h3>Capabilities Preview</h3>
+                <p>{preview ? `${preview.tools.length} tools resolved` : "No preview available"}</p>
+              </div>
+            </div>
+            {preview ? (
+              <div className="model-table compact">
+                <div className="model-row header">
+                  <span>Default agent</span>
+                  <span>Model</span>
+                  <span>Tools</span>
+                </div>
+                <div className="model-row">
+                  <span>{preview.defaultAgent.name}</span>
+                  <span>{preview.model.name || preview.model.id}</span>
+                  <span>{preview.tools.map((tool) => tool.id).join(", ") || "-"}</span>
+                </div>
+                {preview.warnings?.length ? (
+                  <div className="notice warning">{preview.warnings.join(" ")}</div>
+                ) : null}
+              </div>
+            ) : (
+              <div className="empty-cell">Capabilities could not be resolved.</div>
+            )}
+          </div>
+        </section>
+      ) : (
+        <section className="panel empty">No app selected.</section>
+      )}
+    </div>
+  );
+}
+
 function AgentsPage({
   agents,
   setAgents,
   settings,
   localModels,
+  tools,
+  onCreateAgent,
+  onPatchAgent,
 }: {
   agents: Agent[];
   setAgents: (agents: Agent[] | ((agents: Agent[]) => Agent[])) => void;
   settings: Settings | null;
   localModels: OllamaModel[];
+  tools: ToolRecord[];
+  onCreateAgent: () => Promise<Agent | null>;
+  onPatchAgent: (agentId: string, patch: Partial<Agent>) => Promise<void>;
 }) {
   const [activeId, setActiveId] = useState(agents[0]?.id || "");
   const [query, setQuery] = useState("");
+  const pendingAgentPatches = useRef<Record<string, Partial<Agent>>>({});
+  const agentPatchTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const providerOptions = modelProviderOptions(settings);
   const filtered = agents.filter((agent) => [agent.name, agent.role, agent.description].join(" ").toLowerCase().includes(query.toLowerCase()));
   const active = agents.find((agent) => agent.id === activeId) || agents[0];
   const activeProviderId = agentProviderId(active, settings);
   const activeModelOptions = useProviderModelOptions(activeProviderId, settings, localModels);
 
-  function updateAgent(patch: Partial<Agent>) {
+  function persistAgentPatch(agentId: string, patch: Partial<Agent>, mode: "immediate" | "debounced") {
+    if (mode === "debounced") {
+      pendingAgentPatches.current[agentId] = {
+        ...(pendingAgentPatches.current[agentId] || {}),
+        ...patch,
+      };
+      if (agentPatchTimers.current[agentId]) {
+        clearTimeout(agentPatchTimers.current[agentId]);
+      }
+      agentPatchTimers.current[agentId] = setTimeout(() => {
+        const pending = pendingAgentPatches.current[agentId];
+        delete pendingAgentPatches.current[agentId];
+        delete agentPatchTimers.current[agentId];
+        if (pending && Object.keys(pending).length) {
+          void onPatchAgent(agentId, pending);
+        }
+      }, 500);
+      return;
+    }
+
+    void onPatchAgent(agentId, patch);
+  }
+
+  function updateAgent(patch: Partial<Agent>, mode: "immediate" | "debounced" = "immediate") {
     if (!active) {
       return;
     }
     setAgents((list) => list.map((agent) => (agent.id === active.id ? { ...agent, ...patch, updatedAt: timestampNow() } : agent)));
+    persistAgentPatch(active.id, patch, mode);
   }
 
-  function createAgent() {
-    const defaultProviderId = agentProviderId(undefined, settings);
-    const defaultProvider = providerOptions.find((option) => option.id === defaultProviderId) || providerOptions[0];
-    const agent: Agent = {
-      id: `ag_${Math.random().toString(36).slice(2, 7)}`,
-      name: "New agent",
-      role: "Draft role",
-      description: "",
-      systemPrompt: "",
-      defaultProviderId: defaultProvider.id,
-      defaultProvider: defaultProvider.label,
-      defaultModel: "default",
-      defaultEnvironment: "planner",
-      autonomy: "ask",
-      permissions: { browser: true, fileRead: true, fileWrite: false, terminal: false },
-      status: "draft",
-      tasksRun: 0,
-      updatedAt: timestampNow(),
-    };
-    setAgents((list) => [agent, ...list]);
-    setActiveId(agent.id);
-  }
-
-  function removeAgent(id: string) {
-    setAgents((list) => list.filter((agent) => agent.id !== id));
-    if (id === activeId) {
-      setActiveId(agents.find((agent) => agent.id !== id)?.id || "");
+  async function createAgent() {
+    const agent = await onCreateAgent();
+    if (agent) {
+      setActiveId(agent.id);
     }
   }
 
@@ -1240,6 +1744,12 @@ function AgentsPage({
       updateAgent({ defaultModel: activeModelOptions[0] });
     }
   }, [active?.id, activeProviderId, active?.defaultModel, activeModelOptions]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(agentPatchTimers.current).forEach(clearTimeout);
+    };
+  }, []);
 
   return (
     <div className="agents-layout">
@@ -1274,11 +1784,8 @@ function AgentsPage({
               <p>Last updated {active.updatedAt} / {active.tasksRun} tasks run</p>
             </div>
             <div className="button-row">
-              <button type="button" onClick={() => updateAgent({ status: active.status === "active" ? "paused" : "active" })}>
-                {active.status === "active" ? "Pause" : "Activate"}
-              </button>
-              <button className="danger-outline" type="button" onClick={() => removeAgent(active.id)}>
-                Delete
+              <button type="button" onClick={() => updateAgent({ enabled: !(active.enabled ?? true), status: active.status === "active" ? "paused" : "active" })}>
+                {active.enabled === false || active.status !== "active" ? "Enable" : "Disable"}
               </button>
             </div>
           </div>
@@ -1287,20 +1794,20 @@ function AgentsPage({
             <div className="field-row">
               <label>
                 Name
-                <input value={active.name} onChange={(event) => updateAgent({ name: event.target.value })} />
+                <input value={active.name} onChange={(event) => updateAgent({ name: event.target.value }, "debounced")} />
               </label>
               <label>
                 Role
-                <input value={active.role} onChange={(event) => updateAgent({ role: event.target.value })} />
+                <input value={active.role} disabled title="Server-owned in v1" />
               </label>
             </div>
             <label>
               Description
-              <input value={active.description} onChange={(event) => updateAgent({ description: event.target.value })} />
+              <input value={active.description} onChange={(event) => updateAgent({ description: event.target.value }, "debounced")} />
             </label>
             <label>
               System prompt
-              <textarea rows={9} value={active.systemPrompt} onChange={(event) => updateAgent({ systemPrompt: event.target.value })} />
+              <textarea rows={9} value={active.systemPrompt} onChange={(event) => updateAgent({ systemPrompt: event.target.value }, "debounced")} />
             </label>
             <div className="field-row three">
               <label>
@@ -1310,7 +1817,11 @@ function AgentsPage({
                   value={activeProviderId}
                   onChange={(event) => {
                     const selected = providerOptions.find((option) => option.id === event.target.value) || providerOptions[0];
-                    updateAgent({ defaultProviderId: selected.id, defaultProvider: selected.label });
+                    updateAgent({
+                      defaultProviderId: selected.id,
+                      defaultProvider: selected.label,
+                      defaultModel: defaultAgentModelForProvider(selected.id, settings, localModels),
+                    });
                   }}
                 >
                   {providerOptions.map((item) => (
@@ -1329,17 +1840,72 @@ function AgentsPage({
                 />
               </label>
               <label>
+                Model ID
+                <input value={active.defaultModelId || ""} onChange={(event) => updateAgent({ defaultModelId: event.target.value || null }, "debounced")} placeholder="optional catalog model id" />
+              </label>
+            </div>
+            <div className="field-row three">
+              <label>
+                Temperature
+                <input
+                  type="number"
+                  min="0"
+                  max="2"
+                  step="0.1"
+                  value={active.temperature ?? ""}
+                  onChange={(event) => updateAgent({ temperature: event.target.value === "" ? null : Number(event.target.value) })}
+                />
+              </label>
+              <label>
+                Max tokens
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={active.maxTokens ?? ""}
+                  onChange={(event) => updateAgent({ maxTokens: event.target.value === "" ? null : Number(event.target.value) })}
+                />
+              </label>
+              <label>
                 Environment
-                <select value={active.defaultEnvironment} onChange={(event) => updateAgent({ defaultEnvironment: event.target.value as Environment })}>
+                <select value={active.defaultEnvironment} disabled title="Server-owned in v1">
                   {environments.map((item) => (
                     <option key={item} value={item}>{item}</option>
                   ))}
                 </select>
               </label>
             </div>
+            <div className="settings-section">
+              <h3>Allowed tools</h3>
+              <div className="permission-list">
+                {tools.map((tool) => {
+                  const selected = (active.allowedToolIds || []).some((id) => id === tool.id);
+                  return (
+                    <label key={tool.id} className="toggle-row">
+                      <span>
+                        {tool.name}
+                        <small>{tool.id} / {tool.enabled ? tool.riskLevel : "disabled"}</small>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={selected}
+                        onChange={(event) => {
+                          const current = active.allowedToolIds || [];
+                          updateAgent({
+                            allowedToolIds: event.target.checked
+                              ? Array.from(new Set([...current, tool.id]))
+                              : current.filter((id) => id !== tool.id),
+                          });
+                        }}
+                      />
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
             <div className="chip-row wrap">
               {autonomyLevels.map((item) => (
-                <button key={item} type="button" className={active.autonomy === item ? "chip active" : "chip"} onClick={() => updateAgent({ autonomy: item })}>
+                <button key={item} type="button" className={active.autonomy === item ? "chip active" : "chip"} disabled title="Server-owned in v1">
                   {labelize(item)}
                 </button>
               ))}
@@ -1358,7 +1924,8 @@ function AgentsPage({
                   <input
                     type="checkbox"
                     checked={active.permissions[key]}
-                    onChange={(event) => updateAgent({ permissions: { ...active.permissions, [key]: event.target.checked } })}
+                    disabled
+                    title="Server-owned in v1"
                   />
                 </label>
               ))}
@@ -1814,7 +2381,11 @@ function ModelsPage(props: {
                             type="button"
                             onClick={() => verifyProvider(provider)}
                             disabled={props.busy || providerVerifyBusyId === provider.id}
-                            title="Calls the LiteLLM gateway with the current provider values and a small test prompt."
+                            title={
+                              providerType === "ollama"
+                                ? "Checks Ollama /api/tags directly without running model generation."
+                                : "Calls the LiteLLM gateway with the current provider values and a small test prompt."
+                            }
                           >
                             {providerVerifyBusyId === provider.id ? "Testing..." : "Test Connection"}
                           </button>
@@ -2408,6 +2979,17 @@ function agentProviderId(agent: Agent | undefined, settings: Settings | null): s
   return fallback;
 }
 
+function defaultAgentModelForProvider(providerId: string, settings: Settings | null, localModels: OllamaModel[]): string {
+  if (providerId === "ollama") {
+    return localModels[0]?.name || settings?.default_model || "";
+  }
+  const provider = settings?.litellm_providers.find((item) => item.id === providerId);
+  if (!provider) {
+    return settings?.default_model || "";
+  }
+  return localProviderModelCatalog(provider).models[0]?.name || "";
+}
+
 function modelPlaceholderForProvider(providerId: string, settings: Settings | null): string {
   if (!settings || providerId === "ollama") {
     return settings?.default_model || "default";
@@ -2418,6 +3000,58 @@ function modelPlaceholderForProvider(providerId: string, settings: Settings | nu
   }
   const suggestions = suggestedModelNames(provider.provider_type);
   return suggestions[0] || "model name";
+}
+
+function selectedOptions(select: HTMLSelectElement): string[] {
+  return Array.from(select.selectedOptions).map((option) => option.value);
+}
+
+function ToolsPage({
+  tools,
+  onPatchTool,
+}: {
+  tools: ToolRecord[];
+  onPatchTool: (toolId: string, patch: Partial<ToolRecord>) => Promise<void>;
+}) {
+  return (
+    <div className="stack">
+      <section className="panel toolbar-panel">
+        <div>
+          <h2>Tools</h2>
+          <p>{tools.length} configured capabilities</p>
+        </div>
+      </section>
+      <section className="panel">
+        <div className="model-table">
+          <div className="model-row header">
+            <span>Tool</span>
+            <span>Risk</span>
+            <span>Status</span>
+            <span>Enabled</span>
+          </div>
+          {tools.map((tool) => (
+            <div className="model-row" key={tool.id}>
+              <span>
+                <strong>{tool.name}</strong>
+                <small>{tool.id}</small>
+              </span>
+              <span>{labelize(tool.riskLevel)}</span>
+              <span>{tool.enabled ? "Callable" : "Planned"}</span>
+              <span>
+                <input
+                  type="checkbox"
+                  checked={tool.enabled}
+                  onChange={(event) => void onPatchTool(tool.id, { enabled: event.target.checked })}
+                  aria-label={`Toggle ${tool.name}`}
+                />
+              </span>
+            </div>
+          ))}
+          {!tools.length ? <div className="empty-cell">No tools configured.</div> : null}
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function PermissionsPage({
@@ -2481,9 +3115,15 @@ function PermissionsPage({
   );
 }
 
-function LogsPage({ auditLog, runs }: { auditLog: AuditEntry[]; runs: RunRecord[] }) {
+function LogsPage({ auditLog, serverAudit, runs }: { auditLog: AuditEntry[]; serverAudit: ServerAuditRecord[]; runs: RunRecord[] }) {
   const [query, setQuery] = useState("");
-  const filtered = auditLog.filter((entry) =>
+  const filteredServerAudit = serverAudit.filter((entry) =>
+    [entry.event, entry.level, entry.message, entry.app_id, entry.agent_id, entry.run_id]
+      .join(" ")
+      .toLowerCase()
+      .includes(query.toLowerCase()),
+  );
+  const filteredLocalAudit = auditLog.filter((entry) =>
     [entry.action, entry.taskId, entry.agent, entry.environment, entry.result, entry.risk, entry.approval]
       .join(" ")
       .toLowerCase()
@@ -2491,17 +3131,16 @@ function LogsPage({ auditLog, runs }: { auditLog: AuditEntry[]; runs: RunRecord[
   );
 
   function exportCsv() {
-    const header = "timestamp,taskId,agent,action,environment,result,risk,approval";
-    const rows = filtered.map((entry) =>
+    const header = "timestamp,event,level,message,appId,agentId,runId";
+    const rows = filteredServerAudit.map((entry) =>
       [
-        entry.timestamp,
-        entry.taskId,
-        entry.agent,
-        entry.action,
-        entry.environment,
-        entry.result,
-        entry.risk,
-        entry.approval,
+        entry.created_at,
+        entry.event,
+        entry.level,
+        entry.message,
+        entry.app_id || "",
+        entry.agent_id || "",
+        entry.run_id || "",
       ]
         .map((value) => `"${String(value).replace(/"/g, '""')}"`)
         .join(","),
@@ -2519,18 +3158,27 @@ function LogsPage({ auditLog, runs }: { auditLog: AuditEntry[]; runs: RunRecord[
       <section className="panel toolbar-panel">
         <div>
           <h2>Audit Log</h2>
-          <p>Every agent action, classified by risk and approval state.</p>
+          <p>App, agent, and run policy decisions from the backend.</p>
         </div>
         <div className="filter-row">
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search actions, tasks, agents" />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search events, apps, agents" />
           <button type="button" onClick={exportCsv}>
             Export CSV
           </button>
         </div>
       </section>
       <section className="panel">
-        <AuditTable entries={filtered} />
+        <ServerAuditTable entries={filteredServerAudit} />
       </section>
+      {filteredLocalAudit.length ? (
+        <section className="panel">
+          <div className="section-header">
+            <h2>Local Task Audit</h2>
+            <p>Operator-console events from local demo task state.</p>
+          </div>
+          <AuditTable entries={filteredLocalAudit} />
+        </section>
+      ) : null}
       <section className="panel">
         <div className="section-header">
           <h2>Model Runs</h2>
@@ -2884,10 +3532,12 @@ function RunsTable({ runs }: { runs: RunRecord[] }) {
       <thead>
         <tr>
           <th>Time</th>
+          <th>App</th>
+          <th>Agent</th>
           <th>Provider</th>
           <th>Model</th>
+          <th>Model ID</th>
           <th>Status</th>
-          <th>Source</th>
           <th>Duration</th>
           <th>Usage</th>
           <th>Summary</th>
@@ -2897,12 +3547,14 @@ function RunsTable({ runs }: { runs: RunRecord[] }) {
         {runs.map((run) => (
           <tr key={run.id}>
             <td>{formatTime(run.started_at)}</td>
+            <td>{run.app_id || run.source_app || "-"}</td>
+            <td>{run.agent_id || "-"}</td>
             <td>{run.provider || "ollama"}</td>
             <td>{run.model}</td>
+            <td>{run.model_id || "-"}</td>
             <td>
               <StatusBadge status={run.status} />
             </td>
-            <td>{run.source_app || "-"}</td>
             <td>{run.duration_ms}ms</td>
             <td>{formatUsage(run.usage)}</td>
             <td>{run.error || run.prompt_summary}</td>
@@ -2910,8 +3562,46 @@ function RunsTable({ runs }: { runs: RunRecord[] }) {
         ))}
         {!runs.length ? (
           <tr>
-            <td colSpan={8} className="empty-cell">
+            <td colSpan={10} className="empty-cell">
               No runs recorded.
+            </td>
+          </tr>
+        ) : null}
+      </tbody>
+    </table>
+  );
+}
+
+function ServerAuditTable({ entries }: { entries: ServerAuditRecord[] }) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>Timestamp</th>
+          <th>Level</th>
+          <th>Event</th>
+          <th>App</th>
+          <th>Agent</th>
+          <th>Run</th>
+          <th>Message</th>
+        </tr>
+      </thead>
+      <tbody>
+        {entries.map((entry) => (
+          <tr key={entry.id}>
+            <td>{formatTime(entry.created_at)}</td>
+            <td><StatusBadge status={entry.level} /></td>
+            <td>{entry.event}</td>
+            <td>{entry.app_id || "-"}</td>
+            <td>{entry.agent_id || "-"}</td>
+            <td>{entry.run_id || "-"}</td>
+            <td>{entry.message}</td>
+          </tr>
+        ))}
+        {!entries.length ? (
+          <tr>
+            <td colSpan={7} className="empty-cell">
+              No audit events recorded.
             </td>
           </tr>
         ) : null}

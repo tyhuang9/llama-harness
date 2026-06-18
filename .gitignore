@@ -1,5 +1,6 @@
 graphify-out/
 .graphify/
+.agent/
 .graphifyignore
 .graphifyinclude
 target/
@@ -10,6 +11,7 @@ bundled/litellm-runtime/
 .env
 .DS_Store
 *.log
+logs/
 runs.jsonl
 litellm.config.yaml
 litellm.*.config.yaml

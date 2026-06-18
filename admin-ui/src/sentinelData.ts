@@ -31,12 +31,17 @@ export type Agent = {
   role: string;
   description: string;
   systemPrompt: string;
+  defaultModelId?: string | null;
   defaultProviderId: string;
   defaultProvider?: ModelProvider;
   defaultModel: string;
   defaultEnvironment: Environment;
   autonomy: "observe" | "ask" | "low-risk" | "autonomous";
   permissions: AgentPermissions;
+  allowedToolIds?: string[];
+  temperature?: number | null;
+  maxTokens?: number | null;
+  enabled?: boolean;
   status: "active" | "paused" | "draft";
   tasksRun: number;
   updatedAt: string;

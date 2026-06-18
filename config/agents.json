@@ -1,0 +1,31 @@
+[
+  {
+    "id": "note-assistant",
+    "name": "Note Assistant",
+    "role": "Note assistant",
+    "description": "Helps summarize, analyze, and reason about notes.",
+    "system_prompt": "You are a local assistant for a note-taking app. Help summarize notes, extract action items, analyze selected text, and answer questions using provided note context.",
+    "default_model_id": "ollama-default",
+    "default_provider_id": "ollama",
+    "default_model": "",
+    "default_environment": "planner",
+    "autonomy": "ask",
+    "permissions": {
+      "browser": false,
+      "file_read": false,
+      "file_write": false,
+      "terminal": false
+    },
+    "allowed_tool_ids": [
+      "notes.read",
+      "notes.search",
+      "reminders.create"
+    ],
+    "temperature": 0.2,
+    "max_tokens": 512,
+    "enabled": true,
+    "status": "active",
+    "tasks_run": 0,
+    "updated_at": "seed"
+  }
+]

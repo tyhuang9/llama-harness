@@ -22,6 +22,7 @@ pub struct AppConfig {
     pub litellm: LiteLlmSettings,
     pub litellm_providers: Vec<LiteLlmProviderConfig>,
     pub model_routes: Vec<ModelRoute>,
+    pub agents: Vec<AgentConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,6 +80,46 @@ pub struct ModelRoute {
     pub notes: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub description: String,
+    #[serde(alias = "systemPrompt")]
+    pub system_prompt: String,
+    #[serde(alias = "defaultModelId")]
+    pub default_model_id: Option<String>,
+    #[serde(alias = "defaultProviderId")]
+    pub default_provider_id: String,
+    #[serde(alias = "defaultModel")]
+    pub default_model: String,
+    #[serde(alias = "defaultEnvironment")]
+    pub default_environment: String,
+    pub autonomy: String,
+    pub permissions: AgentPermissions,
+    #[serde(alias = "allowedToolIds")]
+    pub allowed_tool_ids: Vec<String>,
+    pub temperature: Option<f32>,
+    #[serde(alias = "maxTokens")]
+    pub max_tokens: Option<u32>,
+    pub enabled: bool,
+    pub status: String,
+    pub tasks_run: u64,
+    #[serde(alias = "updatedAt")]
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentPermissions {
+    pub browser: bool,
+    pub file_read: bool,
+    pub file_write: bool,
+    pub terminal: bool,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -93,6 +134,7 @@ impl Default for AppConfig {
             litellm: LiteLlmSettings::default(),
             litellm_providers: Vec::new(),
             model_routes: Vec::new(),
+            agents: Vec::new(),
         }
     }
 }
@@ -162,6 +204,42 @@ impl Default for ModelRoute {
     }
 }
 
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: "New agent".to_string(),
+            role: "General assistant".to_string(),
+            description: String::new(),
+            system_prompt: String::new(),
+            default_model_id: None,
+            default_provider_id: "ollama".to_string(),
+            default_model: String::new(),
+            default_environment: "planner".to_string(),
+            autonomy: "ask".to_string(),
+            permissions: AgentPermissions::default(),
+            allowed_tool_ids: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            enabled: true,
+            status: "draft".to_string(),
+            tasks_run: 0,
+            updated_at: String::new(),
+        }
+    }
+}
+
+impl Default for AgentPermissions {
+    fn default() -> Self {
+        Self {
+            browser: true,
+            file_read: true,
+            file_write: false,
+            terminal: false,
+        }
+    }
+}
+
 impl AppConfig {
     pub fn default_model_for_provider(&self, provider: &str) -> Option<String> {
         match provider {
@@ -218,6 +296,37 @@ pub fn default_runs_path() -> PathBuf {
     }
 
     local
+}
+
+pub fn default_audit_path() -> PathBuf {
+    if let Ok(path) = env::var("LLAMA_HARNESS_AUDIT_LOG") {
+        return PathBuf::from(path);
+    }
+
+    let local = PathBuf::from("logs/audit.jsonl");
+    if local.exists() {
+        return local;
+    }
+
+    let parent = PathBuf::from("../logs/audit.jsonl");
+    if parent.parent().is_some_and(Path::exists) {
+        return parent;
+    }
+
+    local
+}
+
+pub fn default_catalog_dir(config_path: &Path) -> PathBuf {
+    if let Ok(path) = env::var("LLAMA_HARNESS_CONFIG_DIR") {
+        return PathBuf::from(path);
+    }
+
+    let parent = config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty());
+    parent
+        .map(|path| path.join("config"))
+        .unwrap_or_else(|| PathBuf::from("config"))
 }
 
 pub async fn load_config(path: &Path) -> Result<AppConfig> {
@@ -290,6 +399,7 @@ mod tests {
         assert!(!config.litellm.enabled);
         assert!(config.litellm_providers.is_empty());
         assert!(config.model_routes.is_empty());
+        assert!(config.agents.is_empty());
     }
 
     #[test]

@@ -1,7 +1,11 @@
 use crate::{
+    app_policy::{
+        self, AppCapabilitiesResponse, AppPolicyError, AppPolicyErrorKind, ClientAppConfig,
+        DomainCatalog, ToolConfig,
+    },
     config::{
-        self, AppConfig, GenerationSettings, InstructionSettings, LiteLlmProviderConfig,
-        LiteLlmSettings, ModelRoute, REDACTED_SECRET,
+        self, AgentConfig, AgentPermissions, AppConfig, GenerationSettings, InstructionSettings,
+        LiteLlmProviderConfig, LiteLlmSettings, ModelRoute, REDACTED_SECRET,
     },
     litellm::{generate_litellm_config, litellm_model_for_provider},
     litellm_runtime::{litellm_start_command_summary, LiteLlmRuntimeManager},
@@ -10,7 +14,7 @@ use crate::{
         ChatMessage, ModelProvider, ProviderChatRequest, ProviderRegistry, ProviderStreamEvent,
         TokenUsage,
     },
-    runs::{self, RunRecord, RunStatus},
+    runs::{self, AuditLevel, AuditRecord, RunRecord, RunStatus},
     secrets::{self, LITELLM_MASTER_KEY_ENV},
 };
 use axum::{
@@ -35,13 +39,18 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 const MAX_RECENT_RUNS: usize = 100;
+const MAX_RECENT_AUDIT: usize = 100;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub config_path: PathBuf,
+    pub catalog: Arc<RwLock<DomainCatalog>>,
+    pub catalog_dir: PathBuf,
     pub runs_path: PathBuf,
     pub runs: Arc<RwLock<VecDeque<RunRecord>>>,
+    pub audit_path: PathBuf,
+    pub audit: Arc<RwLock<VecDeque<AuditRecord>>>,
     pub providers: ProviderRegistry,
     pub litellm_runtime: LiteLlmRuntimeManager,
     pub started_at: DateTime<Utc>,
@@ -189,6 +198,91 @@ struct ProviderModelOption {
     source: String,
 }
 
+#[derive(Serialize)]
+struct SetupStatusResponse {
+    litellm_enabled: bool,
+    litellm_ready: bool,
+    usable_provider_count: usize,
+    usable_model_count: usize,
+    active_agent_count: usize,
+    ready: bool,
+    next_step: SetupStep,
+    missing_steps: Vec<SetupStep>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SetupStep {
+    StartLitellm,
+    AddProvider,
+    SelectModel,
+    CreateAgent,
+    Ready,
+}
+
+#[derive(Deserialize)]
+struct AgentCreateRequest {
+    id: Option<String>,
+    name: Option<String>,
+    role: Option<String>,
+    description: Option<String>,
+    system_prompt: Option<String>,
+    default_model_id: Option<String>,
+    default_provider_id: Option<String>,
+    default_model: Option<String>,
+    default_environment: Option<String>,
+    autonomy: Option<String>,
+    permissions: Option<AgentPermissions>,
+    allowed_tool_ids: Option<Vec<String>>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    enabled: Option<bool>,
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AgentPatch {
+    name: Option<String>,
+    description: Option<String>,
+    system_prompt: Option<String>,
+    default_model_id: Option<String>,
+    default_provider_id: Option<String>,
+    default_model: Option<String>,
+    allowed_tool_ids: Option<Vec<String>>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    enabled: Option<bool>,
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AgentChatRequest {
+    messages: Option<Vec<ChatMessage>>,
+    prompt: Option<String>,
+    instructions: Option<String>,
+    app_context: Option<serde_json::Value>,
+    generation: Option<GenerationSettings>,
+    tools: Option<serde_json::Value>,
+    tool_choice: Option<serde_json::Value>,
+    source_app: Option<String>,
+    metadata: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct AgentChatResponse {
+    run_id: String,
+    agent_id: String,
+    provider: String,
+    model: String,
+    message: ChatMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<serde_json::Value>,
+    usage: Option<TokenUsage>,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    duration_ms: u64,
+}
+
 #[derive(Deserialize)]
 struct RunsQuery {
     limit: Option<usize>,
@@ -197,6 +291,63 @@ struct RunsQuery {
 #[derive(Serialize)]
 struct RunsResponse {
     runs: Vec<RunRecord>,
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct AuditResponse {
+    audit: Vec<AuditRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppPatch {
+    name: Option<String>,
+    description: Option<Option<String>>,
+    default_agent_id: Option<String>,
+    allowed_agent_ids: Option<Vec<String>>,
+    allowed_tool_ids: Option<Option<Vec<String>>>,
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolPatch {
+    name: Option<String>,
+    description: Option<String>,
+    risk_level: Option<String>,
+    enabled: Option<bool>,
+    input_schema: Option<Option<serde_json::Value>>,
+    output_schema: Option<Option<serde_json::Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunCreateRequest {
+    app_id: String,
+    agent_id: Option<String>,
+    input: Option<String>,
+    messages: Option<Vec<ChatMessage>>,
+    instructions: Option<String>,
+    context: Option<serde_json::Value>,
+    generation: Option<GenerationSettings>,
+    metadata: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunCreateResponse {
+    run_id: String,
+    status: RunStatus,
+    app_id: String,
+    agent_id: String,
+    model_id: String,
+    output: String,
+    duration_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -215,13 +366,6 @@ struct SettingsPatch {
 }
 
 #[derive(Serialize)]
-struct ToolsResponse {
-    enabled: bool,
-    summary: &'static str,
-    planned_registry_shape: serde_json::Value,
-}
-
-#[derive(Serialize)]
 struct StreamEvent<'a> {
     run_id: &'a str,
     content: &'a str,
@@ -231,10 +375,27 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/health", get(health))
+        .route("/models", get(list_models))
+        .route("/agents", get(list_agents))
+        .route("/apps", get(list_apps))
+        .route("/apps/:app_id", get(get_app).patch(patch_app))
+        .route("/apps/:app_id/capabilities", get(app_capabilities))
+        .route("/tools", get(list_tools))
+        .route("/tools/:tool_id", get(get_tool).patch(patch_tool))
+        .route("/runs", get(list_runs).post(create_run))
+        .route("/runs/stream", post(stream_run))
+        .route("/audit", get(list_audit))
         .route("/api/health", get(health))
         .route("/api/models", get(list_models))
         .route("/api/models/default", post(set_default_model))
         .route("/api/models/test", post(test_model))
+        .route("/api/setup/status", get(setup_status))
+        .route("/api/agents", get(list_agents).post(create_agent))
+        .route("/api/agents/:agent_id", get(get_agent).patch(patch_agent))
+        .route("/api/agents/:agent_id/chat", post(agent_chat))
+        .route("/api/apps", get(list_apps))
+        .route("/api/apps/:app_id", get(get_app).patch(patch_app))
+        .route("/api/apps/:app_id/capabilities", get(app_capabilities))
         .route("/api/providers", get(list_providers))
         .route(
             "/api/providers/:provider_id/models",
@@ -253,9 +414,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/chat/completions", post(chat_completions))
         .route("/api/chat", post(chat))
         .route("/api/chat/stream", post(stream_chat))
-        .route("/api/runs", get(list_runs))
+        .route("/api/runs", get(list_runs).post(create_run))
+        .route("/api/runs/stream", post(stream_run))
+        .route("/api/audit", get(list_audit))
         .route("/api/settings", get(get_settings).put(update_settings))
-        .route("/api/tools", get(tools_placeholder))
+        .route("/api/tools", get(list_tools))
+        .route("/api/tools/:tool_id", get(get_tool).patch(patch_tool))
         .with_state(state)
 }
 
@@ -334,6 +498,475 @@ async fn test_model(
         payload.source_app = Some("admin-ui".to_string());
     }
     chat_with_payload(state, payload).await
+}
+
+async fn setup_status(State(state): State<AppState>) -> Json<SetupStatusResponse> {
+    let app_env = load_app_env_or_default().await;
+    let config = state.config.read().await.clone();
+    let hydrated_config = hydrate_config_secrets(config.clone(), &app_env);
+    let ollama_models = state
+        .providers
+        .list_ollama_models(&hydrated_config)
+        .await
+        .ok();
+    let litellm_ready = state
+        .litellm_runtime
+        .readiness_healthy(&hydrated_config)
+        .await;
+
+    let mut usable_provider_count = 0;
+    let mut usable_model_count = 0;
+    if let Some(models) = &ollama_models {
+        if !models.is_empty() {
+            usable_provider_count += 1;
+            usable_model_count += models.len();
+        }
+    }
+
+    if hydrated_config.litellm.enabled && litellm_ready {
+        for provider in hydrated_config
+            .litellm_providers
+            .iter()
+            .filter(|provider| provider.enabled)
+        {
+            usable_provider_count += 1;
+            usable_model_count += suggested_provider_models(provider).len().max(1);
+        }
+    }
+
+    let active_agent_count = state
+        .catalog
+        .read()
+        .await
+        .agents
+        .iter()
+        .filter(|agent| app_policy::agent_enabled(agent))
+        .count();
+    let mut missing_steps = Vec::new();
+    if config.litellm.enabled && !litellm_ready {
+        missing_steps.push(SetupStep::StartLitellm);
+    }
+    if usable_provider_count == 0 {
+        missing_steps.push(SetupStep::AddProvider);
+    }
+    if usable_model_count == 0 {
+        missing_steps.push(SetupStep::SelectModel);
+    }
+    if active_agent_count == 0 {
+        missing_steps.push(SetupStep::CreateAgent);
+    }
+    let next_step = missing_steps.first().copied().unwrap_or(SetupStep::Ready);
+
+    Json(SetupStatusResponse {
+        litellm_enabled: config.litellm.enabled,
+        litellm_ready,
+        usable_provider_count,
+        usable_model_count,
+        active_agent_count,
+        ready: missing_steps.is_empty(),
+        next_step,
+        missing_steps,
+    })
+}
+
+async fn list_agents(State(state): State<AppState>) -> Json<Vec<AgentConfig>> {
+    Json(state.catalog.read().await.agents.clone())
+}
+
+async fn get_agent(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+) -> ApiResult<Json<AgentConfig>> {
+    let catalog = state.catalog.read().await;
+    let agent = app_policy::find_agent(&catalog, &agent_id)
+        .cloned()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("unknown agent: {agent_id}")))?;
+    Ok(Json(agent))
+}
+
+async fn create_agent(
+    State(state): State<AppState>,
+    Json(payload): Json<AgentCreateRequest>,
+) -> ApiResult<Json<AgentConfig>> {
+    let config = state.config.read().await.clone();
+    let catalog_snapshot = state.catalog.read().await.clone();
+    let existing_ids = catalog_snapshot
+        .agents
+        .iter()
+        .map(|agent| agent.id.clone())
+        .collect::<Vec<_>>();
+    let mut agent = agent_from_create(payload, &existing_ids)?;
+    validate_agent_defaults(&state, &config, &agent).await?;
+
+    let saved = {
+        let mut catalog = state.catalog.write().await;
+        if catalog
+            .agents
+            .iter()
+            .any(|existing| existing.id.eq_ignore_ascii_case(&agent.id))
+        {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                format!("agent id '{}' is already used", agent.id),
+            ));
+        }
+        agent.updated_at = timestamp_now();
+        catalog.agents.push(agent.clone());
+        app_policy::save_agents(&state.catalog_dir, &catalog.agents)
+            .await
+            .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        agent
+    };
+
+    Ok(Json(saved))
+}
+
+async fn patch_agent(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+    Json(value): Json<serde_json::Value>,
+) -> ApiResult<Json<AgentConfig>> {
+    reject_protected_agent_patch_fields(&value)?;
+    let patch: AgentPatch = serde_json::from_value(value)
+        .map_err(|err| api_error(StatusCode::BAD_REQUEST, err.to_string()))?;
+
+    let config = state.config.read().await.clone();
+    let catalog_snapshot = state.catalog.read().await.clone();
+    let current = app_policy::find_agent(&catalog_snapshot, &agent_id)
+        .cloned()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("unknown agent: {agent_id}")))?;
+    let mut agent = current;
+    apply_agent_patch(&mut agent, patch)?;
+    validate_agent_defaults(&state, &config, &agent).await?;
+
+    let saved = {
+        let mut catalog = state.catalog.write().await;
+        let existing = app_policy::find_agent_mut(&mut catalog, &agent_id).ok_or_else(|| {
+            api_error(StatusCode::NOT_FOUND, format!("unknown agent: {agent_id}"))
+        })?;
+        agent.updated_at = timestamp_now();
+        *existing = agent.clone();
+        app_policy::save_agents(&state.catalog_dir, &catalog.agents)
+            .await
+            .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        agent
+    };
+
+    Ok(Json(saved))
+}
+
+async fn list_apps(State(state): State<AppState>) -> Json<Vec<ClientAppConfig>> {
+    Json(state.catalog.read().await.apps.clone())
+}
+
+async fn get_app(
+    State(state): State<AppState>,
+    AxumPath(app_id): AxumPath<String>,
+) -> ApiResult<Json<ClientAppConfig>> {
+    let catalog = state.catalog.read().await;
+    let app = app_policy::find_app(&catalog, &app_id)
+        .cloned()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("unknown app: {app_id}")))?;
+    Ok(Json(app))
+}
+
+async fn patch_app(
+    State(state): State<AppState>,
+    AxumPath(app_id): AxumPath<String>,
+    Json(patch): Json<AppPatch>,
+) -> ApiResult<Json<ClientAppConfig>> {
+    let saved = {
+        let mut catalog = state.catalog.write().await;
+        let app = app_policy::find_app_mut(&mut catalog, &app_id)
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("unknown app: {app_id}")))?;
+
+        if let Some(name) = patch.name {
+            app.name = trim_or_default(name, "Untitled app");
+        }
+        if let Some(description) = patch.description {
+            app.description = description.map(|value| value.trim().to_string());
+        }
+        if let Some(default_agent_id) = patch.default_agent_id {
+            let default_agent_id = default_agent_id.trim();
+            if default_agent_id.is_empty() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "defaultAgentId is required",
+                ));
+            }
+            app.default_agent_id = default_agent_id.to_string();
+            if !app
+                .allowed_agent_ids
+                .iter()
+                .any(|agent_id| agent_id.eq_ignore_ascii_case(default_agent_id))
+            {
+                app.allowed_agent_ids.push(default_agent_id.to_string());
+            }
+        }
+        if let Some(allowed_agent_ids) = patch.allowed_agent_ids {
+            app.allowed_agent_ids = normalize_id_list(allowed_agent_ids);
+            if !app
+                .allowed_agent_ids
+                .iter()
+                .any(|agent_id| agent_id.eq_ignore_ascii_case(&app.default_agent_id))
+            {
+                app.allowed_agent_ids.push(app.default_agent_id.clone());
+            }
+        }
+        if let Some(allowed_tool_ids) = patch.allowed_tool_ids {
+            app.allowed_tool_ids = allowed_tool_ids.map(normalize_id_list);
+        }
+        if let Some(enabled) = patch.enabled {
+            app.enabled = enabled;
+        }
+
+        let app = app.clone();
+        app_policy::save_apps(&state.catalog_dir, &catalog.apps)
+            .await
+            .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        app
+    };
+
+    Ok(Json(saved))
+}
+
+async fn app_capabilities(
+    State(state): State<AppState>,
+    AxumPath(app_id): AxumPath<String>,
+) -> ApiResult<Json<AppCapabilitiesResponse>> {
+    let (config, catalog) = {
+        (
+            state.config.read().await.clone(),
+            state.catalog.read().await.clone(),
+        )
+    };
+    let fallback_model = first_ollama_model_name(&state, &config).await;
+    let resolved =
+        app_policy::resolve_app_policy(&catalog, &config, &app_id, None, fallback_model.as_deref())
+            .map_err(app_policy_api_error)?;
+    record_audit(
+        &state,
+        audit_record(
+            "app.capabilities_resolved",
+            AuditLevel::Info,
+            format!("Resolved capabilities for app '{}'", resolved.app.id),
+            Some(resolved.app.id.clone()),
+            Some(resolved.agent.id.clone()),
+            None,
+            Some(serde_json::json!({
+                "tool_ids": resolved.tools.iter().map(|tool| tool.id.clone()).collect::<Vec<_>>(),
+                "model_id": resolved.model.id,
+                "warnings": resolved.warnings,
+            })),
+        ),
+    )
+    .await;
+
+    Ok(Json(AppCapabilitiesResponse::from_policy(&resolved)))
+}
+
+async fn list_tools(State(state): State<AppState>) -> Json<Vec<ToolConfig>> {
+    Json(state.catalog.read().await.tools.clone())
+}
+
+async fn get_tool(
+    State(state): State<AppState>,
+    AxumPath(tool_id): AxumPath<String>,
+) -> ApiResult<Json<ToolConfig>> {
+    let catalog = state.catalog.read().await;
+    let tool = catalog
+        .tools
+        .iter()
+        .find(|tool| tool.id.eq_ignore_ascii_case(tool_id.trim()))
+        .cloned()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("unknown tool: {tool_id}")))?;
+    Ok(Json(tool))
+}
+
+async fn patch_tool(
+    State(state): State<AppState>,
+    AxumPath(tool_id): AxumPath<String>,
+    Json(patch): Json<ToolPatch>,
+) -> ApiResult<Json<ToolConfig>> {
+    let saved = {
+        let mut catalog = state.catalog.write().await;
+        let tool = catalog
+            .tools
+            .iter_mut()
+            .find(|tool| tool.id.eq_ignore_ascii_case(tool_id.trim()))
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("unknown tool: {tool_id}")))?;
+
+        if let Some(name) = patch.name {
+            tool.name = trim_or_default(name, "Untitled tool");
+        }
+        if let Some(description) = patch.description {
+            tool.description = description.trim().to_string();
+        }
+        if let Some(risk_level) = patch.risk_level {
+            let risk_level = risk_level.trim().to_ascii_lowercase();
+            if !["low", "medium", "high"].contains(&risk_level.as_str()) {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid riskLevel '{risk_level}'"),
+                ));
+            }
+            tool.risk_level = risk_level;
+        }
+        if let Some(enabled) = patch.enabled {
+            tool.enabled = enabled;
+        }
+        if let Some(input_schema) = patch.input_schema {
+            tool.input_schema = input_schema;
+        }
+        if let Some(output_schema) = patch.output_schema {
+            tool.output_schema = output_schema;
+        }
+
+        let tool = tool.clone();
+        app_policy::save_tools(&state.catalog_dir, &catalog.tools)
+            .await
+            .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        tool
+    };
+
+    Ok(Json(saved))
+}
+
+async fn agent_chat(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+    Json(payload): Json<AgentChatRequest>,
+) -> ApiResult<Json<AgentChatResponse>> {
+    let app_env = load_app_env().await?;
+    let config = hydrate_config_secrets(state.config.read().await.clone(), &app_env);
+    let catalog = state.catalog.read().await.clone();
+    let agent = app_policy::find_agent(&catalog, &agent_id)
+        .cloned()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("unknown agent: {agent_id}")))?;
+    if !app_policy::agent_enabled(&agent) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("agent '{}' is not active", agent.id),
+        ));
+    }
+    validate_agent_defaults(&state, &config, &agent).await?;
+
+    let source_app = payload
+        .source_app
+        .unwrap_or_else(|| "agent-api".to_string());
+    let messages = normalize_messages(payload.messages, payload.prompt)?;
+    let messages = apply_agent_context(
+        &config.instructions,
+        &agent,
+        payload.instructions,
+        payload.app_context,
+        messages,
+    );
+    let tools = payload.tools.or_else(|| {
+        app_policy::resolve_app_policy(&catalog, &config, &source_app, Some(&agent.id), None)
+            .ok()
+            .and_then(|policy| provider_tools_from_policy(&policy.tools))
+    });
+    let tool_choice = payload
+        .tool_choice
+        .or_else(|| tools.as_ref().map(|_| serde_json::json!("auto")));
+    let metadata = Some(agent_chat_metadata(
+        payload.metadata,
+        &source_app,
+        &agent.id,
+    ));
+
+    let resolved = resolve_chat(
+        &state,
+        ChatRequest {
+            provider: Some(agent.default_provider_id.clone()),
+            model: Some(agent.default_model.clone()),
+            source_app: Some(source_app.clone()),
+            messages: Some(messages),
+            prompt: None,
+            instructions: None,
+            generation: payload.generation,
+            tools: tools.clone(),
+            tool_choice,
+            stream: Some(false),
+            metadata,
+        },
+    )
+    .await?;
+
+    let provider_request = resolved.provider_request(false);
+    let run_id = Uuid::new_v4().to_string();
+    let started_at = Utc::now();
+    let started_timer = Instant::now();
+    let prompt_summary = summarize_messages(&resolved.messages);
+    let result = resolved.provider.chat_completion(provider_request).await;
+    let ended_at = Utc::now();
+    let duration_ms = duration_ms(started_timer.elapsed());
+
+    match result {
+        Ok(response) => {
+            let message = ChatMessage::text("assistant", response.content);
+            let model = response.model.unwrap_or_else(|| resolved.model.clone());
+            let record = RunRecord {
+                id: run_id.clone(),
+                provider: resolved.provider_id.clone(),
+                model: model.clone(),
+                source_app: resolved.source_app,
+                app_id: Some(source_app.clone()),
+                agent_id: Some(agent.id.clone()),
+                model_id: app_policy::model_config_for_agent(&catalog, &agent)
+                    .map(|model| model.id.clone()),
+                resolved_tool_ids: tool_ids_from_provider_tools(&tools),
+                prompt_summary,
+                response_summary: Some(truncate(&message.content_text(), 500)),
+                status: RunStatus::Completed,
+                started_at,
+                ended_at,
+                duration_ms,
+                error: None,
+                usage: response.usage.clone(),
+            };
+            record_run(&state, record).await;
+            increment_agent_tasks_run(&state, &agent.id).await?;
+
+            Ok(Json(AgentChatResponse {
+                run_id,
+                agent_id: agent.id,
+                provider: resolved.provider_id,
+                model,
+                message,
+                tool_calls: response.tool_calls,
+                usage: response.usage,
+                started_at,
+                ended_at,
+                duration_ms,
+            }))
+        }
+        Err(err) => {
+            let error = err.to_string();
+            let record = RunRecord {
+                id: run_id,
+                provider: resolved.provider_id,
+                model: resolved.model,
+                source_app: resolved.source_app,
+                app_id: Some(source_app.clone()),
+                agent_id: Some(agent.id.clone()),
+                model_id: app_policy::model_config_for_agent(&catalog, &agent)
+                    .map(|model| model.id.clone()),
+                resolved_tool_ids: tool_ids_from_provider_tools(&tools),
+                prompt_summary,
+                response_summary: None,
+                status: RunStatus::Failed,
+                started_at,
+                ended_at,
+                duration_ms,
+                error: Some(error.clone()),
+                usage: None,
+            };
+            record_run(&state, record).await;
+            Err(api_error(StatusCode::BAD_GATEWAY, error))
+        }
+    }
 }
 
 async fn list_providers(State(state): State<AppState>) -> Json<Vec<ProviderStatus>> {
@@ -463,7 +1096,6 @@ async fn test_litellm_provider(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("litellm");
-    let has_draft_provider = payload.draft_provider.is_some();
     let draft_provider = match payload.draft_provider {
         Some(provider) => Some(normalize_litellm_provider_config(
             provider,
@@ -472,7 +1104,8 @@ async fn test_litellm_provider(
         )?),
         None => None,
     };
-    if let Some(provider) = draft_provider {
+    let has_draft_provider = draft_provider.is_some();
+    if let Some(provider) = draft_provider.clone() {
         let mut replaced = false;
         config.litellm_providers = config
             .litellm_providers
@@ -490,6 +1123,29 @@ async fn test_litellm_provider(
             config.litellm_providers.push(provider);
         }
     }
+    let configured_provider = if provider_id == "litellm" {
+        None
+    } else {
+        Some(find_litellm_provider(&config, provider_id).ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown LiteLLM provider: {provider_id}"),
+            )
+        })?)
+    };
+    if let Some(provider) = &configured_provider {
+        if normalize_provider_type(&provider.provider_type) == "ollama" {
+            return test_ollama_provider_connection(
+                &state,
+                &config,
+                provider_id,
+                provider,
+                requested_model,
+            )
+            .await;
+        }
+    }
+
     let mut app_env = load_app_env().await?;
     if has_draft_provider {
         overlay_inline_provider_keys(&mut app_env, &config.litellm_providers);
@@ -523,12 +1179,9 @@ async fn test_litellm_provider(
     let model = if provider_id == "litellm" {
         requested_model.to_string()
     } else {
-        let configured_provider = find_litellm_provider(&config, provider_id).ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                format!("unknown LiteLLM provider: {provider_id}"),
-            )
-        })?;
+        let configured_provider = configured_provider
+            .as_ref()
+            .expect("non-litellm provider was resolved before runtime setup");
         litellm_model_for_provider(&configured_provider, requested_model)
     };
     let provider = state
@@ -576,6 +1229,58 @@ async fn test_litellm_provider(
             Err(api_error(StatusCode::BAD_GATEWAY, error))
         }
     }
+}
+
+async fn test_ollama_provider_connection(
+    state: &AppState,
+    config: &AppConfig,
+    provider_id: &str,
+    provider: &LiteLlmProviderConfig,
+    requested_model: &str,
+) -> ApiResult<Json<LiteLlmProviderTestResponse>> {
+    let endpoint = provider
+        .api_base
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(config.ollama_endpoint.as_str());
+    let mut ollama_config = config.clone();
+    ollama_config.ollama_endpoint = endpoint.to_string();
+    let models = state
+        .providers
+        .list_ollama_models(&ollama_config)
+        .await
+        .map_err(|err| api_error(StatusCode::BAD_GATEWAY, err.to_string()))?;
+
+    if models.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Ollama is reachable at {endpoint}, but no models are installed."),
+        ));
+    }
+    if !models.iter().any(|model| {
+        model.name == requested_model || model.model.as_deref() == Some(requested_model)
+    }) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Ollama is reachable at {endpoint}, but model '{requested_model}' was not found."
+            ),
+        ));
+    }
+
+    audit_hook(
+        "provider.tested",
+        serde_json::json!({ "provider": provider_id, "model": requested_model, "mode": "ollama_tags" }),
+    );
+    Ok(Json(LiteLlmProviderTestResponse {
+        ok: true,
+        content: format!(
+            "Ollama reachable at {endpoint}. Model '{requested_model}' is available ({} models).",
+            models.len()
+        ),
+        usage: None,
+    }))
 }
 
 async fn apply_litellm_providers(
@@ -800,6 +1505,189 @@ async fn chat(
     chat_with_payload(state, payload).await
 }
 
+async fn create_run(
+    State(state): State<AppState>,
+    Json(payload): Json<RunCreateRequest>,
+) -> ApiResult<Json<RunCreateResponse>> {
+    let app_env = load_app_env().await?;
+    let config = hydrate_config_secrets(state.config.read().await.clone(), &app_env);
+    let catalog = state.catalog.read().await.clone();
+    let fallback_model = first_ollama_model_name(&state, &config).await;
+    let policy = match app_policy::resolve_app_policy(
+        &catalog,
+        &config,
+        &payload.app_id,
+        payload.agent_id.as_deref(),
+        fallback_model.as_deref(),
+    ) {
+        Ok(policy) => policy,
+        Err(err) => {
+            record_audit(
+                &state,
+                audit_record(
+                    "app.run_denied",
+                    audit_level_for_policy_error(&err),
+                    err.message.clone(),
+                    Some(payload.app_id.clone()),
+                    payload.agent_id.clone(),
+                    None,
+                    None,
+                ),
+            )
+            .await;
+            return Err(app_policy_api_error(err));
+        }
+    };
+
+    if policy.provider_model.trim().is_empty() {
+        let message = format!("agent '{}' has no resolved model", policy.agent.id);
+        record_audit(
+            &state,
+            audit_record(
+                "app.run_misconfigured",
+                AuditLevel::Error,
+                message.clone(),
+                Some(policy.app.id.clone()),
+                Some(policy.agent.id.clone()),
+                None,
+                Some(serde_json::json!({ "model_id": policy.model.id })),
+            ),
+        )
+        .await;
+        return Err(api_error(StatusCode::BAD_REQUEST, message));
+    }
+
+    let mut messages = normalize_messages(payload.messages, payload.input)?;
+    messages = apply_agent_context(
+        &config.instructions,
+        &policy.agent,
+        payload.instructions,
+        payload.context,
+        messages,
+    );
+    let tools = provider_tools_from_policy(&policy.tools);
+    let tool_choice = tools.as_ref().map(|_| serde_json::json!("auto"));
+    let metadata = Some(run_metadata(
+        payload.metadata,
+        &policy.app.id,
+        &policy.agent.id,
+        &policy.model.id,
+    ));
+    let generation = payload.generation.unwrap_or(policy.generation.clone());
+    let (provider_id, model, provider) =
+        provider_for_request(&state, &config, &policy.provider_id, &policy.provider_model)?;
+
+    let provider_request = ProviderChatRequest {
+        provider: provider_id.clone(),
+        model: model.clone(),
+        messages: messages.clone(),
+        temperature: Some(generation.temperature),
+        top_p: Some(generation.top_p),
+        max_tokens: Some(generation.max_tokens),
+        tools: tools.clone(),
+        tool_choice,
+        stream: false,
+        metadata,
+    };
+    let run_id = Uuid::new_v4().to_string();
+    let started_at = Utc::now();
+    let started_timer = Instant::now();
+    let prompt_summary = summarize_messages(&messages);
+    let result = provider.chat_completion(provider_request).await;
+    let ended_at = Utc::now();
+    let duration_ms = duration_ms(started_timer.elapsed());
+
+    match result {
+        Ok(response) => {
+            let output = response.content;
+            let model = response.model.unwrap_or(model);
+            let record = RunRecord {
+                id: run_id.clone(),
+                app_id: Some(policy.app.id.clone()),
+                agent_id: Some(policy.agent.id.clone()),
+                model_id: Some(policy.model.id.clone()),
+                resolved_tool_ids: policy.tools.iter().map(|tool| tool.id.clone()).collect(),
+                provider: provider_id,
+                model,
+                source_app: Some(policy.app.id.clone()),
+                prompt_summary,
+                response_summary: Some(truncate(&output, 500)),
+                status: RunStatus::Completed,
+                started_at,
+                ended_at,
+                duration_ms,
+                error: None,
+                usage: response.usage,
+            };
+            record_run(&state, record).await;
+            increment_agent_tasks_run(&state, &policy.agent.id).await?;
+            record_audit(
+                &state,
+                audit_record(
+                    "app.run_completed",
+                    AuditLevel::Info,
+                    format!("Completed run for app '{}'", policy.app.id),
+                    Some(policy.app.id.clone()),
+                    Some(policy.agent.id.clone()),
+                    Some(run_id.clone()),
+                    Some(serde_json::json!({
+                        "model_id": policy.model.id,
+                        "tool_ids": policy.tools.iter().map(|tool| tool.id.clone()).collect::<Vec<_>>(),
+                        "warnings": policy.warnings,
+                    })),
+                ),
+            )
+            .await;
+
+            Ok(Json(RunCreateResponse {
+                run_id,
+                status: RunStatus::Completed,
+                app_id: policy.app.id,
+                agent_id: policy.agent.id,
+                model_id: policy.model.id,
+                output,
+                duration_ms,
+            }))
+        }
+        Err(err) => {
+            let error = err.to_string();
+            let record = RunRecord {
+                id: run_id.clone(),
+                app_id: Some(policy.app.id.clone()),
+                agent_id: Some(policy.agent.id.clone()),
+                model_id: Some(policy.model.id.clone()),
+                resolved_tool_ids: policy.tools.iter().map(|tool| tool.id.clone()).collect(),
+                provider: provider_id,
+                model,
+                source_app: Some(policy.app.id.clone()),
+                prompt_summary,
+                response_summary: None,
+                status: RunStatus::Failed,
+                started_at,
+                ended_at,
+                duration_ms,
+                error: Some(error.clone()),
+                usage: None,
+            };
+            record_run(&state, record).await;
+            record_audit(
+                &state,
+                audit_record(
+                    "app.run_failed",
+                    AuditLevel::Error,
+                    error.clone(),
+                    Some(policy.app.id),
+                    Some(policy.agent.id),
+                    Some(run_id),
+                    Some(serde_json::json!({ "model_id": policy.model.id })),
+                ),
+            )
+            .await;
+            Err(api_error(StatusCode::BAD_GATEWAY, error))
+        }
+    }
+}
+
 async fn stream_chat(
     State(state): State<AppState>,
     Json(payload): Json<ChatRequest>,
@@ -822,6 +1710,10 @@ async fn stream_chat(
             let ended_at = Utc::now();
             let record = RunRecord {
                 id: run_id,
+                app_id: None,
+                agent_id: None,
+                model_id: None,
+                resolved_tool_ids: Vec::new(),
                 provider: resolved.provider_id,
                 model: resolved.model,
                 source_app: resolved.source_app,
@@ -885,9 +1777,173 @@ async fn stream_chat(
         let ended_at = Utc::now();
         let record = RunRecord {
             id: run_id,
+            app_id: None,
+            agent_id: None,
+            model_id: None,
+            resolved_tool_ids: Vec::new(),
             provider: resolved.provider_id,
             model: resolved.model,
             source_app: resolved.source_app,
+            prompt_summary,
+            response_summary: Some(truncate(&response_summary, 500)),
+            status: if error.is_some() { RunStatus::Failed } else { RunStatus::Completed },
+            started_at,
+            ended_at,
+            duration_ms: duration_ms(started_timer.elapsed()),
+            error,
+            usage,
+        };
+        record_run(&stream_state, record).await;
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+async fn stream_run(
+    State(state): State<AppState>,
+    Json(payload): Json<RunCreateRequest>,
+) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    let app_env = load_app_env().await?;
+    let config = hydrate_config_secrets(state.config.read().await.clone(), &app_env);
+    let catalog = state.catalog.read().await.clone();
+    let fallback_model = first_ollama_model_name(&state, &config).await;
+    let policy = app_policy::resolve_app_policy(
+        &catalog,
+        &config,
+        &payload.app_id,
+        payload.agent_id.as_deref(),
+        fallback_model.as_deref(),
+    )
+    .map_err(app_policy_api_error)?;
+
+    if policy.provider_model.trim().is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("agent '{}' has no resolved model", policy.agent.id),
+        ));
+    }
+
+    let mut messages = normalize_messages(payload.messages, payload.input)?;
+    messages = apply_agent_context(
+        &config.instructions,
+        &policy.agent,
+        payload.instructions,
+        payload.context,
+        messages,
+    );
+    let tools = provider_tools_from_policy(&policy.tools);
+    let generation = payload.generation.unwrap_or(policy.generation.clone());
+    let metadata = Some(run_metadata(
+        payload.metadata,
+        &policy.app.id,
+        &policy.agent.id,
+        &policy.model.id,
+    ));
+    let (provider_id, model, provider) =
+        provider_for_request(&state, &config, &policy.provider_id, &policy.provider_model)?;
+
+    let provider_request = ProviderChatRequest {
+        provider: provider_id.clone(),
+        model: model.clone(),
+        messages: messages.clone(),
+        temperature: Some(generation.temperature),
+        top_p: Some(generation.top_p),
+        max_tokens: Some(generation.max_tokens),
+        tools,
+        tool_choice: None,
+        stream: true,
+        metadata,
+    };
+    let run_id = Uuid::new_v4().to_string();
+    let started_at = Utc::now();
+    let started_timer = Instant::now();
+    let prompt_summary = summarize_messages(&messages);
+
+    let provider_stream = match provider.stream_chat_completion(provider_request).await {
+        Ok(provider_stream) => provider_stream,
+        Err(err) => {
+            let error = err.to_string();
+            let ended_at = Utc::now();
+            let record = RunRecord {
+                id: run_id,
+                app_id: Some(policy.app.id),
+                agent_id: Some(policy.agent.id),
+                model_id: Some(policy.model.id),
+                resolved_tool_ids: policy.tools.iter().map(|tool| tool.id.clone()).collect(),
+                provider: provider_id,
+                model,
+                source_app: Some(payload.app_id),
+                prompt_summary,
+                response_summary: None,
+                status: RunStatus::Failed,
+                started_at,
+                ended_at,
+                duration_ms: duration_ms(started_timer.elapsed()),
+                error: Some(error.clone()),
+                usage: None,
+            };
+            record_run(&state, record).await;
+            return Err(api_error(StatusCode::BAD_GATEWAY, error));
+        }
+    };
+
+    let stream_state = state.clone();
+    let stream = async_stream::stream! {
+        let mut provider_stream = provider_stream;
+        let mut response_summary = String::new();
+        let mut error: Option<String> = None;
+        let mut usage: Option<TokenUsage> = None;
+
+        while let Some(event) = provider_stream.next().await {
+            match event {
+                ProviderStreamEvent::Token { content } => {
+                    response_summary.push_str(&content);
+                    if let Ok(event) = Event::default()
+                        .event("token")
+                        .json_data(StreamEvent {
+                            run_id: &run_id,
+                            content: &content,
+                        }) {
+                        yield Ok(event);
+                    }
+                }
+                ProviderStreamEvent::Done { usage: event_usage, raw } => {
+                    usage = event_usage;
+                    if let Ok(event) = Event::default()
+                        .event("done")
+                        .json_data(serde_json::json!({ "run_id": run_id, "usage": usage, "raw": raw })) {
+                        yield Ok(event);
+                    }
+                }
+                ProviderStreamEvent::Error { error: message } => {
+                    error = Some(message.clone());
+                    if let Ok(event) = Event::default()
+                        .event("error")
+                        .json_data(serde_json::json!({ "run_id": run_id, "error": message })) {
+                        yield Ok(event);
+                    }
+                    break;
+                }
+                ProviderStreamEvent::Raw { data } => {
+                    yield Ok(Event::default().event("raw").data(data));
+                }
+            }
+        }
+
+        let ended_at = Utc::now();
+        let app_id = policy.app.id.clone();
+        let agent_id = policy.agent.id.clone();
+        let model_id = policy.model.id.clone();
+        let tool_ids = policy.tools.iter().map(|tool| tool.id.clone()).collect();
+        let record = RunRecord {
+            id: run_id,
+            app_id: Some(app_id),
+            agent_id: Some(agent_id),
+            model_id: Some(model_id),
+            resolved_tool_ids: tool_ids,
+            provider: provider_id,
+            model,
+            source_app: Some(policy.app.id),
             prompt_summary,
             response_summary: Some(truncate(&response_summary, 500)),
             status: if error.is_some() { RunStatus::Failed } else { RunStatus::Completed },
@@ -917,6 +1973,22 @@ async fn list_runs(
         .cloned()
         .collect();
     Json(RunsResponse { runs })
+}
+
+async fn list_audit(
+    State(state): State<AppState>,
+    Query(query): Query<AuditQuery>,
+) -> Json<AuditResponse> {
+    let limit = query.limit.unwrap_or(50).min(MAX_RECENT_AUDIT);
+    let audit = state
+        .audit
+        .read()
+        .await
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect();
+    Json(AuditResponse { audit })
 }
 
 async fn get_settings(State(state): State<AppState>) -> Json<AppConfig> {
@@ -1046,24 +2118,6 @@ async fn update_settings(
     Ok(Json(config))
 }
 
-async fn tools_placeholder() -> Json<ToolsResponse> {
-    Json(ToolsResponse {
-        enabled: false,
-        summary: "Tool calling is intentionally out of scope for the MVP. This endpoint documents the future local-only registry shape.",
-        planned_registry_shape: serde_json::json!({
-            "tools": [
-                {
-                    "name": "string",
-                    "description": "string",
-                    "input_schema": {},
-                    "local_only": true,
-                    "enabled": false
-                }
-            ]
-        }),
-    })
-}
-
 async fn chat_with_payload(state: AppState, payload: ChatRequest) -> ApiResult<Json<ChatResponse>> {
     let resolved = resolve_chat(&state, payload).await?;
     let provider_request = resolved.provider_request(false);
@@ -1083,6 +2137,10 @@ async fn chat_with_payload(state: AppState, payload: ChatRequest) -> ApiResult<J
             let model = response.model.unwrap_or_else(|| resolved.model.clone());
             let record = RunRecord {
                 id: run_id.clone(),
+                app_id: None,
+                agent_id: None,
+                model_id: None,
+                resolved_tool_ids: Vec::new(),
                 provider: resolved.provider_id.clone(),
                 model: model.clone(),
                 source_app: resolved.source_app,
@@ -1112,6 +2170,10 @@ async fn chat_with_payload(state: AppState, payload: ChatRequest) -> ApiResult<J
             let error = err.to_string();
             let record = RunRecord {
                 id: run_id,
+                app_id: None,
+                agent_id: None,
+                model_id: None,
+                resolved_tool_ids: Vec::new(),
                 provider: resolved.provider_id,
                 model: resolved.model,
                 source_app: resolved.source_app,
@@ -1278,10 +2340,566 @@ fn apply_instructions(
     messages
 }
 
+fn apply_agent_context(
+    settings: &InstructionSettings,
+    agent: &AgentConfig,
+    request_instructions: Option<String>,
+    app_context: Option<serde_json::Value>,
+    mut messages: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    let mut parts = Vec::new();
+
+    if settings.enabled {
+        push_trimmed(&mut parts, &settings.system_prompt);
+
+        let tool_context = settings.tool_context.trim();
+        if !tool_context.is_empty() {
+            parts.push(format!(
+                "Available tools and tool instructions:\n{tool_context}"
+            ));
+        }
+    }
+
+    push_trimmed(&mut parts, &agent.system_prompt);
+
+    if let Some(instructions) = request_instructions {
+        let instructions = instructions.trim();
+        if !instructions.is_empty() {
+            parts.push(format!("Request-specific instructions:\n{instructions}"));
+        }
+    }
+
+    if let Some(context) = app_context {
+        parts.push(format!(
+            "App context:\n{}",
+            serde_json::to_string_pretty(&context).unwrap_or_else(|_| context.to_string())
+        ));
+    }
+
+    if !parts.is_empty() {
+        messages.insert(0, ChatMessage::text("system", parts.join("\n\n")));
+    }
+
+    messages
+}
+
+fn agent_from_create(
+    payload: AgentCreateRequest,
+    existing_ids: &[String],
+) -> ApiResult<AgentConfig> {
+    let mut agent = AgentConfig::default();
+    agent.id = payload
+        .id
+        .map(|id| normalize_agent_id(&id))
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| unique_agent_id(existing_ids));
+    if let Some(name) = payload.name {
+        agent.name = trim_or_default(name, "New agent");
+    }
+    if let Some(role) = payload.role {
+        agent.role = trim_or_default(role, "General assistant");
+    }
+    if let Some(description) = payload.description {
+        agent.description = description.trim().to_string();
+    }
+    if let Some(system_prompt) = payload.system_prompt {
+        agent.system_prompt = system_prompt.trim().to_string();
+    }
+    if let Some(default_model_id) = payload.default_model_id {
+        agent.default_model_id = nonempty_trimmed(default_model_id);
+    }
+    if let Some(provider_id) = payload.default_provider_id {
+        agent.default_provider_id = normalize_provider_id(&provider_id);
+    }
+    if let Some(model) = payload.default_model {
+        agent.default_model = model.trim().to_string();
+    }
+    if let Some(environment) = payload.default_environment {
+        agent.default_environment = normalize_agent_enum_value(&environment);
+    }
+    if let Some(autonomy) = payload.autonomy {
+        agent.autonomy = normalize_agent_enum_value(&autonomy);
+    }
+    if let Some(permissions) = payload.permissions {
+        agent.permissions = permissions;
+    }
+    if let Some(allowed_tool_ids) = payload.allowed_tool_ids {
+        agent.allowed_tool_ids = normalize_id_list(allowed_tool_ids);
+    }
+    if let Some(temperature) = payload.temperature {
+        agent.temperature = Some(temperature);
+    }
+    if let Some(max_tokens) = payload.max_tokens {
+        agent.max_tokens = Some(max_tokens);
+    }
+    if let Some(enabled) = payload.enabled {
+        agent.enabled = enabled;
+    }
+    if let Some(status) = payload.status {
+        agent.status = normalize_agent_status(&status)?;
+    }
+    agent.updated_at = timestamp_now();
+    Ok(agent)
+}
+
+fn apply_agent_patch(agent: &mut AgentConfig, patch: AgentPatch) -> ApiResult<()> {
+    if let Some(name) = patch.name {
+        agent.name = name;
+    }
+    if let Some(description) = patch.description {
+        agent.description = description;
+    }
+    if let Some(system_prompt) = patch.system_prompt {
+        agent.system_prompt = system_prompt;
+    }
+    if let Some(default_model_id) = patch.default_model_id {
+        agent.default_model_id = nonempty_trimmed(default_model_id);
+    }
+    if let Some(provider_id) = patch.default_provider_id {
+        agent.default_provider_id = normalize_provider_id(&provider_id);
+    }
+    if let Some(model) = patch.default_model {
+        agent.default_model = model.trim().to_string();
+    }
+    if let Some(allowed_tool_ids) = patch.allowed_tool_ids {
+        agent.allowed_tool_ids = normalize_id_list(allowed_tool_ids);
+    }
+    if let Some(temperature) = patch.temperature {
+        agent.temperature = Some(temperature);
+    }
+    if let Some(max_tokens) = patch.max_tokens {
+        agent.max_tokens = Some(max_tokens);
+    }
+    if let Some(enabled) = patch.enabled {
+        agent.enabled = enabled;
+    }
+    if let Some(status) = patch.status {
+        agent.status = normalize_agent_status(&status)?;
+    }
+    Ok(())
+}
+
+fn reject_protected_agent_patch_fields(value: &serde_json::Value) -> ApiResult<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "agent patch must be a JSON object"))?;
+    let allowed = [
+        "name",
+        "description",
+        "system_prompt",
+        "default_model_id",
+        "default_provider_id",
+        "default_model",
+        "allowed_tool_ids",
+        "temperature",
+        "max_tokens",
+        "enabled",
+        "status",
+    ];
+
+    for key in object.keys() {
+        if !allowed.iter().any(|allowed| allowed == key) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("agent field '{key}' cannot be patched"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+async fn validate_agent_defaults(
+    state: &AppState,
+    config: &AppConfig,
+    agent: &AgentConfig,
+) -> ApiResult<()> {
+    if agent.id.trim().is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "agent id is required"));
+    }
+    if !["draft", "paused", "active"].contains(&agent.status.as_str()) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid agent status '{}'", agent.status),
+        ));
+    }
+
+    let provider_id = agent.default_provider_id.trim();
+    if provider_id.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "default_provider_id is required",
+        ));
+    }
+
+    if agent_is_active(agent)
+        && agent.default_model.trim().is_empty()
+        && agent
+            .default_model_id
+            .as_deref()
+            .is_none_or(|model_id| model_id.trim().is_empty())
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "default_model or default_model_id is required for active agents",
+        ));
+    }
+
+    validate_agent_provider(config, provider_id)?;
+    validate_agent_model(state, config, provider_id, &agent.default_model).await
+}
+
+fn validate_agent_provider(config: &AppConfig, provider_id: &str) -> ApiResult<()> {
+    if provider_id == "ollama" {
+        return Ok(());
+    }
+
+    let provider = find_litellm_provider(config, provider_id).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("unknown model provider: {provider_id}"),
+        )
+    })?;
+    if !provider.enabled {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("provider '{provider_id}' is disabled"),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn validate_agent_model(
+    state: &AppState,
+    config: &AppConfig,
+    provider_id: &str,
+    model: &str,
+) -> ApiResult<()> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Ok(());
+    }
+
+    if provider_id == "ollama" {
+        if let Ok(models) = state.providers.list_ollama_models(config).await {
+            if !models.is_empty() && !models.iter().any(|item| item.name == model) {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("model '{model}' is not available for provider 'ollama'"),
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    let provider = find_litellm_provider(config, provider_id).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("unknown model provider: {provider_id}"),
+        )
+    })?;
+    let models = suggested_provider_models(&provider);
+    if !models.is_empty() {
+        let known_model = models.iter().any(|item| item == model)
+            || models
+                .iter()
+                .map(|item| litellm_model_for_provider(&provider, item))
+                .any(|item| item == model);
+        if !known_model {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("model '{model}' is not available for provider '{provider_id}'"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn agent_is_active(agent: &AgentConfig) -> bool {
+    agent.status == "active"
+}
+
+fn normalize_agent_status(status: &str) -> ApiResult<String> {
+    let status = normalize_agent_enum_value(status);
+    if ["draft", "paused", "active"].contains(&status.as_str()) {
+        Ok(status)
+    } else {
+        Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid agent status '{status}'"),
+        ))
+    }
+}
+
+fn normalize_agent_id(value: &str) -> String {
+    let id = normalize_provider_id(value);
+    if id.starts_with("ag_") {
+        id
+    } else if id.is_empty() {
+        String::new()
+    } else {
+        format!("ag_{id}")
+    }
+}
+
+fn unique_agent_id(existing_ids: &[String]) -> String {
+    loop {
+        let id = format!("ag_{}", Uuid::new_v4().simple());
+        if !existing_ids.iter().any(|existing| existing == &id) {
+            return id;
+        }
+    }
+}
+
+fn normalize_agent_enum_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace([' ', '_'], "-")
+}
+
+fn trim_or_default(value: String, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn timestamp_now() -> String {
+    Utc::now().to_rfc3339()
+}
+
+async fn increment_agent_tasks_run(state: &AppState, agent_id: &str) -> ApiResult<()> {
+    let mut catalog = state.catalog.write().await;
+    if let Some(agent) = app_policy::find_agent_mut(&mut catalog, agent_id) {
+        agent.tasks_run = agent.tasks_run.saturating_add(1);
+        agent.updated_at = timestamp_now();
+        app_policy::save_agents(&state.catalog_dir, &catalog.agents)
+            .await
+            .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    }
+    Ok(())
+}
+
+fn agent_chat_metadata(
+    metadata: Option<serde_json::Value>,
+    source_app: &str,
+    agent_id: &str,
+) -> serde_json::Value {
+    let mut metadata = match metadata {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(value) => {
+            let mut map = serde_json::Map::new();
+            map.insert("request_metadata".to_string(), value);
+            map
+        }
+        None => serde_json::Map::new(),
+    };
+    metadata.insert("source_app".to_string(), serde_json::json!(source_app));
+    metadata.insert("agent_id".to_string(), serde_json::json!(agent_id));
+    serde_json::Value::Object(metadata)
+}
+
 fn push_trimmed(parts: &mut Vec<String>, value: &str) {
     let value = value.trim();
     if !value.is_empty() {
         parts.push(value.to_string());
+    }
+}
+
+async fn first_ollama_model_name(state: &AppState, config: &AppConfig) -> Option<String> {
+    state
+        .providers
+        .list_ollama_models(config)
+        .await
+        .ok()
+        .and_then(|models| models.into_iter().next())
+        .map(|model| model.name)
+}
+
+fn provider_for_request(
+    state: &AppState,
+    config: &AppConfig,
+    requested_provider_id: &str,
+    requested_model: &str,
+) -> ApiResult<(String, String, Arc<dyn ModelProvider>)> {
+    let requested_provider_id = requested_provider_id.trim().to_ascii_lowercase();
+    let requested_model = requested_model.trim();
+    if requested_model.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "model is required"));
+    }
+
+    let (provider_registry_id, model) = if requested_provider_id == "ollama"
+        || requested_provider_id == "litellm"
+    {
+        (requested_provider_id.clone(), requested_model.to_string())
+    } else if let Some(litellm_provider) = find_litellm_provider(config, &requested_provider_id) {
+        (
+            "litellm".to_string(),
+            litellm_model_for_provider(&litellm_provider, requested_model),
+        )
+    } else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("unknown model provider: {requested_provider_id}"),
+        ));
+    };
+    let provider = state
+        .providers
+        .get(&provider_registry_id, config)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown model provider: {requested_provider_id}"),
+            )
+        })?;
+
+    Ok((requested_provider_id, model, provider))
+}
+
+fn provider_tools_from_policy(tools: &[ToolConfig]) -> Option<serde_json::Value> {
+    let provider_tools = tools
+        .iter()
+        .filter(|tool| tool.enabled)
+        .map(|tool| {
+            let name = tool.id.replace('.', "_");
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema.clone().unwrap_or_else(|| serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": true
+                    }))
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if provider_tools.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Array(provider_tools))
+    }
+}
+
+fn tool_ids_from_provider_tools(tools: &Option<serde_json::Value>) -> Vec<String> {
+    tools
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn run_metadata(
+    metadata: Option<serde_json::Value>,
+    app_id: &str,
+    agent_id: &str,
+    model_id: &str,
+) -> serde_json::Value {
+    let mut metadata = match metadata {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(value) => {
+            let mut map = serde_json::Map::new();
+            map.insert("request_metadata".to_string(), value);
+            map
+        }
+        None => serde_json::Map::new(),
+    };
+    metadata.insert("app_id".to_string(), serde_json::json!(app_id));
+    metadata.insert("agent_id".to_string(), serde_json::json!(agent_id));
+    metadata.insert("model_id".to_string(), serde_json::json!(model_id));
+    serde_json::Value::Object(metadata)
+}
+
+fn app_policy_api_error(error: AppPolicyError) -> (StatusCode, Json<ApiError>) {
+    let status = match error.kind {
+        AppPolicyErrorKind::NotFound => StatusCode::NOT_FOUND,
+        AppPolicyErrorKind::Disabled => StatusCode::FORBIDDEN,
+        AppPolicyErrorKind::Forbidden => StatusCode::FORBIDDEN,
+        AppPolicyErrorKind::Misconfigured => StatusCode::BAD_REQUEST,
+    };
+    api_error(status, error.message)
+}
+
+fn audit_level_for_policy_error(error: &AppPolicyError) -> AuditLevel {
+    match error.kind {
+        AppPolicyErrorKind::Forbidden | AppPolicyErrorKind::Disabled => AuditLevel::Denied,
+        AppPolicyErrorKind::NotFound => AuditLevel::Warn,
+        AppPolicyErrorKind::Misconfigured => AuditLevel::Error,
+    }
+}
+
+fn audit_record(
+    event: impl Into<String>,
+    level: AuditLevel,
+    message: impl Into<String>,
+    app_id: Option<String>,
+    agent_id: Option<String>,
+    run_id: Option<String>,
+    metadata: Option<serde_json::Value>,
+) -> AuditRecord {
+    AuditRecord {
+        id: format!("audit_{}", Uuid::new_v4().simple()),
+        event: event.into(),
+        level,
+        message: message.into(),
+        app_id,
+        agent_id,
+        run_id,
+        metadata,
+        created_at: Utc::now(),
+    }
+}
+
+async fn record_audit(state: &AppState, record: AuditRecord) {
+    let logging_enabled = state.config.read().await.logging_enabled;
+    {
+        let mut history = state.audit.write().await;
+        runs::push_recent_audit(&mut history, record.clone(), MAX_RECENT_AUDIT);
+    }
+
+    if logging_enabled {
+        if let Err(err) = runs::append_audit_jsonl(&state.audit_path, &record).await {
+            tracing::warn!(error = %err, "failed to append audit log");
+        }
+    }
+}
+
+fn normalize_id_list(ids: Vec<String>) -> Vec<String> {
+    ids.into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .fold(Vec::new(), |mut acc, id| {
+            if !acc
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&id))
+            {
+                acc.push(id);
+            }
+            acc
+        })
+}
+
+fn nonempty_trimmed(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
     }
 }
 
@@ -2253,5 +3871,116 @@ mod tests {
             Some("sk-draft")
         );
         assert_eq!(providers[0].api_key.as_deref(), Some("sk-draft"));
+    }
+
+    #[test]
+    fn protected_agent_patch_fields_are_rejected() {
+        let patch = serde_json::json!({
+            "name": "Notebook helper",
+            "tasks_run": 12
+        });
+
+        assert!(reject_protected_agent_patch_fields(&patch).is_err());
+    }
+
+    #[test]
+    fn app_editable_agent_patch_fields_are_allowed() {
+        let patch = serde_json::json!({
+            "name": "Notebook helper",
+            "description": "Helps with current notes",
+            "system_prompt": "Stay concise.",
+            "default_model_id": "ollama-default",
+            "default_provider_id": "ollama",
+            "default_model": "qwen2.5:7b",
+            "allowed_tool_ids": ["notes.read"],
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "enabled": true,
+            "status": "active"
+        });
+
+        assert!(reject_protected_agent_patch_fields(&patch).is_ok());
+    }
+
+    #[test]
+    fn agent_patch_preserves_editing_spaces() {
+        let mut agent = AgentConfig::default();
+        let result = apply_agent_patch(
+            &mut agent,
+            AgentPatch {
+                name: Some("Notebook helper ".to_string()),
+                description: Some("Draft with normal spaces ".to_string()),
+                system_prompt: Some("Keep user spacing intact. ".to_string()),
+                default_model_id: None,
+                default_provider_id: None,
+                default_model: None,
+                allowed_tool_ids: None,
+                temperature: None,
+                max_tokens: None,
+                enabled: None,
+                status: None,
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(agent.name, "Notebook helper ");
+        assert_eq!(agent.description, "Draft with normal spaces ");
+        assert_eq!(agent.system_prompt, "Keep user spacing intact. ");
+    }
+
+    #[test]
+    fn agent_context_prepends_agent_prompt_and_app_context() {
+        let mut agent = AgentConfig::default();
+        agent.system_prompt = "Use the current page context.".to_string();
+        let messages = apply_agent_context(
+            &InstructionSettings::default(),
+            &agent,
+            Some("Return a tool call when editing.".to_string()),
+            Some(serde_json::json!({ "activePage": { "title": "Daily" } })),
+            vec![ChatMessage::text("user", "Append the summary.")],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0]
+            .content_text()
+            .contains("Use the current page context."));
+        assert!(messages[0].content_text().contains("Return a tool call"));
+        assert!(messages[0].content_text().contains("activePage"));
+    }
+
+    #[test]
+    fn configured_tools_use_openai_function_shape_when_enabled() {
+        let tools = provider_tools_from_policy(&[ToolConfig {
+            id: "notes.read".to_string(),
+            name: "Read Notes".to_string(),
+            description: "Read note content.".to_string(),
+            risk_level: "low".to_string(),
+            enabled: true,
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" }
+                },
+                "required": ["query"]
+            })),
+            output_schema: None,
+        }])
+        .expect("enabled tool should produce provider tools");
+        let tools = tools.as_array().expect("tools should be an array");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0]
+                .pointer("/function/name")
+                .and_then(serde_json::Value::as_str),
+            Some("notes_read")
+        );
+        assert_eq!(
+            tools[0]
+                .pointer("/function/parameters/properties/query/type")
+                .and_then(serde_json::Value::as_str),
+            Some("string")
+        );
     }
 }

@@ -43,6 +43,64 @@ export type ModelRoute = {
   notes: string | null;
 };
 
+export type AgentPermissions = {
+  browser: boolean;
+  file_read: boolean;
+  file_write: boolean;
+  terminal: boolean;
+};
+
+export type AgentRecord = {
+  id: string;
+  name: string;
+  role: string;
+  description: string;
+  system_prompt: string;
+  default_model_id: string | null;
+  default_provider_id: string;
+  default_model: string;
+  default_environment: string;
+  autonomy: "observe" | "ask" | "low-risk" | "autonomous" | string;
+  permissions: AgentPermissions;
+  allowed_tool_ids: string[];
+  temperature: number | null;
+  max_tokens: number | null;
+  enabled: boolean;
+  status: "active" | "paused" | "draft";
+  tasks_run: number;
+  updated_at: string;
+};
+
+export type AgentCreateRequest = Partial<AgentRecord>;
+
+export type AgentPatch = Partial<
+  Pick<
+    AgentRecord,
+    | "name"
+    | "description"
+    | "system_prompt"
+    | "default_model_id"
+    | "default_provider_id"
+    | "default_model"
+    | "allowed_tool_ids"
+    | "temperature"
+    | "max_tokens"
+    | "enabled"
+    | "status"
+  >
+>;
+
+export type SetupStatus = {
+  litellm_enabled: boolean;
+  litellm_ready: boolean;
+  usable_provider_count: number;
+  usable_model_count: number;
+  active_agent_count: number;
+  ready: boolean;
+  next_step: "start_litellm" | "add_provider" | "select_model" | "create_agent" | "ready";
+  missing_steps: Array<"start_litellm" | "add_provider" | "select_model" | "create_agent" | "ready">;
+};
+
 export type Settings = {
   ollama_endpoint: string;
   default_provider: string;
@@ -55,6 +113,63 @@ export type Settings = {
   litellm: LiteLlmSettings;
   litellm_providers: LiteLlmProviderConfig[];
   model_routes: ModelRoute[];
+  agents: AgentRecord[];
+};
+
+export type AppRecord = {
+  id: string;
+  name: string;
+  description: string | null;
+  defaultAgentId: string;
+  allowedAgentIds: string[];
+  allowedToolIds: string[] | null;
+  enabled: boolean;
+};
+
+export type AppPatch = Partial<
+  Pick<AppRecord, "name" | "description" | "defaultAgentId" | "allowedAgentIds" | "allowedToolIds" | "enabled">
+>;
+
+export type ToolRecord = {
+  id: string;
+  name: string;
+  description: string;
+  riskLevel: "low" | "medium" | "high" | string;
+  enabled: boolean;
+  inputSchema: unknown | null;
+  outputSchema: unknown | null;
+};
+
+export type ToolPatch = Partial<Pick<ToolRecord, "name" | "description" | "riskLevel" | "enabled" | "inputSchema" | "outputSchema">>;
+
+export type AppCapabilities = {
+  appId: string;
+  appName: string;
+  defaultAgent: {
+    id: string;
+    name: string;
+    description: string;
+  };
+  allowedAgents: Array<{
+    id: string;
+    name: string;
+    description: string;
+  }>;
+  tools: Array<{
+    id: string;
+    name: string;
+    description: string;
+    riskLevel: string;
+    enabled: boolean;
+  }>;
+  model: {
+    id: string;
+    name: string;
+    provider: string;
+    modelName: string;
+    status: string;
+  };
+  warnings?: string[];
 };
 
 export type Health = {
@@ -90,6 +205,10 @@ export type ModelsResponse = {
 
 export type RunRecord = {
   id: string;
+  app_id?: string | null;
+  agent_id?: string | null;
+  model_id?: string | null;
+  resolved_tool_ids?: string[];
   provider: string;
   model: string;
   source_app: string | null;
@@ -101,6 +220,39 @@ export type RunRecord = {
   duration_ms: number;
   error: string | null;
   usage?: TokenUsage | null;
+};
+
+export type AuditRecord = {
+  id: string;
+  event: string;
+  level: "info" | "warn" | "denied" | "error";
+  message: string;
+  app_id?: string | null;
+  agent_id?: string | null;
+  run_id?: string | null;
+  metadata?: unknown | null;
+  created_at: string;
+};
+
+export type RunCreateRequest = {
+  appId: string;
+  agentId?: string | null;
+  input?: string;
+  messages?: Array<{ role: string; content: string | unknown }>;
+  instructions?: string;
+  context?: unknown;
+  generation?: GenerationSettings;
+  metadata?: unknown;
+};
+
+export type RunCreateResponse = {
+  runId: string;
+  status: "completed" | "failed";
+  appId: string;
+  agentId: string;
+  modelId: string;
+  output: string;
+  durationMs: number;
 };
 
 export type TokenUsage = {
@@ -210,6 +362,33 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<Health>("/health"),
+  setupStatus: () => request<SetupStatus>("/api/setup/status"),
+  agents: () => request<AgentRecord[]>("/api/agents"),
+  agent: (agentId: string) => request<AgentRecord>(`/api/agents/${encodeURIComponent(agentId)}`),
+  createAgent: (agent: AgentCreateRequest) =>
+    request<AgentRecord>("/api/agents", {
+      method: "POST",
+      body: JSON.stringify(agent),
+    }),
+  patchAgent: (agentId: string, patch: AgentPatch) =>
+    request<AgentRecord>(`/api/agents/${encodeURIComponent(agentId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  apps: () => request<AppRecord[]>("/api/apps"),
+  app: (appId: string) => request<AppRecord>(`/api/apps/${encodeURIComponent(appId)}`),
+  patchApp: (appId: string, patch: AppPatch) =>
+    request<AppRecord>(`/api/apps/${encodeURIComponent(appId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  appCapabilities: (appId: string) => request<AppCapabilities>(`/api/apps/${encodeURIComponent(appId)}/capabilities`),
+  tools: () => request<ToolRecord[]>("/api/tools"),
+  patchTool: (toolId: string, patch: ToolPatch) =>
+    request<ToolRecord>(`/api/tools/${encodeURIComponent(toolId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
   providers: () => request<ProviderStatus[]>("/api/providers"),
   providerModels: (providerId: string) => request<ProviderModelsResponse>(`/api/providers/${encodeURIComponent(providerId)}/models`),
   models: () => request<ModelsResponse>("/api/models"),
@@ -263,5 +442,10 @@ export const api = {
       }),
     }),
   runs: (limit = 50) => request<{ runs: RunRecord[] }>(`/api/runs?limit=${limit}`),
-  tools: () => request<unknown>("/api/tools"),
+  createRun: (payload: RunCreateRequest) =>
+    request<RunCreateResponse>("/api/runs", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  audit: (limit = 50) => request<{ audit: AuditRecord[] }>(`/api/audit?limit=${limit}`),
 };

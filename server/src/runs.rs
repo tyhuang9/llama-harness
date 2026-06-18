@@ -11,6 +11,29 @@ use tokio::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunRecord {
     pub id: String,
+    #[serde(
+        default,
+        alias = "appId",
+        alias = "app_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub app_id: Option<String>,
+    #[serde(
+        default,
+        alias = "agentId",
+        alias = "agent_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub agent_id: Option<String>,
+    #[serde(
+        default,
+        alias = "modelId",
+        alias = "model_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_tool_ids: Vec<String>,
     #[serde(default = "default_provider")]
     pub provider: String,
     pub model: String,
@@ -24,6 +47,32 @@ pub struct RunRecord {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub id: String,
+    pub event: String,
+    pub level: AuditLevel,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditLevel {
+    Info,
+    Warn,
+    Denied,
+    Error,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,6 +110,30 @@ pub async fn load_runs(path: &Path, max_records: usize) -> Result<VecDeque<RunRe
     }
 }
 
+pub async fn load_audit(path: &Path, max_records: usize) -> Result<VecDeque<AuditRecord>> {
+    match fs::read_to_string(path).await {
+        Ok(contents) => {
+            let mut records = VecDeque::new();
+            for line in contents
+                .lines()
+                .rev()
+                .filter(|line| !line.trim().is_empty())
+            {
+                if records.len() >= max_records {
+                    break;
+                }
+                match serde_json::from_str::<AuditRecord>(line) {
+                    Ok(record) => records.push_back(record),
+                    Err(err) => tracing::warn!(error = %err, "skipping malformed audit log line"),
+                }
+            }
+            Ok(records)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(VecDeque::new()),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
 pub fn push_recent(history: &mut VecDeque<RunRecord>, record: RunRecord, max_records: usize) {
     history.push_front(record);
     while history.len() > max_records {
@@ -68,7 +141,29 @@ pub fn push_recent(history: &mut VecDeque<RunRecord>, record: RunRecord, max_rec
     }
 }
 
+pub fn push_recent_audit(
+    history: &mut VecDeque<AuditRecord>,
+    record: AuditRecord,
+    max_records: usize,
+) {
+    history.push_front(record);
+    while history.len() > max_records {
+        history.pop_back();
+    }
+}
+
 pub async fn append_jsonl(path: &Path, record: &RunRecord) -> Result<()> {
+    append_record_jsonl(path, record).await
+}
+
+pub async fn append_audit_jsonl(path: &Path, record: &AuditRecord) -> Result<()> {
+    append_record_jsonl(path, record).await
+}
+
+async fn append_record_jsonl<T>(path: &Path, record: &T) -> Result<()>
+where
+    T: Serialize,
+{
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)

@@ -1,0 +1,29 @@
+[
+  {
+    "id": "notes.read",
+    "name": "Read Notes",
+    "description": "Read note content supplied by the Note app.",
+    "riskLevel": "low",
+    "enabled": false,
+    "inputSchema": null,
+    "outputSchema": null
+  },
+  {
+    "id": "notes.search",
+    "name": "Search Notes",
+    "description": "Search note content supplied by the Note app.",
+    "riskLevel": "low",
+    "enabled": false,
+    "inputSchema": null,
+    "outputSchema": null
+  },
+  {
+    "id": "reminders.create",
+    "name": "Create Reminder",
+    "description": "Create a reminder requested from note context.",
+    "riskLevel": "medium",
+    "enabled": false,
+    "inputSchema": null,
+    "outputSchema": null
+  }
+]
