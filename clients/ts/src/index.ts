@@ -273,6 +273,79 @@ export type AppCapabilities = {
   warnings?: string[];
 };
 
+export type PairingStatus = "pending" | "approved" | "denied" | "expired";
+export type AppTokenKind = "pairing" | "service";
+
+export type AppPairingSummary = {
+  id: string;
+  appId: string;
+  appName: string;
+  requestedScopes: string[];
+  origin: string | null;
+  redirectUri: string | null;
+  userCode: string;
+  status: PairingStatus;
+  createdAt: string;
+  expiresAt: string;
+  approvedAt: string | null;
+  deniedAt: string | null;
+  deliveredAt: string | null;
+};
+
+export type AppTokenSummary = {
+  id: string;
+  appId: string;
+  name: string;
+  scopes: string[];
+  origin: string | null;
+  kind: AppTokenKind;
+  createdAt: string;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  revokedAt: string | null;
+};
+
+export type ConnectionsResponse = {
+  pairings: AppPairingSummary[];
+  tokens: AppTokenSummary[];
+};
+
+export type PairingStartRequest = {
+  appId: string;
+  appName?: string;
+  requestedScopes?: string[];
+  origin?: string;
+  redirectUri?: string;
+};
+
+export type PairingStartResponse = {
+  pairingId: string;
+  pairingSecret: string;
+  userCode: string;
+  verificationUri: string;
+  expiresAt: string;
+};
+
+export type PairingExchangeResponse = {
+  status: "approved";
+  appId: string;
+  tokenId: string;
+  token: string;
+  scopes: string[];
+};
+
+export type ServiceTokenCreateRequest = {
+  name?: string;
+  scopes?: string[];
+  origin?: string;
+  expiresAt?: string;
+};
+
+export type IssuedAppTokenResponse = {
+  token: string;
+  record: AppTokenSummary;
+};
+
 export type ToolRecord = {
   id: string;
   name: string;
@@ -443,6 +516,50 @@ export class LlamaHarnessClient {
 
   appCapabilities(appId: string): Promise<AppCapabilities> {
     return this.request(`/api/apps/${encodeURIComponent(appId)}/capabilities`);
+  }
+
+  startPairing(request: PairingStartRequest): Promise<PairingStartResponse> {
+    return this.request("/api/pairing/start", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  exchangePairing(pairingId: string, pairingSecret: string): Promise<PairingExchangeResponse> {
+    return this.request(`/api/pairing/${encodeURIComponent(pairingId)}/exchange`, {
+      method: "POST",
+      body: JSON.stringify({ pairingSecret }),
+    });
+  }
+
+  listConnections(): Promise<ConnectionsResponse> {
+    return this.request("/api/admin/connections");
+  }
+
+  approvePairing(pairingId: string, scopes?: string[]): Promise<AppPairingSummary> {
+    return this.request(`/api/admin/pairing/${encodeURIComponent(pairingId)}/approve`, {
+      method: "POST",
+      body: JSON.stringify({ scopes }),
+    });
+  }
+
+  denyPairing(pairingId: string): Promise<AppPairingSummary> {
+    return this.request(`/api/admin/pairing/${encodeURIComponent(pairingId)}/deny`, {
+      method: "POST",
+    });
+  }
+
+  createServiceToken(appId: string, request: ServiceTokenCreateRequest): Promise<IssuedAppTokenResponse> {
+    return this.request(`/api/admin/apps/${encodeURIComponent(appId)}/tokens`, {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  revokeAppToken(appId: string, tokenId: string): Promise<AppTokenSummary> {
+    return this.request(`/api/admin/apps/${encodeURIComponent(appId)}/tokens/${encodeURIComponent(tokenId)}/revoke`, {
+      method: "POST",
+    });
   }
 
   listTools(): Promise<ToolRecord[]> {

@@ -130,6 +130,79 @@ export type AppPatch = Partial<
   Pick<AppRecord, "name" | "description" | "defaultAgentId" | "allowedAgentIds" | "allowedToolIds" | "enabled">
 >;
 
+export type PairingStatus = "pending" | "approved" | "denied" | "expired";
+export type AppTokenKind = "pairing" | "service";
+
+export type AppPairingSummary = {
+  id: string;
+  appId: string;
+  appName: string;
+  requestedScopes: string[];
+  origin: string | null;
+  redirectUri: string | null;
+  userCode: string;
+  status: PairingStatus;
+  createdAt: string;
+  expiresAt: string;
+  approvedAt: string | null;
+  deniedAt: string | null;
+  deliveredAt: string | null;
+};
+
+export type AppTokenSummary = {
+  id: string;
+  appId: string;
+  name: string;
+  scopes: string[];
+  origin: string | null;
+  kind: AppTokenKind;
+  createdAt: string;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  revokedAt: string | null;
+};
+
+export type ConnectionsResponse = {
+  pairings: AppPairingSummary[];
+  tokens: AppTokenSummary[];
+};
+
+export type PairingStartRequest = {
+  appId: string;
+  appName?: string;
+  requestedScopes?: string[];
+  origin?: string;
+  redirectUri?: string;
+};
+
+export type PairingStartResponse = {
+  pairingId: string;
+  pairingSecret: string;
+  userCode: string;
+  verificationUri: string;
+  expiresAt: string;
+};
+
+export type PairingExchangeResponse = {
+  status: "approved";
+  appId: string;
+  tokenId: string;
+  token: string;
+  scopes: string[];
+};
+
+export type ServiceTokenCreateRequest = {
+  name?: string;
+  scopes?: string[];
+  origin?: string;
+  expiresAt?: string;
+};
+
+export type IssuedAppTokenResponse = {
+  token: string;
+  record: AppTokenSummary;
+};
+
 export type ToolRecord = {
   id: string;
   name: string;
@@ -405,6 +478,37 @@ export const api = {
       body: JSON.stringify(patch),
     }),
   appCapabilities: (appId: string) => request<AppCapabilities>(`/api/apps/${encodeURIComponent(appId)}/capabilities`),
+  adminAppCapabilities: (appId: string) =>
+    request<AppCapabilities>(`/api/admin/apps/${encodeURIComponent(appId)}/capabilities`),
+  startPairing: (payload: PairingStartRequest) =>
+    request<PairingStartResponse>("/api/pairing/start", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  exchangePairing: (pairingId: string, pairingSecret: string) =>
+    request<PairingExchangeResponse>(`/api/pairing/${encodeURIComponent(pairingId)}/exchange`, {
+      method: "POST",
+      body: JSON.stringify({ pairingSecret }),
+    }),
+  connections: () => request<ConnectionsResponse>("/api/admin/connections"),
+  approvePairing: (pairingId: string, scopes?: string[]) =>
+    request<AppPairingSummary>(`/api/admin/pairing/${encodeURIComponent(pairingId)}/approve`, {
+      method: "POST",
+      body: JSON.stringify({ scopes }),
+    }),
+  denyPairing: (pairingId: string) =>
+    request<AppPairingSummary>(`/api/admin/pairing/${encodeURIComponent(pairingId)}/deny`, {
+      method: "POST",
+    }),
+  createServiceToken: (appId: string, payload: ServiceTokenCreateRequest) =>
+    request<IssuedAppTokenResponse>(`/api/admin/apps/${encodeURIComponent(appId)}/tokens`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  revokeAppToken: (appId: string, tokenId: string) =>
+    request<AppTokenSummary>(`/api/admin/apps/${encodeURIComponent(appId)}/tokens/${encodeURIComponent(tokenId)}/revoke`, {
+      method: "POST",
+    }),
   tools: () => request<ToolRecord[]>("/api/tools"),
   patchTool: (toolId: string, patch: ToolPatch) =>
     request<ToolRecord>(`/api/tools/${encodeURIComponent(toolId)}`, {
