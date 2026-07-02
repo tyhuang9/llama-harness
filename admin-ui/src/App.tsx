@@ -6,8 +6,11 @@ import {
   AgentPatch,
   AgentRecord,
   AppCapabilities,
+  AppPairingSummary,
   AppRecord,
+  AppTokenSummary,
   ApplyLiteLlmProvidersResponse,
+  ConnectionsResponse,
   AuditRecord as ServerAuditRecord,
   ChatResponse,
   GenerateLiteLlmConfigResponse,
@@ -21,6 +24,7 @@ import {
   ProviderModelsResponse,
   ProviderStatus,
   RunRecord,
+  ServiceTokenCreateRequest,
   setApiBase,
   Settings,
   ToolRecord,
@@ -78,6 +82,8 @@ const nav: Array<{ id: Page; label: string; detail?: string }> = [
   { id: "instructions", label: "Instructions", detail: "Global prompts" },
   { id: "settings", label: "Settings", detail: "API and generation" },
 ];
+
+const DEFAULT_APP_SCOPES = ["capabilities:read", "runs:create", "runs:stream", "tool-results:submit"];
 
 const taskFilters: Array<TaskStatus | "all"> = [
   "all",
@@ -302,6 +308,7 @@ export default function App() {
   const [apps, setApps] = useState<AppRecord[]>([]);
   const [tools, setTools] = useState<ToolRecord[]>([]);
   const [appCapabilities, setAppCapabilities] = useState<Record<string, AppCapabilities>>({});
+  const [connections, setConnections] = useState<ConnectionsResponse>({ pairings: [], tokens: [] });
   const [serverAudit, setServerAudit] = useState<ServerAuditRecord[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [apiBaseInput, setApiBaseInput] = useState(getApiBase());
@@ -330,7 +337,17 @@ export default function App() {
 
   async function refreshAll(fakeDataOverride = fakeDataEnabled) {
     setError(null);
-    const [healthResult, settingsResult, runsResult, providersResult, agentsResult, appsResult, toolsResult, auditResult] = await Promise.allSettled([
+    const [
+      healthResult,
+      settingsResult,
+      runsResult,
+      providersResult,
+      agentsResult,
+      appsResult,
+      toolsResult,
+      auditResult,
+      connectionsResult,
+    ] = await Promise.allSettled([
       api.health(),
       api.settings(),
       api.runs(50),
@@ -339,6 +356,7 @@ export default function App() {
       api.apps(),
       api.tools(),
       api.audit(50),
+      api.connections(),
     ]);
 
     if (healthResult.status === "fulfilled") {
@@ -368,7 +386,7 @@ export default function App() {
 
     if (appsResult.status === "fulfilled") {
       setApps(appsResult.value);
-      const capabilityEntries = await Promise.allSettled(appsResult.value.map((app) => api.appCapabilities(app.id)));
+      const capabilityEntries = await Promise.allSettled(appsResult.value.map((app) => api.adminAppCapabilities(app.id)));
       const nextCapabilities: Record<string, AppCapabilities> = {};
       capabilityEntries.forEach((result, index) => {
         if (result.status === "fulfilled") {
@@ -384,6 +402,10 @@ export default function App() {
 
     if (auditResult.status === "fulfilled") {
       setServerAudit(auditResult.value.audit);
+    }
+
+    if (connectionsResult.status === "fulfilled") {
+      setConnections(connectionsResult.value);
     }
 
     try {
@@ -667,7 +689,7 @@ export default function App() {
     try {
       const updated = await api.patchApp(appId, patch);
       setApps((list) => list.map((app) => (app.id === appId ? updated : app)));
-      const capabilities = await api.appCapabilities(appId);
+      const capabilities = await api.adminAppCapabilities(appId);
       setAppCapabilities((current) => ({ ...current, [appId]: capabilities }));
     } catch (err) {
       setError((err as Error).message);
@@ -679,7 +701,7 @@ export default function App() {
     try {
       const updated = await api.patchTool(toolId, patch);
       setTools((list) => list.map((tool) => (tool.id === toolId ? updated : tool)));
-      const capabilityEntries = await Promise.allSettled(apps.map((app) => api.appCapabilities(app.id)));
+      const capabilityEntries = await Promise.allSettled(apps.map((app) => api.adminAppCapabilities(app.id)));
       const nextCapabilities: Record<string, AppCapabilities> = {};
       capabilityEntries.forEach((result, index) => {
         if (result.status === "fulfilled") {
@@ -691,6 +713,32 @@ export default function App() {
       setError((err as Error).message);
       await refreshAll().catch(() => undefined);
     }
+  }
+
+  async function refreshConnections() {
+    const result = await api.connections();
+    setConnections(result);
+  }
+
+  async function approvePairing(pairingId: string, scopes?: string[]) {
+    await api.approvePairing(pairingId, scopes);
+    await refreshConnections();
+  }
+
+  async function denyPairing(pairingId: string) {
+    await api.denyPairing(pairingId);
+    await refreshConnections();
+  }
+
+  async function createServiceToken(appId: string, payload: ServiceTokenCreateRequest) {
+    const issued = await api.createServiceToken(appId, payload);
+    await refreshConnections();
+    return issued;
+  }
+
+  async function revokeAppToken(appId: string, tokenId: string) {
+    await api.revokeAppToken(appId, tokenId);
+    await refreshConnections();
   }
 
   function openTask(taskId: string) {
@@ -930,7 +978,12 @@ export default function App() {
               agents={agents}
               tools={tools}
               capabilities={appCapabilities}
+              connections={connections}
               onPatchApp={patchAppRecord}
+              onApprovePairing={approvePairing}
+              onDenyPairing={denyPairing}
+              onCreateServiceToken={createServiceToken}
+              onRevokeAppToken={revokeAppToken}
             />
           ) : null}
           {page === "agents" ? (
@@ -1517,17 +1570,34 @@ function AppsPage({
   agents,
   tools,
   capabilities,
+  connections,
   onPatchApp,
+  onApprovePairing,
+  onDenyPairing,
+  onCreateServiceToken,
+  onRevokeAppToken,
 }: {
   apps: AppRecord[];
   agents: Agent[];
   tools: ToolRecord[];
   capabilities: Record<string, AppCapabilities>;
+  connections: ConnectionsResponse;
   onPatchApp: (appId: string, patch: Partial<AppRecord>) => Promise<void>;
+  onApprovePairing: (pairingId: string, scopes?: string[]) => Promise<void>;
+  onDenyPairing: (pairingId: string) => Promise<void>;
+  onCreateServiceToken: (appId: string, payload: ServiceTokenCreateRequest) => Promise<{ token: string; record: AppTokenSummary }>;
+  onRevokeAppToken: (appId: string, tokenId: string) => Promise<void>;
 }) {
   const [activeId, setActiveId] = useState(apps[0]?.id || "");
+  const [tokenName, setTokenName] = useState("");
+  const [tokenScopes, setTokenScopes] = useState(DEFAULT_APP_SCOPES.join(", "));
+  const [issuedToken, setIssuedToken] = useState<{ token: string; record: AppTokenSummary } | null>(null);
+  const [connectionBusy, setConnectionBusy] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const active = apps.find((app) => app.id === activeId) || apps[0];
   const preview = active ? capabilities[active.id] : null;
+  const activePairings = active ? connections.pairings.filter((pairing) => pairing.appId === active.id) : [];
+  const activeTokens = active ? connections.tokens.filter((token) => token.appId === active.id) : [];
 
   useEffect(() => {
     if (!activeId && apps[0]) {
@@ -1535,11 +1605,84 @@ function AppsPage({
     }
   }, [activeId, apps]);
 
+  useEffect(() => {
+    setConnectionError(null);
+    setIssuedToken(null);
+    setTokenName("");
+    setTokenScopes(DEFAULT_APP_SCOPES.join(", "));
+  }, [active?.id]);
+
   function updateApp(patch: Partial<AppRecord>) {
     if (!active) {
       return;
     }
     void onPatchApp(active.id, patch);
+  }
+
+  async function approvePairing(pairing: AppPairingSummary) {
+    setConnectionBusy(`approve:${pairing.id}`);
+    setConnectionError(null);
+    try {
+      await onApprovePairing(pairing.id, pairing.requestedScopes);
+    } catch (err) {
+      setConnectionError((err as Error).message);
+    } finally {
+      setConnectionBusy(null);
+    }
+  }
+
+  async function denyPairing(pairing: AppPairingSummary) {
+    setConnectionBusy(`deny:${pairing.id}`);
+    setConnectionError(null);
+    try {
+      await onDenyPairing(pairing.id);
+    } catch (err) {
+      setConnectionError((err as Error).message);
+    } finally {
+      setConnectionBusy(null);
+    }
+  }
+
+  async function createToken(event: FormEvent) {
+    event.preventDefault();
+    if (!active) {
+      return;
+    }
+    const scopes = parseScopeInput(tokenScopes);
+    if (!scopes.length) {
+      setConnectionError("Enter at least one scope.");
+      return;
+    }
+    setConnectionBusy("create-token");
+    setConnectionError(null);
+    setIssuedToken(null);
+    try {
+      const issued = await onCreateServiceToken(active.id, {
+        name: tokenName.trim() || undefined,
+        scopes,
+      });
+      setIssuedToken(issued);
+      setTokenName("");
+    } catch (err) {
+      setConnectionError((err as Error).message);
+    } finally {
+      setConnectionBusy(null);
+    }
+  }
+
+  async function revokeToken(token: AppTokenSummary) {
+    if (token.revokedAt) {
+      return;
+    }
+    setConnectionBusy(`revoke:${token.id}`);
+    setConnectionError(null);
+    try {
+      await onRevokeAppToken(token.appId, token.id);
+    } catch (err) {
+      setConnectionError((err as Error).message);
+    } finally {
+      setConnectionBusy(null);
+    }
   }
 
   return (
@@ -1661,6 +1804,145 @@ function AppsPage({
               </div>
             ) : (
               <div className="empty-cell">Capabilities could not be resolved.</div>
+            )}
+          </div>
+
+          {connectionError ? <div className="notice error">{connectionError}</div> : null}
+
+          <div className="settings-section">
+            <div className="section-header">
+              <div>
+                <h3>Pairing Requests</h3>
+                <p>{activePairings.length ? `${activePairings.length} requests` : "No requests for this app"}</p>
+              </div>
+            </div>
+            {activePairings.length ? (
+              <div className="table-scroll">
+                <table className="model-table">
+                  <thead>
+                    <tr>
+                      <th>User code</th>
+                      <th>Status</th>
+                      <th>Requested scopes</th>
+                      <th>Origin</th>
+                      <th>Expires</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {activePairings.map((pairing) => (
+                      <tr key={pairing.id}>
+                        <td>
+                          <strong>{pairing.userCode}</strong>
+                          <code>{pairing.id}</code>
+                        </td>
+                        <td>{pairing.status}</td>
+                        <td>{pairing.requestedScopes.join(", ") || "-"}</td>
+                        <td>{pairing.origin || "-"}</td>
+                        <td>{formatDateTime(pairing.expiresAt)}</td>
+                        <td>
+                          {pairing.status === "pending" ? (
+                            <div className="button-row table-actions">
+                              <button type="button" disabled={connectionBusy !== null} onClick={() => void approvePairing(pairing)}>
+                                {connectionBusy === `approve:${pairing.id}` ? "Approving" : "Approve"}
+                              </button>
+                              <button
+                                className="danger-outline"
+                                type="button"
+                                disabled={connectionBusy !== null}
+                                onClick={() => void denyPairing(pairing)}
+                              >
+                                {connectionBusy === `deny:${pairing.id}` ? "Denying" : "Deny"}
+                              </button>
+                            </div>
+                          ) : (
+                            <span>{pairing.deliveredAt ? "Token delivered" : "-"}</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-cell">Apps start pairing through the client SDK.</div>
+            )}
+          </div>
+
+          <div className="settings-section">
+            <div className="section-header">
+              <div>
+                <h3>Service Tokens</h3>
+                <p>{activeTokens.length ? `${activeTokens.length} tokens issued` : "No service tokens"}</p>
+              </div>
+            </div>
+            <form className="compact-form" onSubmit={createToken}>
+              <div className="field-row">
+                <label>
+                  Token name
+                  <input value={tokenName} onChange={(event) => setTokenName(event.target.value)} placeholder={`${active.name} backend`} />
+                </label>
+                <label>
+                  Scopes
+                  <input value={tokenScopes} onChange={(event) => setTokenScopes(event.target.value)} />
+                </label>
+              </div>
+              <div className="form-actions">
+                <button type="submit" disabled={connectionBusy !== null}>
+                  {connectionBusy === "create-token" ? "Creating" : "Create service token"}
+                </button>
+              </div>
+            </form>
+            {issuedToken ? (
+              <div className="notice token-reveal">
+                <div>
+                  <strong>Token created</strong>
+                  <p>This value is shown once. Store it in the connecting app or backend service.</p>
+                </div>
+                <code>{issuedToken.token}</code>
+              </div>
+            ) : null}
+            {activeTokens.length ? (
+              <div className="table-scroll">
+                <table className="model-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Kind</th>
+                      <th>Scopes</th>
+                      <th>Last used</th>
+                      <th>Status</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {activeTokens.map((token) => (
+                      <tr key={token.id}>
+                        <td>
+                          <strong>{token.name}</strong>
+                          <code>{token.id}</code>
+                        </td>
+                        <td>{token.kind}</td>
+                        <td>{token.scopes.join(", ") || "-"}</td>
+                        <td>{formatDateTime(token.lastUsedAt)}</td>
+                        <td>{appTokenStatus(token)}</td>
+                        <td>
+                          <button
+                            className="danger-outline"
+                            type="button"
+                            disabled={connectionBusy !== null || Boolean(token.revokedAt)}
+                            onClick={() => void revokeToken(token)}
+                          >
+                            {connectionBusy === `revoke:${token.id}` ? "Revoking" : token.revokedAt ? "Revoked" : "Revoke"}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-cell">Create a token for backend services that cannot complete user pairing.</div>
             )}
           </div>
         </section>
@@ -3764,6 +4046,43 @@ function formatTime(value: string): string {
     minute: "2-digit",
     second: "2-digit",
   }).format(new Date(value));
+}
+
+function formatDateTime(value?: string | null): string {
+  if (!value) {
+    return "-";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function parseScopeInput(value: string): string[] {
+  return Array.from(
+    new Set(
+      value
+        .split(/[,\s]+/)
+        .map((scope) => scope.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function appTokenStatus(token: AppTokenSummary): string {
+  if (token.revokedAt) {
+    return "revoked";
+  }
+  if (token.expiresAt && new Date(token.expiresAt).getTime() <= Date.now()) {
+    return "expired";
+  }
+  return "active";
 }
 
 function formatBytes(value?: number | null): string {

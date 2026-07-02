@@ -448,6 +448,17 @@ button.theme-toggle {
   color: #ffc2bb;
 }
 
+.token-reveal {
+  display: grid;
+  gap: 10px;
+}
+
+.token-reveal code {
+  display: block;
+  overflow-wrap: anywhere;
+  color: #a7d7ba;
+}
+
 .stack {
   display: grid;
   gap: 14px;
