@@ -17,17 +17,24 @@
   scrollbar-width: thin;
 }
 
+html,
+body,
+#root {
+  width: 100%;
+  min-height: 100%;
+}
+
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
   background: #0b0c0b;
-  overflow-y: scroll;
+  overflow: hidden;
 }
 
 @supports (overflow: overlay) {
   body {
-    overflow-y: overlay;
+    overflow: hidden;
   }
 }
 
@@ -242,6 +249,9 @@ tr:last-child td {
   display: grid;
   grid-template-columns: 248px minmax(0, 1fr);
   min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
   background: #0b0c0b;
 }
 
@@ -252,6 +262,9 @@ tr:last-child td {
   grid-template-rows: auto 1fr auto;
   gap: 22px;
   height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
   border-right: 1px solid #252923;
   background: #111310;
   padding: 18px 12px;
@@ -348,6 +361,10 @@ tr:last-child td {
 .workspace {
   width: 100%;
   max-width: none;
+  min-width: 0;
+  height: 100vh;
+  height: 100dvh;
+  overflow: auto;
   margin: 0 auto;
   padding: 20px clamp(12px, 1.15vw, 26px) 34px;
 }
@@ -1420,6 +1437,7 @@ button.chip.active {
   grid-template-columns: 304px minmax(0, 1fr);
   gap: 16px;
   min-height: min(760px, calc(100vh - 120px));
+  min-height: min(760px, calc(100dvh - 120px));
 }
 
 .agent-list {
@@ -1705,14 +1723,26 @@ button.chip.active {
 }
 
 @media (max-width: 980px) {
+  body {
+    overflow-y: auto;
+  }
+
   .app-shell {
     grid-template-columns: 1fr;
+    height: auto;
+    overflow: visible;
   }
 
   .sidebar {
     position: static;
     height: auto;
     min-height: auto;
+    overflow: visible;
+  }
+
+  .workspace {
+    height: auto;
+    overflow: visible;
   }
 
   .tabs {

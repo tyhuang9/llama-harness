@@ -12,13 +12,19 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Llama Harness",
         "width": 1280,
         "height": 820,
         "minWidth": 960,
         "minHeight": 620,
         "decorations": true,
-        "resizable": true
+        "resizable": true,
+        "maximizable": true,
+        "minimizable": true,
+        "closable": true,
+        "fullscreen": false,
+        "maximized": false
       }
     ],
     "security": {
