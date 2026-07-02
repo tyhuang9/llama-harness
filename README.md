@@ -10,6 +10,7 @@ The API is the product. The admin UI is only a local configuration and inspectio
 - Direct local Ollama support with `http://localhost:11434` as the default endpoint.
 - App-managed LiteLLM runtime for gateway-backed models without vendoring LiteLLM into this repo.
 - Provider-scoped agent defaults so Agents can use local Ollama or a saved LiteLLM provider.
+- App-scoped bearer tokens for external app capabilities, runs, streaming runs, and tool-result continuation.
 - Local admin UI for settings, providers, apps, agents, tools, permissions, runs, audit, and model testing.
 - Tauri desktop shell for running the local dashboard as a desktop app.
 - TypeScript client SDK for other local apps.
@@ -347,6 +348,19 @@ Top-level concepts are separate:
 
 Agents are not nested under apps. An agent can be reused by multiple apps. An app chooses which agents it may use and which one is the default.
 
+App-facing routes require an app token. Interactive apps can start a pairing request, show the `userCode`, wait for the local operator to approve it in the admin UI Apps page, then exchange the pairing secret for a bearer token. Backend services that cannot show a user pairing screen should use a service token created from the admin UI.
+
+```ts
+const harness = new LlamaHarnessClient({ baseUrl: "http://127.0.0.1:8787" });
+const setup = await harness.startPairing({ appId: "note", appName: "Note" });
+// Show setup.userCode to the user. After approval:
+const issued = await harness.exchangePairing(setup.pairingId, setup.pairingSecret);
+const appHarness = new LlamaHarnessClient({
+  baseUrl: "http://127.0.0.1:8787",
+  token: issued.token,
+});
+```
+
 The seeded Note policy is:
 
 ```json
@@ -382,7 +396,8 @@ Note should connect with:
 Then discover its resolved assignment:
 
 ```bash
-curl http://127.0.0.1:8787/apps/note/capabilities
+curl http://127.0.0.1:8787/apps/note/capabilities \
+  -H "authorization: Bearer $LLAMA_HARNESS_APP_TOKEN"
 ```
 
 Example response:
@@ -427,6 +442,7 @@ If no `agentId` is supplied when creating a run, llama-harness uses the app's de
 ```bash
 curl -X POST http://127.0.0.1:8787/runs \
   -H 'content-type: application/json' \
+  -H "authorization: Bearer $LLAMA_HARNESS_APP_TOKEN" \
   -d '{
     "appId": "note",
     "agentId": null,
@@ -440,7 +456,7 @@ curl -X POST http://127.0.0.1:8787/runs \
   }'
 ```
 
-The response includes the resolved app, agent, model, output, duration, and `toolRequests` when the model asks the app to run tools. Apps submit those results to `POST /runs/:runId/tool-results`; the response either completes the run or returns another `requires_action` round. `POST /runs/stream` provides the same app policy flow over SSE. `/api/apps`, `/api/apps/:appId/capabilities`, `/api/runs`, `/api/runs/:runId/tool-results`, `/api/runs/stream`, and `/api/audit` are equivalent API-prefixed routes for existing clients.
+The response includes the resolved app, agent, model, output, duration, and `toolRequests` when the model asks the app to run tools. Apps submit those results to `POST /runs/:runId/tool-results`; the response either completes the run or returns another `requires_action` round. `POST /runs/stream` provides the same app policy flow over SSE. `/api/apps/:appId/capabilities`, `/api/runs`, `/api/runs/:runId/tool-results`, and `/api/runs/stream` are equivalent API-prefixed app routes and require the same bearer token. Admin-only preview and connection management routes live under `/api/admin/*`.
 
 ## Configure Global Instructions
 
@@ -528,7 +544,10 @@ curl http://127.0.0.1:8787/api/audit
 ```ts
 import { LlamaHarnessClient } from "@llama-harness/client";
 
-const harness = new LlamaHarnessClient({ baseUrl: "http://127.0.0.1:8787" });
+const harness = new LlamaHarnessClient({
+  baseUrl: "http://127.0.0.1:8787",
+  token: process.env.LLAMA_HARNESS_APP_TOKEN,
+});
 
 const health = await harness.health();
 const models = await harness.listModels();
@@ -545,7 +564,7 @@ const result = await harness.run({
 - Ollama must already be installed and running locally.
 - LiteLLM setup requires either the dev venv from `scripts/setup-litellm-dev.*` or the bundled runtime from `scripts/build-litellm-runtime.*`.
 - No default model is selected until one is configured.
-- API token storage exists in settings, but request enforcement is not implemented yet.
+- App-facing routes enforce app-scoped bearer tokens; local admin/configuration routes are still intended for a trusted loopback operator.
 - Instruction settings and tool capability records steer model behavior, but they do not implement real tool execution.
 - Run history is intentionally lightweight and capped in memory.
 - Audit is intentionally lightweight and omits full prompts, secrets, and full app context.

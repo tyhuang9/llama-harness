@@ -2,10 +2,10 @@
 
 ## Active
 
-- [ ] Decide whether the local API token setting should be enforced by the server.
+- [ ] Decide whether the local admin/configuration API should require an operator token.
   - Priority: Medium
   - Area: server
-  - Notes: `api_token` is persisted in settings for future local auth, but complex auth is out of scope for the MVP.
+  - Notes: app-facing policy routes require app-scoped bearer tokens, but local admin/configuration routes are still trusted loopback endpoints.
 
 - [ ] Add packaging guidance for running the server and UI together.
   - Priority: Medium
@@ -22,6 +22,10 @@
 None.
 
 ## Completed
+
+- [x] ~~Add production app connection tokens.~~
+  - Completed in: `52629a9`
+  - Notes: Added file-backed pairing requests, service tokens, app-scoped bearer enforcement for capabilities/runs/tool results, and admin connection controls.
 
 - [x] ~~Implement app-agent policy model.~~
   - Completed in: `84494e3`
