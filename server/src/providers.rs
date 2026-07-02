@@ -73,6 +73,8 @@ pub struct ChatMessage {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
 }
 
 impl ChatMessage {
@@ -82,6 +84,7 @@ impl ChatMessage {
             content: MessageContent::Text(content.into()),
             name: None,
             tool_call_id: None,
+            tool_calls: None,
         }
     }
 

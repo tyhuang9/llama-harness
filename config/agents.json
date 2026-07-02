@@ -17,9 +17,16 @@
       "terminal": false
     },
     "allowed_tool_ids": [
-      "notes.read",
-      "notes.search",
-      "reminders.create"
+      "note.getCurrentPage",
+      "note.getSelectedBlocks",
+      "note.searchPages",
+      "note.createBlock",
+      "note.updateBlock",
+      "note.deleteBlock",
+      "note.moveBlock",
+      "note.createPage",
+      "note.renamePage",
+      "note.openPage"
     ],
     "temperature": 0.2,
     "max_tokens": 512,

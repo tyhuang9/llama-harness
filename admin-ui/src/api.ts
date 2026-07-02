@@ -214,12 +214,21 @@ export type RunRecord = {
   source_app: string | null;
   prompt_summary: string;
   response_summary: string | null;
-  status: "completed" | "failed";
+  status: "completed" | "requires_action" | "failed";
   started_at: string;
   ended_at: string;
   duration_ms: number;
   error: string | null;
   usage?: TokenUsage | null;
+};
+
+export type RunToolRequest = {
+  id: string;
+  toolId: string;
+  name: string;
+  arguments: unknown;
+  riskLevel: "low" | "medium" | "high" | string;
+  displayName: string;
 };
 
 export type AuditRecord = {
@@ -247,12 +256,25 @@ export type RunCreateRequest = {
 
 export type RunCreateResponse = {
   runId: string;
-  status: "completed" | "failed";
+  status: "completed" | "requires_action" | "failed";
   appId: string;
   agentId: string;
   modelId: string;
-  output: string;
+  output?: string;
+  toolRequests: RunToolRequest[];
   durationMs: number;
+};
+
+export type RunToolResult = {
+  toolCallId: string;
+  toolId?: string;
+  result?: unknown;
+  error?: string;
+};
+
+export type RunToolResultsRequest = {
+  appId: string;
+  toolResults: RunToolResult[];
 };
 
 export type TokenUsage = {
@@ -444,6 +466,11 @@ export const api = {
   runs: (limit = 50) => request<{ runs: RunRecord[] }>(`/api/runs?limit=${limit}`),
   createRun: (payload: RunCreateRequest) =>
     request<RunCreateResponse>("/api/runs", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  submitRunToolResults: (runId: string, payload: RunToolResultsRequest) =>
+    request<RunCreateResponse>(`/api/runs/${encodeURIComponent(runId)}/tool-results`, {
       method: "POST",
       body: JSON.stringify(payload),
     }),

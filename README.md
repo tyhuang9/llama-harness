@@ -341,7 +341,7 @@ Top-level concepts are separate:
 - Models: local Ollama model records in `config/models.json`.
 - Agents: reusable behavior profiles in `config/agents.json`.
 - Apps: external client applications and their allowed agents/tools in `config/apps.json`.
-- Tools: visible local capabilities in `config/tools.json`; execution remains out of scope for now.
+- Tools: visible app capabilities in `config/tools.json`; apps execute their own domain tools and return results to the run.
 - Runs: model execution records in `runs.jsonl`.
 - Audit: policy decisions and denied requests in `logs/audit.jsonl`.
 
@@ -355,7 +355,18 @@ The seeded Note policy is:
   "name": "Note",
   "defaultAgentId": "note-assistant",
   "allowedAgentIds": ["note-assistant"],
-  "allowedToolIds": ["notes.read", "notes.search", "reminders.create"],
+  "allowedToolIds": [
+    "note.getCurrentPage",
+    "note.getSelectedBlocks",
+    "note.searchPages",
+    "note.createBlock",
+    "note.updateBlock",
+    "note.deleteBlock",
+    "note.moveBlock",
+    "note.createPage",
+    "note.renamePage",
+    "note.openPage"
+  ],
   "enabled": true
 }
 ```
@@ -394,11 +405,11 @@ Example response:
   ],
   "tools": [
     {
-      "id": "notes.read",
-      "name": "Read Notes",
-      "description": "Read note content supplied by the Note app.",
+      "id": "note.getCurrentPage",
+      "name": "Get Current Page",
+      "description": "Read the active Note page and, optionally, its visible text blocks.",
       "riskLevel": "low",
-      "enabled": false
+      "enabled": true
     }
   ],
   "model": {
@@ -429,7 +440,7 @@ curl -X POST http://127.0.0.1:8787/runs \
   }'
 ```
 
-The response includes the resolved app, agent, model, output, and duration. `POST /runs/stream` provides the same app policy flow over SSE. `/api/apps`, `/api/apps/:appId/capabilities`, `/api/runs`, `/api/runs/stream`, and `/api/audit` are equivalent API-prefixed routes for existing clients.
+The response includes the resolved app, agent, model, output, duration, and `toolRequests` when the model asks the app to run tools. Apps submit those results to `POST /runs/:runId/tool-results`; the response either completes the run or returns another `requires_action` round. `POST /runs/stream` provides the same app policy flow over SSE. `/api/apps`, `/api/apps/:appId/capabilities`, `/api/runs`, `/api/runs/:runId/tool-results`, `/api/runs/stream`, and `/api/audit` are equivalent API-prefixed routes for existing clients.
 
 ## Configure Global Instructions
 

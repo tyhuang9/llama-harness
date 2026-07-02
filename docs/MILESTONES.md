@@ -216,7 +216,7 @@ Global instructions are stored in `config.json` under `instructions`. When enabl
 4. Update `/api/settings` with enabled instructions and verify `/api/settings` returns the saved values.
 
 ### Known Issues / Follow-ups
-- Instructions describe available tools, but real tool execution remains out of scope for the MVP.
+- Addressed after the MVP: app-owned tools can now be requested through runs and executed by the registered app.
 
 ### Commit / PR
 Local implementation commit: `33050fa`. PR not created yet.
@@ -255,7 +255,7 @@ Agents are reusable top-level records and are not nested under apps. Apps define
 5. Start a temporary server and verify `GET /health`, `GET /models`, `GET /apps`, `GET /apps/note/capabilities`, `POST /runs`, `GET /runs`, and `GET /audit`.
 
 ### Known Issues / Follow-ups
-- Tool execution remains out of scope; tool records are visible planned capabilities unless explicitly enabled and implemented later.
+- Addressed after this milestone: enabled app-owned tools can now produce structured run tool requests and app-submitted results.
 - If no default or local Ollama model is available, app runs return a model-selection error while capabilities show warnings.
 
 ### Commit / PR

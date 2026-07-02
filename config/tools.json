@@ -1,29 +1,171 @@
 [
   {
-    "id": "notes.read",
-    "name": "Read Notes",
-    "description": "Read note content supplied by the Note app.",
+    "id": "note.getCurrentPage",
+    "name": "Get Current Page",
+    "description": "Read the active Note page and, optionally, its visible text blocks.",
     "riskLevel": "low",
-    "enabled": false,
-    "inputSchema": null,
-    "outputSchema": null
+    "enabled": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "includeBlocks": { "type": "boolean" }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "outputSchema": { "type": "object", "additionalProperties": true }
   },
   {
-    "id": "notes.search",
-    "name": "Search Notes",
-    "description": "Search note content supplied by the Note app.",
+    "id": "note.getSelectedBlocks",
+    "name": "Get Selected Blocks",
+    "description": "Read the text blocks currently selected in Note.",
     "riskLevel": "low",
-    "enabled": false,
-    "inputSchema": null,
-    "outputSchema": null
+    "enabled": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "outputSchema": { "type": "object", "additionalProperties": true }
   },
   {
-    "id": "reminders.create",
-    "name": "Create Reminder",
-    "description": "Create a reminder requested from note context.",
+    "id": "note.searchPages",
+    "name": "Search Pages",
+    "description": "Search Note pages by title or active workspace text.",
+    "riskLevel": "low",
+    "enabled": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string" }
+      },
+      "required": ["query"],
+      "additionalProperties": false
+    },
+    "outputSchema": { "type": "object", "additionalProperties": true }
+  },
+  {
+    "id": "note.createBlock",
+    "name": "Create Block",
+    "description": "Create a text block on the active Note page.",
     "riskLevel": "medium",
-    "enabled": false,
-    "inputSchema": null,
-    "outputSchema": null
+    "enabled": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "content": { "type": "string" },
+        "x": { "type": "number" },
+        "y": { "type": "number" }
+      },
+      "required": ["content"],
+      "additionalProperties": false
+    },
+    "outputSchema": { "type": "object", "additionalProperties": true }
+  },
+  {
+    "id": "note.updateBlock",
+    "name": "Update Block",
+    "description": "Update content or layout for a text block on the active Note page.",
+    "riskLevel": "medium",
+    "enabled": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "blockId": { "type": "string" },
+        "content": { "type": "string" },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "width": { "type": "number" },
+        "height": { "type": "number" }
+      },
+      "required": ["blockId"],
+      "additionalProperties": false
+    },
+    "outputSchema": { "type": "object", "additionalProperties": true }
+  },
+  {
+    "id": "note.deleteBlock",
+    "name": "Delete Block",
+    "description": "Delete a text block from the active Note page after app approval.",
+    "riskLevel": "high",
+    "enabled": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "blockId": { "type": "string" }
+      },
+      "required": ["blockId"],
+      "additionalProperties": false
+    },
+    "outputSchema": { "type": "object", "additionalProperties": true }
+  },
+  {
+    "id": "note.moveBlock",
+    "name": "Move Block",
+    "description": "Move a text block on the active Note page.",
+    "riskLevel": "medium",
+    "enabled": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "blockId": { "type": "string" },
+        "x": { "type": "number" },
+        "y": { "type": "number" }
+      },
+      "required": ["blockId", "x", "y"],
+      "additionalProperties": false
+    },
+    "outputSchema": { "type": "object", "additionalProperties": true }
+  },
+  {
+    "id": "note.createPage",
+    "name": "Create Page",
+    "description": "Create a Note page.",
+    "riskLevel": "medium",
+    "enabled": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "folderId": { "type": "string" }
+      },
+      "required": ["title"],
+      "additionalProperties": false
+    },
+    "outputSchema": { "type": "object", "additionalProperties": true }
+  },
+  {
+    "id": "note.renamePage",
+    "name": "Rename Page",
+    "description": "Rename a Note page.",
+    "riskLevel": "medium",
+    "enabled": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pageId": { "type": "string" },
+        "title": { "type": "string" }
+      },
+      "required": ["pageId", "title"],
+      "additionalProperties": false
+    },
+    "outputSchema": { "type": "object", "additionalProperties": true }
+  },
+  {
+    "id": "note.openPage",
+    "name": "Open Page",
+    "description": "Open a Note page in the app.",
+    "riskLevel": "low",
+    "enabled": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pageId": { "type": "string" }
+      },
+      "required": ["pageId"],
+      "additionalProperties": false
+    },
+    "outputSchema": { "type": "object", "additionalProperties": true }
   }
 ]

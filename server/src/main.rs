@@ -15,7 +15,12 @@ use crate::{
 use anyhow::Context;
 use axum::Router;
 use chrono::Utc;
-use std::{collections::VecDeque, env, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    env,
+    net::SocketAddr,
+    sync::Arc,
+};
 use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -56,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         catalog_dir,
         runs_path,
         runs: Arc::new(RwLock::new(run_history)),
+        pending_runs: Arc::new(RwLock::new(HashMap::new())),
         audit_path,
         audit: Arc::new(RwLock::new(audit_history)),
         providers: ProviderRegistry::new(OllamaClient::new()),

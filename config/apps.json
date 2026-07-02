@@ -8,9 +8,16 @@
       "note-assistant"
     ],
     "allowedToolIds": [
-      "notes.read",
-      "notes.search",
-      "reminders.create"
+      "note.getCurrentPage",
+      "note.getSelectedBlocks",
+      "note.searchPages",
+      "note.createBlock",
+      "note.updateBlock",
+      "note.deleteBlock",
+      "note.moveBlock",
+      "note.createPage",
+      "note.renamePage",
+      "note.openPage"
     ],
     "enabled": true
   }

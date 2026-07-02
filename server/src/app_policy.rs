@@ -7,7 +7,18 @@ use tokio::fs;
 
 pub const NOTE_APP_ID: &str = "note";
 pub const NOTE_AGENT_ID: &str = "note-assistant";
-pub const NOTE_TOOL_IDS: [&str; 3] = ["notes.read", "notes.search", "reminders.create"];
+pub const NOTE_TOOL_IDS: [&str; 10] = [
+    "note.getCurrentPage",
+    "note.getSelectedBlocks",
+    "note.searchPages",
+    "note.createBlock",
+    "note.updateBlock",
+    "note.deleteBlock",
+    "note.moveBlock",
+    "note.createPage",
+    "note.renamePage",
+    "note.openPage",
+];
 
 #[derive(Clone, Debug, Default)]
 pub struct DomainCatalog {
@@ -721,34 +732,134 @@ fn seed_apps() -> Vec<ClientAppConfig> {
 
 fn seed_tools() -> Vec<ToolConfig> {
     vec![
-        ToolConfig {
-            id: "notes.read".to_string(),
-            name: "Read Notes".to_string(),
-            description: "Read note content supplied by the Note app.".to_string(),
-            risk_level: "low".to_string(),
-            enabled: false,
-            input_schema: None,
-            output_schema: None,
-        },
-        ToolConfig {
-            id: "notes.search".to_string(),
-            name: "Search Notes".to_string(),
-            description: "Search note content supplied by the Note app.".to_string(),
-            risk_level: "low".to_string(),
-            enabled: false,
-            input_schema: None,
-            output_schema: None,
-        },
-        ToolConfig {
-            id: "reminders.create".to_string(),
-            name: "Create Reminder".to_string(),
-            description: "Create a reminder requested from note context.".to_string(),
-            risk_level: "medium".to_string(),
-            enabled: false,
-            input_schema: None,
-            output_schema: None,
-        },
+        note_tool(
+            "note.getCurrentPage",
+            "Get Current Page",
+            "Read the active Note page and, optionally, its visible text blocks.",
+            "low",
+            json_schema(&[], &[("includeBlocks", "boolean")]),
+        ),
+        note_tool(
+            "note.getSelectedBlocks",
+            "Get Selected Blocks",
+            "Read the text blocks currently selected in Note.",
+            "low",
+            json_schema(&[], &[]),
+        ),
+        note_tool(
+            "note.searchPages",
+            "Search Pages",
+            "Search Note pages by title or active workspace text.",
+            "low",
+            json_schema(&["query"], &[("query", "string")]),
+        ),
+        note_tool(
+            "note.createBlock",
+            "Create Block",
+            "Create a text block on the active Note page.",
+            "medium",
+            json_schema(
+                &["content"],
+                &[("content", "string"), ("x", "number"), ("y", "number")],
+            ),
+        ),
+        note_tool(
+            "note.updateBlock",
+            "Update Block",
+            "Update content or layout for a text block on the active Note page.",
+            "medium",
+            json_schema(
+                &["blockId"],
+                &[
+                    ("blockId", "string"),
+                    ("content", "string"),
+                    ("x", "number"),
+                    ("y", "number"),
+                    ("width", "number"),
+                    ("height", "number"),
+                ],
+            ),
+        ),
+        note_tool(
+            "note.deleteBlock",
+            "Delete Block",
+            "Delete a text block from the active Note page after app approval.",
+            "high",
+            json_schema(&["blockId"], &[("blockId", "string")]),
+        ),
+        note_tool(
+            "note.moveBlock",
+            "Move Block",
+            "Move a text block on the active Note page.",
+            "medium",
+            json_schema(
+                &["blockId", "x", "y"],
+                &[("blockId", "string"), ("x", "number"), ("y", "number")],
+            ),
+        ),
+        note_tool(
+            "note.createPage",
+            "Create Page",
+            "Create a Note page.",
+            "medium",
+            json_schema(&["title"], &[("title", "string"), ("folderId", "string")]),
+        ),
+        note_tool(
+            "note.renamePage",
+            "Rename Page",
+            "Rename a Note page.",
+            "medium",
+            json_schema(
+                &["pageId", "title"],
+                &[("pageId", "string"), ("title", "string")],
+            ),
+        ),
+        note_tool(
+            "note.openPage",
+            "Open Page",
+            "Open a Note page in the app.",
+            "low",
+            json_schema(&["pageId"], &[("pageId", "string")]),
+        ),
     ]
+}
+
+fn note_tool(
+    id: &str,
+    name: &str,
+    description: &str,
+    risk_level: &str,
+    input_schema: serde_json::Value,
+) -> ToolConfig {
+    ToolConfig {
+        id: id.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+        risk_level: risk_level.to_string(),
+        enabled: true,
+        input_schema: Some(input_schema),
+        output_schema: Some(serde_json::json!({
+            "type": "object",
+            "additionalProperties": true
+        })),
+    }
+}
+
+fn json_schema(required: &[&str], properties: &[(&str, &str)]) -> serde_json::Value {
+    let mut property_map = serde_json::Map::new();
+    for (name, property_type) in properties {
+        property_map.insert(
+            (*name).to_string(),
+            serde_json::json!({ "type": property_type }),
+        );
+    }
+
+    serde_json::json!({
+        "type": "object",
+        "properties": property_map,
+        "required": required,
+        "additionalProperties": false
+    })
 }
 
 fn seed_model_name(runtime_config: &AppConfig) -> String {
@@ -779,7 +890,10 @@ mod tests {
             name: "Note Assistant".to_string(),
             default_provider_id: "ollama".to_string(),
             default_model: "llama3".to_string(),
-            allowed_tool_ids: vec!["notes.read".to_string(), "reminders.create".to_string()],
+            allowed_tool_ids: vec![
+                "note.getCurrentPage".to_string(),
+                "note.deleteBlock".to_string(),
+            ],
             status: "active".to_string(),
             enabled: true,
             ..AgentConfig::default()
@@ -792,7 +906,7 @@ mod tests {
                 name: "Note".to_string(),
                 default_agent_id: NOTE_AGENT_ID.to_string(),
                 allowed_agent_ids: vec![NOTE_AGENT_ID.to_string()],
-                allowed_tool_ids: Some(vec!["notes.read".to_string()]),
+                allowed_tool_ids: Some(vec!["note.getCurrentPage".to_string()]),
                 enabled: true,
                 description: None,
             }],
@@ -805,7 +919,7 @@ mod tests {
 
         assert_eq!(resolved.agent.id, NOTE_AGENT_ID);
         assert_eq!(resolved.tools.len(), 1);
-        assert_eq!(resolved.tools[0].id, "notes.read");
+        assert_eq!(resolved.tools[0].id, "note.getCurrentPage");
         assert_eq!(resolved.model.model_name, "llama3");
     }
 

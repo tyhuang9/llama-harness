@@ -76,9 +76,10 @@ pub enum AuditLevel {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Completed,
+    RequiresAction,
     Failed,
 }
 
@@ -135,6 +136,7 @@ pub async fn load_audit(path: &Path, max_records: usize) -> Result<VecDeque<Audi
 }
 
 pub fn push_recent(history: &mut VecDeque<RunRecord>, record: RunRecord, max_records: usize) {
+    history.retain(|existing| existing.id != record.id);
     history.push_front(record);
     while history.len() > max_records {
         history.pop_back();

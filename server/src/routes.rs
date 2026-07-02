@@ -11,8 +11,8 @@ use crate::{
     litellm_runtime::{litellm_start_command_summary, LiteLlmRuntimeManager},
     ollama::OllamaModel,
     providers::{
-        ChatMessage, ModelProvider, ProviderChatRequest, ProviderRegistry, ProviderStreamEvent,
-        TokenUsage,
+        ChatMessage, MessageContent, ModelProvider, ProviderChatRequest, ProviderChatResponse,
+        ProviderRegistry, ProviderStreamEvent, TokenUsage,
     },
     runs::{self, AuditLevel, AuditRecord, RunRecord, RunStatus},
     secrets::{self, LITELLM_MASTER_KEY_ENV},
@@ -49,6 +49,7 @@ pub struct AppState {
     pub catalog_dir: PathBuf,
     pub runs_path: PathBuf,
     pub runs: Arc<RwLock<VecDeque<RunRecord>>>,
+    pub(crate) pending_runs: Arc<RwLock<HashMap<String, PendingRun>>>,
     pub audit_path: PathBuf,
     pub audit: Arc<RwLock<VecDeque<AuditRecord>>>,
     pub providers: ProviderRegistry,
@@ -346,8 +347,58 @@ struct RunCreateResponse {
     app_id: String,
     agent_id: String,
     model_id: String,
-    output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_requests: Vec<RunToolRequest>,
     duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunToolRequest {
+    id: String,
+    tool_id: String,
+    name: String,
+    arguments: serde_json::Value,
+    risk_level: String,
+    display_name: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingRun {
+    app_id: String,
+    agent_id: String,
+    model_id: String,
+    provider_id: String,
+    provider_model: String,
+    resolved_model_name: String,
+    resolved_tool_ids: Vec<String>,
+    tools: Vec<ToolConfig>,
+    messages: Vec<ChatMessage>,
+    provider_tool_calls: serde_json::Value,
+    tool_requests: Vec<RunToolRequest>,
+    generation: GenerationSettings,
+    metadata: Option<serde_json::Value>,
+    started_at: DateTime<Utc>,
+    prompt_summary: String,
+    usage: Option<TokenUsage>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunToolResultsRequest {
+    app_id: String,
+    tool_results: Vec<RunToolResultInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunToolResultInput {
+    tool_call_id: String,
+    tool_id: Option<String>,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -383,6 +434,7 @@ pub fn router(state: AppState) -> Router {
         .route("/tools", get(list_tools))
         .route("/tools/:tool_id", get(get_tool).patch(patch_tool))
         .route("/runs", get(list_runs).post(create_run))
+        .route("/runs/:run_id/tool-results", post(submit_run_tool_results))
         .route("/runs/stream", post(stream_run))
         .route("/audit", get(list_audit))
         .route("/api/health", get(health))
@@ -415,6 +467,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/chat", post(chat))
         .route("/api/chat/stream", post(stream_chat))
         .route("/api/runs", get(list_runs).post(create_run))
+        .route(
+            "/api/runs/:run_id/tool-results",
+            post(submit_run_tool_results),
+        )
         .route("/api/runs/stream", post(stream_run))
         .route("/api/audit", get(list_audit))
         .route("/api/settings", get(get_settings).put(update_settings))
@@ -1587,7 +1643,7 @@ async fn create_run(
         tools: tools.clone(),
         tool_choice,
         stream: false,
-        metadata,
+        metadata: metadata.clone(),
     };
     let run_id = Uuid::new_v4().to_string();
     let started_at = Utc::now();
@@ -1599,55 +1655,34 @@ async fn create_run(
 
     match result {
         Ok(response) => {
-            let output = response.content;
-            let model = response.model.unwrap_or(model);
-            let record = RunRecord {
-                id: run_id.clone(),
-                app_id: Some(policy.app.id.clone()),
-                agent_id: Some(policy.agent.id.clone()),
-                model_id: Some(policy.model.id.clone()),
+            let pending = PendingRun {
+                app_id: policy.app.id.clone(),
+                agent_id: policy.agent.id.clone(),
+                model_id: policy.model.id.clone(),
+                provider_id: provider_id.clone(),
+                provider_model: model.clone(),
+                resolved_model_name: response.model.clone().unwrap_or(model.clone()),
                 resolved_tool_ids: policy.tools.iter().map(|tool| tool.id.clone()).collect(),
-                provider: provider_id,
-                model,
-                source_app: Some(policy.app.id.clone()),
-                prompt_summary,
-                response_summary: Some(truncate(&output, 500)),
-                status: RunStatus::Completed,
+                tools: policy.tools.clone(),
+                messages,
+                provider_tool_calls: serde_json::Value::Array(Vec::new()),
+                tool_requests: Vec::new(),
+                generation,
+                metadata,
                 started_at,
-                ended_at,
-                duration_ms,
-                error: None,
-                usage: response.usage,
+                prompt_summary,
+                usage: response.usage.clone(),
             };
-            record_run(&state, record).await;
-            increment_agent_tasks_run(&state, &policy.agent.id).await?;
-            record_audit(
-                &state,
-                audit_record(
-                    "app.run_completed",
-                    AuditLevel::Info,
-                    format!("Completed run for app '{}'", policy.app.id),
-                    Some(policy.app.id.clone()),
-                    Some(policy.agent.id.clone()),
-                    Some(run_id.clone()),
-                    Some(serde_json::json!({
-                        "model_id": policy.model.id,
-                        "tool_ids": policy.tools.iter().map(|tool| tool.id.clone()).collect::<Vec<_>>(),
-                        "warnings": policy.warnings,
-                    })),
-                ),
-            )
-            .await;
 
-            Ok(Json(RunCreateResponse {
+            finish_app_run_from_provider_response(
+                &state,
                 run_id,
-                status: RunStatus::Completed,
-                app_id: policy.app.id,
-                agent_id: policy.agent.id,
-                model_id: policy.model.id,
-                output,
+                pending,
+                response,
                 duration_ms,
-            }))
+                Some(serde_json::json!({ "warnings": policy.warnings })),
+            )
+            .await
         }
         Err(err) => {
             let error = err.to_string();
@@ -1680,6 +1715,321 @@ async fn create_run(
                     Some(policy.agent.id),
                     Some(run_id),
                     Some(serde_json::json!({ "model_id": policy.model.id })),
+                ),
+            )
+            .await;
+            Err(api_error(StatusCode::BAD_GATEWAY, error))
+        }
+    }
+}
+
+async fn finish_app_run_from_provider_response(
+    state: &AppState,
+    run_id: String,
+    mut pending: PendingRun,
+    response: ProviderChatResponse,
+    duration_ms: u64,
+    audit_extra: Option<serde_json::Value>,
+) -> ApiResult<Json<RunCreateResponse>> {
+    let response_model = response
+        .model
+        .clone()
+        .unwrap_or_else(|| pending.provider_model.clone());
+    pending.resolved_model_name = response_model.clone();
+    pending.usage = response.usage.clone().or(pending.usage.clone());
+
+    if let Some(provider_tool_calls) = response.tool_calls.clone() {
+        let (normalized_tool_calls, tool_requests) =
+            normalize_provider_tool_calls(&provider_tool_calls, &pending.tools).map_err(|err| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("invalid provider tool call: {err}"),
+                )
+            })?;
+
+        if !tool_requests.is_empty() {
+            pending.provider_tool_calls = normalized_tool_calls;
+            pending.tool_requests = tool_requests.clone();
+
+            {
+                let mut pending_runs = state.pending_runs.write().await;
+                pending_runs.insert(run_id.clone(), pending.clone());
+            }
+
+            let output = nonempty_string(response.content);
+            let record = RunRecord {
+                id: run_id.clone(),
+                app_id: Some(pending.app_id.clone()),
+                agent_id: Some(pending.agent_id.clone()),
+                model_id: Some(pending.model_id.clone()),
+                resolved_tool_ids: pending.resolved_tool_ids.clone(),
+                provider: pending.provider_id.clone(),
+                model: response_model,
+                source_app: Some(pending.app_id.clone()),
+                prompt_summary: pending.prompt_summary.clone(),
+                response_summary: output
+                    .as_deref()
+                    .map(|content| truncate(content, 500))
+                    .or_else(|| Some(format!("Requested {} tool(s)", tool_requests.len()))),
+                status: RunStatus::RequiresAction,
+                started_at: pending.started_at,
+                ended_at: Utc::now(),
+                duration_ms,
+                error: None,
+                usage: pending.usage.clone(),
+            };
+            record_run(state, record).await;
+            record_audit(
+                state,
+                audit_record(
+                    "tool.requested",
+                    AuditLevel::Info,
+                    format!(
+                        "Run requested {} tool(s) from app '{}'",
+                        tool_requests.len(),
+                        pending.app_id
+                    ),
+                    Some(pending.app_id.clone()),
+                    Some(pending.agent_id.clone()),
+                    Some(run_id.clone()),
+                    Some(serde_json::json!({
+                        "tool_requests": tool_requests.clone(),
+                        "tool_ids": pending.resolved_tool_ids.clone(),
+                    })),
+                ),
+            )
+            .await;
+
+            return Ok(Json(RunCreateResponse {
+                run_id,
+                status: RunStatus::RequiresAction,
+                app_id: pending.app_id,
+                agent_id: pending.agent_id,
+                model_id: pending.model_id,
+                output,
+                tool_requests,
+                duration_ms,
+            }));
+        }
+    }
+
+    let output = response.content;
+    let record = RunRecord {
+        id: run_id.clone(),
+        app_id: Some(pending.app_id.clone()),
+        agent_id: Some(pending.agent_id.clone()),
+        model_id: Some(pending.model_id.clone()),
+        resolved_tool_ids: pending.resolved_tool_ids.clone(),
+        provider: pending.provider_id.clone(),
+        model: response_model,
+        source_app: Some(pending.app_id.clone()),
+        prompt_summary: pending.prompt_summary.clone(),
+        response_summary: Some(truncate(&output, 500)),
+        status: RunStatus::Completed,
+        started_at: pending.started_at,
+        ended_at: Utc::now(),
+        duration_ms,
+        error: None,
+        usage: response.usage,
+    };
+    record_run(state, record).await;
+    increment_agent_tasks_run(state, &pending.agent_id).await?;
+
+    let mut metadata = serde_json::json!({
+        "model_id": pending.model_id.clone(),
+        "tool_ids": pending.resolved_tool_ids.clone(),
+    });
+    merge_json_object(&mut metadata, audit_extra);
+    record_audit(
+        state,
+        audit_record(
+            "app.run_completed",
+            AuditLevel::Info,
+            format!("Completed run for app '{}'", pending.app_id),
+            Some(pending.app_id.clone()),
+            Some(pending.agent_id.clone()),
+            Some(run_id.clone()),
+            Some(metadata),
+        ),
+    )
+    .await;
+
+    Ok(Json(RunCreateResponse {
+        run_id,
+        status: RunStatus::Completed,
+        app_id: pending.app_id,
+        agent_id: pending.agent_id,
+        model_id: pending.model_id,
+        output: Some(output),
+        tool_requests: Vec::new(),
+        duration_ms,
+    }))
+}
+
+async fn submit_run_tool_results(
+    State(state): State<AppState>,
+    AxumPath(run_id): AxumPath<String>,
+    Json(payload): Json<RunToolResultsRequest>,
+) -> ApiResult<Json<RunCreateResponse>> {
+    let pending = {
+        let pending_runs = state.pending_runs.read().await;
+        pending_runs.get(&run_id).cloned()
+    }
+    .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "run is not waiting for tool results"))?;
+
+    if payload.app_id != pending.app_id {
+        record_audit(
+            &state,
+            audit_record(
+                "tool.result_denied",
+                AuditLevel::Denied,
+                format!(
+                    "Rejected tool results for app '{}' on run owned by '{}'",
+                    payload.app_id, pending.app_id
+                ),
+                Some(payload.app_id),
+                Some(pending.agent_id.clone()),
+                Some(run_id),
+                None,
+            ),
+        )
+        .await;
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "tool results were submitted by the wrong app",
+        ));
+    }
+
+    let tool_messages = tool_result_messages_for_pending(&pending, payload.tool_results)?;
+
+    {
+        let mut pending_runs = state.pending_runs.write().await;
+        pending_runs.remove(&run_id);
+    }
+
+    record_audit(
+        &state,
+        audit_record(
+            "tool.result_received",
+            AuditLevel::Info,
+            format!(
+                "Received {} tool result(s) from app '{}'",
+                tool_messages.len(),
+                pending.app_id
+            ),
+            Some(pending.app_id.clone()),
+            Some(pending.agent_id.clone()),
+            Some(run_id.clone()),
+            Some(serde_json::json!({
+                "tool_call_ids": pending.tool_requests.iter().map(|request| request.id.clone()).collect::<Vec<_>>(),
+                "tool_ids": pending.tool_requests.iter().map(|request| request.tool_id.clone()).collect::<Vec<_>>(),
+            })),
+        ),
+    )
+    .await;
+
+    let app_env = load_app_env().await?;
+    let config = hydrate_config_secrets(state.config.read().await.clone(), &app_env);
+    let (provider_id, model, provider) = provider_for_request(
+        &state,
+        &config,
+        &pending.provider_id,
+        &pending.provider_model,
+    )?;
+    let tools = provider_tools_from_policy(&pending.tools);
+    let tool_choice = tools.as_ref().map(|_| serde_json::json!("auto"));
+    let mut messages = pending.messages.clone();
+    messages.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: MessageContent::Text(String::new()),
+        name: None,
+        tool_call_id: None,
+        tool_calls: Some(pending.provider_tool_calls.clone()),
+    });
+    messages.extend(tool_messages);
+
+    let provider_request = ProviderChatRequest {
+        provider: provider_id.clone(),
+        model: model.clone(),
+        messages: messages.clone(),
+        temperature: Some(pending.generation.temperature),
+        top_p: Some(pending.generation.top_p),
+        max_tokens: Some(pending.generation.max_tokens),
+        tools,
+        tool_choice,
+        stream: false,
+        metadata: pending.metadata.clone(),
+    };
+
+    let result = provider.chat_completion(provider_request).await;
+    let ended_at = Utc::now();
+    let duration_ms = duration_ms_between(pending.started_at, ended_at);
+
+    match result {
+        Ok(response) => {
+            let next_pending = PendingRun {
+                app_id: pending.app_id,
+                agent_id: pending.agent_id,
+                model_id: pending.model_id,
+                provider_id,
+                provider_model: model,
+                resolved_model_name: response
+                    .model
+                    .clone()
+                    .unwrap_or(pending.resolved_model_name),
+                resolved_tool_ids: pending.resolved_tool_ids,
+                tools: pending.tools,
+                messages,
+                provider_tool_calls: serde_json::Value::Array(Vec::new()),
+                tool_requests: Vec::new(),
+                generation: pending.generation,
+                metadata: pending.metadata,
+                started_at: pending.started_at,
+                prompt_summary: pending.prompt_summary,
+                usage: response.usage.clone().or(pending.usage),
+            };
+
+            finish_app_run_from_provider_response(
+                &state,
+                run_id,
+                next_pending,
+                response,
+                duration_ms,
+                Some(serde_json::json!({ "continued_from_tool_results": true })),
+            )
+            .await
+        }
+        Err(err) => {
+            let error = err.to_string();
+            let record = RunRecord {
+                id: run_id.clone(),
+                app_id: Some(pending.app_id.clone()),
+                agent_id: Some(pending.agent_id.clone()),
+                model_id: Some(pending.model_id.clone()),
+                resolved_tool_ids: pending.resolved_tool_ids,
+                provider: provider_id,
+                model,
+                source_app: Some(pending.app_id.clone()),
+                prompt_summary: pending.prompt_summary,
+                response_summary: None,
+                status: RunStatus::Failed,
+                started_at: pending.started_at,
+                ended_at,
+                duration_ms,
+                error: Some(error.clone()),
+                usage: pending.usage,
+            };
+            record_run(&state, record).await;
+            record_audit(
+                &state,
+                audit_record(
+                    "app.run_failed",
+                    AuditLevel::Error,
+                    error.clone(),
+                    Some(pending.app_id),
+                    Some(pending.agent_id),
+                    Some(run_id),
+                    Some(serde_json::json!({ "model_id": pending.model_id })),
                 ),
             )
             .await;
@@ -2763,7 +3113,7 @@ fn provider_tools_from_policy(tools: &[ToolConfig]) -> Option<serde_json::Value>
         .iter()
         .filter(|tool| tool.enabled)
         .map(|tool| {
-            let name = tool.id.replace('.', "_");
+            let name = provider_tool_name(&tool.id);
             serde_json::json!({
                 "type": "function",
                 "function": {
@@ -2784,6 +3134,150 @@ fn provider_tools_from_policy(tools: &[ToolConfig]) -> Option<serde_json::Value>
     } else {
         Some(serde_json::Value::Array(provider_tools))
     }
+}
+
+fn provider_tool_name(tool_id: &str) -> String {
+    tool_id.replace('.', "_")
+}
+
+fn normalize_provider_tool_calls(
+    provider_tool_calls: &serde_json::Value,
+    tools: &[ToolConfig],
+) -> Result<(serde_json::Value, Vec<RunToolRequest>), String> {
+    let calls = provider_tool_calls
+        .as_array()
+        .ok_or_else(|| "tool_calls must be an array".to_string())?;
+    let tools_by_provider_name = tools
+        .iter()
+        .filter(|tool| tool.enabled)
+        .map(|tool| (provider_tool_name(&tool.id), tool))
+        .collect::<HashMap<_, _>>();
+    let mut normalized_calls = Vec::new();
+    let mut requests = Vec::new();
+
+    for (index, call) in calls.iter().enumerate() {
+        let function = call
+            .get("function")
+            .ok_or_else(|| format!("tool call {index} is missing function"))?;
+        let provider_name = function
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("tool call {index} is missing function.name"))?;
+        let tool = tools_by_provider_name
+            .get(provider_name)
+            .ok_or_else(|| format!("unknown tool function '{provider_name}'"))?;
+        let mut normalized_call = call.clone();
+        let call_id = call
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+
+        if let serde_json::Value::Object(map) = &mut normalized_call {
+            map.insert("id".to_string(), serde_json::Value::String(call_id.clone()));
+            map.entry("type".to_string())
+                .or_insert_with(|| serde_json::Value::String("function".to_string()));
+        }
+
+        let arguments = parse_tool_call_arguments(function.get("arguments"))
+            .map_err(|err| format!("tool call '{call_id}' has invalid arguments: {err}"))?;
+        normalized_calls.push(normalized_call);
+        requests.push(RunToolRequest {
+            id: call_id,
+            tool_id: tool.id.clone(),
+            name: provider_name.to_string(),
+            arguments,
+            risk_level: tool.risk_level.clone(),
+            display_name: tool.name.clone(),
+        });
+    }
+
+    Ok((serde_json::Value::Array(normalized_calls), requests))
+}
+
+fn parse_tool_call_arguments(
+    arguments: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    match arguments {
+        Some(serde_json::Value::String(value)) if value.trim().is_empty() => {
+            Ok(serde_json::json!({}))
+        }
+        Some(serde_json::Value::String(value)) => serde_json::from_str(value)
+            .map_err(|err| format!("expected JSON object arguments encoded as a string: {err}")),
+        Some(serde_json::Value::Object(_)) => Ok(arguments.cloned().unwrap_or_default()),
+        Some(serde_json::Value::Null) | None => Ok(serde_json::json!({})),
+        Some(_) => Err("expected object arguments".to_string()),
+    }
+}
+
+fn tool_result_messages_for_pending(
+    pending: &PendingRun,
+    results: Vec<RunToolResultInput>,
+) -> ApiResult<Vec<ChatMessage>> {
+    if results.len() != pending.tool_requests.len() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "expected {} tool result(s), received {}",
+                pending.tool_requests.len(),
+                results.len()
+            ),
+        ));
+    }
+
+    let mut results_by_call_id = HashMap::new();
+    for result in results {
+        let call_id = result.tool_call_id.trim().to_string();
+        if call_id.is_empty() {
+            return Err(api_error(StatusCode::BAD_REQUEST, "toolCallId is required"));
+        }
+        if results_by_call_id.insert(call_id, result).is_some() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "duplicate tool result call id",
+            ));
+        }
+    }
+
+    let mut messages = Vec::new();
+    for request in &pending.tool_requests {
+        let result = results_by_call_id.remove(&request.id).ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("missing tool result for call '{}'", request.id),
+            )
+        })?;
+        if let Some(tool_id) = result.tool_id.as_deref() {
+            if tool_id != request.tool_id {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("tool result for '{}' used the wrong tool id", request.id),
+                ));
+            }
+        }
+
+        let content = match nonempty_trimmed(result.error.unwrap_or_default()) {
+            Some(error) => serde_json::json!({ "error": error }),
+            None => result.result.unwrap_or_else(|| serde_json::json!({})),
+        };
+        messages.push(ChatMessage {
+            role: "tool".to_string(),
+            content: MessageContent::Structured(content),
+            name: Some(provider_tool_name(&request.tool_id)),
+            tool_call_id: Some(request.id.clone()),
+            tool_calls: None,
+        });
+    }
+
+    if !results_by_call_id.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "received tool results that were not requested",
+        ));
+    }
+
+    Ok(messages)
 }
 
 fn tool_ids_from_provider_tools(tools: &Option<serde_json::Value>) -> Vec<String> {
@@ -2903,6 +3397,27 @@ fn nonempty_trimmed(value: String) -> Option<String> {
     }
 }
 
+fn nonempty_string(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn merge_json_object(target: &mut serde_json::Value, source: Option<serde_json::Value>) {
+    let Some(serde_json::Value::Object(source)) = source else {
+        return;
+    };
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+
+    for (key, value) in source {
+        target.insert(key, value);
+    }
+}
+
 async fn record_run(state: &AppState, record: RunRecord) {
     let logging_enabled = state.config.read().await.logging_enabled;
     {
@@ -2965,6 +3480,13 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn duration_ms_between(started_at: DateTime<Utc>, ended_at: DateTime<Utc>) -> u64 {
+    ended_at
+        .signed_duration_since(started_at)
+        .num_milliseconds()
+        .max(0) as u64
 }
 
 async fn load_app_env() -> ApiResult<HashMap<String, String>> {
@@ -3892,7 +4414,7 @@ mod tests {
             "default_model_id": "ollama-default",
             "default_provider_id": "ollama",
             "default_model": "qwen2.5:7b",
-            "allowed_tool_ids": ["notes.read"],
+            "allowed_tool_ids": ["note.getCurrentPage"],
             "temperature": 0.2,
             "max_tokens": 512,
             "enabled": true,
@@ -3952,8 +4474,8 @@ mod tests {
     #[test]
     fn configured_tools_use_openai_function_shape_when_enabled() {
         let tools = provider_tools_from_policy(&[ToolConfig {
-            id: "notes.read".to_string(),
-            name: "Read Notes".to_string(),
+            id: "note.getCurrentPage".to_string(),
+            name: "Get Current Page".to_string(),
             description: "Read note content.".to_string(),
             risk_level: "low".to_string(),
             enabled: true,
@@ -3974,7 +4496,7 @@ mod tests {
             tools[0]
                 .pointer("/function/name")
                 .and_then(serde_json::Value::as_str),
-            Some("notes_read")
+            Some("note_getCurrentPage")
         );
         assert_eq!(
             tools[0]
@@ -3982,5 +4504,78 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("string")
         );
+    }
+
+    #[test]
+    fn provider_tool_calls_map_back_to_note_tool_ids() {
+        let tools = vec![ToolConfig {
+            id: "note.getCurrentPage".to_string(),
+            name: "Get Current Page".to_string(),
+            description: "Read the current page.".to_string(),
+            risk_level: "low".to_string(),
+            enabled: true,
+            input_schema: None,
+            output_schema: None,
+        }];
+        let raw_tool_calls = serde_json::json!([
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "note_getCurrentPage",
+                    "arguments": "{\"includeBlocks\":true}"
+                }
+            }
+        ]);
+
+        let (normalized, requests) =
+            normalize_provider_tool_calls(&raw_tool_calls, &tools).expect("tool call should map");
+
+        assert_eq!(normalized[0]["id"], "call_1");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].tool_id, "note.getCurrentPage");
+        assert_eq!(requests[0].arguments["includeBlocks"], true);
+    }
+
+    #[test]
+    fn tool_result_validation_rejects_wrong_tool_id() {
+        let pending = PendingRun {
+            app_id: "note".to_string(),
+            agent_id: "note-assistant".to_string(),
+            model_id: "ollama-default".to_string(),
+            provider_id: "ollama".to_string(),
+            provider_model: "llama3".to_string(),
+            resolved_model_name: "llama3".to_string(),
+            resolved_tool_ids: vec!["note.getCurrentPage".to_string()],
+            tools: Vec::new(),
+            messages: Vec::new(),
+            provider_tool_calls: serde_json::json!([]),
+            tool_requests: vec![RunToolRequest {
+                id: "call_1".to_string(),
+                tool_id: "note.getCurrentPage".to_string(),
+                name: "note_getCurrentPage".to_string(),
+                arguments: serde_json::json!({}),
+                risk_level: "low".to_string(),
+                display_name: "Get Current Page".to_string(),
+            }],
+            generation: GenerationSettings::default(),
+            metadata: None,
+            started_at: Utc::now(),
+            prompt_summary: "user: summarize".to_string(),
+            usage: None,
+        };
+
+        let error = tool_result_messages_for_pending(
+            &pending,
+            vec![RunToolResultInput {
+                tool_call_id: "call_1".to_string(),
+                tool_id: Some("note.deleteBlock".to_string()),
+                result: Some(serde_json::json!({ "ok": true })),
+                error: None,
+            }],
+        )
+        .expect_err("wrong tool id should be rejected");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 }
