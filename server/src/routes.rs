@@ -1,4 +1,5 @@
 use crate::{
+    app_connections::{self, AppAuthError, AppConnectionStore, AppPairingSummary, AppTokenSummary},
     app_policy::{
         self, AppCapabilitiesResponse, AppPolicyError, AppPolicyErrorKind, ClientAppConfig,
         DomainCatalog, ToolConfig,
@@ -19,7 +20,7 @@ use crate::{
 };
 use axum::{
     extract::{Path as AxumPath, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
@@ -47,6 +48,8 @@ pub struct AppState {
     pub config_path: PathBuf,
     pub catalog: Arc<RwLock<DomainCatalog>>,
     pub catalog_dir: PathBuf,
+    pub connections: Arc<RwLock<AppConnectionStore>>,
+    pub connections_path: PathBuf,
     pub runs_path: PathBuf,
     pub runs: Arc<RwLock<VecDeque<RunRecord>>>,
     pub(crate) pending_runs: Arc<RwLock<HashMap<String, PendingRun>>>,
@@ -306,6 +309,71 @@ struct AuditResponse {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PairingStartRequest {
+    app_id: String,
+    app_name: Option<String>,
+    requested_scopes: Option<Vec<String>>,
+    origin: Option<String>,
+    redirect_uri: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingStartResponse {
+    pairing_id: String,
+    pairing_secret: String,
+    user_code: String,
+    verification_uri: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingExchangeRequest {
+    pairing_secret: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingExchangeResponse {
+    status: String,
+    app_id: String,
+    token_id: String,
+    token: String,
+    scopes: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionsResponse {
+    pairings: Vec<AppPairingSummary>,
+    tokens: Vec<AppTokenSummary>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingDecisionRequest {
+    scopes: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceTokenCreateRequest {
+    name: Option<String>,
+    scopes: Option<Vec<String>>,
+    origin: Option<String>,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IssuedAppTokenResponse {
+    token: String,
+    record: AppTokenSummary,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AppPatch {
     name: Option<String>,
     description: Option<Option<String>>,
@@ -448,6 +516,23 @@ pub fn router(state: AppState) -> Router {
         .route("/api/apps", get(list_apps))
         .route("/api/apps/:app_id", get(get_app).patch(patch_app))
         .route("/api/apps/:app_id/capabilities", get(app_capabilities))
+        .route(
+            "/api/admin/apps/:app_id/capabilities",
+            get(admin_app_capabilities),
+        )
+        .route("/api/pairing/start", post(start_pairing))
+        .route("/api/pairing/:pairing_id/exchange", post(exchange_pairing))
+        .route("/api/admin/connections", get(list_connections))
+        .route(
+            "/api/admin/pairing/:pairing_id/approve",
+            post(approve_pairing),
+        )
+        .route("/api/admin/pairing/:pairing_id/deny", post(deny_pairing))
+        .route("/api/admin/apps/:app_id/tokens", post(create_service_token))
+        .route(
+            "/api/admin/apps/:app_id/tokens/:token_id/revoke",
+            post(revoke_app_token),
+        )
         .route("/api/providers", get(list_providers))
         .route(
             "/api/providers/:provider_id/models",
@@ -788,7 +873,23 @@ async fn patch_app(
 
 async fn app_capabilities(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(app_id): AxumPath<String>,
+) -> ApiResult<Json<AppCapabilitiesResponse>> {
+    authorize_app_headers(&state, &headers, &app_id, "capabilities:read").await?;
+    resolve_app_capabilities(&state, &app_id).await
+}
+
+async fn admin_app_capabilities(
+    State(state): State<AppState>,
+    AxumPath(app_id): AxumPath<String>,
+) -> ApiResult<Json<AppCapabilitiesResponse>> {
+    resolve_app_capabilities(&state, &app_id).await
+}
+
+async fn resolve_app_capabilities(
+    state: &AppState,
+    app_id: &str,
 ) -> ApiResult<Json<AppCapabilitiesResponse>> {
     let (config, catalog) = {
         (
@@ -819,6 +920,267 @@ async fn app_capabilities(
     .await;
 
     Ok(Json(AppCapabilitiesResponse::from_policy(&resolved)))
+}
+
+async fn start_pairing(
+    State(state): State<AppState>,
+    Json(payload): Json<PairingStartRequest>,
+) -> ApiResult<Json<PairingStartResponse>> {
+    let catalog = state.catalog.read().await.clone();
+    let app = app_policy::find_app(&catalog, &payload.app_id).ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            format!("unknown app: {}", payload.app_id),
+        )
+    })?;
+    if !app.enabled {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            format!("app '{}' is disabled", app.id),
+        ));
+    }
+
+    let app_id = app.id.clone();
+    let app_name = payload.app_name.unwrap_or_else(|| app.name.clone());
+    let requested_scopes = payload.requested_scopes.unwrap_or_else(|| {
+        app_connections::DEFAULT_APP_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect()
+    });
+    let now = Utc::now();
+    let (response, snapshot) = {
+        let mut connections = state.connections.write().await;
+        let started = connections.start_pairing(
+            app_id.clone(),
+            app_name,
+            requested_scopes,
+            payload.origin,
+            payload.redirect_uri,
+            now,
+        );
+        let response = PairingStartResponse {
+            pairing_id: started.pairing.id.clone(),
+            pairing_secret: started.pairing_secret,
+            user_code: started.pairing.user_code.clone(),
+            verification_uri: "/api/admin/connections".to_string(),
+            expires_at: started.pairing.expires_at,
+        };
+        (response, connections.clone())
+    };
+    save_connections_snapshot(&state, &snapshot).await?;
+    record_audit(
+        &state,
+        audit_record(
+            "app.pairing_started",
+            AuditLevel::Info,
+            format!("Started pairing for app '{app_id}'"),
+            Some(app_id),
+            None,
+            None,
+            Some(
+                serde_json::json!({ "pairing_id": response.pairing_id, "user_code": response.user_code }),
+            ),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn exchange_pairing(
+    State(state): State<AppState>,
+    AxumPath(pairing_id): AxumPath<String>,
+    Json(payload): Json<PairingExchangeRequest>,
+) -> ApiResult<Json<PairingExchangeResponse>> {
+    let now = Utc::now();
+    let (issued, snapshot) = {
+        let mut connections = state.connections.write().await;
+        let issued = connections
+            .exchange_pairing(&pairing_id, &payload.pairing_secret, now)
+            .map_err(app_auth_api_error)?;
+        (issued, connections.clone())
+    };
+    save_connections_snapshot(&state, &snapshot).await?;
+    record_audit(
+        &state,
+        audit_record(
+            "app.pairing_exchanged",
+            AuditLevel::Info,
+            format!("Delivered app token for '{}'", issued.record.app_id),
+            Some(issued.record.app_id.clone()),
+            None,
+            None,
+            Some(serde_json::json!({ "pairing_id": pairing_id, "token_id": issued.record.id })),
+        ),
+    )
+    .await;
+    Ok(Json(PairingExchangeResponse {
+        status: "approved".to_string(),
+        app_id: issued.record.app_id,
+        token_id: issued.record.id,
+        token: issued.token,
+        scopes: issued.record.scopes,
+    }))
+}
+
+async fn list_connections(State(state): State<AppState>) -> Json<ConnectionsResponse> {
+    let mut connections = state.connections.write().await;
+    connections.expire_stale_pairings(Utc::now());
+    Json(ConnectionsResponse {
+        pairings: connections.pairings(),
+        tokens: connections.tokens(),
+    })
+}
+
+async fn approve_pairing(
+    State(state): State<AppState>,
+    AxumPath(pairing_id): AxumPath<String>,
+    Json(payload): Json<PairingDecisionRequest>,
+) -> ApiResult<Json<AppPairingSummary>> {
+    let now = Utc::now();
+    let (pairing, snapshot) = {
+        let mut connections = state.connections.write().await;
+        let pairing = connections
+            .approve_pairing(&pairing_id, payload.scopes, now)
+            .map_err(app_auth_api_error)?;
+        (pairing, connections.clone())
+    };
+    save_connections_snapshot(&state, &snapshot).await?;
+    record_audit(
+        &state,
+        audit_record(
+            "app.pairing_approved",
+            AuditLevel::Info,
+            format!("Approved pairing for app '{}'", pairing.app_id),
+            Some(pairing.app_id.clone()),
+            None,
+            None,
+            Some(
+                serde_json::json!({ "pairing_id": pairing.id, "scopes": pairing.requested_scopes }),
+            ),
+        ),
+    )
+    .await;
+    Ok(Json(pairing))
+}
+
+async fn deny_pairing(
+    State(state): State<AppState>,
+    AxumPath(pairing_id): AxumPath<String>,
+) -> ApiResult<Json<AppPairingSummary>> {
+    let now = Utc::now();
+    let (pairing, snapshot) = {
+        let mut connections = state.connections.write().await;
+        let pairing = connections
+            .deny_pairing(&pairing_id, now)
+            .map_err(app_auth_api_error)?;
+        (pairing, connections.clone())
+    };
+    save_connections_snapshot(&state, &snapshot).await?;
+    record_audit(
+        &state,
+        audit_record(
+            "app.pairing_denied",
+            AuditLevel::Denied,
+            format!("Denied pairing for app '{}'", pairing.app_id),
+            Some(pairing.app_id.clone()),
+            None,
+            None,
+            Some(serde_json::json!({ "pairing_id": pairing.id })),
+        ),
+    )
+    .await;
+    Ok(Json(pairing))
+}
+
+async fn create_service_token(
+    State(state): State<AppState>,
+    AxumPath(app_id): AxumPath<String>,
+    Json(payload): Json<ServiceTokenCreateRequest>,
+) -> ApiResult<Json<IssuedAppTokenResponse>> {
+    let catalog = state.catalog.read().await.clone();
+    let app = app_policy::find_app(&catalog, &app_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("unknown app: {app_id}")))?;
+    if !app.enabled {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            format!("app '{}' is disabled", app.id),
+        ));
+    }
+
+    let now = Utc::now();
+    let scopes = payload.scopes.unwrap_or_else(|| {
+        app_connections::DEFAULT_APP_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect()
+    });
+    let name = payload
+        .name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("{} service token", app.name));
+    let (issued, snapshot) = {
+        let mut connections = state.connections.write().await;
+        let issued = connections.issue_service_token(
+            app.id.clone(),
+            name,
+            scopes,
+            payload.origin,
+            payload.expires_at,
+            now,
+        );
+        (issued, connections.clone())
+    };
+    save_connections_snapshot(&state, &snapshot).await?;
+    record_audit(
+        &state,
+        audit_record(
+            "app.token_created",
+            AuditLevel::Info,
+            format!("Created service token for app '{}'", issued.record.app_id),
+            Some(issued.record.app_id.clone()),
+            None,
+            None,
+            Some(
+                serde_json::json!({ "token_id": issued.record.id, "scopes": issued.record.scopes }),
+            ),
+        ),
+    )
+    .await;
+    Ok(Json(IssuedAppTokenResponse {
+        token: issued.token,
+        record: AppTokenSummary::from(&issued.record),
+    }))
+}
+
+async fn revoke_app_token(
+    State(state): State<AppState>,
+    AxumPath((app_id, token_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<AppTokenSummary>> {
+    let now = Utc::now();
+    let (record, snapshot) = {
+        let mut connections = state.connections.write().await;
+        let record = connections
+            .revoke_token(&app_id, &token_id, now)
+            .map_err(app_auth_api_error)?;
+        (record, connections.clone())
+    };
+    save_connections_snapshot(&state, &snapshot).await?;
+    record_audit(
+        &state,
+        audit_record(
+            "app.token_revoked",
+            AuditLevel::Warn,
+            format!("Revoked token for app '{}'", record.app_id),
+            Some(record.app_id.clone()),
+            None,
+            None,
+            Some(serde_json::json!({ "token_id": record.id })),
+        ),
+    )
+    .await;
+    Ok(Json(record))
 }
 
 async fn list_tools(State(state): State<AppState>) -> Json<Vec<ToolConfig>> {
@@ -1563,8 +1925,10 @@ async fn chat(
 
 async fn create_run(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<RunCreateRequest>,
 ) -> ApiResult<Json<RunCreateResponse>> {
+    authorize_app_headers(&state, &headers, &payload.app_id, "runs:create").await?;
     let app_env = load_app_env().await?;
     let config = hydrate_config_secrets(state.config.read().await.clone(), &app_env);
     let catalog = state.catalog.read().await.clone();
@@ -1869,8 +2233,10 @@ async fn finish_app_run_from_provider_response(
 async fn submit_run_tool_results(
     State(state): State<AppState>,
     AxumPath(run_id): AxumPath<String>,
+    headers: HeaderMap,
     Json(payload): Json<RunToolResultsRequest>,
 ) -> ApiResult<Json<RunCreateResponse>> {
+    authorize_app_headers(&state, &headers, &payload.app_id, "tool-results:submit").await?;
     let pending = {
         let pending_runs = state.pending_runs.read().await;
         pending_runs.get(&run_id).cloned()
@@ -2151,8 +2517,10 @@ async fn stream_chat(
 
 async fn stream_run(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<RunCreateRequest>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    authorize_app_headers(&state, &headers, &payload.app_id, "runs:stream").await?;
     let app_env = load_app_env().await?;
     let config = hydrate_config_secrets(state.config.read().await.clone(), &app_env);
     let catalog = state.catalog.read().await.clone();
@@ -3327,6 +3695,98 @@ fn app_policy_api_error(error: AppPolicyError) -> (StatusCode, Json<ApiError>) {
         AppPolicyErrorKind::Misconfigured => StatusCode::BAD_REQUEST,
     };
     api_error(status, error.message)
+}
+
+async fn authorize_app_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+    app_id: &str,
+    required_scope: &str,
+) -> ApiResult<()> {
+    let raw_token = match app_connections::bearer_token(
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            record_auth_denial(state, app_id, required_scope, &error).await;
+            return Err(app_auth_api_error(error));
+        }
+    };
+    let now = Utc::now();
+    let (result, snapshot) = {
+        let mut connections = state.connections.write().await;
+        let result = connections.authorize(raw_token, app_id, required_scope, now);
+        let snapshot = if result.is_ok() {
+            Some(connections.clone())
+        } else {
+            None
+        };
+        (result, snapshot)
+    };
+
+    match result {
+        Ok(()) => {
+            if let Some(snapshot) = snapshot {
+                save_connections_snapshot(state, &snapshot).await?;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            record_auth_denial(state, app_id, required_scope, &error).await;
+            Err(app_auth_api_error(error))
+        }
+    }
+}
+
+async fn save_connections_snapshot(
+    state: &AppState,
+    snapshot: &AppConnectionStore,
+) -> ApiResult<()> {
+    app_connections::save_connections(&state.connections_path, snapshot)
+        .await
+        .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+async fn record_auth_denial(
+    state: &AppState,
+    app_id: &str,
+    required_scope: &str,
+    error: &AppAuthError,
+) {
+    record_audit(
+        state,
+        audit_record(
+            "app.auth_denied",
+            AuditLevel::Denied,
+            format!("Rejected app request: {}", error.message()),
+            Some(app_id.to_string()),
+            None,
+            None,
+            Some(serde_json::json!({
+                "required_scope": required_scope,
+                "reason": format!("{:?}", error),
+            })),
+        ),
+    )
+    .await;
+}
+
+fn app_auth_api_error(error: AppAuthError) -> (StatusCode, Json<ApiError>) {
+    let status = match error {
+        AppAuthError::MissingToken
+        | AppAuthError::InvalidToken
+        | AppAuthError::RevokedToken
+        | AppAuthError::ExpiredToken => StatusCode::UNAUTHORIZED,
+        AppAuthError::WrongApp | AppAuthError::MissingScope => StatusCode::FORBIDDEN,
+        AppAuthError::PairingNotFound => StatusCode::NOT_FOUND,
+        AppAuthError::PairingExpired
+        | AppAuthError::PairingDenied
+        | AppAuthError::PairingPending
+        | AppAuthError::PairingAlreadyDelivered => StatusCode::CONFLICT,
+    };
+    api_error(status, error.message())
 }
 
 fn audit_level_for_policy_error(error: &AppPolicyError) -> AuditLevel {

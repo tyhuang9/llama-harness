@@ -1,3 +1,4 @@
+mod app_connections;
 mod app_policy;
 mod config;
 mod litellm;
@@ -41,6 +42,8 @@ async fn main() -> anyhow::Result<()> {
     let config: AppConfig = config::load_config(&config_path).await?;
     let catalog_dir = config::default_catalog_dir(&config_path);
     let catalog = app_policy::load_domain_catalog(&catalog_dir, &config).await?;
+    let connections_path = catalog_dir.join("connections.json");
+    let connections = app_connections::load_connections(&connections_path).await?;
     let run_history = runs::load_runs(&runs_path, 100)
         .await
         .unwrap_or_else(|err| {
@@ -59,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
         config_path,
         catalog: Arc::new(RwLock::new(catalog)),
         catalog_dir,
+        connections: Arc::new(RwLock::new(connections)),
+        connections_path,
         runs_path,
         runs: Arc::new(RwLock::new(run_history)),
         pending_runs: Arc::new(RwLock::new(HashMap::new())),
