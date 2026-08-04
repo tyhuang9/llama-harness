@@ -10,6 +10,8 @@ pub(crate) struct ChatRequest {
     pub(crate) messages: Vec<WireMessage>,
     pub(crate) stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) keep_alive: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tools: Option<Vec<WireToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) options: Option<WireOptions>,
@@ -94,12 +96,14 @@ pub(crate) fn chat_request(
     messages: &[Message],
     tools: &[ToolDefinition],
     generation: &GenerationOptions,
+    keep_alive: Option<&str>,
     stream: bool,
 ) -> ChatRequest {
     ChatRequest {
         model,
         messages: messages.iter().map(wire_message).collect(),
         stream,
+        keep_alive: keep_alive.map(str::to_owned),
         tools: (!tools.is_empty()).then(|| tools.iter().map(wire_tool).collect()),
         options: options(generation),
     }

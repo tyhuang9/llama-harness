@@ -28,6 +28,7 @@ const ERROR_BODY_LIMIT_BYTES: usize = 8 * 1024;
 pub struct OllamaProviderBuilder {
     base_url: String,
     request_timeout: Duration,
+    keep_alive: Option<String>,
     max_response_bytes: usize,
     max_stream_bytes: usize,
     max_stream_line_bytes: usize,
@@ -38,6 +39,7 @@ impl Default for OllamaProviderBuilder {
         Self {
             base_url: DEFAULT_OLLAMA_BASE_URL.into(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            keep_alive: None,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_stream_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_stream_line_bytes: DEFAULT_MAX_STREAM_LINE_BYTES,
@@ -53,6 +55,12 @@ impl OllamaProviderBuilder {
 
     pub fn request_timeout(mut self, request_timeout: Duration) -> Self {
         self.request_timeout = request_timeout;
+        self
+    }
+
+    /// Sets Ollama's per-request model keep-alive value (for example, `"5m"`).
+    pub fn keep_alive(mut self, keep_alive: impl Into<String>) -> Self {
+        self.keep_alive = Some(keep_alive.into());
         self
     }
 
@@ -93,6 +101,7 @@ impl OllamaProviderBuilder {
         Ok(OllamaProvider {
             http,
             base_url,
+            keep_alive: self.keep_alive.filter(|value| !value.trim().is_empty()),
             max_response_bytes: self.max_response_bytes,
             max_stream_bytes: self.max_stream_bytes,
             max_stream_line_bytes: self.max_stream_line_bytes,
@@ -104,6 +113,7 @@ impl OllamaProviderBuilder {
 pub struct OllamaProvider {
     http: Client,
     base_url: Url,
+    keep_alive: Option<String>,
     max_response_bytes: usize,
     max_stream_bytes: usize,
     max_stream_line_bytes: usize,
@@ -138,6 +148,7 @@ impl OllamaProvider {
             &request.messages,
             &request.tools,
             &request.generation,
+            self.keep_alive.as_deref(),
             true,
         );
         let response = self
@@ -279,6 +290,7 @@ impl ModelProvider for OllamaProvider {
             &request.messages,
             &request.tools,
             &request.generation,
+            self.keep_alive.as_deref(),
             false,
         );
         let response = self

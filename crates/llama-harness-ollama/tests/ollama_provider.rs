@@ -164,7 +164,11 @@ async fn chat_maps_generation_messages_tools_tool_calls_and_usage() {
         }),
     )])
     .await;
-    let provider = provider(&base_url);
+    let provider = OllamaProvider::builder()
+        .base_url(&base_url)
+        .keep_alive("5m")
+        .build()
+        .unwrap();
     let mut model_request = request(CancellationToken::new());
     model_request.tools = vec![tool()];
 
@@ -182,6 +186,7 @@ async fn chat_maps_generation_messages_tools_tool_calls_and_usage() {
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(requests[0].path, "/api/chat");
     assert_eq!(body["stream"], false);
+    assert_eq!(body["keep_alive"], "5m");
     assert_eq!(
         body["options"],
         json!({"temperature":0.2,"top_p":0.9,"num_predict":64})
