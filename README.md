@@ -43,6 +43,7 @@ llama-harness/
   crates/llama-harness-observability/ Redacted local SQLite event store
   crates/llama-harness-evals/ Deterministic evaluation and replay contracts
   crates/llama-harness-cli/ Local model, trace, and evaluation CLI
+  examples/local-task-agent/ Runnable embedded reference application
   server/        Legacy Rust backend service (still supported during migration)
   admin-ui/      Local admin dashboard
   clients/ts/    TypeScript client SDK for external apps
@@ -74,6 +75,18 @@ cargo run -p llama-harness-cli -- eval validate path/to/suite.yaml
 cargo run -p llama-harness-cli -- inspect run <run-id> --db traces.sqlite --export-json
 cargo run -p llama-harness-cli -- models list
 ```
+
+## Embedded example
+
+Run the deterministic local task-agent reference without a daemon, network, or GPU:
+
+```bash
+cargo run -p local-task-agent -- --trace-db local-task-agent-traces.sqlite
+cargo test -p local-task-agent
+cargo run -p llama-harness-cli -- eval validate evals/local-task-agent/suite.yaml
+```
+
+The application owns its in-memory tasks and three tools (`list_tasks`, `create_task`, `update_task`); state changes use the application approval callback and traces are redacted SQLite records. See [embedding](docs/embedding.md) for its API boundary and optional local-Ollama use.
 
 The legacy server remains outside this virtual Cargo workspace so it can continue to be tested independently:
 
