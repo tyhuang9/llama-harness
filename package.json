@@ -3,12 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "npm run tauri:dev",
-    "api:dev": "cargo run --manifest-path server/Cargo.toml",
-    "web:dev": "npm --prefix admin-ui run dev",
-    "build": "npm --prefix admin-ui run build",
-    "desktop:before-dev": "node scripts/tauri-before-dev.mjs",
-    "tauri:dev": "cd desktop && npm exec tauri -- dev",
-    "tauri:build": "cd desktop && npm exec tauri -- build"
+    "dev": "npm run console:dev",
+    "build": "npm run console:build",
+    "console:web": "npm --prefix apps/harness-console run dev",
+    "console:test": "npm --prefix apps/harness-console run test",
+    "console:dev": "cd apps/harness-console && npm exec tauri -- dev",
+    "console:build": "cd apps/harness-console && npm exec tauri -- build",
+    "legacy:api:dev": "cargo run --manifest-path server/Cargo.toml"
   }
 }

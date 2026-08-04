@@ -1,0 +1,36 @@
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  CommandPreview,
+  CommandResult,
+  ConsoleApi,
+  ConsoleEvent,
+  ConsoleModels,
+  ConsolePreferences,
+  ConsoleRun,
+  EvalLaunchRequest,
+  EvaluationArtifacts,
+  ProjectWorkspace,
+  ReplayLaunchRequest,
+} from "./types";
+
+export const tauriConsoleApi: ConsoleApi = {
+  getPreferences: () => invoke<ConsolePreferences>("get_preferences"),
+  connectWorkspace: (workspace: ProjectWorkspace) =>
+    invoke<ConsolePreferences>("connect_workspace", { workspace }),
+  savePreferences: (update: ConsolePreferences) =>
+    invoke<ConsolePreferences>("save_preferences", { update }),
+  listRuns: (query) => invoke<ConsoleRun[]>("list_runs", { query }),
+  listRunEvents: (runId: string) =>
+    invoke<ConsoleEvent[]>("list_run_events", { runId }),
+  listModels: () => invoke<ConsoleModels>("list_models"),
+  listEvaluationArtifacts: () =>
+    invoke<EvaluationArtifacts>("list_evaluation_artifacts"),
+  previewEvalCommand: (request: EvalLaunchRequest) =>
+    invoke<CommandPreview>("preview_eval_command", { request }),
+  launchEvalCommand: (request: EvalLaunchRequest) =>
+    invoke<CommandResult>("launch_eval_command", { request }),
+  previewReplayCommand: (request: ReplayLaunchRequest) =>
+    invoke<CommandPreview>("preview_replay_command", { request }),
+  launchReplayCommand: (request: ReplayLaunchRequest) =>
+    invoke<CommandResult>("launch_replay_command", { request }),
+};
