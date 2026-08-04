@@ -11,6 +11,7 @@ import type {
   ConsoleRun,
   EvalLaunchRequest,
   EvaluationArtifacts,
+  PromptfooArtifact,
   ProjectWorkspace,
 } from "./types";
 
@@ -34,6 +35,7 @@ export function App({ api = tauriConsoleApi }: { api?: ConsoleApi }) {
   const [agents, setAgents] = useState<LoadState<AgentDefinition[]>>({ loading: false });
   const [runs, setRuns] = useState<LoadState<ConsoleRun[]>>({ loading: false });
   const [artifacts, setArtifacts] = useState<LoadState<EvaluationArtifacts>>({ loading: false });
+  const [promptfooArtifacts, setPromptfooArtifacts] = useState<LoadState<PromptfooArtifact[]>>({ loading: false });
 
   const workspace = preferences?.workspace;
   const refreshWorkspaceData = async () => {
@@ -42,16 +44,19 @@ export function App({ api = tauriConsoleApi }: { api?: ConsoleApi }) {
     setRuns((current) => ({ ...current, loading: true, error: undefined }));
     setAgents((current) => ({ ...current, loading: true, error: undefined }));
     setArtifacts((current) => ({ ...current, loading: true, error: undefined }));
-    const [nextModels, nextRuns, nextAgents, nextArtifacts] = await Promise.allSettled([
+    setPromptfooArtifacts((current) => ({ ...current, loading: true, error: undefined }));
+    const [nextModels, nextRuns, nextAgents, nextArtifacts, nextPromptfooArtifacts] = await Promise.allSettled([
       api.listModels(),
       api.listRuns({}),
       api.listAgents(),
       api.listEvaluationArtifacts(),
+      api.listPromptfooArtifacts(),
     ]);
     setModels(toLoadState(nextModels));
     setRuns(toLoadState(nextRuns));
     setAgents(toLoadState(nextAgents));
     setArtifacts(toLoadState(nextArtifacts));
+    setPromptfooArtifacts(toLoadState(nextPromptfooArtifacts));
   };
 
   useEffect(() => {
@@ -130,7 +135,7 @@ export function App({ api = tauriConsoleApi }: { api?: ConsoleApi }) {
           <RunsScreen api={api} initialState={runs} />
         )}
         {preferences && workspace && view === "evaluations" && (
-          <EvaluationsScreen api={api} state={artifacts} />
+          <EvaluationsScreen api={api} state={artifacts} promptfooArtifacts={promptfooArtifacts} />
         )}
         {preferences && workspace && view === "settings" && (
           <SettingsScreen api={api} preferences={preferences} onSaved={updatePreferences} />
@@ -308,7 +313,7 @@ function RunsScreen({ api, initialState }: { api: ConsoleApi; initialState: Load
   );
 }
 
-function EvaluationsScreen({ api, state }: { api: ConsoleApi; state: LoadState<EvaluationArtifacts> }) {
+function EvaluationsScreen({ api, state, promptfooArtifacts }: { api: ConsoleApi; state: LoadState<EvaluationArtifacts>; promptfooArtifacts: LoadState<PromptfooArtifact[]> }) {
   const [request, setRequest] = useState<EvalLaunchRequest>({ suitePath: "", models: [], repeat: undefined });
   const [preview, setPreview] = useState<CommandPreview>();
   const [result, setResult] = useState<CommandResult>();
@@ -334,6 +339,11 @@ function EvaluationsScreen({ api, state }: { api: ConsoleApi; state: LoadState<E
           {reportSummary.length === 0 && !state.loading && <EmptyState title="No evaluation reports found" detail="Set an existing JSON artifact directory in Project, then run your embedding application to write a report." />}
           {reportSummary.map(({ path, report }) => <EvaluationReportCard key={path} path={path} report={report} />)}
           {state.value?.skippedFiles.length ? <p className="muted">Skipped {state.value.skippedFiles.length} JSON file(s) that were not Harness evaluation reports.</p> : null}
+          <h3>Promptfoo artifacts</h3>
+          {promptfooArtifacts.loading && <Loading label="Reading generated Promptfoo artifacts" />}
+          {promptfooArtifacts.error && <Notice kind="error">{promptfooArtifacts.error}</Notice>}
+          {promptfooArtifacts.value?.length === 0 && !promptfooArtifacts.loading && <p className="muted">No generated Promptfoo config or raw result exists under <code>.llama-harness</code>.</p>}
+          {promptfooArtifacts.value?.map((artifact) => <details className="report-card" key={artifact.path}><summary>{artifact.kind === "generated_config" ? "Generated Promptfoo config" : "Raw Promptfoo result"}</summary><small title={artifact.path}>{artifact.path}</small>{artifact.truncated && <p className="muted">Preview is capped at 512 KiB.</p>}<pre>{artifact.content}</pre></details>)}
         </section>
         <section className="panel" aria-labelledby="cli-title"><h3 id="cli-title">Constrained Harness CLI</h3>
           <p className="muted">This creates only a project-relative <code>cargo run -p llama-harness-cli -- eval run</code> command. Standalone evaluation execution remains intentionally unavailable without the embedding application’s adapter.</p>

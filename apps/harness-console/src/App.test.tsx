@@ -20,6 +20,7 @@ function apiWith(preferences: ConsolePreferences): ConsoleApi {
     listModels: vi.fn().mockResolvedValue({ health: { healthy: true }, models: [] }),
     listAgents: vi.fn().mockResolvedValue([]),
     listEvaluationArtifacts: vi.fn().mockResolvedValue({ reports: [], skippedFiles: [] }),
+    listPromptfooArtifacts: vi.fn().mockResolvedValue([]),
     previewEvalCommand: vi.fn(),
     launchEvalCommand: vi.fn(),
     previewReplayCommand: vi.fn(),

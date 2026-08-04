@@ -28,7 +28,7 @@ The native bridge canonicalizes configured paths, opens the trace database in re
 - **Models** reads direct loopback Ollama health and installed-model capabilities.
 - **Agents** displays validated project-owned manifest definitions: version, prompt-version metadata, default model, allowlist, limits, optional schema, and developer-visible system instructions. An unconfigured manifest produces an empty state rather than sample agents.
 - **Runs** lists redacted SQLite runs and shows the ordered causal event timeline. Raw trace payloads are discarded before data reaches the webview, even if an older database contains them.
-- **Evaluations** reads saved normalized Harness reports. It also previews or launches fixed, project-relative Harness CLI evaluation/replay commands; it cannot run arbitrary shell commands.
+- **Evaluations** reads saved normalized Harness reports and exposes the fixed generated Promptfoo config and raw result under the selected project's `.llama-harness` directory. It also previews or launches fixed, project-relative Harness CLI evaluation/replay commands; it cannot run arbitrary shell commands.
 
 The standalone CLI intentionally reports when an evaluation or replay needs the embedding application’s tools, fixtures, policy, and approval adapter. The console shows that diagnostic rather than reporting a false success.
 

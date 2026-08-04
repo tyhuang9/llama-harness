@@ -10,6 +10,7 @@ import type {
   ConsoleRun,
   EvalLaunchRequest,
   EvaluationArtifacts,
+  PromptfooArtifact,
   ProjectWorkspace,
   ReplayLaunchRequest,
 } from "./types";
@@ -27,6 +28,7 @@ export const tauriConsoleApi: ConsoleApi = {
   listAgents: () => invoke<AgentDefinition[]>("list_agents"),
   listEvaluationArtifacts: () =>
     invoke<EvaluationArtifacts>("list_evaluation_artifacts"),
+  listPromptfooArtifacts: () => invoke<PromptfooArtifact[]>("list_promptfoo_artifacts"),
   previewEvalCommand: (request: EvalLaunchRequest) =>
     invoke<CommandPreview>("preview_eval_command", { request }),
   launchEvalCommand: (request: EvalLaunchRequest) =>

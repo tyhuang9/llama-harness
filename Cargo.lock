@@ -815,6 +815,7 @@ dependencies = [
  "llama-harness-evals",
  "llama-harness-observability",
  "llama-harness-ollama",
+ "llama-harness-promptfoo",
  "serde_json",
  "serde_yaml",
  "thiserror",
@@ -875,6 +876,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "llama-harness-promptfoo"
+version = "0.1.0"
+dependencies = [
+ "llama-harness-core",
+ "llama-harness-evals",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

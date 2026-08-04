@@ -16,6 +16,7 @@ llama-harness-core = { path = "../llama-harness-core" }
 llama-harness-evals = { path = "../llama-harness-evals" }
 llama-harness-observability = { path = "../llama-harness-observability" }
 llama-harness-ollama = { path = "../llama-harness-ollama" }
+llama-harness-promptfoo = { path = "../llama-harness-promptfoo" }
 serde_json = "1"
 serde_yaml = "0.9"
 thiserror = "2"

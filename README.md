@@ -74,6 +74,7 @@ Read the detailed guides before embedding:
 - [tools and policies](docs/tools-and-policies.md)
 - [observability](docs/observability.md)
 - [evaluations](docs/evaluations.md)
+- [Promptfoo integration](docs/promptfoo-integration.md)
 - [developer console](docs/developer-console.md)
 - [migration map](docs/migration.md)
 

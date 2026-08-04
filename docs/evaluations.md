@@ -84,4 +84,4 @@ Trace inspection reads the optional local SQLite store. Exports contain only per
 
 ## Promptfoo
 
-Promptfoo generation and execution are deliberately deferred. A future wrapper will consume the same validated suite and invoke the application executor, then write visible generated files under `.llama-harness/`. Promptfoo is not a dependency of the core runtime or this deterministic test path.
+The optional, development-only Promptfoo wrapper is documented in [Promptfoo integration](promptfoo-integration.md). It generates a visible custom provider, config, raw output, redacted local trace database, and normalized report under `.llama-harness/`. Promptfoo is not a dependency of the core runtime or deterministic application-evaluation path.
