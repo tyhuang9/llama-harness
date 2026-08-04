@@ -1,0 +1,22 @@
+[package]
+name = "llama-harness-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Local developer CLI for llama-harness"
+
+[[bin]]
+name = "llama-harness"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+llama-harness-core = { path = "../llama-harness-core" }
+llama-harness-evals = { path = "../llama-harness-evals" }
+llama-harness-observability = { path = "../llama-harness-observability" }
+llama-harness-ollama = { path = "../llama-harness-ollama" }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
