@@ -456,5 +456,14 @@ async fn real_ollama_smoke_is_opt_in() {
         provider.health().await.unwrap().healthy,
         "Ollama should be running"
     );
-    let _ = provider.list_models().await.unwrap();
+    let models = provider.list_models().await.unwrap();
+    let Some(model) = models.first() else {
+        return;
+    };
+    let mut smoke_request = request(CancellationToken::new());
+    smoke_request.model = model.id.clone();
+    smoke_request.messages = vec![Message::user("Reply with the word: smoke")];
+    smoke_request.generation.max_output_tokens = Some(8);
+    let response = provider.complete(smoke_request).await.unwrap();
+    assert!(response.final_output.is_some() || !response.tool_calls.is_empty());
 }
