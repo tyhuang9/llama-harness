@@ -3,7 +3,7 @@ use llama_harness_core::{EventRecord, EventSink, RunEvent, RunStatus};
 use rusqlite::{
     params,
     types::{ToSql, Value as SqlValue},
-    Connection, OptionalExtension, Transaction,
+    Connection, OpenFlags, OptionalExtension, Transaction,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -133,6 +133,16 @@ impl SqliteEventSink {
         validate_config(&config)?;
         let mut connection = Connection::open(path)?;
         configure_and_migrate(&mut connection, &config)?;
+        Ok(Self::from_connection(connection, config))
+    }
+
+    /// Opens an existing trace database for inspection without changing its schema or
+    /// SQLite journal settings. This is intended for local developer tooling that
+    /// must never create a database or mutate a project's trace store while reading it.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, TraceStoreError> {
+        let config = TraceStoreConfig::default();
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(config.busy_timeout)?;
         Ok(Self::from_connection(connection, config))
     }
 

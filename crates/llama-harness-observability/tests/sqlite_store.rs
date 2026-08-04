@@ -98,6 +98,34 @@ fn migration_append_query_reopen_and_conflict_are_deterministic() {
 }
 
 #[test]
+fn read_only_open_inspects_existing_traces_without_permitting_writes() {
+    let path = temporary_database("read-only");
+    let writer = SqliteEventSink::open(&path, TraceStoreConfig::default()).unwrap();
+    writer
+        .append(&started("run-read", "trace-read", 10))
+        .unwrap();
+    drop(writer);
+
+    let reader = SqliteEventSink::open_read_only(&path).unwrap();
+    assert_eq!(reader.events_for_run("run-read", 10, 0).unwrap().len(), 1);
+    assert!(matches!(
+        reader.append(&completed(
+            "run-read",
+            "trace-read",
+            2,
+            20,
+            RunStatus::Completed
+        )),
+        Err(TraceStoreError::Sqlite(_))
+    ));
+    drop(reader);
+
+    fs::remove_file(&path).unwrap();
+    let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[test]
 fn raw_payloads_are_opt_in_bounded_and_redacted_before_write_and_export() {
     let raw_payload = json!({
         "authorization": "Bearer top-secret",
