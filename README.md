@@ -1,6 +1,6 @@
 # llama-harness
 
-llama-harness is evolving into an embedded Rust agent runtime with an optional legacy local HTTP/SSE service. The new `llama-harness-core` crate runs inside an application and does not require a daemon; the existing Axum server still talks to local Ollama and manages the LiteLLM sidecar during migration.
+llama-harness is evolving into an embedded Rust agent runtime with optional local developer tooling and a legacy HTTP/SSE service during migration. The core runs inside an application and does not require a Harness daemon; direct loopback Ollama, local SQLite traces, deterministic evaluations, and a developer CLI are separate optional crates.
 
 The API is the product. The admin UI is only a local configuration and inspection dashboard.
 
@@ -39,6 +39,10 @@ The API is the product. The admin UI is only a local configuration and inspectio
 ```text
 llama-harness/
   crates/llama-harness-core/  Embedded, provider-neutral agent runner
+  crates/llama-harness-ollama/ Direct loopback Ollama provider
+  crates/llama-harness-observability/ Redacted local SQLite event store
+  crates/llama-harness-evals/ Deterministic evaluation and replay contracts
+  crates/llama-harness-cli/ Local model, trace, and evaluation CLI
   server/        Legacy Rust backend service (still supported during migration)
   admin-ui/      Local admin dashboard
   clients/ts/    TypeScript client SDK for external apps
@@ -61,7 +65,15 @@ Build and test the embedded core from the repository root:
 cargo test --workspace
 ```
 
-`llama-harness-core` exposes a provider-neutral `AgentRunner`, application-owned tools, policy/approval hooks, JSON-schema validation, cancellation, and a deterministic scripted mock provider. It does not yet ship a direct Ollama provider, HTTP adapter, persistence layer, or UI approval flow. See [architecture](docs/architecture.md) and the [legacy migration map](docs/migration.md).
+`llama-harness-core` exposes a provider-neutral `AgentRunner`, application-owned tools, policy/approval hooks, JSON-schema validation, cancellation, and a deterministic scripted mock provider. `llama-harness-ollama` adds direct loopback Ollama support, while `llama-harness-observability` provides opt-in redacted SQLite traces. See [architecture](docs/architecture.md), [observability](docs/observability.md), [evaluations](docs/evaluations.md), and the [legacy migration map](docs/migration.md).
+
+Validate an evaluation suite or inspect a local trace without starting the legacy daemon:
+
+```bash
+cargo run -p llama-harness-cli -- eval validate path/to/suite.yaml
+cargo run -p llama-harness-cli -- inspect run <run-id> --db traces.sqlite --export-json
+cargo run -p llama-harness-cli -- models list
+```
 
 The legacy server remains outside this virtual Cargo workspace so it can continue to be tested independently:
 
