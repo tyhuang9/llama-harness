@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/llama-harness-core", "crates/llama-harness-ollama"]
+members = [
+  "crates/llama-harness-core",
+  "crates/llama-harness-ollama",
+  "crates/llama-harness-observability",
+]
 exclude = ["server", "desktop/src-tauri"]
 resolver = "2"
 
