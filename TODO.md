@@ -2,77 +2,27 @@
 
 ## Active
 
-- [ ] Decide whether the local admin/configuration API should require an operator token.
-  - Priority: Medium
-  - Area: server
-  - Notes: app-facing policy routes require app-scoped bearer tokens, but local admin/configuration routes are still trusted loopback endpoints.
+- [ ] Decide the end state for the isolated legacy server, TypeScript client, LiteLLM scripts, and legacy configuration.
+  - Priority: High
+  - Area: migration
+  - Notes: The reworked embedded runtime and local console do not depend on these files. Remove or adapt them in a dedicated, separately reviewable branch.
 
-- [ ] Add packaging guidance for running the server and UI together.
+- [ ] Add installer, signing, and Windows/macOS/Linux packaging checks for `apps/harness-console`.
   - Priority: Medium
-  - Area: infra
-  - Notes: Current setup uses separate Rust and Vite dev commands.
+  - Area: developer console
+  - Notes: The Tauri crate and frontend build locally; release packaging has not been verified.
 
-- [ ] Upgrade Vite/esbuild dev tooling when the project is ready for the breaking update.
+- [ ] Add console integration coverage against a real temporary SQLite trace store and report-artifact directory.
+  - Priority: Medium
+  - Area: developer console
+  - Notes: Unit tests cover path/loopback/command constraints and React state. A cross-process Tauri integration harness remains future work.
+
+- [ ] Upgrade the console Vite/esbuild dependency chain after evaluating the breaking changes.
   - Priority: Low
-  - Area: admin-ui
-  - Notes: `npm audit` reports dev-server advisories through Vite 5; `npm audit --omit=dev` reports 0 production vulnerabilities.
-
-## In Progress
-
-None.
+  - Area: developer console
+  - Notes: `npm audit` currently reports transitive development-tool vulnerabilities. Do not use a forced upgrade without testing the Tauri/Vite integration.
 
 ## Completed
 
-- [x] ~~Add production app connection tokens.~~
-  - Completed in: `52629a9`
-  - Notes: Added file-backed pairing requests, service tokens, app-scoped bearer enforcement for capabilities/runs/tool results, and admin connection controls.
-
-- [x] ~~Implement app-agent policy model.~~
-  - Completed in: `84494e3`
-  - Notes: Added top-level app/agent/tool/model catalog files, app capability resolution, app-policy run endpoints, backend audit JSONL, admin UI Apps/Tools/Audit updates, and TypeScript client helpers.
-
-- [x] ~~Create initial project structure.~~
-  - Completed in: `8336012`
-  - Notes: Added `server/`, `admin-ui/`, `clients/ts/`, and `docs/`.
-
-- [x] ~~Implement Ollama-only MVP API surface.~~
-  - Completed in: `8336012`
-  - Notes: Added health, models, chat, streaming chat, settings, runs, and tools placeholder endpoints.
-
-- [x] ~~Create minimal local admin UI.~~
-  - Completed in: `8336012`
-  - Notes: Added dashboard, models, runs, tools, and settings views.
-
-- [x] ~~Create TypeScript client SDK skeleton.~~
-  - Completed in: `8336012`
-  - Notes: Added health, listModels, chat, streamChat, runs, settings, and updateSettings helpers.
-
-- [x] ~~Verify the MVP against a live Ollama model on the target machine.~~
-  - Completed in: `8336012`
-  - Notes: Verified `/health`, `/api/settings`, `/api/runs`, and `/api/chat` with local `qwen2.5:7b`.
-
-- [x] ~~Complete initial MVP branch.~~
-  - Completed in: `8336012`
-  - Notes: Built the server, admin UI, TypeScript client, and MVP docs on `feature/initial-mvp`.
-
-- [x] ~~Merge initial MVP into main.~~
-  - Completed in: local `main` branch at `41652ac`
-  - Notes: Created local `main` from the completed initial MVP branch because the repo had no existing main commit.
-
-- [x] ~~Add global instructions and admin UI refresh.~~
-  - Completed in: `33050fa`
-  - Notes: Added global/request-specific LLM instructions and a softer dark admin UI.
-
-## Backlog / Future
-
-- [ ] Add a production static-file mode for serving the built admin UI from the Rust server.
-  - Priority: Low
-  - Notes: Useful later if the harness should run as one local process.
-
-- [ ] Add a richer local tool registry after the API contract settles.
-  - Priority: Low
-  - Notes: Tool records are now first-class visible capabilities, but real local tool execution is still intentionally out of scope.
-
-- [ ] Add integration tests with a fake Ollama server.
-  - Priority: Medium
-  - Notes: Would make model and chat API behavior testable without requiring local Ollama.
+- [x] Embedded core, direct local Ollama, SQLite traces, evaluation contracts, CLI, and local task-agent reference.
+- [x] Replace the daemon-backed seeded admin dashboard with the optional project-oriented developer console.
