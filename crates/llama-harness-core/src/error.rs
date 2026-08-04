@@ -19,6 +19,10 @@ pub enum HarnessError {
     Provider(String),
     #[error("retryable provider error: {0}")]
     RetryableProvider(String),
+    #[error("policy error: {0}")]
+    Policy(String),
+    #[error("approval error: {0}")]
+    Approval(String),
     #[error("tool error: {0}")]
     Tool(String),
     #[error("cancelled")]
@@ -38,6 +42,8 @@ impl HarnessError {
             Self::InvalidTool(_) => "invalid_tool",
             Self::InvalidArguments(_) => "invalid_arguments",
             Self::Provider(_) | Self::RetryableProvider(_) => "provider_error",
+            Self::Policy(_) => "policy_error",
+            Self::Approval(_) => "approval_error",
             Self::Tool(_) => "tool_error",
             Self::Cancelled => "cancelled",
             Self::TimedOut(_) => "timed_out",

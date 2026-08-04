@@ -17,4 +17,4 @@ tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }

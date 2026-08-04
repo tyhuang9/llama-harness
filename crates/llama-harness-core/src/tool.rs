@@ -64,6 +64,7 @@ impl ToolResult {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> &ToolDefinition;
+    /// Cancellation is cooperative and cannot undo external effects already started by a tool.
     async fn execute(
         &self,
         arguments: Value,

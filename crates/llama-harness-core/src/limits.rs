@@ -91,7 +91,7 @@ fn validate_schema_references(schema: &Value) -> Result<(), String> {
     match schema {
         Value::Object(values) => {
             for (key, value) in values {
-                if matches!(key.as_str(), "$ref" | "$dynamicRef") {
+                if matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef") {
                     let reference = value
                         .as_str()
                         .ok_or_else(|| format!("{key} must be a string"))?;

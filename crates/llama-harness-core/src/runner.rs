@@ -2,7 +2,7 @@ use crate::{
     agent::{RunRequest, RunResult, RunStatus},
     event::{EventEmitter, EventSink, InMemoryEventSink, RunEvent},
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len, AgentLimits},
-    message::{Message, MessageRole},
+    message::Message,
     model::{ModelProvider, ModelRequest, ModelResponse},
     policy::{ApprovalHandler, DenyApproval, PolicyDecision, PolicyEngine, SafeDefaultPolicy},
     tool::{Tool, ToolCall, ToolRegistry, ToolResult},
@@ -118,8 +118,16 @@ impl AgentRunner {
                     model: model.clone(),
                 });
                 let call_cancellation = request.cancellation.child_token();
-                let call_deadline =
-                    provider_deadline(deadline, request.agent.limits.max_model_call_duration_ms);
+                let call_deadline = match provider_deadline(
+                    deadline,
+                    request.agent.limits.max_model_call_duration_ms,
+                ) {
+                    Ok(deadline) => deadline,
+                    Err(error) => {
+                        apply_terminal_error(&mut result, error);
+                        break 'run;
+                    }
+                };
                 let completion = self.provider.complete(ModelRequest {
                     model: model.clone(),
                     messages: messages.clone(),
@@ -778,13 +786,20 @@ fn absolute_deadline(duration_ms: Option<u64>) -> Result<Option<Instant>, Harnes
 fn provider_deadline(
     run_deadline: Option<Instant>,
     provider_duration_ms: Option<u64>,
-) -> Option<Instant> {
+) -> Result<Option<Instant>, HarnessError> {
     let provider_deadline = provider_duration_ms
-        .and_then(|duration_ms| Instant::now().checked_add(Duration::from_millis(duration_ms)));
+        .map(|duration_ms| {
+            Instant::now()
+                .checked_add(Duration::from_millis(duration_ms))
+                .ok_or_else(|| {
+                    HarnessError::InvalidRequest("model call duration is too large".into())
+                })
+        })
+        .transpose()?;
     match (run_deadline, provider_deadline) {
-        (Some(run), Some(provider)) => Some(run.min(provider)),
-        (Some(run), None) => Some(run),
-        (None, provider) => provider,
+        (Some(run), Some(provider)) => Ok(Some(run.min(provider))),
+        (Some(run), None) => Ok(Some(run)),
+        (None, provider) => Ok(provider),
     }
 }
 
@@ -855,9 +870,4 @@ fn merge_generation(
 
 fn canonical_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
-}
-
-#[allow(dead_code)]
-fn _message_role_is_part_of_public_contract(role: MessageRole) -> MessageRole {
-    role
 }
