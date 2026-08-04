@@ -8,7 +8,7 @@ members = [
   "crates/llama-harness-cli",
   "examples/local-task-agent",
 ]
-exclude = ["server", "desktop/src-tauri", "apps/harness-console/src-tauri"]
+exclude = ["apps/harness-console/src-tauri"]
 resolver = "2"
 
 [workspace.package]

@@ -12,7 +12,7 @@
 - `examples/local-task-agent`: deterministic, runnable reference integration with explicit task tools and policy approval.
 - `apps/harness-console`: optional Tauri/React desktop console for one local project workspace.
 
-The retired daemon-backed admin dashboard and its desktop wrapper have been removed. `server/`, `clients/ts/`, LiteLLM scripts, and legacy configuration remain isolated during the migration; they are not used by the embedded runtime or the developer console.
+The retired daemon-backed service, HTTP/SSE TypeScript client, LiteLLM scripts, JSON configuration, admin dashboard, and desktop wrapper have been removed. The repository now contains only the embedded-runtime architecture and optional local developer tooling.
 
 ## Quick start
 
@@ -91,10 +91,8 @@ llama-harness/
   examples/local-task-agent/
   apps/harness-console/       Optional local Tauri developer console
   evals/local-task-agent/
+  tools/promptfoo/            Pinned development-only Promptfoo dependency
   docs/
-  server/                     Isolated legacy service during migration
-  clients/ts/                 Isolated legacy client during migration
-  scripts/                    Legacy/runtime helpers retained for migration
 ```
 
 ## Verification
@@ -108,15 +106,9 @@ npm --prefix apps/harness-console run test
 npm --prefix apps/harness-console run build
 ```
 
-The old server remains independently buildable only for migration work:
-
-```bash
-cargo test --manifest-path server/Cargo.toml
-```
-
 ## Current boundaries
 
 - No hosted accounts, multi-user tenancy, cloud sync, model marketplace, or generic remote model gateway is part of the rework.
 - Ollama must already be installed and running locally for live model discovery or inference.
 - The console stores only its own local workspace preferences. It cannot enable raw trace capture, change retention in an existing database, or retrieve chain-of-thought.
-- Legacy HTTP/SSE, TypeScript client, LiteLLM, and configuration workflows are migration material, not dependencies of the reworked runtime.
+- The retired HTTP/SSE, TypeScript client, LiteLLM, and JSON-configuration workflows no longer exist in this repository. Historical configuration, pairing tokens, JSONL run history, and audit data are not migrated into the redacted SQLite trace store.
