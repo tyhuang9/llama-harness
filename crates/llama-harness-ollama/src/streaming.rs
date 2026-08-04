@@ -49,10 +49,6 @@ pub(crate) fn stream_response(
                 yield Err(HarnessError::ResourceLimit(format!("Ollama stream exceeds {max_stream_bytes} bytes")));
                 return;
             }
-            if buffer.len().saturating_add(chunk.len()) > max_line_bytes {
-                yield Err(HarnessError::ResourceLimit(format!("Ollama stream line exceeds {max_line_bytes} bytes")));
-                return;
-            }
             buffer.extend_from_slice(&chunk);
             while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
                 let line = buffer.drain(..=newline).collect::<Vec<_>>();
@@ -71,6 +67,10 @@ pub(crate) fn stream_response(
                         return;
                     }
                 }
+            }
+            if buffer.len() > max_line_bytes {
+                yield Err(HarnessError::ResourceLimit(format!("Ollama stream line exceeds {max_line_bytes} bytes")));
+                return;
             }
         }
         if !buffer.trim_ascii().is_empty() {

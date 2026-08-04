@@ -304,7 +304,11 @@ async fn streaming_handles_fragmented_ndjson_tool_calls_and_completion() {
         socket.write_all(&body.as_bytes()[31..]).await.unwrap();
         socket.shutdown().await.unwrap();
     });
-    let provider = provider(&base_url);
+    let provider = OllamaProvider::builder()
+        .base_url(base_url)
+        .max_stream_line_bytes(200)
+        .build()
+        .unwrap();
 
     let events = provider
         .stream_chat(request(CancellationToken::new()))
