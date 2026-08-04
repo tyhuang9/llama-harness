@@ -10,11 +10,11 @@
 - Evaluation and CLI foundation: strict YAML/JSON suites, deterministic assertions, report/replay artifacts, and local CLI validation/inspection.
 - Local task-agent example: mock-first task tools, explicit approval, trace persistence, evaluation suite, and opt-in real Ollama smoke test.
 - Developer console: optional Tauri/React console with real project-path validation, read-only trace inspection, direct loopback Ollama discovery, evaluation artifact inspection, constrained CLI launch previews, accessible empty/error/loading states, and no seeded data.
+- Project agent catalog and Promptfoo evaluation: validated project-owned manifests, a development-only concrete local-task-agent adapter, redacted trace-linked normalized reports, and fixed generated artifact inspection.
+- Legacy retirement: removed the daemon-backed server, HTTP/SSE TypeScript client, LiteLLM scripts, legacy JSON configuration, and obsolete development commands.
 
 ### Migration work remaining
 
-- Decide whether the retained legacy server should receive a narrow adapter to the embedded runtime or be removed in a dedicated migration branch.
-- Classify or remove the legacy TypeScript client, LiteLLM runtime scripts, and JSON configuration once consumers have migrated.
 - Add installer/signing and cross-platform packaging verification for the developer console.
 
 Historical daemon/dashboard milestones are preserved in Git history. They are not current architecture guidance.

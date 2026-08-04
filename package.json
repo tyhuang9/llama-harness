@@ -8,7 +8,6 @@
     "console:web": "npm --prefix apps/harness-console run dev",
     "console:test": "npm --prefix apps/harness-console run test",
     "console:dev": "cd apps/harness-console && npm exec tauri -- dev",
-    "console:build": "cd apps/harness-console && npm exec tauri -- build",
-    "legacy:api:dev": "cargo run --manifest-path server/Cargo.toml"
+    "console:build": "cd apps/harness-console && npm exec tauri -- build"
   }
 }

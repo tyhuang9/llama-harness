@@ -2,11 +2,6 @@
 
 ## Active
 
-- [ ] Decide the end state for the isolated legacy server, TypeScript client, LiteLLM scripts, and legacy configuration.
-  - Priority: High
-  - Area: migration
-  - Notes: The reworked embedded runtime and local console do not depend on these files. Remove or adapt them in a dedicated, separately reviewable branch.
-
 - [ ] Add installer, signing, and Windows/macOS/Linux packaging checks for `apps/harness-console`.
   - Priority: Medium
   - Area: developer console
@@ -26,3 +21,4 @@
 
 - [x] Embedded core, direct local Ollama, SQLite traces, evaluation contracts, CLI, and local task-agent reference.
 - [x] Replace the daemon-backed seeded admin dashboard with the optional project-oriented developer console.
+- [x] Remove the retired daemon, HTTP/SSE client, LiteLLM scripts, and legacy configuration after the embedded replacements were verified.
