@@ -1,0 +1,20 @@
+[package]
+name = "llama-harness-evals"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Deterministic evaluation and replay contracts for llama-harness"
+
+[dependencies]
+async-trait = "0.1"
+llama-harness-core = { path = "../llama-harness-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+llama-harness-observability = { path = "../llama-harness-observability" }
+tokio = { version = "1", features = ["macros", "rt"] }

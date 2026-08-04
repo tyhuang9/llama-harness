@@ -3,6 +3,7 @@ members = [
   "crates/llama-harness-core",
   "crates/llama-harness-ollama",
   "crates/llama-harness-observability",
+  "crates/llama-harness-evals",
 ]
 exclude = ["server", "desktop/src-tauri"]
 resolver = "2"
