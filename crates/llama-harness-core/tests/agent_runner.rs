@@ -295,9 +295,13 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
         vec![&MessageRole::System, &MessageRole::User, &MessageRole::User]
     );
     let feedback = &requests[1].messages[3..];
-    assert_eq!(feedback.len(), 2);
-    assert_eq!(feedback[0].tool_call_id.as_deref(), Some("first"));
-    assert_eq!(feedback[1].tool_call_id.as_deref(), Some("second"));
+    assert_eq!(feedback.len(), 3);
+    assert_eq!(feedback[0].role, MessageRole::Assistant);
+    assert_eq!(feedback[0].tool_calls.len(), 2);
+    assert_eq!(feedback[0].tool_calls[0].id, "first");
+    assert_eq!(feedback[0].tool_calls[1].id, "second");
+    assert_eq!(feedback[1].tool_call_id.as_deref(), Some("first"));
+    assert_eq!(feedback[2].tool_call_id.as_deref(), Some("second"));
     assert_eq!(
         events
             .events()

@@ -227,6 +227,12 @@ impl AgentRunner {
                 break;
             }
 
+            messages.push(Message::assistant_tool_calls(response.tool_calls.clone()));
+            if let Err(error) = ensure_transcript(&messages, &request.agent.limits) {
+                apply_terminal_error(&mut result, error);
+                break;
+            }
+
             for call in response.tool_calls {
                 if let Err(error) =
                     check_stopped(&request.cancellation, deadline, "run deadline reached")
