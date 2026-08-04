@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -28,6 +28,8 @@ pub struct AgentDefinition {
     pub limits: AgentLimits,
     #[serde(default)]
     pub generation: GenerationOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     #[serde(default)]
     pub metadata: JsonMap,
 }
@@ -37,6 +39,11 @@ pub struct AgentLimits {
     pub max_model_calls: u32,
     pub max_tool_calls: u32,
     pub max_identical_tool_calls: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_run_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_call_duration_ms: Option<u64>,
+    pub max_output_repairs: u32,
 }
 
 impl Default for AgentLimits {
@@ -45,6 +52,9 @@ impl Default for AgentLimits {
             max_model_calls: 8,
             max_tool_calls: 16,
             max_identical_tool_calls: 2,
+            max_run_duration_ms: None,
+            max_model_call_duration_ms: None,
+            max_output_repairs: 1,
         }
     }
 }
@@ -259,6 +269,13 @@ pub struct Usage {
 pub struct ModelCapabilities {
     pub supports_tools: bool,
     pub supports_streaming: bool,
+    pub supports_structured_output: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub capabilities: ModelCapabilities,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderHealth {
@@ -272,6 +289,7 @@ pub trait ModelProvider: Send + Sync {
     fn id(&self) -> &str;
     fn capabilities(&self) -> ModelCapabilities;
     async fn health(&self) -> Result<ProviderHealth, HarnessError>;
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError>;
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError>;
 }
 
@@ -447,6 +465,10 @@ pub enum HarnessError {
     Tool(String),
     #[error("cancelled")]
     Cancelled,
+    #[error("timed out: {0}")]
+    TimedOut(String),
+    #[error("invalid structured output: {0}")]
+    InvalidOutput(String),
 }
 impl HarnessError {
     fn run_error(&self) -> RunError {
@@ -457,6 +479,8 @@ impl HarnessError {
             Self::Provider(_) => "provider_error",
             Self::Tool(_) => "tool_error",
             Self::Cancelled => "cancelled",
+            Self::TimedOut(_) => "timed_out",
+            Self::InvalidOutput(_) => "invalid_output",
         };
         RunError {
             code: code.into(),
@@ -524,8 +548,21 @@ impl AgentRunner {
         messages.push(Message::user(request.input.clone()));
         let mut model_calls = 0;
         let mut tool_calls = 0;
+        let mut output_repairs = 0;
         let mut identical_calls: HashMap<String, u32> = HashMap::new();
         loop {
+            if request
+                .agent
+                .limits
+                .max_run_duration_ms
+                .is_some_and(|limit| started.elapsed() >= Duration::from_millis(limit))
+            {
+                result.status = RunStatus::Failed;
+                result
+                    .errors
+                    .push(HarnessError::TimedOut("run duration limit reached".into()).run_error());
+                break;
+            }
             if request.cancellation.is_cancelled() {
                 result.status = RunStatus::Cancelled;
                 result.cancelled = true;
@@ -546,23 +583,35 @@ impl AgentRunner {
                 call_number: model_calls,
                 model: model.clone(),
             });
-            let response = match self
-                .provider
-                .complete(ModelRequest {
-                    model: model.clone(),
-                    messages: messages.clone(),
-                    tools: self
-                        .tools
-                        .allowed_definitions(&request.agent.tool_allowlist),
-                    generation: merge_generation(
-                        &request.agent.generation,
-                        &request.overrides.generation,
-                    ),
-                    metadata: request.metadata.clone(),
-                    cancellation: request.cancellation.clone(),
-                })
-                .await
-            {
+            let call_cancellation = request.cancellation.child_token();
+            let completion = self.provider.complete(ModelRequest {
+                model: model.clone(),
+                messages: messages.clone(),
+                tools: self
+                    .tools
+                    .allowed_definitions(&request.agent.tool_allowlist),
+                generation: merge_generation(
+                    &request.agent.generation,
+                    &request.overrides.generation,
+                ),
+                metadata: request.metadata.clone(),
+                cancellation: call_cancellation.clone(),
+            });
+            let completion_result = match request.agent.limits.max_model_call_duration_ms {
+                Some(limit) => {
+                    match tokio::time::timeout(Duration::from_millis(limit), completion).await {
+                        Ok(response) => response,
+                        Err(_) => {
+                            call_cancellation.cancel();
+                            Err(HarnessError::TimedOut(
+                                "model call duration limit reached".into(),
+                            ))
+                        }
+                    }
+                }
+                None => completion.await,
+            };
+            let response = match completion_result {
                 Ok(response) => response,
                 Err(error) => {
                     result.status = if matches!(error, HarnessError::Cancelled) {
@@ -579,9 +628,26 @@ impl AgentRunner {
                 call_number: model_calls,
             });
             if let Some(output) = response.final_output {
-                result.status = RunStatus::Completed;
-                result.final_output = Some(output);
-                break;
+                if let Err(error) = validate_output(&request.agent, &output) {
+                    if output_repairs >= request.agent.limits.max_output_repairs {
+                        result.errors.push(error.run_error());
+                        break;
+                    }
+                    output_repairs += 1;
+                    messages.push(Message {
+                        role: MessageRole::Assistant,
+                        content: output,
+                        tool_call_id: None,
+                    });
+                    messages.push(Message::system(
+                        "Return only JSON that satisfies the requested output schema.",
+                    ));
+                    continue;
+                } else {
+                    result.status = RunStatus::Completed;
+                    result.final_output = Some(output);
+                    break;
+                }
             }
             if response.tool_calls.is_empty() {
                 result.errors.push(RunError {
@@ -812,7 +878,24 @@ fn validate_request(request: &RunRequest) -> Result<(), HarnessError> {
             "all limits must be greater than zero".into(),
         ));
     }
+    if let Some(schema) = &request.agent.output_schema {
+        jsonschema::validator_for(schema).map_err(|error| {
+            HarnessError::InvalidRequest(format!("invalid output schema: {error}"))
+        })?;
+    }
     Ok(())
+}
+
+fn validate_output(agent: &AgentDefinition, output: &str) -> Result<(), HarnessError> {
+    let Some(schema) = &agent.output_schema else {
+        return Ok(());
+    };
+    let value = serde_json::from_str(output)
+        .map_err(|error| HarnessError::InvalidOutput(format!("output is not JSON: {error}")))?;
+    jsonschema::validator_for(schema)
+        .map_err(|error| HarnessError::InvalidOutput(format!("invalid output schema: {error}")))?
+        .validate(&value)
+        .map_err(|error| HarnessError::InvalidOutput(error.to_string()))
 }
 fn merge_generation(
     base: &GenerationOptions,
@@ -863,6 +946,7 @@ pub mod mock {
             ModelCapabilities {
                 supports_tools: true,
                 supports_streaming: false,
+                supports_structured_output: true,
             }
         }
         async fn health(&self) -> Result<ProviderHealth, HarnessError> {
@@ -870,6 +954,12 @@ pub mod mock {
                 healthy: true,
                 detail: None,
             })
+        }
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError> {
+            Ok(vec![ModelInfo {
+                id: "mock-model".into(),
+                capabilities: self.capabilities(),
+            }])
         }
         async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError> {
             if request.cancellation.is_cancelled() {
@@ -990,6 +1080,7 @@ mod tests {
                 tool_allowlist: vec!["read".into()],
                 limits: AgentLimits::default(),
                 generation: GenerationOptions::default(),
+                output_schema: None,
                 metadata: JsonMap::new(),
             },
             input: "hello".into(),
@@ -1185,5 +1276,34 @@ mod tests {
         .await
         .unwrap();
         assert!(result.cancelled);
+    }
+
+    #[tokio::test]
+    async fn repairs_invalid_structured_output_once() {
+        let provider = Arc::new(MockModelProvider::scripted([
+            final_response("not json"),
+            final_response(r#"{"answer":"done"}"#),
+        ]));
+        let mut request = request();
+        request.agent.output_schema = Some(json!({"type":"object","required":["answer"]}));
+        let result = AgentRunner::builder(provider)
+            .build()
+            .run(request)
+            .await
+            .unwrap();
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(result.final_output.as_deref(), Some(r#"{"answer":"done"}"#));
+    }
+
+    #[tokio::test]
+    async fn mock_provider_reports_inventory_and_captures_request() {
+        let provider = Arc::new(MockModelProvider::scripted([final_response("done")]));
+        assert_eq!(provider.list_models().await.unwrap()[0].id, "mock-model");
+        AgentRunner::builder(provider.clone())
+            .build()
+            .run(request())
+            .await
+            .unwrap();
+        assert_eq!(provider.requests().len(), 1);
     }
 }
