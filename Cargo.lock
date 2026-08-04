@@ -877,6 +877,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "local-task-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "llama-harness-core",
+ "llama-harness-evals",
+ "llama-harness-observability",
+ "llama-harness-ollama",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
