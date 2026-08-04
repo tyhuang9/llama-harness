@@ -74,6 +74,13 @@ export type EvaluationArtifacts = {
   skippedFiles: string[];
 };
 
+export type PromptfooArtifact = {
+  kind: "generated_config" | "raw_result";
+  path: string;
+  content: string;
+  truncated: boolean;
+};
+
 export type CommandPreview = {
   program: string;
   args: string[];
@@ -105,6 +112,7 @@ export type ConsoleApi = {
   listModels(): Promise<ConsoleModels>;
   listAgents(): Promise<AgentDefinition[]>;
   listEvaluationArtifacts(): Promise<EvaluationArtifacts>;
+  listPromptfooArtifacts(): Promise<PromptfooArtifact[]>;
   previewEvalCommand(request: EvalLaunchRequest): Promise<CommandPreview>;
   launchEvalCommand(request: EvalLaunchRequest): Promise<CommandResult>;
   previewReplayCommand(request: ReplayLaunchRequest): Promise<CommandPreview>;

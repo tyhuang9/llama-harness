@@ -12,6 +12,7 @@ bundled/litellm-runtime/
 .DS_Store
 *.log
 logs/
+.llama-harness/
 runs.jsonl
 litellm.config.yaml
 litellm.*.config.yaml

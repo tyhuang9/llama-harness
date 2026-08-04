@@ -1,0 +1,8 @@
+{
+  "name": "@llama-harness/promptfoo-tools",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "promptfoo": "0.122.0"
+  }
+}

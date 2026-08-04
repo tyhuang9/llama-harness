@@ -3,9 +3,11 @@ use llama_harness_core::{load_agent_manifest_path, AgentDefinition, ModelProvide
 use llama_harness_evals::{load_suite_path, EvaluationReport, RegressionCase};
 use llama_harness_observability::{ExportedRun, SqliteEventSink, TraceStoreConfig};
 use llama_harness_ollama::{OllamaProvider, DEFAULT_OLLAMA_BASE_URL};
+use llama_harness_promptfoo::{generate_workspace, normalize_observations, PromptfooError};
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
 };
 use thiserror::Error;
 
@@ -54,6 +56,8 @@ enum EvalCommand {
     Run(EvalRunArgs),
     /// Print a normalized evaluation report written by an embedding application.
     Results(ReportArgs),
+    /// Generate, inspect, or run the bounded local Promptfoo adapter.
+    Promptfoo(PromptfooArgs),
 }
 
 #[derive(Args)]
@@ -87,6 +91,27 @@ struct ReportArgs {
     /// Include only one case ID.
     #[arg(long)]
     case: Option<String>,
+}
+
+#[derive(Args)]
+struct PromptfooArgs {
+    /// Validated evaluation suite owned by the current project.
+    suite: PathBuf,
+    /// Override one or more local Ollama models (ollama:<installed-model>).
+    #[arg(long = "model")]
+    models: Vec<String>,
+    /// Project-local output directory for generated config, raw output, and traces.
+    #[arg(long, default_value = ".llama-harness")]
+    output_dir: PathBuf,
+    /// Loopback Ollama base URL.
+    #[arg(long, default_value = DEFAULT_OLLAMA_BASE_URL)]
+    ollama_url: String,
+    /// Print the generated config after validating it.
+    #[arg(long)]
+    show_config: bool,
+    /// Invoke the pinned development-only Promptfoo package, then normalize trace-linked results.
+    #[arg(long)]
+    run: bool,
 }
 
 #[derive(Args)]
@@ -170,6 +195,8 @@ enum CliError {
     #[error(transparent)]
     AgentManifest(#[from] llama_harness_core::AgentManifestError),
     #[error(transparent)]
+    Promptfoo(#[from] PromptfooError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -177,6 +204,8 @@ enum CliError {
     ApplicationExecutorRequired(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("Promptfoo execution failed: {0}")]
+    PromptfooExecution(String),
 }
 
 #[tokio::main]
@@ -314,7 +343,101 @@ fn run_eval(command: EvalCommand) -> Result<(), CliError> {
             }
             Ok(())
         }
+        EvalCommand::Promptfoo(arguments) => run_promptfoo(arguments),
     }
+}
+
+fn run_promptfoo(arguments: PromptfooArgs) -> Result<(), CliError> {
+    let project_root = std::env::current_dir()?.canonicalize()?;
+    let output_dir = if arguments.output_dir.is_absolute() {
+        arguments.output_dir.clone()
+    } else {
+        project_root.join(&arguments.output_dir)
+    };
+    fs::create_dir_all(&output_dir)?;
+    let output_dir = output_dir.canonicalize()?;
+    if !output_dir.starts_with(&project_root) {
+        return Err(CliError::Promptfoo(PromptfooError::Invalid(
+            "--output-dir must remain inside the current project root".into(),
+        )));
+    }
+    let workspace = generate_workspace(
+        &arguments.suite,
+        &project_root,
+        &output_dir,
+        &arguments.models,
+        &arguments.ollama_url,
+    )?;
+    println!(
+        "generated Promptfoo config: {}",
+        workspace.config_path.display()
+    );
+    println!("generated provider: {}", workspace.provider_path.display());
+    println!(
+        "raw Promptfoo output: {}",
+        workspace.raw_result_path.display()
+    );
+    println!("trace database: {}", workspace.trace_db_path.display());
+    if arguments.show_config {
+        println!("\n{}", fs::read_to_string(&workspace.config_path)?);
+    }
+    if !arguments.run {
+        return Ok(());
+    }
+    for path in [
+        &workspace.observation_path,
+        &workspace.normalized_report_path,
+    ] {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let status = ProcessCommand::new(npm)
+        .current_dir(&project_root)
+        .args([
+            "--prefix",
+            "tools/promptfoo",
+            "exec",
+            "promptfoo",
+            "--",
+            "eval",
+            "-c",
+        ])
+        .arg(&workspace.config_path)
+        .args(["-o"])
+        .arg(&workspace.raw_result_path)
+        .status()
+        .map_err(|error| {
+            CliError::PromptfooExecution(format!(
+            "could not start npm/Promptfoo ({error}). Run npm --prefix tools/promptfoo install."
+        ))
+        })?;
+    if !status.success() {
+        return Err(CliError::PromptfooExecution(format!(
+            "pinned Promptfoo exited with {status}; inspect {}",
+            workspace.raw_result_path.display()
+        )));
+    }
+    let report = normalize_observations(
+        &arguments.suite,
+        &workspace.observation_path,
+        &workspace.normalized_report_path,
+    )?;
+    println!(
+        "normalized trace-linked report: {} ({}/{} passed)",
+        workspace.normalized_report_path.display(),
+        report.passed_count(),
+        report.results.len()
+    );
+    if report.failed_count() > 0 {
+        return Err(CliError::PromptfooExecution(format!(
+            "{} Harness assertion(s) failed; inspect {}",
+            report.failed_count(),
+            workspace.normalized_report_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn run_replay(arguments: ReplayArgs) -> Result<(), CliError> {
@@ -525,6 +648,16 @@ mod tests {
             "--db",
             "traces.sqlite",
             "--export-json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "llama-harness",
+            "eval",
+            "promptfoo",
+            "suite.yaml",
+            "--model",
+            "ollama:qwen3",
+            "--run",
         ])
         .is_ok());
         assert!(Cli::try_parse_from(["llama-harness", "models", "list"]).is_ok());
