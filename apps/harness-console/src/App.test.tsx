@@ -18,6 +18,7 @@ function apiWith(preferences: ConsolePreferences): ConsoleApi {
     listRuns: vi.fn().mockResolvedValue([]),
     listRunEvents: vi.fn().mockResolvedValue([]),
     listModels: vi.fn().mockResolvedValue({ health: { healthy: true }, models: [] }),
+    listAgents: vi.fn().mockResolvedValue([]),
     listEvaluationArtifacts: vi.fn().mockResolvedValue({ reports: [], skippedFiles: [] }),
     previewEvalCommand: vi.fn(),
     launchEvalCommand: vi.fn(),
@@ -65,5 +66,18 @@ describe("developer console", () => {
     expect(screen.getByText("Redacted event timeline")).toBeInTheDocument();
     expect(screen.queryByText("rawPayload")).not.toBeInTheDocument();
     await waitFor(() => expect(api.listRunEvents).toHaveBeenCalledWith("run-1"));
+  });
+
+  it("renders a configured project agent manifest without inventing agent data", async () => {
+    const api = apiWith({ workspace, rawPayloadPreference: false, redactionKeyFragments: [] });
+    vi.mocked(api.listAgents).mockResolvedValue([
+      { id: "local-task-agent", name: "Local Task Agent", version: "1", systemInstructions: "Use registered tools.", defaultModel: "ollama:qwen3", toolAllowlist: ["list_tasks"], limits: { maxModelCalls: 4, maxToolCalls: 3 }, metadata: { prompt_version: "task-v1" } },
+    ]);
+    render(<App api={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Agents/ }));
+    expect(await screen.findByRole("heading", { name: "Local Task Agent" })).toBeInTheDocument();
+    expect(screen.getByText("ollama:qwen3")).toBeInTheDocument();
+    expect(screen.queryByText(/sample agent/i)).not.toBeInTheDocument();
   });
 });

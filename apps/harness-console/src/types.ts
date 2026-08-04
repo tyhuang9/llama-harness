@@ -2,7 +2,20 @@ export type ProjectWorkspace = {
   projectRoot: string;
   traceDbPath: string;
   evaluationResultsPath?: string;
+  agentManifestPath?: string;
   ollamaUrl: string;
+};
+
+export type AgentDefinition = {
+  id: string;
+  name: string;
+  version: string;
+  systemInstructions: string;
+  defaultModel: string;
+  toolAllowlist: string[];
+  limits: { maxModelCalls: number; maxToolCalls: number };
+  outputSchema?: Record<string, unknown>;
+  metadata: Record<string, unknown>;
 };
 
 export type ConsolePreferences = {
@@ -90,6 +103,7 @@ export type ConsoleApi = {
   listRuns(query: { traceId?: string; status?: string }): Promise<ConsoleRun[]>;
   listRunEvents(runId: string): Promise<ConsoleEvent[]>;
   listModels(): Promise<ConsoleModels>;
+  listAgents(): Promise<AgentDefinition[]>;
   listEvaluationArtifacts(): Promise<EvaluationArtifacts>;
   previewEvalCommand(request: EvalLaunchRequest): Promise<CommandPreview>;
   launchEvalCommand(request: EvalLaunchRequest): Promise<CommandResult>;

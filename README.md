@@ -71,8 +71,10 @@ Read the detailed guides before embedding:
 
 - [architecture](docs/architecture.md)
 - [embedding](docs/embedding.md)
+- [tools and policies](docs/tools-and-policies.md)
 - [observability](docs/observability.md)
 - [evaluations](docs/evaluations.md)
+- [developer console](docs/developer-console.md)
 - [migration map](docs/migration.md)
 
 ## Repository structure

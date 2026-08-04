@@ -67,6 +67,7 @@ input::placeholder { color: #798ca9; }
 .health-row p { margin: .25rem 0 0; color: #9eb1cb; font-size: .86rem; }
 .card-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
 .model-card { padding: 1rem; }
+.agent-card { margin-bottom: 1rem; padding: 1rem; }.agent-title { display: flex; align-items: start; justify-content: space-between; gap: 1rem; }.agent-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .8rem; margin: 1rem 0; }.agent-grid div { display: grid; gap: .18rem; }.agent-grid dt { color: #91a5c0; font-size: .72rem; text-transform: uppercase; }.agent-grid dd { margin: 0; color: #dce6f4; overflow-wrap: anywhere; }.agent-card details { margin-top: .65rem; }.agent-card summary { color: #a9dbf5; cursor: pointer; }.agent-card details p { color: #c7d4e6; line-height: 1.5; }.agent-card pre { overflow: auto; padding: .6rem; border-radius: .35rem; background: #09101d; font-size: .74rem; }
 .tag-row { display: flex; flex-wrap: wrap; gap: .42rem; }
 .tag { padding: .25rem .45rem; border-radius: 999px; color: #9eafc7; background: #1a273a; font-size: .72rem; }
 .tag.active { color: #bbf4d1; background: #173d2c; }

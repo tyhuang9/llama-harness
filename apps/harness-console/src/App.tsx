@@ -1,6 +1,7 @@
 import { FormEvent, type ReactNode, useEffect, useMemo, useState } from "react";
 import { tauriConsoleApi } from "./bridge";
 import type {
+  AgentDefinition,
   CommandPreview,
   CommandResult,
   ConsoleApi,
@@ -13,12 +14,13 @@ import type {
   ProjectWorkspace,
 } from "./types";
 
-type View = "project" | "models" | "runs" | "evaluations" | "settings";
+type View = "project" | "models" | "agents" | "runs" | "evaluations" | "settings";
 type LoadState<T> = { value?: T; loading: boolean; error?: string };
 
 const navigation: Array<{ id: View; label: string; hint: string }> = [
   { id: "project", label: "Project", hint: "Local paths" },
   { id: "models", label: "Models", hint: "Loopback Ollama" },
+  { id: "agents", label: "Agents", hint: "Project manifest" },
   { id: "runs", label: "Runs", hint: "Redacted SQLite traces" },
   { id: "evaluations", label: "Evaluations", hint: "Saved artifacts" },
   { id: "settings", label: "Settings", hint: "Console preferences" },
@@ -29,6 +31,7 @@ export function App({ api = tauriConsoleApi }: { api?: ConsoleApi }) {
   const [view, setView] = useState<View>("project");
   const [startupError, setStartupError] = useState<string>();
   const [models, setModels] = useState<LoadState<ConsoleModels>>({ loading: false });
+  const [agents, setAgents] = useState<LoadState<AgentDefinition[]>>({ loading: false });
   const [runs, setRuns] = useState<LoadState<ConsoleRun[]>>({ loading: false });
   const [artifacts, setArtifacts] = useState<LoadState<EvaluationArtifacts>>({ loading: false });
 
@@ -37,14 +40,17 @@ export function App({ api = tauriConsoleApi }: { api?: ConsoleApi }) {
     if (!workspace) return;
     setModels((current) => ({ ...current, loading: true, error: undefined }));
     setRuns((current) => ({ ...current, loading: true, error: undefined }));
+    setAgents((current) => ({ ...current, loading: true, error: undefined }));
     setArtifacts((current) => ({ ...current, loading: true, error: undefined }));
-    const [nextModels, nextRuns, nextArtifacts] = await Promise.allSettled([
+    const [nextModels, nextRuns, nextAgents, nextArtifacts] = await Promise.allSettled([
       api.listModels(),
       api.listRuns({}),
+      api.listAgents(),
       api.listEvaluationArtifacts(),
     ]);
     setModels(toLoadState(nextModels));
     setRuns(toLoadState(nextRuns));
+    setAgents(toLoadState(nextAgents));
     setArtifacts(toLoadState(nextArtifacts));
   };
 
@@ -62,7 +68,7 @@ export function App({ api = tauriConsoleApi }: { api?: ConsoleApi }) {
     void refreshWorkspaceData();
     // Refresh only when the selected workspace changes; the API object is stable in production.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workspace?.projectRoot, workspace?.traceDbPath, workspace?.evaluationResultsPath, workspace?.ollamaUrl]);
+  }, [workspace?.projectRoot, workspace?.traceDbPath, workspace?.evaluationResultsPath, workspace?.agentManifestPath, workspace?.ollamaUrl]);
 
   const connectedLabel = workspace ? workspace.projectRoot : "No local project connected";
   const updatePreferences = (next: ConsolePreferences) => setPreferences(next);
@@ -119,6 +125,7 @@ export function App({ api = tauriConsoleApi }: { api?: ConsoleApi }) {
         {preferences && workspace && view === "models" && (
           <ModelsScreen state={models} onRefresh={() => void refreshWorkspaceData()} />
         )}
+        {preferences && workspace && view === "agents" && <AgentsScreen state={agents} />}
         {preferences && workspace && view === "runs" && (
           <RunsScreen api={api} initialState={runs} />
         )}
@@ -155,6 +162,7 @@ function ProjectScreen({
       projectRoot: "",
       traceDbPath: "",
       evaluationResultsPath: "",
+      agentManifestPath: "",
       ollamaUrl: "http://127.0.0.1:11434",
     },
   );
@@ -169,6 +177,7 @@ function ProjectScreen({
       const saved = await api.connectWorkspace({
         ...workspace,
         evaluationResultsPath: workspace.evaluationResultsPath?.trim() || undefined,
+        agentManifestPath: workspace.agentManifestPath?.trim() || undefined,
       });
       onSaved(saved);
     } catch (reason) {
@@ -190,6 +199,7 @@ function ProjectScreen({
         <PathField label="Project root" value={workspace.projectRoot} onChange={(projectRoot) => setWorkspace((current) => ({ ...current, projectRoot }))} required />
         <PathField label="SQLite trace database" value={workspace.traceDbPath} onChange={(traceDbPath) => setWorkspace((current) => ({ ...current, traceDbPath }))} required />
         <PathField label="Evaluation results path (optional)" value={workspace.evaluationResultsPath ?? ""} onChange={(evaluationResultsPath) => setWorkspace((current) => ({ ...current, evaluationResultsPath }))} />
+        <PathField label="Agent manifest path (optional)" value={workspace.agentManifestPath ?? ""} onChange={(agentManifestPath) => setWorkspace((current) => ({ ...current, agentManifestPath }))} />
         <PathField label="Local Ollama URL" value={workspace.ollamaUrl} onChange={(ollamaUrl) => setWorkspace((current) => ({ ...current, ollamaUrl }))} required />
         {error && <Notice kind="error">{error}</Notice>}
         <button className="button primary" disabled={saving} type="submit">{saving ? "Connecting…" : "Connect local project"}</button>
@@ -224,6 +234,30 @@ function ModelsScreen({ state, onRefresh }: { state: LoadState<ConsoleModels>; o
           )}
         </>
       )}
+    </section>
+  );
+}
+
+function AgentsScreen({ state }: { state: LoadState<AgentDefinition[]> }) {
+  return (
+    <section className="page" aria-labelledby="agents-title">
+      <PageHeading eyebrow="PROJECT-OWNED DEFINITIONS" title="Agents" />
+      {state.loading && <Loading label="Reading validated agent manifest" />}
+      {state.error && <Notice kind="error">{state.error}</Notice>}
+      {state.value && state.value.length === 0 && (
+        <EmptyState
+          title="No agent manifest configured"
+          detail="Add an existing project-relative YAML or JSON agent manifest in Project. The console only inspects definitions; your application still owns tool registration, policy, and approvals."
+        />
+      )}
+      {state.value?.map((agent) => (
+        <article className="agent-card panel" key={agent.id}>
+          <div className="agent-title"><div><p className="eyebrow">{agent.id}</p><h3>{agent.name}</h3></div><span className="tag active">v{agent.version}</span></div>
+          <dl className="agent-grid"><div><dt>Default model</dt><dd>{agent.defaultModel}</dd></div><div><dt>Limits</dt><dd>{agent.limits.maxModelCalls} model / {agent.limits.maxToolCalls} tool calls</dd></div><div><dt>Allowed tools</dt><dd>{agent.toolAllowlist.length ? agent.toolAllowlist.join(", ") : "None declared"}</dd></div><div><dt>Prompt version</dt><dd>{String(agent.metadata.prompt_version ?? "Not declared")}</dd></div></dl>
+          {agent.systemInstructions && <details><summary>System instructions</summary><p>{agent.systemInstructions}</p></details>}
+          {agent.outputSchema && <details><summary>Structured output schema</summary><pre>{JSON.stringify(agent.outputSchema, null, 2)}</pre></details>}
+        </article>
+      ))}
     </section>
   );
 }

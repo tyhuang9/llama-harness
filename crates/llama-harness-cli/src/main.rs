@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use llama_harness_core::ModelProvider;
+use llama_harness_core::{load_agent_manifest_path, AgentDefinition, ModelProvider};
 use llama_harness_evals::{load_suite_path, EvaluationReport, RegressionCase};
 use llama_harness_observability::{ExportedRun, SqliteEventSink, TraceStoreConfig};
 use llama_harness_ollama::{OllamaProvider, DEFAULT_OLLAMA_BASE_URL};
@@ -38,6 +38,11 @@ enum Command {
     Models {
         #[command(subcommand)]
         command: ModelsCommand,
+    },
+    /// Inspect project-owned agent definition manifests.
+    Agents {
+        #[command(subcommand)]
+        command: AgentsCommand,
     },
 }
 
@@ -117,6 +122,36 @@ enum ModelsCommand {
     List(OllamaArgs),
 }
 
+#[derive(Subcommand)]
+enum AgentsCommand {
+    /// List validated agent definitions in a YAML or JSON manifest.
+    List(AgentManifestArgs),
+    /// Inspect one validated agent definition by its stable ID.
+    Inspect(AgentInspectArgs),
+    /// Validate a project-owned agent manifest without executing an agent.
+    Validate(AgentManifestArgs),
+}
+
+#[derive(Args)]
+struct AgentManifestArgs {
+    /// Explicit project-owned YAML or JSON manifest path.
+    manifest: PathBuf,
+    /// Emit machine-readable JSON where applicable.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct AgentInspectArgs {
+    /// Explicit project-owned YAML or JSON manifest path.
+    manifest: PathBuf,
+    /// Stable agent ID.
+    agent_id: String,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Args)]
 struct OllamaArgs {
     /// Loopback Ollama base URL.
@@ -132,6 +167,8 @@ enum CliError {
     Trace(#[from] llama_harness_observability::TraceStoreError),
     #[error(transparent)]
     Provider(#[from] llama_harness_core::HarnessError),
+    #[error(transparent)]
+    AgentManifest(#[from] llama_harness_core::AgentManifestError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -157,7 +194,77 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Replay(arguments) => run_replay(arguments),
         Command::Inspect { command } => run_inspect(command),
         Command::Models { command } => run_models(command).await,
+        Command::Agents { command } => run_agents(command),
     }
+}
+
+fn run_agents(command: AgentsCommand) -> Result<(), CliError> {
+    match command {
+        AgentsCommand::Validate(arguments) => {
+            let manifest = load_agent_manifest_path(arguments.manifest)?;
+            if arguments.json {
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
+            } else {
+                println!(
+                    "valid agent manifest v{}: {} agent(s)",
+                    manifest.version,
+                    manifest.agents.len()
+                );
+            }
+            Ok(())
+        }
+        AgentsCommand::List(arguments) => {
+            let manifest = load_agent_manifest_path(arguments.manifest)?;
+            if arguments.json {
+                println!("{}", serde_json::to_string_pretty(&manifest.agents)?);
+            } else if manifest.agents.is_empty() {
+                println!("no agents in the validated manifest");
+            } else {
+                for agent in manifest.agents {
+                    println!(
+                        "{}\t{}\tv{}\tmodel={}\ttools={}",
+                        agent.id,
+                        agent.name,
+                        agent.version,
+                        agent.default_model,
+                        agent.tool_allowlist.join(",")
+                    );
+                }
+            }
+            Ok(())
+        }
+        AgentsCommand::Inspect(arguments) => {
+            let manifest = load_agent_manifest_path(arguments.manifest)?;
+            let agent = manifest
+                .agents
+                .into_iter()
+                .find(|agent| agent.id == arguments.agent_id)
+                .ok_or_else(|| CliError::NotFound(format!("agent {}", arguments.agent_id)))?;
+            print_agent(&agent, arguments.json)
+        }
+    }
+}
+
+fn print_agent(agent: &AgentDefinition, as_json: bool) -> Result<(), CliError> {
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(agent)?);
+    } else {
+        println!(
+            "agent {} ({})\nversion: {}\ndefault model: {}\nallowed tools: {}\nmodel calls: {}\ntool calls: {}",
+            agent.id,
+            agent.name,
+            agent.version,
+            agent.default_model,
+            if agent.tool_allowlist.is_empty() {
+                "none".to_owned()
+            } else {
+                agent.tool_allowlist.join(", ")
+            },
+            agent.limits.max_model_calls,
+            agent.limits.max_tool_calls,
+        );
+    }
+    Ok(())
 }
 
 fn run_eval(command: EvalCommand) -> Result<(), CliError> {
@@ -421,6 +528,15 @@ mod tests {
         ])
         .is_ok());
         assert!(Cli::try_parse_from(["llama-harness", "models", "list"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "llama-harness",
+            "agents",
+            "inspect",
+            "agents.yaml",
+            "task-agent",
+            "--json",
+        ])
+        .is_ok());
     }
 
     #[test]
@@ -468,5 +584,24 @@ mod tests {
         let missing = std::env::temp_dir().join("llama-harness-cli-missing-report.json");
         let error = read_report(&missing).unwrap_err();
         assert!(matches!(error, CliError::Io(_)));
+    }
+
+    #[test]
+    fn agent_rendering_keeps_manifest_metadata_visible() {
+        let agent = AgentDefinition {
+            id: "task-agent".into(),
+            name: "Task Agent".into(),
+            version: "2".into(),
+            system_instructions: "No secrets".into(),
+            default_model: "ollama:qwen3".into(),
+            tool_allowlist: vec!["list_tasks".into()],
+            limits: Default::default(),
+            generation: Default::default(),
+            output_schema: None,
+            metadata: Default::default(),
+        };
+        let json = serde_json::to_string(&agent).unwrap();
+        assert!(json.contains("task-agent"));
+        assert!(json.contains("list_tasks"));
     }
 }

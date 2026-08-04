@@ -1,0 +1,26 @@
+version: 1
+agents:
+  - id: local-task-agent
+    name: Local Task Agent
+    version: "1"
+    system_instructions: >-
+      Use only registered task tools. Preserve ambiguity as unresolved; never
+      guess a state change.
+    default_model: ollama:local-task-agent
+    tool_allowlist: [list_tasks, create_task, update_task]
+    limits:
+      max_model_calls: 4
+      max_tool_calls: 3
+      max_identical_tool_calls: 2
+      max_output_repairs: 1
+      max_provider_retries: 2
+      max_input_bytes: 65536
+      max_request_payload_bytes: 262144
+      max_model_response_bytes: 1048576
+      max_tool_arguments_bytes: 65536
+      max_tool_result_bytes: 1048576
+      max_transcript_bytes: 4194304
+      max_json_depth: 64
+    metadata:
+      prompt_version: local-task-agent-prompt-1
+      source: examples/local-task-agent

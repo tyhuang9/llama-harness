@@ -5,11 +5,11 @@
 
 use async_trait::async_trait;
 use llama_harness_core::{
+    load_agent_manifest,
     mock::{final_response, tool_response, MockModelProvider},
-    AgentDefinition, AgentLimits, AgentRunner, ApprovalHandler, ApprovalRecord, EventSink,
-    GenerationOptions, HarnessError, InMemoryEventSink, JsonMap, ModelProvider, PolicyDecision,
-    PolicyEngine, RunOverrides, RunRequest, Tool, ToolCall, ToolDefinition, ToolRegistry,
-    ToolResult, ToolRisk,
+    AgentDefinition, AgentRunner, ApprovalHandler, ApprovalRecord, EventSink, GenerationOptions,
+    HarnessError, InMemoryEventSink, JsonMap, ModelProvider, PolicyDecision, PolicyEngine,
+    RunOverrides, RunRequest, Tool, ToolCall, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
 };
 use llama_harness_evals::{EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation};
 use serde::{Deserialize, Serialize};
@@ -266,27 +266,19 @@ impl ApprovalHandler for StaticApproval {
     }
 }
 
-pub fn task_agent_definition(model: impl Into<String>) -> AgentDefinition {
-    AgentDefinition {
-        id: "local-task-agent".into(),
-        name: "Local Task Agent".into(),
-        version: "1".into(),
-        system_instructions: "Use only registered task tools. Preserve ambiguity as unresolved; never guess a state change.".into(),
-        default_model: model.into(),
-        tool_allowlist: vec![
-            LIST_TASKS_TOOL.into(),
-            CREATE_TASK_TOOL.into(),
-            UPDATE_TASK_TOOL.into(),
-        ],
-        limits: AgentLimits {
-            max_model_calls: 4,
-            max_tool_calls: 3,
-            ..AgentLimits::default()
-        },
-        generation: GenerationOptions::default(),
-        output_schema: None,
-        metadata: JsonMap::new(),
-    }
+pub fn task_agent_definition(model: impl Into<String>) -> Result<AgentDefinition, HarnessError> {
+    let mut agent = load_agent_manifest(include_str!("../llama-harness.agents.yaml"), Some("yaml"))
+        .map_err(|error| {
+            HarnessError::InvalidRequest(format!("invalid bundled agent manifest: {error}"))
+        })?
+        .agents
+        .into_iter()
+        .find(|agent| agent.id == "local-task-agent")
+        .ok_or_else(|| {
+            HarnessError::InvalidRequest("bundled agent manifest lacks local-task-agent".into())
+        })?;
+    agent.default_model = model.into();
+    Ok(agent)
 }
 
 pub struct TaskAgentRuntime {
@@ -310,7 +302,7 @@ pub fn build_runtime(
     ] {
         tools.register(Arc::new(TaskTool::new(kind, Arc::clone(&store))))?;
     }
-    let agent = task_agent_definition(model);
+    let agent = task_agent_definition(model)?;
     let runner = AgentRunner::builder(provider)
         .tools(tools)
         .policy(Arc::new(TaskPolicy))

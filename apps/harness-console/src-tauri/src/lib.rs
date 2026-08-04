@@ -4,7 +4,9 @@
 //! loopback Ollama process directly. It never starts or contacts the retired
 //! HTTP daemon, and it never sends raw trace payloads to the webview.
 
-use llama_harness_core::{ModelInfo, ModelProvider, ProviderHealth};
+use llama_harness_core::{
+    load_agent_manifest_path, AgentDefinition, ModelInfo, ModelProvider, ProviderHealth,
+};
 use llama_harness_evals::EvaluationReport;
 use llama_harness_observability::{RunListQuery, SqliteEventSink};
 use llama_harness_ollama::OllamaProvider;
@@ -26,6 +28,7 @@ pub struct ProjectWorkspace {
     pub project_root: String,
     pub trace_db_path: String,
     pub evaluation_results_path: Option<String>,
+    pub agent_manifest_path: Option<String>,
     pub ollama_url: String,
 }
 
@@ -155,6 +158,7 @@ pub fn run() {
             list_runs,
             list_run_events,
             list_models,
+            list_agents,
             list_evaluation_artifacts,
             preview_eval_command,
             launch_eval_command,
@@ -299,6 +303,17 @@ async fn list_models(state: State<'_, ConsoleState>) -> Result<ConsoleModels, St
 }
 
 #[tauri::command]
+fn list_agents(state: State<'_, ConsoleState>) -> Result<Vec<AgentDefinition>, String> {
+    let workspace = state.workspace()?;
+    let Some(path) = workspace.agent_manifest_path else {
+        return Ok(Vec::new());
+    };
+    load_agent_manifest_path(&path)
+        .map(|manifest| manifest.agents)
+        .map_err(|error| format!("Could not read project agent manifest: {error}"))
+}
+
+#[tauri::command]
 fn list_evaluation_artifacts(
     state: State<'_, ConsoleState>,
 ) -> Result<EvaluationArtifacts, String> {
@@ -390,6 +405,15 @@ fn validate_workspace(mut workspace: ProjectWorkspace) -> Result<ProjectWorkspac
         .as_deref()
         .map(|path| canonical_existing_path(path, "Evaluation results"))
         .transpose()?;
+    let agent_manifest = workspace
+        .agent_manifest_path
+        .as_deref()
+        .map(|path| canonical_project_file(&root, path, "Agent manifest"))
+        .transpose()?;
+    if let Some(path) = &agent_manifest {
+        load_agent_manifest_path(path)
+            .map_err(|error| format!("Agent manifest is not valid: {error}"))?;
+    }
     let ollama_url = workspace.ollama_url.trim();
     if ollama_url.is_empty() {
         return Err("Ollama URL is required.".to_owned());
@@ -402,8 +426,16 @@ fn validate_workspace(mut workspace: ProjectWorkspace) -> Result<ProjectWorkspac
     workspace.project_root = root.display().to_string();
     workspace.trace_db_path = trace_database.display().to_string();
     workspace.evaluation_results_path = evaluation_results.map(|path| path.display().to_string());
+    workspace.agent_manifest_path = agent_manifest.map(|path| path.display().to_string());
     workspace.ollama_url = ollama_url.to_owned();
     Ok(workspace)
+}
+
+fn canonical_project_file(root: &Path, value: &str, label: &str) -> Result<PathBuf, String> {
+    let path = canonical_existing_file(value, label)?;
+    path.strip_prefix(root)
+        .map_err(|_| format!("{label} must be inside the selected project root."))?;
+    Ok(path)
 }
 
 fn canonical_existing_directory(value: &str, label: &str) -> Result<PathBuf, String> {
@@ -617,6 +649,7 @@ mod tests {
             project_root: root.display().to_string(),
             trace_db_path: root.join("traces.sqlite").display().to_string(),
             evaluation_results_path: None,
+            agent_manifest_path: None,
             ollama_url: "http://127.0.0.1:11434".to_owned(),
         };
         (root, workspace)

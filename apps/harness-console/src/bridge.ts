@@ -3,6 +3,7 @@ import type {
   CommandPreview,
   CommandResult,
   ConsoleApi,
+  AgentDefinition,
   ConsoleEvent,
   ConsoleModels,
   ConsolePreferences,
@@ -23,6 +24,7 @@ export const tauriConsoleApi: ConsoleApi = {
   listRunEvents: (runId: string) =>
     invoke<ConsoleEvent[]>("list_run_events", { runId }),
   listModels: () => invoke<ConsoleModels>("list_models"),
+  listAgents: () => invoke<AgentDefinition[]>("list_agents"),
   listEvaluationArtifacts: () =>
     invoke<EvaluationArtifacts>("list_evaluation_artifacts"),
   previewEvalCommand: (request: EvalLaunchRequest) =>
