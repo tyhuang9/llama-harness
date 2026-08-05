@@ -1,6 +1,6 @@
 # llama-harness
 
-llama-harness is a local AI harness for routing chat requests through a stable Rust HTTP/SSE API. It talks directly to a locally running Ollama instance and can manage a local LiteLLM Proxy sidecar for OpenAI-compatible cloud or gateway providers.
+llama-harness is evolving into an embedded Rust agent runtime with an optional legacy local HTTP/SSE service. The new `llama-harness-core` crate runs inside an application and does not require a daemon; the existing Axum server still talks to local Ollama and manages the LiteLLM sidecar during migration.
 
 The API is the product. The admin UI is only a local configuration and inspection dashboard.
 
@@ -38,7 +38,8 @@ The API is the product. The admin UI is only a local configuration and inspectio
 
 ```text
 llama-harness/
-  server/        Rust backend service
+  crates/llama-harness-core/  Embedded, provider-neutral agent runner
+  server/        Legacy Rust backend service (still supported during migration)
   admin-ui/      Local admin dashboard
   clients/ts/    TypeScript client SDK for external apps
   desktop/       Tauri desktop shell
@@ -50,6 +51,22 @@ llama-harness/
   requirements-litellm.txt
   README.md
   TODO.md
+```
+
+## Embedded Core (New)
+
+Build and test the embedded core from the repository root:
+
+```bash
+cargo test --workspace
+```
+
+`llama-harness-core` exposes a provider-neutral `AgentRunner`, application-owned tools, policy/approval hooks, JSON-schema validation, cancellation, and a deterministic scripted mock provider. It does not yet ship a direct Ollama provider, HTTP adapter, persistence layer, or UI approval flow. See [architecture](docs/architecture.md) and the [legacy migration map](docs/migration.md).
+
+The legacy server remains outside this virtual Cargo workspace so it can continue to be tested independently:
+
+```bash
+cargo test --manifest-path server/Cargo.toml
 ```
 
 The repository tracks a safe baseline `config.json` so new checkouts have LiteLLM settings and a local Ollama-through-LiteLLM provider. Treat your working `config.json` as local runtime state after that. To hide future local edits from normal Git status:
