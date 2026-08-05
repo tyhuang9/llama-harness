@@ -1,0 +1,11 @@
+version: 1
+id: minimal-agent
+name: Minimal Agent Suite
+agent: minimal-agent
+models:
+  - ollama:small
+cases:
+  - id: responds
+    input: Respond safely.
+    expected:
+      status: completed

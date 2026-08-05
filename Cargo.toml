@@ -1,6 +1,14 @@
 [workspace]
-members = ["crates/llama-harness-core"]
-exclude = ["server", "desktop/src-tauri"]
+members = [
+  "crates/llama-harness-core",
+  "crates/llama-harness-ollama",
+  "crates/llama-harness-observability",
+  "crates/llama-harness-evals",
+  "crates/llama-harness-promptfoo",
+  "crates/llama-harness-cli",
+  "examples/local-task-agent",
+]
+exclude = ["apps/harness-console/src-tauri"]
 resolver = "2"
 
 [workspace.package]

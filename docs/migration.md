@@ -1,14 +1,21 @@
-# Migration from the legacy service
+# Completing the embedded-runtime migration
 
-The existing Axum server remains supported and independently testable during this migration. This branch does not route production traffic through the core library yet.
+The daemon-backed Axum service, HTTP/SSE TypeScript client, LiteLLM sidecar scripts, legacy JSON configuration, seeded admin dashboard, and desktop wrapper have been retired. The maintained architecture is the embedded Rust `AgentRunner`, direct loopback Ollama provider, optional redacted SQLite trace sink, deterministic evaluation contracts, concrete local task-agent example, and optional Developer Console.
 
-| Existing service responsibility | Migration status |
+## What changed
+
+| Retired responsibility | Maintained replacement |
 | --- | --- |
-| Axum routes, SSE, bearer tokens, pairing, and local admin UI | Retain as legacy transport/UI. A later adapter may call the embedded core. |
-| `server/src/ollama.rs` direct HTTP client | Retain now; migrate its request/response mapping into a `ModelProvider` implementation later. |
-| LiteLLM sidecar/runtime management | Retain now. It is transport/runtime orchestration, not core agent-loop behavior. |
-| `server/src/app_policy.rs` catalog and app authorization | Retain now; map resolved agent/tool policy into `AgentDefinition`, `PolicyEngine`, and `ApprovalHandler` later. |
-| App-submitted tool continuation | Deprecate for embedded callers over time; embedded applications execute their own `Tool` implementations directly. |
-| JSON configuration and JSONL run/audit persistence | Retain as legacy host persistence. The core deliberately has no persistence. |
+| HTTP routes, SSE streaming, bearer tokens, pairing, and daemon lifecycle | An application embeds `AgentRunner` and owns its lifecycle, tools, policy, approvals, and UI. |
+| Server-owned Ollama proxy | `llama-harness-ollama` talks directly to a loopback-only local Ollama instance. |
+| LiteLLM runtime and remote-provider configuration | No replacement: this rework is intentionally local-Ollama only. |
+| Server catalog/app authorization | A project-owned agent manifest plus application `Tool`, `PolicyEngine`, and `ApprovalHandler` implementations. |
+| HTTP tool-continuation requests | Direct application-owned `Tool` implementations registered in the embedded process. |
+| JSONL run/audit persistence | Optional project-local SQLite causal events through `llama-harness-observability`, with raw payloads disabled by default. |
+| Admin dashboard / desktop wrapper | Optional `apps/harness-console` Tauri console for a selected local workspace. |
 
-Adopters can start with a scripted mock and an application-owned read-only tool. Direct Ollama, legacy-server adapters, streaming, persistence, and UI approval surfaces are intentionally not supplied by this branch.
+## Data and configuration
+
+There is no automatic data migration. The retired JSON configuration, app catalogs, provider credentials, pairing/bearer tokens, JSONL run history, and audit records are not consumed by the new runtime and must not be copied into the trace database. SQLite traces are new, redacted causal-event evidence; they do not reconstruct old requests, responses, fixture state, or hidden reasoning.
+
+To adopt the new architecture, define a project-owned agent manifest, construct application tools and policy/approval handlers, select an already-installed local Ollama model, and optionally attach a project-local SQLite event sink. Use versioned suites and the Promptfoo adapter only for development evaluation. The Developer Console may then inspect that project’s redacted traces, serialized agent definitions, evaluation artifacts, fixed generated Promptfoo files, and local Ollama inventory.

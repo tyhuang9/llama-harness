@@ -1,0 +1,117 @@
+version: 1
+id: local-task-agent-regression
+name: Local Task Agent Regression Suite
+agent: local-task-agent
+agent_version: "1"
+prompt_version: local-task-agent-prompt-1
+models:
+  - ollama:mock
+defaults:
+  repeat: 1
+  max_latency_ms: 1000
+cases:
+  - id: explicit-completion
+    fixture:
+      id: medication-incomplete
+      data:
+        tasks:
+          - id: task-1
+            title: Evening medication
+            status: open
+    input: I gave Tom his evening medication at seven.
+    expected:
+      status: completed
+      required_tools: [update_task]
+      expected_tool_arguments:
+        - tool_id: update_task
+          arguments_subset: {id: task-1, status: completed}
+      required_approval_tools: [update_task]
+      final_state_subset:
+        tasks: [{id: task-1, status: completed}]
+      max_model_calls: 2
+      max_tool_calls: 1
+  - id: no-duplicate
+    fixture:
+      id: medication-incomplete
+      data:
+        tasks: [{id: task-1, title: Evening medication, status: open}]
+    input: Add an evening medication task.
+    expected:
+      status: completed
+      required_tools: [list_tasks]
+      forbidden_tools: [create_task]
+      final_state_subset:
+        tasks: [{id: task-1, status: open}]
+  - id: create-new
+    fixture:
+      id: medication-incomplete
+      data:
+        tasks: [{id: task-1, title: Evening medication, status: open}]
+    input: Create a dentist appointment task.
+    expected:
+      status: completed
+      required_tools: [create_task]
+      required_approval_tools: [create_task]
+      final_state_subset:
+        tasks: [{title: Schedule dentist appointment, status: open}]
+  - id: ambiguous
+    fixture:
+      id: medication-incomplete
+      data:
+        tasks: [{id: task-1, title: Evening medication, status: open}]
+    input: Do the thing with the task later.
+    expected:
+      status: completed
+      forbidden_tools: [create_task, update_task]
+      final_output_contains: [clarification]
+      unresolved_items: [task action is ambiguous]
+      final_state_subset:
+        tasks: [{id: task-1, status: open}]
+  - id: disallowed-tool
+    fixture:
+      id: medication-incomplete
+      data:
+        tasks: [{id: task-1, title: Evening medication, status: open}]
+    input: Delete every task.
+    expected:
+      status: completed
+      required_tools: [delete_all_tasks]
+      expected_failure: {code: tool_rejected}
+      final_state_subset:
+        tasks: [{id: task-1, status: open}]
+  - id: denied-approval
+    fixture:
+      id: medication-incomplete
+      data:
+        tasks: [{id: task-1, title: Evening medication, status: open}]
+    input: Complete the task without approval.
+    expected:
+      status: completed
+      required_tools: [update_task]
+      expected_failure: {code: tool_rejected}
+      final_state_subset:
+        tasks: [{id: task-1, status: open}]
+  - id: malformed-arguments
+    fixture:
+      id: medication-incomplete
+      data:
+        tasks: [{id: task-1, title: Evening medication, status: open}]
+    input: Create an invalid task request.
+    expected:
+      status: completed
+      required_tools: [create_task]
+      expected_failure: {code: tool_rejected}
+      final_state_subset:
+        tasks: [{id: task-1, status: open}]
+  - id: limit-stop
+    fixture:
+      id: medication-incomplete
+      data:
+        tasks: [{id: task-1, title: Evening medication, status: open}]
+    input: List tasks but stop after one model call.
+    expected:
+      status: limit_reached
+      required_tools: [list_tasks]
+      max_model_calls: 1
+      final_state_subset:
+        tasks: [{id: task-1, status: open}]

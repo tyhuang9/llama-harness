@@ -1,0 +1,24 @@
+[package]
+name = "local-task-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "local-task-agent"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+llama-harness-core = { path = "../../crates/llama-harness-core" }
+llama-harness-evals = { path = "../../crates/llama-harness-evals" }
+llama-harness-observability = { path = "../../crates/llama-harness-observability" }
+llama-harness-ollama = { path = "../../crates/llama-harness-ollama" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-util = "0.7"
