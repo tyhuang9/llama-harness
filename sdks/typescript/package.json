@@ -1,0 +1,12 @@
+{
+  "name": "llama-harness-typescript-sdk-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build:runtime": "cargo build --manifest-path ../../Cargo.toml -p llama-harness-runtime",
+    "build": "npm run build --workspace @llama-harness/sdk",
+    "test": "npm run build:runtime && npm run test --workspace @llama-harness/sdk",
+    "pack:dry-run": "npm pack --dry-run --workspace @llama-harness/sdk"
+  }
+}
