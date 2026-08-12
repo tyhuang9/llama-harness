@@ -1,0 +1,134 @@
+name: Manual release validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact release version already reflected in package metadata
+        required: true
+        default: 0.1.0
+        type: string
+      publish:
+        description: Publish only after manual artifact and package review
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: Runtime ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: win32-x64
+            executable: llama-harness-runtime.exe
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+            executable: llama-harness-runtime
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
+            executable: llama-harness-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and stage runtime
+        shell: pwsh
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p llama-harness-runtime
+          $stage = "release-stage/${{ matrix.platform }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $releaseName = "llama-harness-runtime-${{ matrix.platform }}"
+          if ("${{ matrix.executable }}".EndsWith(".exe")) { $releaseName += ".exe" }
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" "$stage/$releaseName"
+          python scripts/prepare_sdk_runtime_packages.py --runtime "$stage/$releaseName" --platform ${{ matrix.platform }} --version ${{ inputs.version }} --out "$stage/sdk-stage"
+      - name: Build platform SDK archives
+        shell: pwsh
+        run: |
+          $npmVersion = node -p "require('./sdks/typescript/packages/sdk/package.json').version"
+          if ($npmVersion -ne "${{ inputs.version }}") { throw "npm SDK version $npmVersion does not match release input" }
+          $pythonVersion = (Select-String -Path "sdks/python/pyproject.toml" -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($pythonVersion -ne "${{ inputs.version }}") { throw "Python SDK version $pythonVersion does not match release input" }
+          npm pack "release-stage/${{ matrix.platform }}/sdk-stage/npm/runtime-${{ matrix.platform }}"
+          Move-Item "llama-harness-runtime-${{ matrix.platform }}-${{ inputs.version }}.tgz" "release-stage/${{ matrix.platform }}/"
+          python -m pip install --disable-pip-version-check build wheel
+          python -m build --wheel "release-stage/${{ matrix.platform }}/sdk-stage/python-source"
+          $tag = (Get-Content "release-stage/${{ matrix.platform }}/sdk-stage/platform.json" | ConvertFrom-Json).python_platform_tag
+          $wheel = (Get-ChildItem "release-stage/${{ matrix.platform }}/sdk-stage/python-source/dist" -Filter *.whl | Select-Object -First 1).FullName
+          python -m wheel tags --platform-tag $tag --remove $wheel
+          python scripts/inspect_python_packages.py --dist "release-stage/${{ matrix.platform }}/sdk-stage/python-source/dist" --require-runtime
+          Move-Item "release-stage/${{ matrix.platform }}/sdk-stage/python-source/dist/*" "release-stage/${{ matrix.platform }}/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-harness-${{ matrix.platform }}
+          path: |
+            release-stage/${{ matrix.platform }}/llama-harness-runtime-${{ matrix.platform }}*
+            release-stage/${{ matrix.platform }}/*.tgz
+            release-stage/${{ matrix.platform }}/*.whl
+          if-no-files-found: error
+  sdk:
+    name: SDK package validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build SDK npm package
+        shell: pwsh
+        run: |
+          $npmVersion = node -p "require('./sdks/typescript/packages/sdk/package.json').version"
+          if ($npmVersion -ne "${{ inputs.version }}") { throw "npm SDK version $npmVersion does not match release input" }
+          npm --prefix sdks/typescript ci
+          npm --prefix sdks/typescript run build
+          npm --prefix sdks/typescript pack --workspace @llama-harness/sdk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-harness-npm-sdk
+          path: sdks/typescript/llama-harness-sdk-${{ inputs.version }}.tgz
+          if-no-files-found: error
+  rust-release-check:
+    name: Rust release validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo run -p xtask -- release-check
+  manifest:
+    needs: [runtime, sdk, rust-release-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/write_release_manifest.py --artifacts release-artifacts --version ${{ inputs.version }} --output release-artifacts/release-manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-harness-release-manifest
+          path: release-artifacts/
+      - name: Publication gate
+        if: ${{ inputs.publish }}
+        run: |
+          echo "Publication remains a separate, human-approved operation."
+          echo "Review checksums, package contents, registry credentials, and ordered publish dry-runs before enabling registry upload steps."

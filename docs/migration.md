@@ -1,16 +1,16 @@
 # Completing the embedded-runtime migration
 
-The daemon-backed Axum service, HTTP/SSE TypeScript client, LiteLLM sidecar scripts, legacy JSON configuration, seeded admin dashboard, and desktop wrapper have been retired. The maintained architecture is the embedded Rust `AgentRunner`, direct loopback Ollama provider, optional redacted SQLite trace sink, deterministic evaluation contracts, concrete local task-agent example, and optional Developer Console.
+The daemon-backed Axum service, HTTP/SSE TypeScript client, LiteLLM sidecar scripts, legacy JSON configuration, seeded admin dashboard, and desktop wrapper have been retired. The maintained architecture is the embedded Rust `AgentRunner`, direct loopback Ollama provider, optional redacted SQLite trace sink, deterministic evaluation contracts, concrete local task-agent example, optional Developer Console, and managed child-sidecar SDKs for Node and Python.
 
 ## What changed
 
 | Retired responsibility | Maintained replacement |
 | --- | --- |
-| HTTP routes, SSE streaming, bearer tokens, pairing, and daemon lifecycle | An application embeds `AgentRunner` and owns its lifecycle, tools, policy, approvals, and UI. |
+| HTTP routes, SSE streaming, bearer tokens, pairing, and daemon lifecycle | An application embeds `AgentRunner` and owns its lifecycle, tools, policy, approvals, and UI. Node/Python use a private child sidecar, never a shared service. |
 | Server-owned Ollama proxy | `llama-harness-ollama` talks directly to a loopback-only local Ollama instance. |
 | LiteLLM runtime and remote-provider configuration | No replacement: this rework is intentionally local-Ollama only. |
 | Server catalog/app authorization | A project-owned agent manifest plus application `Tool`, `PolicyEngine`, and `ApprovalHandler` implementations. |
-| HTTP tool-continuation requests | Direct application-owned `Tool` implementations registered in the embedded process. |
+| HTTP tool-continuation requests | Direct application-owned Rust `Tool` implementations or correlated Node/Python child-sidecar callbacks, always validated by the canonical runner. |
 | JSONL run/audit persistence | Optional project-local SQLite causal events through `llama-harness-observability`, with raw payloads disabled by default. |
 | Admin dashboard / desktop wrapper | Optional `apps/harness-console` Tauri console for a selected local workspace. |
 
