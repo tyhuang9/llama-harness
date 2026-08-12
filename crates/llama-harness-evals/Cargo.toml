@@ -1,14 +1,21 @@
 [package]
 name = "llama-harness-evals"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Deterministic evaluation and replay contracts for llama-harness"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/llama-harness-evals"
+keywords = ["agents", "evaluation", "testing"]
+categories = ["development-tools", "development-tools::testing"]
+publish = ["crates-io"]
 
 [dependencies]
 async-trait = "0.1"
-llama-harness-core = { path = "../llama-harness-core" }
+llama-harness-core = { version = "0.1.0", path = "../llama-harness-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -16,5 +23,5 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-llama-harness-observability = { path = "../llama-harness-observability" }
+llama-harness-observability = { version = "0.1.0", path = "../llama-harness-observability" }
 tokio = { version = "1", features = ["macros", "rt"] }
