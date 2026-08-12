@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="llama-harness API reference and integration guide." />
+    <title>llama-harness API reference</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="llama-harness home">
+        <span class="brand-mark" aria-hidden="true">lh</span>
+        <span>llama-harness</span>
+      </a>
+      <nav class="topnav" aria-label="Primary navigation">
+        <a href="#api">API reference</a>
+        <a href="https://github.com/tyhuang9/llama-harness">GitHub</a>
+        <a class="top-button" href="#quickstart">Get started</a>
+      </nav>
+      <button class="menu-button" type="button" aria-expanded="false" aria-controls="sidebar">Menu</button>
+    </header>
+
+    <div class="layout" id="top">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-kicker">Documentation</div>
+        <label class="search-label" for="doc-search">Search docs</label>
+        <input id="doc-search" class="search" type="search" placeholder="Search" />
+        <nav class="side-nav" aria-label="Documentation navigation">
+          <a class="active" href="#overview">Overview</a>
+          <a href="#quickstart">Quickstart</a>
+          <div class="nav-group">Core API</div>
+          <a href="#agent-runner">AgentRunner</a>
+          <a href="#tools">Tools &amp; policies</a>
+          <a href="#runs">Runs &amp; events</a>
+          <div class="nav-group">Integrations</div>
+          <a href="#typescript">TypeScript SDK</a>
+          <a href="#python">Python SDK</a>
+          <a href="#tauri">Tauri</a>
+          <div class="nav-group">Resources</div>
+          <a href="architecture.md">Architecture</a>
+          <a href="security.md">Security</a>
+          <a href="releasing.md">Releasing</a>
+        </nav>
+        <div class="sidebar-foot">API version <strong>v1</strong><br />Runtime protocol is JSONL over stdio.</div>
+      </aside>
+
+      <main class="content">
+        <section class="hero" id="overview">
+          <div class="eyebrow">LOCAL AGENT RUNTIME · API REFERENCE</div>
+          <h1>Build controlled agent workflows.</h1>
+          <p class="lede">llama-harness gives your application one canonical runner for model loops, tools, policy, approvals, limits, cancellation, and causal events.</p>
+          <div class="hero-actions">
+            <a class="button primary" href="#quickstart">Start building <span aria-hidden="true">→</span></a>
+            <a class="button secondary" href="https://github.com/tyhuang9/llama-harness">View on GitHub</a>
+          </div>
+          <div class="install-strip" aria-label="Install from Git">
+            <span class="prompt">$</span><code>cargo add llama-harness --git https://github.com/tyhuang9/llama-harness --rev 9953d6c</code><button class="copy" type="button" data-copy="cargo add llama-harness --git https://github.com/tyhuang9/llama-harness --rev 9953d6c">Copy</button>
+          </div>
+        </section>
+
+        <section class="notice" id="quickstart">
+          <div class="notice-icon" aria-hidden="true">i</div>
+          <div><strong>Available from Git today.</strong><br />The Rust facade is not published to crates.io yet. Pin a reviewed Git revision for pre-release integrations.</div>
+          <a href="integrating-note.md">Integration guide →</a>
+        </section>
+
+        <section class="section" id="api">
+          <div class="section-heading"><div><div class="eyebrow">CORE API</div><h2>AgentRunner</h2></div><span class="badge">Rust</span></div>
+          <p>The embedded engine is the source of truth. Construct a runner in your Rust or Tauri process, register application-owned tools, and execute a bounded run.</p>
+          <div class="api-grid" id="agent-runner">
+            <div class="api-card"><div class="method">AgentRunner::builder</div><p>Configure the model provider, policy, approval handler, limits, and event sink.</p><a href="embedding.md">Read embedding guide →</a></div>
+            <div class="api-card"><div class="method">runner.run(request)</div><p>Execute one agent request and receive a typed result with ordered causal events.</p><a href="architecture.md">See architecture →</a></div>
+            <div class="api-card"><div class="method">runner.cancel(run_id)</div><p>Cancel a known run. Cancellation is propagated through pending model and callback waits.</p><a href="tools-and-policies.md">Review controls →</a></div>
+          </div>
+          <div class="code-block" role="region" aria-label="Rust quickstart code"><div class="code-toolbar"><span>Rust</span><button class="copy" type="button" data-copy="let runner = AgentRunner::builder(provider).build();\nlet result = runner.run(request).await?;">Copy</button></div><pre><code><span class="kw">let</span> runner = AgentRunner::builder(provider).build();
+<span class="kw">let</span> result = runner.run(request).await?;
+println!(<span class="str">"{}"</span>, result.final_output.unwrap_or_default());</code></pre></div>
+        </section>
+
+        <section class="section" id="tools">
+          <div class="section-heading"><div><div class="eyebrow">CONTROL PLANE</div><h2>Tools, policy, and approvals</h2></div><span class="badge green">Fail closed</span></div>
+          <p>Tool schemas are validated before execution. Policy runs before approval, state-changing tools require explicit authorization, and callback failures terminate safely.</p>
+          <div class="table-wrap"><table><thead><tr><th>Concept</th><th>What it controls</th><th>Default</th></tr></thead><tbody><tr><td><code>Tool</code></td><td>Schema, arguments, read-only declaration, execution</td><td>Application-owned</td></tr><tr><td><code>PolicyEngine</code></td><td>Whether a proposed call is allowed</td><td>Read-only safe default</td></tr><tr><td><code>ApprovalHandler</code></td><td>User or host confirmation for risky actions</td><td>Deny if missing</td></tr><tr><td><code>AgentLimits</code></td><td>Calls, tokens, duration, output and input bounds</td><td>Explicit per run</td></tr></tbody></table></div>
+        </section>
+
+        <section class="section" id="runs">
+          <div class="section-heading"><div><div class="eyebrow">OBSERVABILITY</div><h2>Runs and events</h2></div><span class="badge">Ordered</span></div>
+          <p>Each run emits structured, ordered events. Attach a redacted local SQLite sink when you need trace inspection; chain-of-thought is never collected.</p>
+          <div class="resource-list"><a href="observability.md"><span><strong>SqliteEventSink</strong><small>Persist redacted event records locally.</small></span><span>→</span></a><a href="https://github.com/tyhuang9/llama-harness/blob/main/protocol/compatibility/v1.md"><span><strong>Protocol v1</strong><small>Versioned JSONL envelopes for sidecar clients.</small></span><span>→</span></a></div>
+        </section>
+
+        <section class="section integrations">
+          <div class="section-heading"><div><div class="eyebrow">INTEGRATIONS</div><h2>Use the same engine anywhere</h2></div></div>
+          <div class="integration-grid"><article id="typescript"><span class="integration-tag">Node / TypeScript</span><h3>Managed child runtime</h3><p>Start the Rust runtime only when your client calls <code>HarnessClient.start()</code>. Tools, policy, and approvals stay in the host process.</p><a href="typescript-sdk.md">TypeScript SDK guide →</a></article><article id="python"><span class="integration-tag">Python</span><h3>Asyncio-native SDK</h3><p>Use an async context manager, typed callbacks, ordered events, cancellation, and an explicit runtime path.</p><a href="python-sdk.md">Python SDK guide →</a></article><article id="tauri"><span class="integration-tag">Tauri</span><h3>Embedded Rust backend</h3><p>Keep capabilities in the Rust backend and forward structured events plus opaque approval IDs to the webview.</p><a href="tauri.md">Tauri guide →</a></article></div>
+        </section>
+
+        <footer class="footer"><span>llama-harness · API reference v1</span><span><a href="https://github.com/tyhuang9/llama-harness">GitHub</a> · <a href="releasing.md">Releases</a></span></footer>
+      </main>
+    </div>
+    <script src="script.js"></script>
+  </body>
+</html>

@@ -4,6 +4,11 @@
 workflows. One canonical `AgentRunner` owns model/tool looping, validation,
 policy, approvals, limits, cancellation, and causal events.
 
+**[Read the API documentation →](https://tyhuang9.github.io/llama-harness/)**
+
+The documentation site is a Stripe-inspired, searchable API reference for the
+core runner, tool controls, sidecar SDKs, Tauri integration, and release path.
+
 Rust and Tauri applications embed that engine directly. Node/TypeScript and
 Python applications may use a private `llama-harness-runtime` JSONL child
 process that wraps the same engine. It is not a daemon, HTTP listener, hosted
@@ -62,6 +67,8 @@ the frontend receives structured events and opaque one-time approval IDs, never
 direct tool capability. See the linked guides below.
 
 ## Guides
+
+- [API documentation](https://tyhuang9.github.io/llama-harness/) (GitHub Pages)
 
 - [Architecture](docs/architecture.md) and [embedding](docs/embedding.md)
 - [Protocol compatibility](protocol/compatibility/v1.md) and [SDK architecture](docs/sdk-architecture.md)
