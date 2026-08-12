@@ -78,6 +78,10 @@ pub struct RunRequest {
     pub evaluation: JsonMap,
     #[serde(skip, default = "CancellationToken::new")]
     pub cancellation: CancellationToken,
+    #[serde(skip)]
+    pub run_id: Option<String>,
+    #[serde(skip)]
+    pub trace_id: Option<String>,
 }
 
 impl RunRequest {
@@ -92,7 +96,23 @@ impl RunRequest {
             overrides: RunOverrides::default(),
             evaluation: JsonMap::new(),
             cancellation: CancellationToken::new(),
+            run_id: None,
+            trace_id: None,
         }
+    }
+
+    /// Sets a host-generated run ID, used by child-process adapters to correlate
+    /// their lifecycle with the canonical embedded run.
+    pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
+    }
+
+    /// Sets a host-generated trace ID when a transport needs a stable external
+    /// correlation value for the canonical run.
+    pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self
     }
 }
 

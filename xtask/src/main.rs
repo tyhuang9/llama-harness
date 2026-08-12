@@ -9,6 +9,7 @@ const PUBLISHABLE_CRATES: &[&str] = &[
     "llama-harness-observability",
     "llama-harness-evals",
     "llama-harness-protocol",
+    "llama-harness-runtime",
     "llama-harness",
 ];
 

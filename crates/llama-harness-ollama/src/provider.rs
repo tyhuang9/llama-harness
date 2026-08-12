@@ -96,6 +96,8 @@ impl OllamaProviderBuilder {
         let base_url = parse_loopback_url(&self.base_url)?;
         let http = Client::builder()
             .timeout(self.request_timeout)
+            // A loopback endpoint must not redirect a sidecar request elsewhere.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| HarnessError::Provider(format!("create Ollama client: {error}")))?;
         Ok(OllamaProvider {

@@ -1,4 +1,4 @@
-use crate::{HarnessError, RunRequest, ToolDefinition};
+use crate::{HarnessError, RunRequest, ToolCallContext, ToolDefinition};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +27,17 @@ pub trait PolicyEngine: Send + Sync {
         arguments: &Value,
         request: &RunRequest,
     ) -> Result<PolicyDecision, HarnessError>;
+
+    /// Decides with immutable correlation for protocol-backed policy handlers.
+    async fn decide_with_context(
+        &self,
+        _: &ToolCallContext,
+        tool: &ToolDefinition,
+        arguments: &Value,
+        request: &RunRequest,
+    ) -> Result<PolicyDecision, HarnessError> {
+        self.decide(tool, arguments, request).await
+    }
 }
 
 #[async_trait]
@@ -37,6 +48,17 @@ pub trait ApprovalHandler: Send + Sync {
         arguments: &Value,
         request: &RunRequest,
     ) -> Result<ApprovalRecord, HarnessError>;
+
+    /// Approves with immutable correlation for protocol-backed approval handlers.
+    async fn approve_with_context(
+        &self,
+        _: &ToolCallContext,
+        tool: &ToolDefinition,
+        arguments: &Value,
+        request: &RunRequest,
+    ) -> Result<ApprovalRecord, HarnessError> {
+        self.approve(tool, arguments, request).await
+    }
 }
 
 pub struct AllowAllPolicy;

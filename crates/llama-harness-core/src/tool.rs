@@ -16,6 +16,15 @@ pub struct ToolCall {
     pub arguments_json: String,
 }
 
+/// Immutable correlation data for one validated tool call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallContext {
+    pub run_id: String,
+    pub trace_id: String,
+    pub call_id: String,
+    pub tool_id: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolRisk {
@@ -70,6 +79,18 @@ pub trait Tool: Send + Sync {
         arguments: Value,
         cancellation: CancellationToken,
     ) -> Result<ToolResult, HarnessError>;
+
+    /// Executes with immutable run and call correlation. Existing embedded tools
+    /// may implement only [`Self::execute`]; adapters can override this method
+    /// when the correlation data must cross a process boundary.
+    async fn execute_with_context(
+        &self,
+        _: &ToolCallContext,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, HarnessError> {
+        self.execute(arguments, cancellation).await
+    }
 }
 
 struct RegisteredTool {

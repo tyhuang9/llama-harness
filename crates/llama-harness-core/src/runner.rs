@@ -5,7 +5,7 @@ use crate::{
     message::Message,
     model::{ModelProvider, ModelRequest, ModelResponse},
     policy::{ApprovalHandler, DenyApproval, PolicyDecision, PolicyEngine, SafeDefaultPolicy},
-    tool::{Tool, ToolCall, ToolRegistry, ToolResult},
+    tool::{Tool, ToolCall, ToolCallContext, ToolRegistry, ToolResult},
     GenerationOptions, HarnessError, RunError,
 };
 use jsonschema::Validator;
@@ -53,8 +53,14 @@ impl AgentRunner {
         let output_validator = validate_request(&request)?;
         let started = StdInstant::now();
         let deadline = absolute_deadline(request.agent.limits.max_run_duration_ms)?;
-        let run_id = Uuid::new_v4().to_string();
-        let trace_id = Uuid::new_v4().to_string();
+        let run_id = request
+            .run_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let trace_id = request
+            .trace_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let model = request
             .overrides
             .model
@@ -377,8 +383,19 @@ impl AgentRunner {
                     continue;
                 }
 
+                let context = ToolCallContext {
+                    run_id: result.id.clone(),
+                    trace_id: result.trace_id.clone(),
+                    call_id: call.id.clone(),
+                    tool_id: call.tool_id.clone(),
+                };
                 let decision = match await_guarded(
-                    self.policy.decide(tool.definition(), &arguments, &request),
+                    self.policy.decide_with_context(
+                        &context,
+                        tool.definition(),
+                        &arguments,
+                        &request,
+                    ),
                     &request.cancellation,
                     deadline,
                     "policy decision exceeded run deadline",
@@ -422,8 +439,12 @@ impl AgentRunner {
                             tool_id: call.tool_id.clone(),
                         });
                         let mut approval = match await_guarded(
-                            self.approvals
-                                .approve(tool.definition(), &arguments, &request),
+                            self.approvals.approve_with_context(
+                                &context,
+                                tool.definition(),
+                                &arguments,
+                                &request,
+                            ),
                             &request.cancellation,
                             deadline,
                             "approval exceeded run deadline",
@@ -449,6 +470,7 @@ impl AgentRunner {
                                     &mut messages,
                                     &call,
                                     tool,
+                                    &context,
                                     arguments,
                                     &request.cancellation,
                                     deadline,
@@ -485,6 +507,7 @@ impl AgentRunner {
                                 &mut messages,
                                 &call,
                                 tool,
+                                &context,
                                 arguments,
                                 &request.cancellation,
                                 deadline,
@@ -533,6 +556,7 @@ impl AgentRunner {
         messages: &mut Vec<Message>,
         call: &ToolCall,
         tool: Arc<dyn Tool>,
+        context: &ToolCallContext,
         arguments: Value,
         cancellation: &CancellationToken,
         deadline: Option<Instant>,
@@ -545,7 +569,7 @@ impl AgentRunner {
             "run deadline reached before tool invocation",
         )?;
         let tool_cancellation = cancellation.child_token();
-        let execution = tool.execute(arguments, tool_cancellation.clone());
+        let execution = tool.execute_with_context(context, arguments, tool_cancellation.clone());
         let tool_result = await_guarded(
             execution,
             cancellation,

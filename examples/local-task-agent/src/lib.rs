@@ -337,6 +337,8 @@ impl TaskAgentRuntime {
                 },
                 evaluation: JsonMap::new(),
                 cancellation: CancellationToken::new(),
+                run_id: None,
+                trace_id: None,
             })
             .await
     }
