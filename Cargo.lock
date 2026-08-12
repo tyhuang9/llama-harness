@@ -935,6 +935,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "llama-harness-scripted-runtime"
+version = "0.1.0"
+dependencies = [
+ "llama-harness-core",
+ "llama-harness-protocol",
+ "llama-harness-runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "local-task-agent"
 version = "0.1.0"
 dependencies = [
