@@ -6,6 +6,8 @@ from .client import (
     HarnessError,
     HarnessRun,
     PolicyRequest,
+    ProviderHealth,
+    ProviderModel,
     RunCancelledError,
     RuntimeExitedError,
     RuntimeProtocolError,
@@ -16,7 +18,7 @@ from .client import (
 )
 
 __all__ = [
-    "ApprovalRequest", "HarnessClient", "HarnessError", "HarnessRun", "PolicyRequest",
+    "ApprovalRequest", "HarnessClient", "HarnessError", "HarnessRun", "PolicyRequest", "ProviderHealth", "ProviderModel",
     "RunCancelledError", "RuntimeExitedError", "RuntimeProtocolError",
     "RuntimeUnavailableError", "Tool", "ToolContext", "tool",
 ]

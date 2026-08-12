@@ -3,7 +3,7 @@ import os
 import unittest
 from pathlib import Path
 
-from llama_harness import HarnessClient, Tool
+from llama_harness import HarnessClient, ProviderHealth, ProviderModel, Tool
 
 
 class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
@@ -60,3 +60,11 @@ class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, {"policy": 1, "approval": 1, "tool": 1})
         self.assertGreaterEqual(len(events), 4)
         self.assertEqual([event["sequence"] for event in events], sorted(event["sequence"] for event in events))
+
+    async def test_workspace_scripted_runtime_exposes_provider_inspection(self) -> None:
+        runtime = Path(__file__).resolve().parents[3] / "target" / "debug" / "llama-harness-scripted-runtime.exe"
+        if not runtime.is_file():
+            self.skipTest("workspace scripted runtime has not been built")
+        async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=runtime) as client:
+            self.assertEqual(await client.health(), ProviderHealth(True))
+            self.assertEqual(await client.list_models(), [ProviderModel("mock-model", True, False, True)])

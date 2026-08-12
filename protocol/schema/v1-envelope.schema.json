@@ -23,7 +23,7 @@
     "type": {
       "type": "string",
       "enum": [
-        "client_hello", "start_run", "cancel_run", "tool_result", "policy_decision", "approval_decision", "ping", "shutdown",
+        "client_hello", "start_run", "cancel_run", "tool_result", "policy_decision", "approval_decision", "get_provider_health", "get_model_inventory", "ping", "shutdown",
         "runtime_hello", "command_acknowledged", "protocol_error", "run_started", "run_event", "policy_decision_requested", "approval_requested", "tool_execution_requested", "run_completed", "run_failed", "run_cancelled", "pong", "provider_health", "model_inventory"
       ]
     },

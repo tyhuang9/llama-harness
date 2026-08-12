@@ -91,6 +91,8 @@ export interface RunOptions {
 
 export interface RunEvent { type: string; sequence: number; timestampMs: number; traceId: string; event: Record<string, Json>; }
 export interface RunResult { status: "completed" | "failed" | "cancelled" | "limit_reached"; finalOutput?: string; model: string; traceId: string; durationMs: number; [key: string]: Json | undefined; }
+export interface ProviderHealth { healthy: boolean; detail?: string; }
+export interface ProviderModel { id: string; capabilities: { supportsTools: boolean; supportsStreaming: boolean; supportsStructuredOutput: boolean; }; }
 export interface HarnessClientOptions { provider: OllamaProvider; runtimePath?: string; runtimeArgs?: string[]; onStderr?: (line: string) => void; }
 
 export class HarnessError extends Error {}
@@ -132,7 +134,7 @@ export class HarnessClient {
   async run(options: RunOptions): Promise<HarnessRun> {
     const tools = options.tools ?? [];
     const payload = {
-      provider: { kind: "ollama", base_url: this.options.provider.baseUrl ?? "http://127.0.0.1:11434" },
+      provider: toWireProvider(this.options.provider),
       agent: toWireAgent(options.agent),
       input: options.input,
       application_context: options.applicationContext ?? {},
@@ -148,6 +150,24 @@ export class HarnessClient {
     for (const event of this.buffered.get(run.id) ?? []) this.handleRunMessage(run, event);
     this.buffered.delete(run.id);
     return new HarnessRun(run);
+  }
+
+  async health(): Promise<ProviderHealth> {
+    const response = await this.request({ type: "get_provider_health", payload: { provider: toWireProvider(this.options.provider) } });
+    if (response.type !== "provider_health") throw new RuntimeProtocolError(`Expected provider_health, received ${response.type}`);
+    return { healthy: Boolean(response.payload.healthy), detail: typeof response.payload.detail === "string" ? response.payload.detail : undefined };
+  }
+
+  async listModels(): Promise<ProviderModel[]> {
+    const response = await this.request({ type: "get_model_inventory", payload: { provider: toWireProvider(this.options.provider) } });
+    if (response.type !== "model_inventory") throw new RuntimeProtocolError(`Expected model_inventory, received ${response.type}`);
+    const models = response.payload.models;
+    if (!Array.isArray(models)) throw new RuntimeProtocolError("Model inventory did not contain models");
+    return models.map((value) => {
+      const model = value as Record<string, Json>;
+      const capabilities = model.capabilities as Record<string, Json>;
+      return { id: String(model.id), capabilities: { supportsTools: Boolean(capabilities?.supports_tools), supportsStreaming: Boolean(capabilities?.supports_streaming), supportsStructuredOutput: Boolean(capabilities?.supports_structured_output) } };
+    });
   }
 
   async close(): Promise<void> {
@@ -171,7 +191,7 @@ export class HarnessClient {
 
   private receive(envelope: Envelope): void {
     const pending = this.pending.get(envelope.request_id);
-    if (pending && ["runtime_hello", "command_acknowledged", "protocol_error", "pong"].includes(envelope.type)) { this.pending.delete(envelope.request_id); pending.resolve(envelope); return; }
+    if (pending && ["runtime_hello", "command_acknowledged", "protocol_error", "pong", "provider_health", "model_inventory"].includes(envelope.type)) { this.pending.delete(envelope.request_id); pending.resolve(envelope); return; }
     if (!envelope.run_id) return;
     const run = this.runs.get(envelope.run_id);
     if (!run) { const buffered = this.buffered.get(envelope.run_id) ?? []; buffered.push(envelope); this.buffered.set(envelope.run_id, buffered); return; }
@@ -229,6 +249,7 @@ function optionalNumber(value: Json | undefined): number | undefined { return ty
 function callbackRequest(runId: string, payload: Record<string, Json>, tool: ToolDefinition): PolicyRequest { return { runId, traceId: String(payload.trace_id), callId: String(payload.call_id), tool, arguments: payload.arguments as Json, deadlineMs: optionalNumber(payload.deadline_ms) }; }
 function validateTool(tool: HarnessTool): void { if (!tool.id.trim() || !tool.name.trim() || !tool.description.trim()) throw new HarnessError("Tool id, name, and description are required"); }
 function toWireTool(tool: ToolDefinition): Record<string, unknown> { return { id: tool.id, name: tool.name, description: tool.description, arguments_schema: tool.argumentsSchema, risk: tool.risk, idempotent: tool.idempotent, read_only: tool.readOnly }; }
+function toWireProvider(provider: OllamaProvider): Record<string, string> { return { kind: "ollama", base_url: provider.baseUrl ?? "http://127.0.0.1:11434" }; }
 function fromWireTool(tool: Record<string, Json>): ToolDefinition { return { id: String(tool.id), name: String(tool.name), description: String(tool.description), argumentsSchema: tool.arguments_schema ?? {}, risk: String(tool.risk) as ToolDefinition["risk"], idempotent: Boolean(tool.idempotent), readOnly: Boolean(tool.read_only) }; }
 function toWireGeneration(generation: GenerationOptions): Record<string, unknown> { return compact({ temperature: generation.temperature, top_p: generation.topP, max_output_tokens: generation.maxOutputTokens }); }
 function toWireAgent(agent: AgentDefinition): Record<string, unknown> { const defaults: AgentLimits = { maxModelCalls: 8, maxToolCalls: 16, maxIdenticalToolCalls: 2, maxOutputRepairs: 1, maxProviderRetries: 2, maxInputBytes: 65536, maxRequestPayloadBytes: 262144, maxModelResponseBytes: 1048576, maxToolArgumentsBytes: 65536, maxToolResultBytes: 1048576, maxTranscriptBytes: 4194304, maxJsonDepth: 64 }; const limits = { ...defaults, ...agent.limits }; return compact({ id: agent.id, name: agent.name, version: agent.version, system_instructions: agent.instructions ?? "", default_model: agent.defaultModel, tool_allowlist: agent.toolAllowlist ?? [], limits: compact({ max_model_calls: limits.maxModelCalls, max_tool_calls: limits.maxToolCalls, max_identical_tool_calls: limits.maxIdenticalToolCalls, max_run_duration_ms: limits.maxRunDurationMs, max_model_call_duration_ms: limits.maxModelCallDurationMs, max_output_repairs: limits.maxOutputRepairs, max_provider_retries: limits.maxProviderRetries, max_input_bytes: limits.maxInputBytes, max_request_payload_bytes: limits.maxRequestPayloadBytes, max_model_response_bytes: limits.maxModelResponseBytes, max_tool_arguments_bytes: limits.maxToolArgumentsBytes, max_tool_result_bytes: limits.maxToolResultBytes, max_transcript_bytes: limits.maxTranscriptBytes, max_json_depth: limits.maxJsonDepth }), generation: toWireGeneration(agent.generation ?? {}), output_schema: agent.outputSchema, metadata: agent.metadata ?? {} }); }

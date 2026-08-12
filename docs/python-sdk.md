@@ -26,3 +26,7 @@ async with await HarnessClient.start(provider={"kind": "ollama"}) as client:
 closed. Always close the client (the context manager does so), and treat
 cancellation as cooperative: it stops subsequent agent work but cannot reverse
 a tool's completed external side effect.
+
+Use `await client.health()` and `await client.list_models()` for typed provider
+inspection before a run. They are separate child commands and therefore do not
+allocate a run, alter a transcript, or invoke a host tool callback.
