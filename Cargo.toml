@@ -4,6 +4,7 @@ members = [
   "crates/llama-harness-protocol",
   "crates/llama-harness-runtime",
   "crates/llama-harness-scripted-runtime",
+  "crates/llama-harness-tauri",
   "crates/llama-harness-core",
   "crates/llama-harness-ollama",
   "crates/llama-harness-observability",
@@ -11,6 +12,7 @@ members = [
   "crates/llama-harness-promptfoo",
   "crates/llama-harness-cli",
   "examples/local-task-agent",
+  "examples/tauri-agent-host",
   "xtask",
 ]
 exclude = ["apps/harness-console/src-tauri"]

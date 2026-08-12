@@ -65,3 +65,6 @@ pub use llama_harness_evals::{
 
 #[cfg(feature = "protocol")]
 pub use llama_harness_protocol as protocol;
+
+#[cfg(feature = "tauri")]
+pub use llama_harness_tauri as tauri;
