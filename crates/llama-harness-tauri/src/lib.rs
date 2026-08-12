@@ -187,7 +187,8 @@ pub enum RunRegistryError {
 }
 
 /// Payload emitted to the frontend when the canonical runner requests a user
-/// approval. The frontend returns the opaque `approval_id` to [`Self::respond`].
+/// approval. The frontend returns the opaque `approval_id` to
+/// [`ApprovalRouter::respond`].
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingApproval {
@@ -257,7 +258,8 @@ impl<E: FrontendEmitter> ApprovalRouter<E> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .filter_map(|(id, entry)| (entry.run_id == run_id).then(|| id.clone()))
+            .filter(|(_, entry)| entry.run_id == run_id)
+            .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         let mut cancelled = 0;
         for id in ids {
