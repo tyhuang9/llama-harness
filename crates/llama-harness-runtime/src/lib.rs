@@ -53,7 +53,49 @@ pub enum RuntimeError {
     WriterStopped,
 }
 
+/// Creates the model provider used by a child runtime instance.
+///
+/// The production binary installs [`OllamaProviderFactory`]. Test-only child
+/// binaries can inject a deterministic provider without adding another public
+/// provider kind to protocol v1.
+pub trait ProviderFactory: Send + Sync {
+    fn create(
+        &self,
+        configuration: &ProviderConfiguration,
+    ) -> Result<Arc<dyn ModelProvider>, HarnessError>;
+
+    fn provider_names(&self) -> Vec<String> {
+        vec!["ollama".into()]
+    }
+}
+
+/// The production provider factory. It deliberately supports only the
+/// existing loopback-only Ollama integration.
+pub struct OllamaProviderFactory;
+
+impl ProviderFactory for OllamaProviderFactory {
+    fn create(
+        &self,
+        configuration: &ProviderConfiguration,
+    ) -> Result<Arc<dyn ModelProvider>, HarnessError> {
+        match configuration {
+            ProviderConfiguration::Ollama { base_url } => Ok(Arc::new(
+                OllamaProvider::builder().base_url(base_url).build()?,
+            )),
+        }
+    }
+}
+
 pub async fn serve_stdio() -> Result<(), RuntimeError> {
+    serve_stdio_with_factory(Arc::new(OllamaProviderFactory)).await
+}
+
+/// Serves the protocol over stdio with an application-supplied provider
+/// factory. This is intended for deterministic integration-test sidecars; the
+/// production binary calls [`serve_stdio`] and remains Ollama-only.
+pub async fn serve_stdio_with_factory(
+    provider_factory: Arc<dyn ProviderFactory>,
+) -> Result<(), RuntimeError> {
     let (writer, writer_task) = start_writer();
     let state = Arc::new(RuntimeState::new(writer));
     let stdin = io::stdin();
@@ -99,7 +141,12 @@ pub async fn serve_stdio() -> Result<(), RuntimeError> {
                     )?;
                 } else {
                     handshake_complete = true;
-                    send_runtime_hello(&state, envelope.request_id, hello)?;
+                    send_runtime_hello(
+                        &state,
+                        envelope.request_id,
+                        hello,
+                        provider_factory.provider_names(),
+                    )?;
                 }
             }
             _ if !handshake_complete => {
@@ -130,8 +177,9 @@ pub async fn serve_stdio() -> Result<(), RuntimeError> {
                     "start_run",
                 )?;
                 let run_state = Arc::clone(&state);
+                let provider_factory = Arc::clone(&provider_factory);
                 runs.spawn(async move {
-                    run_start(run_state, run_id, *start, cancellation).await;
+                    run_start(run_state, run_id, *start, cancellation, provider_factory).await;
                 });
             }
             ProtocolMessage::CancelRun(CancelRun { .. }) => {
@@ -193,6 +241,7 @@ async fn run_start(
     run_id: String,
     start: StartRun,
     cancellation: CancellationToken,
+    provider_factory: Arc<dyn ProviderFactory>,
 ) {
     let trace_id = Uuid::new_v4().to_string();
     let run_sequence = state.next_sequence(&run_id);
@@ -211,6 +260,7 @@ async fn run_start(
         start.request,
         cancellation.clone(),
         trace_id.clone(),
+        provider_factory.as_ref(),
     );
     match result {
         Ok((runner, request)) => match runner.run(request).await {
@@ -259,12 +309,9 @@ fn build_runner(
     request: WireRunRequest,
     cancellation: CancellationToken,
     trace_id: String,
+    provider_factory: &dyn ProviderFactory,
 ) -> Result<(AgentRunner, RunRequest), HarnessError> {
-    let provider: Arc<dyn ModelProvider> = match request.provider {
-        ProviderConfiguration::Ollama { base_url } => {
-            Arc::new(OllamaProvider::builder().base_url(base_url).build()?)
-        }
-    };
+    let provider = provider_factory.create(&request.provider)?;
     let mut tools = ToolRegistry::default();
     for definition in request.tools {
         tools.register(Arc::new(BridgeTool {
@@ -723,6 +770,7 @@ fn send_runtime_hello(
     state: &RuntimeState,
     request_id: String,
     _: ClientHello,
+    providers: Vec<String>,
 ) -> Result<(), RuntimeError> {
     state.send(Envelope::new(
         request_id,
@@ -737,7 +785,7 @@ fn send_runtime_hello(
                 max_pending_callbacks: MAX_PENDING_CALLBACKS,
                 max_queue_depth: MAX_QUEUE_DEPTH,
             },
-            providers: vec!["ollama".into()],
+            providers,
         }),
     ))
 }

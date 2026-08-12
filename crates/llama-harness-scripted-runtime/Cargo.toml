@@ -1,0 +1,21 @@
+[package]
+name = "llama-harness-scripted-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Deterministic test sidecar for llama-harness SDK integration tests"
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "llama-harness-scripted-runtime"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+llama-harness-core = { version = "0.1.0", path = "../llama-harness-core" }
+llama-harness-protocol = { version = "0.1.0", path = "../llama-harness-protocol" }
+llama-harness-runtime = { version = "0.1.0", path = "../llama-harness-runtime" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
