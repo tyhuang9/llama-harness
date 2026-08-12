@@ -1,14 +1,18 @@
 [package]
 name = "llama-harness-promptfoo"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Development-only Promptfoo workspace generation for llama-harness"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = false
 
 [dependencies]
-llama-harness-core = { path = "../llama-harness-core" }
-llama-harness-evals = { path = "../llama-harness-evals" }
+llama-harness-core = { version = "0.1.0", path = "../llama-harness-core" }
+llama-harness-evals = { version = "0.1.0", path = "../llama-harness-evals" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

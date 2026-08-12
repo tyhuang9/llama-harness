@@ -1,22 +1,30 @@
 [package]
 name = "llama-harness-cli"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Local developer CLI for llama-harness"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/llama-harness-cli"
+keywords = ["agents", "cli", "evaluation"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
 
 [[bin]]
 name = "llama-harness"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-llama-harness-core = { path = "../llama-harness-core" }
-llama-harness-evals = { path = "../llama-harness-evals" }
-llama-harness-observability = { path = "../llama-harness-observability" }
-llama-harness-ollama = { path = "../llama-harness-ollama" }
-llama-harness-promptfoo = { path = "../llama-harness-promptfoo" }
+llama-harness-core = { version = "0.1.0", path = "../llama-harness-core" }
+llama-harness-evals = { version = "0.1.0", path = "../llama-harness-evals" }
+llama-harness-observability = { version = "0.1.0", path = "../llama-harness-observability" }
+llama-harness-ollama = { version = "0.1.0", path = "../llama-harness-ollama" }
+llama-harness-promptfoo = { version = "0.1.0", path = "../llama-harness-promptfoo" }
 serde_json = "1"
 serde_yaml = "0.9"
 thiserror = "2"

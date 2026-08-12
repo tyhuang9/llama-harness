@@ -1,0 +1,30 @@
+[package]
+name = "llama-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Rust-native framework for building controlled agentic workflows"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/llama-harness"
+keywords = ["agents", "llm", "ollama", "tools"]
+categories = ["development-tools", "asynchronous"]
+publish = ["crates-io"]
+
+[features]
+default = []
+ollama = ["dep:llama-harness-ollama"]
+observability = ["dep:llama-harness-observability"]
+evals = ["dep:llama-harness-evals"]
+full = ["ollama", "observability", "evals"]
+
+[dependencies]
+llama-harness-core = { version = "0.1.0", path = "../llama-harness-core" }
+llama-harness-evals = { version = "0.1.0", path = "../llama-harness-evals", optional = true }
+llama-harness-observability = { version = "0.1.0", path = "../llama-harness-observability", optional = true }
+llama-harness-ollama = { version = "0.1.0", path = "../llama-harness-ollama", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

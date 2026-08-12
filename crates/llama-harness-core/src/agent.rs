@@ -31,6 +31,29 @@ pub struct AgentDefinition {
     pub metadata: JsonMap,
 }
 
+impl AgentDefinition {
+    /// Creates a minimal agent definition with the conservative runtime defaults.
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        version: impl Into<String>,
+        default_model: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            version: version.into(),
+            system_instructions: String::new(),
+            default_model: default_model.into(),
+            tool_allowlist: vec![],
+            limits: AgentLimits::default(),
+            generation: GenerationOptions::default(),
+            output_schema: None,
+            metadata: JsonMap::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 pub struct RunOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +78,22 @@ pub struct RunRequest {
     pub evaluation: JsonMap,
     #[serde(skip, default = "CancellationToken::new")]
     pub cancellation: CancellationToken,
+}
+
+impl RunRequest {
+    /// Creates a run request with empty host-provided context and a fresh cancellation token.
+    pub fn new(agent: AgentDefinition, input: impl Into<String>) -> Self {
+        Self {
+            agent,
+            input: input.into(),
+            application_context: JsonMap::new(),
+            history: vec![],
+            metadata: JsonMap::new(),
+            overrides: RunOverrides::default(),
+            evaluation: JsonMap::new(),
+            cancellation: CancellationToken::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
