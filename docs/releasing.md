@@ -25,7 +25,8 @@ The helper deliberately does not claim that `cargo publish --dry-run` can comple
 The order follows workspace dependencies and is verified by the release checklist:
 
 1. `llama-harness-core`
-2. `llama-harness-evals`, `llama-harness-observability`, and `llama-harness-ollama`
-3. `llama-harness`
+2. `llama-harness-protocol`
+3. `llama-harness-evals`, `llama-harness-observability`, and `llama-harness-ollama`
+4. `llama-harness`
 
 Later protocol, Tauri, runtime, npm, PyPI, and binary-release steps are documented alongside the sidecar distribution work. A Tauri application receives compiled Rust dependencies inside its own installer; Ollama remains a separately installed local inference service.

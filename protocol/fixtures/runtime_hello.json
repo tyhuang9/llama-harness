@@ -1,0 +1,19 @@
+{
+  "protocol_version": "1.0",
+  "request_id": "hello-1",
+  "type": "runtime_hello",
+  "payload": {
+    "runtime_version": "0.1.0",
+    "capabilities": {
+      "supports_output_deltas": false,
+      "supports_structured_output": true,
+      "supports_trace_persistence": true,
+      "concurrent_runs": 16,
+      "max_pending_callbacks": 128,
+      "max_queue_depth": 256
+    },
+    "providers": [
+      "ollama"
+    ]
+  }
+}

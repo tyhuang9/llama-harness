@@ -18,13 +18,15 @@ default = []
 ollama = ["dep:llama-harness-ollama"]
 observability = ["dep:llama-harness-observability"]
 evals = ["dep:llama-harness-evals"]
-full = ["ollama", "observability", "evals"]
+protocol = ["dep:llama-harness-protocol"]
+full = ["ollama", "observability", "evals", "protocol"]
 
 [dependencies]
 llama-harness-core = { version = "0.1.0", path = "../llama-harness-core" }
 llama-harness-evals = { version = "0.1.0", path = "../llama-harness-evals", optional = true }
 llama-harness-observability = { version = "0.1.0", path = "../llama-harness-observability", optional = true }
 llama-harness-ollama = { version = "0.1.0", path = "../llama-harness-ollama", optional = true }
+llama-harness-protocol = { version = "0.1.0", path = "../llama-harness-protocol", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

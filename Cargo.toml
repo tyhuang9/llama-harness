@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/llama-harness",
+  "crates/llama-harness-protocol",
   "crates/llama-harness-core",
   "crates/llama-harness-ollama",
   "crates/llama-harness-observability",

@@ -1,0 +1,20 @@
+[package]
+name = "llama-harness-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Versioned language-neutral wire contracts for llama-harness SDKs"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/llama-harness-protocol"
+keywords = ["agents", "protocol", "sdk"]
+categories = ["development-tools", "encoding"]
+publish = ["crates-io"]
+
+[dependencies]
+schemars = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
