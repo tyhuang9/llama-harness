@@ -6,7 +6,7 @@ No package or release artifact is published by this repository's normal CI check
 
 Create a crates.io account and token, verify intended package-name availability, and store the token only in the protected CI secret store. Published crates.io versions are immutable: correct a bad release with a new version or, when appropriate, yank it; yanking does not delete the published source package.
 
-The initial publishable Rust crates use a unified `0.1.0` version. The development-only Promptfoo integration, examples, developer console, and release helper are intentionally not published. The CLI is also local-only while it depends on development-only Promptfoo support.
+The initial publishable Rust crates use a unified `0.1.0` version. The development-only Promptfoo integration, scripted test runtime, examples, developer console, and release helper are intentionally not published. The CLI is also local-only while it depends on development-only Promptfoo support.
 
 ## Local release verification
 
@@ -27,7 +27,13 @@ The order follows workspace dependencies and is verified by the release checklis
 1. `llama-harness-core`
 2. `llama-harness-protocol`
 3. `llama-harness-evals`, `llama-harness-observability`, and `llama-harness-ollama`
-4. `llama-harness-runtime`
+4. `llama-harness-runtime` and `llama-harness-tauri`
 5. `llama-harness`
 
-Later protocol, Tauri, runtime, npm, PyPI, and binary-release steps are documented alongside the sidecar distribution work. A Tauri application receives compiled Rust dependencies inside its own installer; Ollama remains a separately installed local inference service.
+## Sidecar SDK distribution
+
+The release workflow at `.github/workflows/release.yml` is manual-dispatch only. It builds `llama-harness-runtime` for supported Windows x64, macOS arm64, and Linux x64 targets, generates checksums and a machine-readable manifest, and stages a matching platform-specific npm runtime package plus Python wheel. It does not build model images, pull models, or package Ollama.
+
+The workflow defaults to validation mode. Set its `publish` input only after a reviewer confirms the version, generated manifest, checksums, package contents, registry credentials, and release notes. Keep the publication order: Rust dependencies first, runtime artifacts next, npm/PyPI SDK packages after their corresponding artifacts, then the facade. Registry publication remains an operator action; no normal CI job publishes packages.
+
+A Tauri application receives compiled Rust dependencies inside its own installer; Ollama remains a separately installed local inference service.

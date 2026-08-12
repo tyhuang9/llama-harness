@@ -1,6 +1,6 @@
 # Embedding Llama Harness
 
-Llama Harness runs in the consuming Rust or Tauri application process. The application owns its tools, data, policy, approval callback, and UI; the embedded runtime owns the bounded model/tool loop. Ollama is the optional shared local inference process at `http://127.0.0.1:11434`. No Harness daemon is started or required.
+Llama Harness runs in the consuming Rust or Tauri application process. The application owns its tools, data, policy, approval callback, and UI; the embedded runtime owns the bounded model/tool loop. Ollama is the optional shared local inference process at `http://127.0.0.1:11434`. No Harness daemon is started or required. For non-Rust callers, use the managed child-sidecar SDKs instead of trying to expose this embedded API across an HTTP port.
 
 The runnable reference is [`examples/local-task-agent`](../examples/local-task-agent). It keeps an in-memory task store in the application, registers only `list_tasks`, `create_task`, and `update_task`, requires approval for mutations, and writes redacted structured events to a project-selected SQLite database.
 
@@ -47,6 +47,11 @@ Call `runner.run(RunRequest { ... }).await` from an application command or funct
 Tools are application implementations of the typed `Tool` trait. The runner validates model-proposed JSON against each registered tool schema, checks the agent allowlist, applies the application policy, and invokes approval where required. It never exposes a universal shell, filesystem, or database tool.
 
 Use proposal/commit tools for sensitive mutations when appropriate: an application can let a model generate a proposal, validate and preview it, collect user approval, then expose a narrowly scoped commit tool. Cancellation and timeouts stop future runner work but cannot roll back an external side effect already started by a tool; application tools must remain idempotent or use application-level idempotency keys where needed.
+
+For a Tauri host, enable the facade's `tauri` feature and read
+[`tauri.md`](tauri.md). It forwards structured events, maps frontend approvals
+through opaque one-time identifiers, and registers cancellation tokens; it does
+not transfer tools, provider credentials, or a mutable trace path to the webview.
 
 ## Deterministic evaluation
 

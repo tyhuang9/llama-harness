@@ -9,5 +9,7 @@ dist/
 .env
 .DS_Store
 *.log
+__pycache__/
+*.py[cod]
 logs/
 .llama-harness/
