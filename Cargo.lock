@@ -920,6 +920,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "llama-harness-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "llama-harness-core",
+ "llama-harness-ollama",
+ "llama-harness-protocol",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "local-task-agent"
 version = "0.1.0"
 dependencies = [

@@ -27,6 +27,7 @@ The order follows workspace dependencies and is verified by the release checklis
 1. `llama-harness-core`
 2. `llama-harness-protocol`
 3. `llama-harness-evals`, `llama-harness-observability`, and `llama-harness-ollama`
-4. `llama-harness`
+4. `llama-harness-runtime`
+5. `llama-harness`
 
 Later protocol, Tauri, runtime, npm, PyPI, and binary-release steps are documented alongside the sidecar distribution work. A Tauri application receives compiled Rust dependencies inside its own installer; Ollama remains a separately installed local inference service.

@@ -38,6 +38,8 @@ fn request() -> RunRequest {
         overrides: RunOverrides::default(),
         evaluation: JsonMap::new(),
         cancellation: CancellationToken::new(),
+        run_id: None,
+        trace_id: None,
     }
 }
 
@@ -47,6 +49,23 @@ fn call(id: &str, tool_id: &str, arguments_json: &str) -> ToolCall {
         tool_id: tool_id.into(),
         arguments_json: arguments_json.into(),
     }
+}
+
+#[tokio::test]
+async fn host_supplied_run_and_trace_ids_preserve_external_correlation() {
+    let provider = Arc::new(MockModelProvider::scripted([final_response("done")]));
+    let runner = AgentRunner::builder(provider).build();
+    let result = runner
+        .run(
+            request()
+                .with_run_id("runtime-run-1")
+                .with_trace_id("runtime-trace-1"),
+        )
+        .await
+        .expect("the canonical runner must accept transport correlations");
+
+    assert_eq!(result.id, "runtime-run-1");
+    assert_eq!(result.trace_id, "runtime-trace-1");
 }
 
 fn response(final_output: Option<&str>, tool_calls: Vec<ToolCall>) -> ModelResponse {
