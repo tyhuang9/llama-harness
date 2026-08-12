@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://llama-harness.dev/protocol/v1/envelope.schema.json",
+  "title": "llama-harness protocol v1 envelope",
+  "description": "The outer JSONL frame. Rust types in llama-harness-protocol define the typed command payloads; unknown optional fields are tolerated within a compatible major version.",
+  "type": "object",
+  "required": ["protocol_version", "request_id", "type", "payload"],
+  "properties": {
+    "protocol_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "client_hello", "start_run", "cancel_run", "tool_result", "policy_decision", "approval_decision", "ping", "shutdown",
+        "runtime_hello", "command_acknowledged", "protocol_error", "run_started", "run_event", "policy_decision_requested", "approval_requested", "tool_execution_requested", "run_completed", "run_failed", "run_cancelled", "pong", "provider_health", "model_inventory"
+      ]
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}

@@ -8,6 +8,7 @@ const PUBLISHABLE_CRATES: &[&str] = &[
     "llama-harness-ollama",
     "llama-harness-observability",
     "llama-harness-evals",
+    "llama-harness-protocol",
     "llama-harness",
 ];
 
@@ -15,14 +16,19 @@ fn main() -> ExitCode {
     match env::args().nth(1).as_deref() {
         Some("release-check") => release_check(),
         Some("package-list") => package_list(),
-        Some("protocol-check") => {
-            eprintln!("protocol checks are added with the protocol crate");
-            ExitCode::FAILURE
-        }
+        Some("protocol-check") => protocol_check(),
         _ => {
             eprintln!("usage: cargo run -p xtask -- <release-check|package-list|protocol-check>");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn protocol_check() -> ExitCode {
+    if run_cargo(&["test", "--package", "llama-harness-protocol"]) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
