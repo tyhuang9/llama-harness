@@ -24,6 +24,18 @@ class RuntimeExitedError(HarnessError): pass
 class RunCancelledError(HarnessError): pass
 
 @dataclass(frozen=True)
+class ProviderHealth:
+    healthy: bool
+    detail: str | None = None
+
+@dataclass(frozen=True)
+class ProviderModel:
+    id: str
+    supports_tools: bool
+    supports_streaming: bool
+    supports_structured_output: bool
+
+@dataclass(frozen=True)
 class ToolContext:
     run_id: str
     trace_id: str
@@ -149,6 +161,22 @@ class HarnessClient:
         for envelope in self._buffered.pop(run_id, []): self._dispatch_run(state, envelope)
         return HarnessRun(self, state)
 
+    async def health(self) -> ProviderHealth:
+        response = await self._request("get_provider_health", {"provider": _provider(self._provider)})
+        if response["type"] != "provider_health":
+            raise RuntimeProtocolError(f"Expected provider_health, received {response['type']}")
+        payload = response["payload"]
+        return ProviderHealth(bool(payload["healthy"]), str(payload["detail"]) if payload.get("detail") is not None else None)
+
+    async def list_models(self) -> list[ProviderModel]:
+        response = await self._request("get_model_inventory", {"provider": _provider(self._provider)})
+        if response["type"] != "model_inventory":
+            raise RuntimeProtocolError(f"Expected model_inventory, received {response['type']}")
+        models = response["payload"].get("models")
+        if not isinstance(models, list):
+            raise RuntimeProtocolError("Model inventory did not contain models")
+        return [ProviderModel(str(value["id"]), bool(value["capabilities"]["supports_tools"]), bool(value["capabilities"]["supports_streaming"]), bool(value["capabilities"]["supports_structured_output"])) for value in models]
+
     async def _request(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         request_id = str(uuid.uuid4()); future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future(); self._pending[request_id] = future
         await self._send(kind, payload, request_id=request_id)
@@ -181,7 +209,7 @@ class HarnessClient:
 
     def _receive(self, envelope: dict[str, Any]) -> None:
         pending = self._pending.pop(envelope["request_id"], None)
-        if pending and envelope["type"] in {"runtime_hello", "command_acknowledged", "protocol_error", "pong"}:
+        if pending and envelope["type"] in {"runtime_hello", "command_acknowledged", "protocol_error", "pong", "provider_health", "model_inventory"}:
             pending.set_result(envelope); return
         run_id = envelope.get("run_id")
         if not isinstance(run_id, str): return

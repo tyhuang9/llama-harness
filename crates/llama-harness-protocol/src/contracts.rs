@@ -129,6 +129,8 @@ pub enum ProtocolMessage {
     ToolResult(ToolResultResponse),
     PolicyDecision(PolicyDecisionResponse),
     ApprovalDecision(ApprovalDecisionResponse),
+    GetProviderHealth(ProviderInspectionRequest),
+    GetModelInventory(ProviderInspectionRequest),
     Ping(Ping),
     Shutdown(Shutdown),
     RuntimeHello(RuntimeHello),
@@ -156,6 +158,8 @@ impl ProtocolMessage {
             | Self::ToolResult(_)
             | Self::PolicyDecision(_)
             | Self::ApprovalDecision(_)
+            | Self::GetProviderHealth(_)
+            | Self::GetModelInventory(_)
             | Self::Ping(_)
             | Self::Shutdown(_) => MessageDirection::ClientToRuntime,
             _ => MessageDirection::RuntimeToClient,
@@ -203,6 +207,13 @@ pub struct RuntimeCapabilities {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StartRun {
     pub request: WireRunRequest,
+}
+
+/// A provider inspection command is separate from an agent run and therefore
+/// does not allocate a run ID or invoke application tools.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderInspectionRequest {
+    pub provider: ProviderConfiguration,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

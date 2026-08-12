@@ -6,6 +6,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line) as { request_id: string; type: string; payload: Record<string, unknown>; };
   if (message.type === "client_hello") {
     write({ protocol_version: "1.0", request_id: message.request_id, type: "runtime_hello", payload: { runtime_version: "test", capabilities: { supports_output_deltas: false, supports_structured_output: true, supports_trace_persistence: false, concurrent_runs: 1, max_pending_callbacks: 1, max_queue_depth: 8 }, providers: ["ollama"] } });
+  } else if (message.type === "get_provider_health") {
+    write({ protocol_version: "1.0", request_id: message.request_id, type: "provider_health", payload: { healthy: true, detail: "fake runtime" } });
+  } else if (message.type === "get_model_inventory") {
+    write({ protocol_version: "1.0", request_id: message.request_id, type: "model_inventory", payload: { models: [{ id: "mock", capabilities: { supports_tools: true, supports_streaming: false, supports_structured_output: true } }] } });
   } else if (message.type === "start_run") {
     write({ protocol_version: "1.0", request_id: message.request_id, run_id: "test-run", type: "command_acknowledged", payload: { command: "start_run" } });
     write({ protocol_version: "1.0", request_id: "tool-request", run_id: "test-run", type: "tool_execution_requested", payload: { run_sequence: 1, callback_id: "tool-1", trace_id: "test-trace", call_id: "call-1", tool: { id: "notes.search", name: "Search", description: "Search notes", arguments_schema: {}, risk: "low", idempotent: true, read_only: true }, arguments: { query: "harness" } } });

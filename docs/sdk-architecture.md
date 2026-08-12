@@ -24,5 +24,10 @@ locations or downloads code. A sidecar parent owns its child lifetime: `close`
 sends shutdown, EOF/crash cancels active work, and cancellation cannot undo a
 host side effect already under way.
 
+Provider inspection is explicit and outside the run lifecycle:
+`health`/`listModels` in TypeScript and `health`/`list_models` in Python issue
+their own typed commands and never allocate a run, invoke a tool, or alter an
+agent transcript.
+
 See [`protocol/compatibility/v1.md`](../protocol/compatibility/v1.md) for the
 wire compatibility policy and the language-specific guides for examples.

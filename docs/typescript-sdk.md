@@ -28,3 +28,7 @@ explicit user decision. Both return typed decisions; missing or throwing
 handlers fail closed for state-changing tools and approvals. Call
 `run.cancel()` for cooperative cancellation and `client.close()` at shutdown.
 `runtimeArgs` exists for deterministic test harnesses, not normal distribution.
+
+Use `await client.health()` and `await client.listModels()` for typed provider
+inspection before a run. Those calls are separate JSONL commands: they do not
+start an agent loop, create a run ID, or request a host tool callback.

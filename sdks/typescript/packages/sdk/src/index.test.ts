@@ -25,6 +25,14 @@ test("routes a typed host tool callback and ordered runtime event", async () => 
   } finally { await client.close(); }
 });
 
+test("keeps provider health and model inventory outside agent runs", async () => {
+  const client = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js")] });
+  try {
+    assert.deepEqual(await client.health(), { healthy: true, detail: "fake runtime" });
+    assert.deepEqual(await client.listModels(), [{ id: "mock", capabilities: { supportsTools: true, supportsStreaming: false, supportsStructuredOutput: true } }]);
+  } finally { await client.close(); }
+});
+
 test("performs a handshake with the workspace-built Rust runtime", { skip: !existsSync(resolve(process.cwd(), "../../../../target/debug/llama-harness-runtime.exe")) }, async () => {
   const client = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: resolve(process.cwd(), "../../../../target/debug/llama-harness-runtime.exe") });
   await client.close();

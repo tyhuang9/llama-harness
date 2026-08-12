@@ -25,14 +25,15 @@ use llama_harness_core::{
 use llama_harness_ollama::OllamaProvider;
 use llama_harness_protocol::{
     decode_line, ApprovalDecisionResponse, ApprovalRequest, CancelRun, ClientHello,
-    CommandAcknowledged, Envelope, Ping, PolicyDecisionRequest, PolicyDecisionResponse, Pong,
-    ProtocolErrorCode, ProtocolErrorPayload, ProtocolMessage, ProviderConfiguration, RunCancelled,
-    RunCompleted, RunEventPayload, RunFailed, RunStarted, RuntimeCapabilities, RuntimeHello,
-    StartRun, ToolExecutionRequest, ToolResultResponse, WireAgentDefinition, WireAgentLimits,
-    WireApprovalRecord, WireGenerationOptions, WireMessage, WireMessageRole, WirePolicyDecision,
-    WireRunError, WireRunOverrides, WireRunRequest, WireRunResult, WireRunStatus,
-    WireToolDefinition, WireToolResult, WireToolRisk, MAX_CONCURRENT_RUNS, MAX_MESSAGE_BYTES,
-    MAX_PENDING_CALLBACKS, MAX_QUEUE_DEPTH,
+    CommandAcknowledged, Envelope, ModelInfo as WireModelInfo, ModelInventoryResponse, Ping,
+    PolicyDecisionRequest, PolicyDecisionResponse, Pong, ProtocolErrorCode, ProtocolErrorPayload,
+    ProtocolMessage, ProviderConfiguration, ProviderHealthResponse, ProviderInspectionRequest,
+    RunCancelled, RunCompleted, RunEventPayload, RunFailed, RunStarted, RuntimeCapabilities,
+    RuntimeHello, StartRun, ToolExecutionRequest, ToolResultResponse, WireAgentDefinition,
+    WireAgentLimits, WireApprovalRecord, WireGenerationOptions, WireMessage, WireMessageRole,
+    WirePolicyDecision, WireRunError, WireRunOverrides, WireRunRequest, WireRunResult,
+    WireRunStatus, WireToolDefinition, WireToolResult, WireToolRisk, MAX_CONCURRENT_RUNS,
+    MAX_MESSAGE_BYTES, MAX_PENDING_CALLBACKS, MAX_QUEUE_DEPTH,
 };
 use tokio::{
     io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -206,6 +207,22 @@ pub async fn serve_stdio_with_factory(
             ProtocolMessage::ToolResult(response) => resolve_callback(&state, response)?,
             ProtocolMessage::PolicyDecision(response) => resolve_policy(&state, response)?,
             ProtocolMessage::ApprovalDecision(response) => resolve_approval(&state, response)?,
+            ProtocolMessage::GetProviderHealth(request) => {
+                let state = Arc::clone(&state);
+                let provider_factory = Arc::clone(&provider_factory);
+                let request_id = envelope.request_id;
+                runs.spawn(async move {
+                    report_provider_health(state, provider_factory, request_id, request).await;
+                });
+            }
+            ProtocolMessage::GetModelInventory(request) => {
+                let state = Arc::clone(&state);
+                let provider_factory = Arc::clone(&provider_factory);
+                let request_id = envelope.request_id;
+                runs.spawn(async move {
+                    report_model_inventory(state, provider_factory, request_id, request).await;
+                });
+            }
             ProtocolMessage::Ping(Ping { nonce }) => {
                 state.send(Envelope::new(
                     envelope.request_id,
@@ -789,6 +806,69 @@ fn send_runtime_hello(
         }),
     ))
 }
+
+async fn report_provider_health(
+    state: Arc<RuntimeState>,
+    provider_factory: Arc<dyn ProviderFactory>,
+    request_id: String,
+    request: ProviderInspectionRequest,
+) {
+    let result = match provider_factory.create(&request.provider) {
+        Ok(provider) => provider.health().await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(health) => {
+            let _ = state.send(Envelope::new(
+                request_id,
+                None,
+                ProtocolMessage::ProviderHealth(ProviderHealthResponse {
+                    healthy: health.healthy,
+                    detail: health.detail,
+                }),
+            ));
+        }
+        Err(error) => {
+            let _ = send_protocol_error(
+                &state,
+                &request_id,
+                ProtocolErrorCode::RuntimeUnavailable,
+                error.to_string(),
+            );
+        }
+    }
+}
+
+async fn report_model_inventory(
+    state: Arc<RuntimeState>,
+    provider_factory: Arc<dyn ProviderFactory>,
+    request_id: String,
+    request: ProviderInspectionRequest,
+) {
+    let result = match provider_factory.create(&request.provider) {
+        Ok(provider) => provider.list_models().await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(models) => {
+            let _ = state.send(Envelope::new(
+                request_id,
+                None,
+                ProtocolMessage::ModelInventory(ModelInventoryResponse {
+                    models: models.into_iter().map(to_wire_model_info).collect(),
+                }),
+            ));
+        }
+        Err(error) => {
+            let _ = send_protocol_error(
+                &state,
+                &request_id,
+                ProtocolErrorCode::RuntimeUnavailable,
+                error.to_string(),
+            );
+        }
+    }
+}
 fn acknowledge(
     state: &RuntimeState,
     request_id: String,
@@ -983,6 +1063,16 @@ fn to_wire_tool_definition(definition: ToolDefinition) -> WireToolDefinition {
         },
         idempotent: definition.idempotent,
         read_only: definition.read_only,
+    }
+}
+fn to_wire_model_info(info: llama_harness_core::ModelInfo) -> WireModelInfo {
+    WireModelInfo {
+        id: info.id,
+        capabilities: llama_harness_protocol::ModelCapabilities {
+            supports_tools: info.capabilities.supports_tools,
+            supports_streaming: info.capabilities.supports_streaming,
+            supports_structured_output: info.capabilities.supports_structured_output,
+        },
     }
 }
 fn to_core_policy(decision: WirePolicyDecision) -> PolicyDecision {
