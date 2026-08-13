@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="description" content="Deterministic evaluations and replay guide for llama-harness." /><title>Deterministic evaluations and replay | llama-harness</title><link rel="stylesheet" href="../styles.css" /></head>
+<body class="guide-page"><a class="skip-link" href="#guide-content">Skip to guide content</a><header class="topbar guide-header"><a class="brand" href="../index.html" aria-label="llama-harness documentation home"><span class="brand-mark" aria-hidden="true">lh</span><span>llama-harness</span></a><a class="guide-back-link" href="../index.html">Back to docs</a></header><main id="guide-content" class="guide-main" tabindex="-1"><article class="guide-article"><p class="guide-source">Guide source: <code>evaluations.md</code></p><h1 id="deterministic-evaluations-and-replay">Deterministic evaluations and replay</h1>
+      <p><code>llama-harness-evals</code> defines a provider-neutral YAML or JSON evaluation suite and evaluates it through an application-supplied <code>EvalExecutor</code>. The executor owns fixture construction, sandboxed application tools, policies, approvals, and the <code>AgentRunner</code> instance. This keeps evaluations on the same runtime path as an application while avoiding a generic shell, filesystem, or database tool.</p>
+      <h2 id="suite-format">Suite format</h2>
+      <p>Suites use version <code>1</code>, a stable suite and agent ID, one or more model IDs, defaults, and explicit cases. Each case can provide an isolated fixture, input, history/context, agent or prompt-version/override, tags, and deterministic expectations.</p>
+      <pre><code class="language-yaml">version: 1
+id: task-agent-core
+name: Task Agent Core Regression Suite
+agent: task-agent
+agent_version: &quot;2&quot;
+models: [ollama:qwen3:8b]
+defaults:
+  repeat: 1
+  max_latency_ms: 10000
+cases:
+  - id: explicit-completion
+    fixture:
+      id: medication-incomplete
+      data: {tasks: [{id: task-123, status: incomplete}]}
+    input: Complete the evening medication task.
+    expected:
+      status: completed
+      required_tools: [update_task]
+      forbidden_tools: [create_task]
+      expected_tool_arguments:
+        - tool_id: update_task
+          arguments_subset: {id: task-123, status: completed}
+      final_state_subset:
+        tasks: [{id: task-123, status: completed}]
+      max_model_calls: 3
+      max_tool_calls: 2</code></pre>
+      <p>Supported deterministic assertions include terminal status, exact or contained final output, a JSON-output subset, required/forbidden tools, tool sequence and argument subsets, final-state and unresolved-item subsets, approved tools, maximum model/tool calls, latency, cancellation, and expected error metadata. Array subsets are order-independent. Model-graded assertions are intentionally not part of this first implementation.</p>
+      <h2 id="running-a-suite">Running a suite</h2>
+      <p>Validate a local suite without needing Ollama, a GPU, or an application fixture adapter:</p>
+      <pre><code class="language-bash">cargo run -p llama-harness-cli -- eval validate path/to/suite.yaml</code></pre>
+      <p>An embedding app executes its real controlled loop by implementing <code>EvalExecutor</code> and calling:</p>
+      <pre><code class="language-rust">let report = llama_harness_evals::evaluate_suite(
+    &amp;suite,
+    &amp;application_executor,
+    &amp;model_overrides,
+    repeat_override,
+).await?;</code></pre>
+      <p>Each call receives an owned fixture clone. Applications should create fresh sandbox state from it, register only the tools allowed for the case, run the real <code>AgentRunner</code>, return a final state snapshot, and clean up their sandbox. The standalone <code>llama-harness eval run</code> command validates input but deliberately returns a clear error until an embedding application or example adapter is configured; it never fabricates application-owned tools.</p>
+      <p>Reports are serializable normalized JSON. Browse a saved report locally with:</p>
+      <pre><code class="language-bash">llama-harness eval results .llama-harness/results/report.json
+llama-harness eval results .llama-harness/results/report.json --failed --case explicit-completion</code></pre>
+      <h2 id="regression-replay">Regression replay</h2>
+      <p><code>export_regression_case</code> creates a self-contained regression artifact from an explicit suite case, model selection, agent/prompt metadata, and the linked trace ID. The trace ID is evidence only. Replay calls <code>replay_regression</code> through the same application executor; it does not reconstruct fixture data, user input, raw requests, or hidden reasoning from a SQLite trace.</p>
+      <p>The CLI can inspect a saved artifact with <code>llama-harness replay regression.json --json</code>. Executing it requires the embedding application's adapter for the same reason that <code>eval run</code> does.</p>
+      <h2 id="trace-and-model-inspection">Trace and model inspection</h2>
+      <pre><code class="language-bash">llama-harness inspect run &lt;run-id&gt; --db traces.sqlite
+llama-harness inspect run &lt;run-id&gt; --db traces.sqlite --export-json
+llama-harness models health
+llama-harness models list</code></pre>
+      <p>Trace inspection reads the optional local SQLite store. Exports contain only persisted, redacted values; raw payloads remain unavailable when trace storage had its default raw-data setting. No evaluation artifact or report collects hidden chain-of-thought.</p>
+      <h2 id="promptfoo">Promptfoo</h2>
+      <p>The optional, development-only Promptfoo wrapper is documented in <a href="promptfoo-integration.html">Promptfoo integration</a>. It generates a visible custom provider, config, raw output, redacted local trace database, and normalized report under <code>.llama-harness/</code>. Promptfoo is not a dependency of the core runtime or deterministic application-evaluation path.</p></article></main><footer class="guide-footer"><a href="../index.html">Back to documentation</a></footer></body>
+</html>
+

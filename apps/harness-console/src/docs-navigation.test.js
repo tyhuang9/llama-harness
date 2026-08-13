@@ -27,7 +27,7 @@ afterEach(() => {
 });
 
 describe("documentation navigation", () => {
-  it("maps every in-page sidebar item to an existing section and guide items to Markdown", () => {
+  it("maps every in-page sidebar item to an existing section and guide items to rendered HTML", () => {
     const { document } = loadDocs();
     const links = [...document.querySelectorAll(".side-nav a")];
     const inPage = links.filter((link) => link.getAttribute("href").startsWith("#"));
@@ -38,7 +38,7 @@ describe("documentation navigation", () => {
     expect(document.querySelector('.side-nav a[href="#api"]')?.textContent).toBe("AgentRunner");
     expect(document.querySelector('.side-nav a[href="#integrations"]')?.textContent).toBe("Use the same engine anywhere");
     expect(links.filter((link) => /SDK|Tauri integration/.test(link.textContent)).map((link) => link.getAttribute("href")))
-      .toEqual(["typescript-sdk.md", "python-sdk.md", "tauri.md"]);
+      .toEqual(["guides/typescript-sdk.html", "guides/python-sdk.html", "guides/tauri.html"]);
     expect(activeLinks(document)).toHaveLength(1);
     expect(activeLinks(document)[0].getAttribute("aria-current")).toBe("location");
   });
@@ -122,7 +122,7 @@ describe("documentation navigation", () => {
     search.value = "security";
     search.dispatchEvent(new window.Event("input", { bubbles: true }));
 
-    expect(document.querySelector('.side-nav a[href="security.md"]').hidden).toBe(false);
+    expect(document.querySelector('.side-nav a[href="guides/security.html"]').hidden).toBe(false);
     expect(document.querySelector('.side-nav a[href="#api"]').hidden).toBe(true);
   });
 });
