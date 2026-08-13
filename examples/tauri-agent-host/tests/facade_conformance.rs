@@ -242,7 +242,6 @@ async fn facade_only_denial_and_cancellation_leave_no_write_and_clear_host_state
     ));
     let task = tokio::spawn(async move { cancelling.run(pending_request).await.unwrap() });
     let _ = approval_id_after(&emitter, approvals_before).await;
-    assert_eq!(router.cancel_run(&run_id), 1);
     assert!(registry.cancel(&run_id));
     assert!(task.await.unwrap().cancelled);
     assert!(registry.complete(&run_id));

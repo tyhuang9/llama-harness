@@ -248,6 +248,20 @@ struct PendingApprovalEntry {
     sender: oneshot::Sender<ApprovalRecord>,
 }
 
+struct PendingApprovalGuard {
+    approval_id: String,
+    pending: Arc<Mutex<HashMap<String, PendingApprovalEntry>>>,
+}
+
+impl Drop for PendingApprovalGuard {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.approval_id);
+    }
+}
+
 /// Bounded approval-routing configuration. Defaults are intentionally small
 /// enough to fail closed when a host loses its approval surface.
 #[derive(Clone, Debug)]
@@ -419,6 +433,10 @@ impl<E: FrontendEmitter> ApprovalHandler for ApprovalRouter<E> {
                 },
             );
         }
+        let _pending_guard = PendingApprovalGuard {
+            approval_id: approval_id.clone(),
+            pending: Arc::clone(&self.pending),
+        };
         let payload = PendingApproval {
             approval_id: approval_id.clone(),
             run_id: context.run_id.clone(),
@@ -428,10 +446,6 @@ impl<E: FrontendEmitter> ApprovalHandler for ApprovalRouter<E> {
             arguments: arguments.clone(),
         };
         if let Err(error) = self.emitter.emit(&self.event_name, payload) {
-            self.pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&approval_id);
             return Err(HarnessError::Approval(format!(
                 "could not emit approval request: {error}"
             )));
@@ -441,10 +455,6 @@ impl<E: FrontendEmitter> ApprovalHandler for ApprovalRouter<E> {
             _ = request.cancellation.cancelled() => Err(HarnessError::Cancelled),
             _ = tokio::time::sleep(self.settings.timeout) => Err(HarnessError::TimedOut("approval response".into())),
         };
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&approval_id);
         let record = outcome?;
         Ok(ApprovalRecord {
             call_id: context.call_id.clone(),
@@ -492,7 +502,9 @@ mod tests {
 
     use super::*;
     use llama_harness_core::{
-        AgentDefinition, EventRecord, InMemoryEventSink, RunEvent, RunRequest, ToolRisk,
+        mock::{tool_response, MockModelProvider},
+        AgentDefinition, AgentRunner, EventRecord, InMemoryEventSink, PolicyDecision, PolicyEngine,
+        RunEvent, RunRequest, Tool, ToolCall, ToolRegistry, ToolResult, ToolRisk,
     };
 
     #[derive(Clone, Default)]
@@ -518,6 +530,73 @@ mod tests {
             idempotent: false,
             read_only: false,
         }
+    }
+
+    struct ApprovalPolicy;
+
+    #[async_trait]
+    impl PolicyEngine for ApprovalPolicy {
+        async fn decide(
+            &self,
+            _: &ToolDefinition,
+            _: &serde_json::Value,
+            _: &RunRequest,
+        ) -> Result<PolicyDecision, HarnessError> {
+            Ok(PolicyDecision::RequireApproval {
+                reason: "test approval".into(),
+            })
+        }
+    }
+
+    struct NoopTool(ToolDefinition);
+
+    #[async_trait]
+    impl Tool for NoopTool {
+        fn definition(&self) -> &ToolDefinition {
+            &self.0
+        }
+
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+            _: CancellationToken,
+        ) -> Result<ToolResult, HarnessError> {
+            Ok(ToolResult::success(serde_json::json!({"ok": true})))
+        }
+    }
+
+    fn approval_runner(router: Arc<ApprovalRouter<TestEmitter>>) -> Arc<AgentRunner> {
+        let mut tools = ToolRegistry::default();
+        tools.register(Arc::new(NoopTool(tool()))).unwrap();
+        Arc::new(
+            AgentRunner::builder(Arc::new(MockModelProvider::scripted([tool_response(
+                ToolCall {
+                    id: "call".into(),
+                    tool_id: "notes.write".into(),
+                    arguments_json: "{}".into(),
+                },
+            )])))
+            .tools(tools)
+            .policy(Arc::new(ApprovalPolicy))
+            .approvals(router)
+            .build(),
+        )
+    }
+
+    fn approval_request(run_id: &str) -> RunRequest {
+        let mut agent = AgentDefinition::new("agent", "Agent", "1", "mock");
+        agent.tool_allowlist = vec!["notes.write".into()];
+        RunRequest::new(agent, "write").with_run_id(run_id)
+    }
+
+    async fn wait_for_pending(router: &ApprovalRouter<TestEmitter>, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while router.pending_count() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending approval count did not converge");
     }
 
     #[test]
@@ -632,6 +711,60 @@ mod tests {
         );
         request.cancellation.cancel();
         assert!(matches!(cancelling.await, Err(HarnessError::Cancelled)));
+        assert_eq!(router.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_runner_approval_futures_release_capacity() {
+        let router = Arc::new(ApprovalRouter::with_settings(
+            TestEmitter::default(),
+            DEFAULT_APPROVAL_EVENT_NAME,
+            ApprovalRouterSettings {
+                timeout: std::time::Duration::from_secs(60),
+                ..ApprovalRouterSettings::default()
+            },
+        ));
+
+        let mut deadline_request = approval_request("deadline-run");
+        deadline_request.agent.limits.max_run_duration_ms = Some(5);
+        let deadline_result = approval_runner(Arc::clone(&router))
+            .run(deadline_request)
+            .await
+            .unwrap();
+        assert!(deadline_result
+            .errors
+            .iter()
+            .any(|error| error.code == "timed_out"));
+        assert_eq!(router.pending_count(), 0);
+
+        let cancellation_request = approval_request("cancel-run");
+        let cancellation = cancellation_request.cancellation.clone();
+        let cancellation_runner = approval_runner(Arc::clone(&router));
+        let cancellation_task =
+            tokio::spawn(
+                async move { cancellation_runner.run(cancellation_request).await.unwrap() },
+            );
+        wait_for_pending(&router, 1).await;
+        cancellation.cancel();
+        assert!(cancellation_task.await.unwrap().cancelled);
+        assert_eq!(router.pending_count(), 0);
+
+        let first_runner = approval_runner(Arc::clone(&router));
+        let first_task =
+            tokio::spawn(async move { first_runner.run(approval_request("aborted-run")).await });
+        wait_for_pending(&router, 1).await;
+
+        let second_request = approval_request("unrelated-run");
+        let second_cancellation = second_request.cancellation.clone();
+        let second_runner = approval_runner(Arc::clone(&router));
+        let second_task = tokio::spawn(async move { second_runner.run(second_request).await });
+        wait_for_pending(&router, 2).await;
+
+        first_task.abort();
+        assert!(first_task.await.unwrap_err().is_cancelled());
+        wait_for_pending(&router, 1).await;
+        second_cancellation.cancel();
+        assert!(second_task.await.unwrap().unwrap().cancelled);
         assert_eq!(router.pending_count(), 0);
     }
 
