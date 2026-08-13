@@ -6,6 +6,9 @@ graphify-out/
 target/
 node_modules/
 dist/
+release-stage/
+sdk-dist/
+llama-harness-sdk-*.tgz
 .env
 .DS_Store
 *.log

@@ -9,6 +9,7 @@
       <p>Run the release helper from a clean checkout:</p>
       <pre><code class="language-bash">cargo run -p xtask -- release-check</code></pre>
       <p>It runs formatting, linting, tests, docs, and <code>cargo package --list</code> for each publishable crate. <code>cargo package --list</code> exposes exactly what a crates.io source package would contain without publishing it.</p>
+      <p>Continuous verification runs the Rust checks on Windows, macOS, and Linux; blocks Rust advisory, license, and source-policy failures; and tests, builds, and inspects both SDK packages. The developer console's npm audit is reported but does not block a runtime release: its current Vite/esbuild and nanoid findings are development-tooling-only and are tracked separately in <code>TODO.md</code>.</p>
       <p>The helper deliberately does not claim that <code>cargo publish --dry-run</code> can completely validate the very first release: crates with unpublished first-party dependencies cannot be resolved by crates.io until their dependencies exist. After the dependency crates have been staged or published in order, run <code>cargo publish --dry-run --package &lt;crate&gt;</code> for each crate before the actual publication command.</p>
       <h2 id="publication-order">Publication order</h2>
       <p>The order follows workspace dependencies and is verified by the release checklist:</p>
@@ -16,5 +17,9 @@
       <h2 id="sidecar-sdk-distribution">Sidecar SDK distribution</h2>
       <p>The release workflow at <code>.github/workflows/release.yml</code> is manual-dispatch only. It builds <code>llama-harness-runtime</code> for supported Windows x64, macOS arm64, and Linux x64 targets, generates checksums and a machine-readable manifest, and stages a matching platform-specific npm runtime package plus Python wheel. It does not build model images, pull models, or package Ollama.</p>
       <p>The workflow defaults to validation mode. Set its <code>publish</code> input only after a reviewer confirms the version, generated manifest, checksums, package contents, registry credentials, and release notes. Keep the publication order: Rust dependencies first, runtime artifacts next, npm/PyPI SDK packages after their corresponding artifacts, then the facade. Registry publication remains an operator action; no normal CI job publishes packages.</p>
+      <p>For a local platform rehearsal without publishing, run:</p>
+      <pre><code class="language-powershell">python -m pip install build wheel
+pwsh -File scripts/validate_release.ps1 -Platform win32-x64 -Target x86_64-pc-windows-msvc -Executable llama-harness-runtime.exe</code></pre>
+      <p>Inspect <code>release-stage/local/artifacts/release-manifest.json</code> and <code>checksums.sha256</code>; the helper rejects a mismatch before returning successfully.</p>
       <p>A Tauri application receives compiled Rust dependencies inside its own installer; Ollama remains a separately installed local inference service.</p></article></main><footer class="guide-footer"><a href="../index.html">Back to documentation</a></footer></body>
 </html>

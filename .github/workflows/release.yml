@@ -48,39 +48,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build and stage runtime
+      - name: Build, inspect, and stage platform SDK archives
         shell: pwsh
         run: |
-          cargo build --release --locked --target ${{ matrix.target }} -p llama-harness-runtime
-          $stage = "release-stage/${{ matrix.platform }}"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          $releaseName = "llama-harness-runtime-${{ matrix.platform }}"
-          if ("${{ matrix.executable }}".EndsWith(".exe")) { $releaseName += ".exe" }
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" "$stage/$releaseName"
-          python scripts/prepare_sdk_runtime_packages.py --runtime "$stage/$releaseName" --platform ${{ matrix.platform }} --version ${{ inputs.version }} --out "$stage/sdk-stage"
-      - name: Build platform SDK archives
-        shell: pwsh
-        run: |
-          $npmVersion = node -p "require('./sdks/typescript/packages/sdk/package.json').version"
-          if ($npmVersion -ne "${{ inputs.version }}") { throw "npm SDK version $npmVersion does not match release input" }
-          $pythonVersion = (Select-String -Path "sdks/python/pyproject.toml" -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          if ($pythonVersion -ne "${{ inputs.version }}") { throw "Python SDK version $pythonVersion does not match release input" }
-          npm pack "release-stage/${{ matrix.platform }}/sdk-stage/npm/runtime-${{ matrix.platform }}"
-          Move-Item "llama-harness-runtime-${{ matrix.platform }}-${{ inputs.version }}.tgz" "release-stage/${{ matrix.platform }}/"
           python -m pip install --disable-pip-version-check build wheel
-          python -m build --wheel "release-stage/${{ matrix.platform }}/sdk-stage/python-source"
-          $tag = (Get-Content "release-stage/${{ matrix.platform }}/sdk-stage/platform.json" | ConvertFrom-Json).python_platform_tag
-          $wheel = (Get-ChildItem "release-stage/${{ matrix.platform }}/sdk-stage/python-source/dist" -Filter *.whl | Select-Object -First 1).FullName
-          python -m wheel tags --platform-tag $tag --remove $wheel
-          python scripts/inspect_python_packages.py --dist "release-stage/${{ matrix.platform }}/sdk-stage/python-source/dist" --require-runtime
-          Move-Item "release-stage/${{ matrix.platform }}/sdk-stage/python-source/dist/*" "release-stage/${{ matrix.platform }}/"
+          pwsh -File scripts/validate_release.ps1 -Platform ${{ matrix.platform }} -Target ${{ matrix.target }} -Executable ${{ matrix.executable }} -Version ${{ inputs.version }} -Output release-stage/${{ matrix.platform }}
       - uses: actions/upload-artifact@v4
         with:
           name: llama-harness-${{ matrix.platform }}
           path: |
-            release-stage/${{ matrix.platform }}/llama-harness-runtime-${{ matrix.platform }}*
-            release-stage/${{ matrix.platform }}/*.tgz
-            release-stage/${{ matrix.platform }}/*.whl
+            release-stage/${{ matrix.platform }}/artifacts/*
           if-no-files-found: error
   sdk:
     name: SDK package validation
@@ -90,18 +67,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Build SDK npm package
         shell: pwsh
         run: |
           $npmVersion = node -p "require('./sdks/typescript/packages/sdk/package.json').version"
           if ($npmVersion -ne "${{ inputs.version }}") { throw "npm SDK version $npmVersion does not match release input" }
           npm --prefix sdks/typescript ci
-          npm --prefix sdks/typescript run build
+          npm --prefix sdks/typescript test
           npm --prefix sdks/typescript pack --workspace @llama-harness/sdk
+          python scripts/inspect_npm_package.py --package llama-harness-sdk-${{ inputs.version }}.tgz --name @llama-harness/sdk --version ${{ inputs.version }}
       - uses: actions/upload-artifact@v4
         with:
           name: llama-harness-npm-sdk
-          path: sdks/typescript/llama-harness-sdk-${{ inputs.version }}.tgz
+          path: llama-harness-sdk-${{ inputs.version }}.tgz
           if-no-files-found: error
   rust-release-check:
     name: Rust release validation
@@ -123,6 +104,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python scripts/write_release_manifest.py --artifacts release-artifacts --version ${{ inputs.version }} --output release-artifacts/release-manifest.json
+      - run: python scripts/inspect_release_artifacts.py --artifacts release-artifacts --version ${{ inputs.version }} --platform win32-x64 --platform darwin-arm64 --platform linux-x64
       - uses: actions/upload-artifact@v4
         with:
           name: llama-harness-release-manifest
