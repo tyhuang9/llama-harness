@@ -20,5 +20,8 @@ approval IDs, but must not receive provider credentials, arbitrary filesystem
 paths, tool capabilities, or a raw trace-export API. Use a fixed app-data trace
 filename through `trace_database_path`, attach a redacted `SqliteEventSink`
 through `FanoutEventSink` if persistence is needed, and cancel registered runs
-when a Note workspace closes. No local HTTP daemon is needed or supported for
-this embedded path.
+when a Note workspace closes. Construct the emitters with `TauriTargetEmitter`
+for the `main` window only: widgets, previews, and auxiliary windows must never
+receive run or approval payloads. No local HTTP daemon is needed or supported
+for this embedded path. See `note-embedding-dependencies.md` for reproducible
+dependency evidence and the accepted current networking cost.

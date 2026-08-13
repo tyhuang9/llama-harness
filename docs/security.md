@@ -22,6 +22,10 @@ surface, and storage path.
   database paths to application-controlled directories.
 - Cancellation, deadlines, and process shutdown are cooperative. They prevent
   future runner work but cannot roll back an external effect that has begun.
+- Tauri approvals and run events are sensitive host-to-window messages. Target
+  them to the main application window with `TauriTargetEmitter`; never
+  broadcast them to widgets, previews, or auxiliary windows. `TauriEmitter` is
+  retained only for non-sensitive compatibility broadcasts.
 
 Report a suspected vulnerability privately to the repository maintainers with a
 minimal reproduction, affected revision, impact, and suggested mitigation. Do
