@@ -1,0 +1,10 @@
+{
+  "name": "llama-harness-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build-guides.mjs --write",
+    "check": "node build-guides.mjs --check",
+    "test": "node --test build-guides.test.mjs"
+  }
+}

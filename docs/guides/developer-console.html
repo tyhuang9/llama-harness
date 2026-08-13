@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="description" content="Developer console guide for llama-harness." /><title>Developer console | llama-harness</title><link rel="stylesheet" href="../styles.css" /></head>
+<body class="guide-page"><a class="skip-link" href="#guide-content">Skip to guide content</a><header class="topbar guide-header"><a class="brand" href="../index.html" aria-label="llama-harness documentation home"><span class="brand-mark" aria-hidden="true">lh</span><span>llama-harness</span></a><a class="guide-back-link" href="../index.html">Back to docs</a></header><main id="guide-content" class="guide-main" tabindex="-1"><article class="guide-article"><p class="guide-source">Guide source: <code>developer-console.md</code></p><h1 id="developer-console">Developer console</h1>
+      <p>Llama Harness Developer Console is an optional local Tauri application for inspecting one selected project workspace. It is not the runtime, a daemon, or a required background service.</p>
+      <h2 id="start-it">Start it</h2>
+      <pre><code class="language-bash">npm --prefix apps/harness-console install
+npm run dev</code></pre>
+      <p>The console stores only local workspace preferences. An application can embed and run <code>AgentRunner</code> without installing or opening the console.</p>
+      <h2 id="connect-a-workspace">Connect a workspace</h2>
+      <p>Project setup requires existing absolute paths for:</p>
+      <ul><li>the project root;</li><li>a project-local SQLite trace database; and</li><li>optionally, evaluation-report JSON and a YAML/JSON agent manifest inside the project root.</li></ul>
+      <p>It also accepts a loopback Ollama URL, normally <code>http://127.0.0.1:11434</code>. Non-loopback URLs are rejected by the shared provider before model discovery.</p>
+      <p>The native bridge canonicalizes configured paths, opens the trace database in read-only mode, and validates a configured agent manifest through <code>llama-harness-core</code>. It never starts or calls the retired HTTP service.</p>
+      <h2 id="inspect-data">Inspect data</h2>
+      <ul><li><strong>Models</strong> reads direct loopback Ollama health and installed-model capabilities.</li><li><strong>Agents</strong> displays validated project-owned manifest definitions: version, prompt-version metadata, default model, allowlist, limits, optional schema, and developer-visible system instructions. An unconfigured manifest produces an empty state rather than sample agents.</li><li><strong>Runs</strong> lists redacted SQLite runs and shows the ordered causal event timeline. Raw trace payloads are discarded before data reaches the webview, even if an older database contains them.</li><li><strong>Evaluations</strong> reads saved normalized Harness reports and exposes the fixed generated Promptfoo config and raw result under the selected project's <code>.llama-harness</code> directory. It also previews or launches fixed, project-relative Harness CLI evaluation/replay commands; it cannot run arbitrary shell commands.</li></ul>
+      <p>The standalone CLI intentionally reports when an evaluation or replay needs the embedding application’s tools, fixtures, policy, and approval adapter. The console shows that diagnostic rather than reporting a false success.</p>
+      <h2 id="boundaries-and-privacy">Boundaries and privacy</h2>
+      <p>The console has no generic model pull/delete controls, universal chat screen, visual agent editor, remote provider support, or generic command runner. It does not capture hidden chain-of-thought. Its local preferences do not retroactively alter trace redaction, raw capture, or retention in an existing database.</p></article></main><footer class="guide-footer"><a href="../index.html">Back to documentation</a></footer></body>
+</html>

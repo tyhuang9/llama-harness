@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="description" content="Tools and policies guide for llama-harness." /><title>Tools and policies | llama-harness</title><link rel="stylesheet" href="../styles.css" /></head>
+<body class="guide-page"><a class="skip-link" href="#guide-content">Skip to guide content</a><header class="topbar guide-header"><a class="brand" href="../index.html" aria-label="llama-harness documentation home"><span class="brand-mark" aria-hidden="true">lh</span><span>llama-harness</span></a><a class="guide-back-link" href="../index.html">Back to docs</a></header><main id="guide-content" class="guide-main" tabindex="-1"><article class="guide-article"><p class="guide-source">Guide source: <code>tools-and-policies.md</code></p><h1 id="tools-and-policies">Tools and policies</h1>
+      <p>Llama Harness executes application-owned tools. The runtime does not provide an unrestricted shell, filesystem, database, or application-function tool.</p>
+      <h2 id="define-and-register-a-tool">Define and register a tool</h2>
+      <p>Implement <code>Tool</code> in the embedding application and expose a <code>ToolDefinition</code> with a stable ID, description, JSON Schema argument contract, risk level, idempotency flag, and read-only flag. Register it in the application's <code>ToolRegistry</code> before building its <code>AgentRunner</code>.</p>
+      <pre><code class="language-rust">let mut tools = ToolRegistry::default();
+tools.register(Arc::new(MyApplicationTool::new(state)))?;
+let runner = AgentRunner::builder(provider).tools(tools).build();</code></pre>
+      <p>The runner validates model-proposed arguments against the registered schema before policy is evaluated or a tool executes. Unknown, disallowed, malformed, and invalid-schema calls become structured rejection events rather than application side effects.</p>
+      <h2 id="agent-allowlists">Agent allowlists</h2>
+      <p>Each <code>AgentDefinition</code> lists <code>tool_allowlist</code>. The provider receives only matching registered tool definitions, and the runner rejects any requested tool outside that list.</p>
+      <p>Project-owned manifests can make definitions inspectable without making them executable on their own:</p>
+      <pre><code class="language-yaml">version: 1
+agents:
+  - id: local-task-agent
+    name: Local Task Agent
+    version: &quot;1&quot;
+    default_model: ollama:qwen3
+    tool_allowlist: [list_tasks, update_task]</code></pre>
+      <p>Validate or inspect a manifest with the local CLI:</p>
+      <pre><code class="language-bash">llama-harness agents validate llama-harness.agents.yaml
+llama-harness agents list llama-harness.agents.yaml
+llama-harness agents inspect llama-harness.agents.yaml local-task-agent --json</code></pre>
+      <p>The manifest is developer-visible metadata. Do not put credentials, secret prompt material, or application data in it. Loading a manifest does not register application tools, resolve a provider, or grant permissions.</p>
+      <h2 id="policy-and-approval">Policy and approval</h2>
+      <p>The application supplies a <code>PolicyEngine</code> returning <code>Allow</code>, <code>Deny</code>, or <code>RequireApproval</code>, plus an async <code>ApprovalHandler</code>. The runtime records those decisions in ordered events. The safe default permits read-only tools and denies state-changing tools unless the embedding application explicitly supplies another policy.</p>
+      <p>Use approvals for high-risk or state-changing actions. The application controls how approval is presented and may cancel while an approval is pending; the runtime does not assume a UI.</p>
+      <h2 id="proposal-and-commit">Proposal and commit</h2>
+      <p>For consequential changes, prefer a two-step application design:</p>
+      <pre><code class="language-text">model proposes a change → application validates/previews it → user approves → application commits it</code></pre>
+      <p>The local task-agent example demonstrates the smaller variant: task mutations require its application approval callback, while task listing is allowed as read-only. Real applications should make their commit boundary explicit and use their own authorization and transactional guarantees.</p></article></main><footer class="guide-footer"><a href="../index.html">Back to documentation</a></footer></body>
+</html>
