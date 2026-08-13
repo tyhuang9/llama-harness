@@ -27,7 +27,7 @@ fn main() -> ExitCode {
 }
 
 fn protocol_check() -> ExitCode {
-    if run_cargo(&["test", "--package", "llama-harness-protocol"]) {
+    if run_cargo(&["test", "--locked", "--package", "llama-harness-protocol"]) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -39,6 +39,7 @@ fn release_check() -> ExitCode {
         vec!["fmt", "--check", "--all"],
         vec![
             "clippy",
+            "--locked",
             "--workspace",
             "--all-targets",
             "--all-features",
@@ -46,8 +47,14 @@ fn release_check() -> ExitCode {
             "-D",
             "warnings",
         ],
-        vec!["test", "--workspace", "--all-features"],
-        vec!["doc", "--workspace", "--all-features", "--no-deps"],
+        vec!["test", "--locked", "--workspace", "--all-features"],
+        vec![
+            "doc",
+            "--locked",
+            "--workspace",
+            "--all-features",
+            "--no-deps",
+        ],
     ] {
         if !run_cargo(&arguments) {
             return ExitCode::FAILURE;
@@ -58,7 +65,14 @@ fn release_check() -> ExitCode {
 
 fn package_list() -> ExitCode {
     for package in PUBLISHABLE_CRATES {
-        if !run_cargo(&["package", "--list", "--allow-dirty", "--package", package]) {
+        if !run_cargo(&[
+            "package",
+            "--list",
+            "--locked",
+            "--allow-dirty",
+            "--package",
+            package,
+        ]) {
             return ExitCode::FAILURE;
         }
     }

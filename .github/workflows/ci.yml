@@ -1,0 +1,86 @@
+name: Continuous verification
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --all-features --locked
+      - run: cargo test --workspace --all-features --locked
+
+  quality:
+    name: Rust quality and release readiness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Block Rust advisory, license, and source-policy failures
+        run: cargo deny check advisories licenses sources
+      - name: Verify Rust release contents and documentation
+        run: cargo run -p xtask -- release-check
+      - name: Verify protocol contract
+        run: cargo run -p xtask -- protocol-check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Verify documentation build inputs
+        run: |
+          npm --prefix docs test
+          npm --prefix docs run check
+
+  sdk:
+    name: SDK validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test and inspect TypeScript SDK package
+        shell: pwsh
+        run: |
+          npm --prefix sdks/typescript ci
+          npm --prefix sdks/typescript test
+          npm --prefix sdks/typescript pack --workspace @llama-harness/sdk
+          python scripts/inspect_npm_package.py --package llama-harness-sdk-0.1.0.tgz --name @llama-harness/sdk --version 0.1.0
+      - name: Test, build, and inspect Python SDK package
+        shell: pwsh
+        run: |
+          cargo build --locked -p llama-harness-runtime -p llama-harness-scripted-runtime
+          $env:PYTHONPATH = "sdks/python/src"
+          python -m unittest discover -s sdks/python/tests -v
+          python -m pip install --disable-pip-version-check build
+          python -m build --outdir sdk-dist sdks/python
+          python scripts/inspect_python_packages.py --dist sdk-dist
+
+  developer-console-audit:
+    name: Developer console audit (nonblocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm --prefix apps/harness-console ci
+      - name: Report development-tool audit findings without blocking runtime release gates
+        continue-on-error: true
+        run: npm --prefix apps/harness-console audit --audit-level=high
