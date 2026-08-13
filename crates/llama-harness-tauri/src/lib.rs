@@ -555,6 +555,7 @@ mod tests {
         AgentDefinition, AgentRunner, EventRecord, InMemoryEventSink, PolicyDecision, PolicyEngine,
         RunEvent, RunRequest, Tool, ToolCall, ToolRegistry, ToolResult, ToolRisk,
     };
+    use tauri::{test::mock_app, Listener, WebviewWindowBuilder};
 
     #[derive(Clone, Default)]
     struct TestEmitter(Arc<Mutex<Vec<(String, serde_json::Value)>>>);
@@ -695,6 +696,45 @@ mod tests {
                 serde_json::json!({"approvalId": "opaque"})
             )]
         );
+    }
+
+    #[test]
+    fn targeted_tauri_app_handle_emits_only_to_the_configured_window() {
+        let app = mock_app();
+        let main = WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let auxiliary = WebviewWindowBuilder::new(&app, "auxiliary", Default::default())
+            .build()
+            .unwrap();
+        let main_events = Arc::new(Mutex::new(Vec::new()));
+        let auxiliary_events = Arc::new(Mutex::new(Vec::new()));
+
+        let main_events_for_listener = Arc::clone(&main_events);
+        main.listen("approval", move |event| {
+            main_events_for_listener
+                .lock()
+                .unwrap()
+                .push(event.payload().to_owned());
+        });
+        let auxiliary_events_for_listener = Arc::clone(&auxiliary_events);
+        auxiliary.listen("approval", move |event| {
+            auxiliary_events_for_listener
+                .lock()
+                .unwrap()
+                .push(event.payload().to_owned());
+        });
+
+        let emitter = TauriTargetEmitter::new(app.handle().clone(), "main");
+        emitter
+            .emit("approval", serde_json::json!({"approvalId": "opaque"}))
+            .unwrap();
+
+        assert_eq!(
+            main_events.lock().unwrap().as_slice(),
+            [r#"{"approvalId":"opaque"}"#]
+        );
+        assert!(auxiliary_events.lock().unwrap().is_empty());
     }
 
     #[test]
