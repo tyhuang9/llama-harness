@@ -19,4 +19,3 @@ async with await HarnessClient.start(provider={&quot;kind&quot;: &quot;ollama&qu
       <p><code>policy</code> and <code>approve</code> may be synchronous or asynchronous. Exceptions fail closed. Always close the client (the context manager does so), and treat cancellation as cooperative: it stops subsequent agent work but cannot reverse a tool's completed external side effect.</p>
       <p>Use <code>await client.health()</code> and <code>await client.list_models()</code> for typed provider inspection before a run. They are separate child commands and therefore do not allocate a run, alter a transcript, or invoke a host tool callback.</p></article></main><footer class="guide-footer"><a href="../index.html">Back to documentation</a></footer></body>
 </html>
-

@@ -221,8 +221,7 @@ export function renderGuide(sourceName) {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="description" content="${escapeHtml(title)} guide for llama-harness." /><title>${escapeHtml(title)} | llama-harness</title><link rel="stylesheet" href="../styles.css" /></head>
 <body class="guide-page"><a class="skip-link" href="#guide-content">Skip to guide content</a><header class="topbar guide-header"><a class="brand" href="../index.html" aria-label="llama-harness documentation home"><span class="brand-mark" aria-hidden="true">lh</span><span>llama-harness</span></a><a class="guide-back-link" href="../index.html">Back to docs</a></header><main id="guide-content" class="guide-main" tabindex="-1"><article class="guide-article"><p class="guide-source">Guide source: <code>${escapeHtml(sourceName)}</code></p>${body}</article></main><footer class="guide-footer"><a href="../index.html">Back to documentation</a></footer></body>
-</html>
-`;
+</html>\n`;
 }
 
 export function checkOrWrite(mode) {
