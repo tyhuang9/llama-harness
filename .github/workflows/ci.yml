@@ -47,7 +47,6 @@ jobs:
           node-version: 20.19.5
       - name: Verify documentation build inputs
         run: |
-          npm --prefix docs ci
           npm --prefix docs test
           npm --prefix docs run check
 

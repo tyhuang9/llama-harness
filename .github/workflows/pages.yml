@@ -32,9 +32,7 @@ jobs:
         with:
           node-version: 20.19.5
       - name: Test documentation
-        run: |
-          npm --prefix docs ci
-          npm --prefix docs test
+        run: npm --prefix docs test
       - name: Verify generated guides
         run: npm --prefix docs run check
       - name: Configure Pages
