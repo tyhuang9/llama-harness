@@ -1,11 +1,83 @@
-"""Reject unexpected payloads in packed npm archives."""
+"""Reject unsafe or unexpected payloads in packed npm archives."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import tarfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+
+SDK_FILES = {
+    "package/package.json",
+    "package/LICENSE",
+    "package/README.md",
+    "package/dist/index.js",
+    "package/dist/index.d.ts",
+}
+
+
+def _safe_member_name(name: str) -> str:
+    if not name or "\\" in name:
+        raise ValueError(f"unsafe archive member path: {name!r}")
+    path = PurePosixPath(name)
+    canonical = path.as_posix()
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"unsafe archive member path: {name!r}")
+    if name.rstrip("/") != canonical:
+        raise ValueError(f"non-canonical archive member path: {name!r}")
+    return canonical
+
+
+def inspect_npm_package(
+    package_path: Path,
+    expected_name: str,
+    expected_version: str,
+    require_runtime: bool = False,
+) -> int:
+    members: dict[str, tarfile.TarInfo] = {}
+    with tarfile.open(package_path, "r:gz") as archive:
+        for member in archive.getmembers():
+            name = _safe_member_name(member.name)
+            if name in members:
+                raise ValueError(f"{package_path}: duplicate archive member: {name}")
+            if not (member.isfile() or member.isdir()):
+                raise ValueError(f"{package_path}: links and special archive members are forbidden: {name}")
+            members[name] = member
+
+        files = {name for name, member in members.items() if member.isfile()}
+        if require_runtime:
+            extension = ".exe" if expected_name.endswith("win32-x64") else ""
+            expected_files = {
+                "package/package.json",
+                "package/LICENSE",
+                "package/README.md",
+                f"package/bin/llama-harness-runtime{extension}",
+            }
+        else:
+            expected_files = SDK_FILES
+        allowed_directories = {
+            str(parent)
+            for name in expected_files
+            for parent in PurePosixPath(name).parents
+            if str(parent) != "."
+        }
+        directories = {name for name, member in members.items() if member.isdir()}
+        if files != expected_files or not directories.issubset(allowed_directories):
+            missing = sorted(expected_files - files)
+            unexpected = sorted((files - expected_files) | (directories - allowed_directories))
+            raise ValueError(f"{package_path}: package contents differ; missing={missing}, unexpected={unexpected}")
+
+        manifest_member = members.get("package/package.json")
+        if manifest_member is None or not manifest_member.isfile():
+            raise ValueError(f"{package_path}: missing package.json")
+        manifest = archive.extractfile(manifest_member)
+        if manifest is None:
+            raise ValueError(f"{package_path}: package.json is unreadable")
+        metadata = json.load(manifest)
+    if metadata.get("name") != expected_name or metadata.get("version") != expected_version:
+        raise ValueError(f"{package_path}: package metadata does not match {expected_name}@{expected_version}")
+    return len(files)
 
 
 def main() -> int:
@@ -15,20 +87,11 @@ def main() -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--require-runtime", action="store_true")
     args = parser.parse_args()
-    with tarfile.open(args.package, "r:gz") as archive:
-        names = archive.getnames()
-        manifest = archive.extractfile("package/package.json")
-        if manifest is None:
-            raise SystemExit(f"{args.package}: missing package.json")
-        package = json.load(manifest)
-    if package.get("name") != args.name or package.get("version") != args.version:
-        raise SystemExit(f"{args.package}: package metadata does not match {args.name}@{args.version}")
-    forbidden = [name for name in names if not name.startswith("package/") or ".env" in name or name.endswith(".pyc") or "/node_modules/" in name]
-    if forbidden:
-        raise SystemExit(f"{args.package}: forbidden package contents: {forbidden}")
-    if args.require_runtime and not any(name.startswith("package/bin/llama-harness-runtime") for name in names):
-        raise SystemExit(f"{args.package}: missing packaged runtime")
-    print(f"{args.package}: {len(names)} files; package contents verified")
+    try:
+        count = inspect_npm_package(args.package, args.name, args.version, args.require_runtime)
+    except (OSError, ValueError, json.JSONDecodeError, tarfile.TarError) as error:
+        raise SystemExit(str(error)) from error
+    print(f"{args.package}: {count} files; package contents verified")
     return 0
 
 

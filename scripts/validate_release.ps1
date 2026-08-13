@@ -7,6 +7,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+python scripts/validate_release_version.py $Version
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
 if (Test-Path -LiteralPath $Output) { throw "refusing to overwrite existing release output: $Output" }
 $npmVersion = node -p "require('./sdks/typescript/packages/sdk/package.json').version"
 if ($npmVersion -ne $Version) { throw "npm SDK version $npmVersion does not match release version" }
@@ -24,6 +26,12 @@ $runtimeName = "llama-harness-runtime-$Platform"
 if ($Executable.EndsWith(".exe")) { $runtimeName += ".exe" }
 $runtime = Join-Path $artifacts $runtimeName
 Copy-Item "target/$Target/release/$Executable" $runtime
+& $runtime --help | Out-Null
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
+if ($Platform -eq "linux-x64") {
+  python scripts/verify_elf_compatibility.py --binary $runtime --max-glibc 2.35
+  if ($LASTEXITCODE) { exit $LASTEXITCODE }
+}
 
 python scripts/prepare_sdk_runtime_packages.py --runtime $runtime --platform $Platform --version $Version --out $sdkStage
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -39,7 +47,7 @@ $tag = (Get-Content (Join-Path $sdkStage "platform.json") | ConvertFrom-Json).py
 $wheel = (Get-ChildItem -LiteralPath $artifacts -Filter "*.whl" | Select-Object -First 1).FullName
 python -m wheel tags --platform-tag $tag --remove $wheel
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
-python scripts/inspect_python_packages.py --dist $artifacts --require-runtime
+python scripts/inspect_python_packages.py --dist $artifacts --version $Version --require-runtime --platform-tag $tag
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 python scripts/write_release_manifest.py --artifacts $artifacts --version $Version --output (Join-Path $artifacts "release-manifest.json")
 if ($LASTEXITCODE) { exit $LASTEXITCODE }

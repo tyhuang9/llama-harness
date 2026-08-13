@@ -7,6 +7,11 @@ import hashlib
 import json
 from pathlib import Path
 
+try:
+    from .validate_release_version import validate_release_version
+except ImportError:
+    from validate_release_version import validate_release_version
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -14,8 +19,15 @@ def main() -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    try:
+        validate_release_version(args.version)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     artifacts = args.artifacts.resolve()
-    files = sorted(path for path in artifacts.rglob("*") if path.is_file() and path.name not in {"checksums.sha256", "release-manifest.json"})
+    files = sorted(path for path in artifacts.iterdir() if path.is_file() and path.name not in {"checksums.sha256", "release-manifest.json"})
+    nested_files = [path for path in artifacts.rglob("*") if path.is_file() and path.parent != artifacts]
+    if nested_files:
+        raise SystemExit(f"release artifacts must be root files: {nested_files}")
     if not files:
         raise SystemExit("no release artifacts found")
     entries = []

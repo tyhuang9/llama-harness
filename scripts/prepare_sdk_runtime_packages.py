@@ -15,7 +15,7 @@ from pathlib import Path
 PYTHON_TAGS = {
     "win32-x64": "win_amd64",
     "darwin-arm64": "macosx_11_0_arm64",
-    "linux-x64": "manylinux_2_17_x86_64",
+    "linux-x64": "manylinux_2_35_x86_64",
 }
 
 
