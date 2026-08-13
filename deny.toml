@@ -1,22 +1,20 @@
 [advisories]
 version = 2
 yanked = "deny"
-# Tauri's Linux GTK3 transitive graph has no upstream replacement yet. These are
-# unmaintained notices, not known runtime vulnerabilities; review on Tauri upgrades.
+# Linux GTK3/proc-macro path: tauri -> gtk/glib -> proc-macro-error. These are
+# unmaintained notices, not known vulnerabilities. Owner: Tauri integration
+# maintainers. TODO/review trigger: every Tauri upgrade or any advisory severity
+# change; remove entries as soon as the upstream GTK path no longer resolves them.
 ignore = [
   "RUSTSEC-2024-0370",
-  "RUSTSEC-2024-0412",
-  "RUSTSEC-2024-0413",
-  "RUSTSEC-2024-0415",
-  "RUSTSEC-2024-0416",
-  "RUSTSEC-2024-0418",
-  "RUSTSEC-2024-0419",
+  "RUSTSEC-2024-0412", "RUSTSEC-2024-0413", "RUSTSEC-2024-0415",
+  "RUSTSEC-2024-0416", "RUSTSEC-2024-0418", "RUSTSEC-2024-0419",
   "RUSTSEC-2024-0420",
-  "RUSTSEC-2025-0075",
-  "RUSTSEC-2025-0080",
-  "RUSTSEC-2025-0081",
-  "RUSTSEC-2025-0098",
-  "RUSTSEC-2025-0100",
+  # Unicode/urlpattern path: tauri-utils -> urlpattern -> unic-*. Owner: Tauri
+  # integration maintainers. TODO/review trigger: every Tauri/urlpattern upgrade
+  # or any advisory severity change; remove when urlpattern drops unic 0.9.
+  "RUSTSEC-2025-0075", "RUSTSEC-2025-0080", "RUSTSEC-2025-0081",
+  "RUSTSEC-2025-0098", "RUSTSEC-2025-0100",
 ]
 
 [licenses]

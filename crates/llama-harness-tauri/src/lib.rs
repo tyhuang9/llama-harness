@@ -44,24 +44,49 @@ pub struct TauriEmitter<R: Runtime> {
 
 /// [`FrontendEmitter`] implementation that sends every payload to one named
 /// Tauri target through [`Emitter::emit_to`].
-pub struct TauriTargetEmitter<R: Runtime> {
-    app: AppHandle<R>,
+struct TargetEmitter<B> {
+    backend: B,
     target: String,
 }
 
-impl<R: Runtime> Clone for TauriTargetEmitter<R> {
+/// Targeted emitter backed by a Tauri [`AppHandle`].
+pub struct TauriTargetEmitter<R: Runtime> {
+    inner: TargetEmitter<AppHandle<R>>,
+}
+
+trait TargetEmissionBackend: Send + Sync + Clone + 'static {
+    fn emit_to<P: Serialize + Clone>(
+        &self,
+        target: &str,
+        event: &str,
+        payload: P,
+    ) -> Result<(), String>;
+}
+
+impl<R: Runtime> TargetEmissionBackend for AppHandle<R> {
+    fn emit_to<P: Serialize + Clone>(
+        &self,
+        target: &str,
+        event: &str,
+        payload: P,
+    ) -> Result<(), String> {
+        Emitter::emit_to(self, target, event, payload).map_err(|error| error.to_string())
+    }
+}
+
+impl<B: Clone> Clone for TargetEmitter<B> {
     fn clone(&self) -> Self {
         Self {
-            app: self.app.clone(),
+            backend: self.backend.clone(),
             target: self.target.clone(),
         }
     }
 }
 
-impl<R: Runtime> TauriTargetEmitter<R> {
-    pub fn new(app: AppHandle<R>, target: impl Into<String>) -> Self {
+impl<B> TargetEmitter<B> {
+    pub fn new(backend: B, target: impl Into<String>) -> Self {
         Self {
-            app,
+            backend,
             target: target.into(),
         }
     }
@@ -71,11 +96,35 @@ impl<R: Runtime> TauriTargetEmitter<R> {
     }
 }
 
+impl<B: TargetEmissionBackend> FrontendEmitter for TargetEmitter<B> {
+    fn emit<P: Serialize + Clone>(&self, event: &str, payload: P) -> Result<(), String> {
+        self.backend.emit_to(&self.target, event, payload)
+    }
+}
+
+impl<R: Runtime> Clone for TauriTargetEmitter<R> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<R: Runtime> TauriTargetEmitter<R> {
+    pub fn new(app: AppHandle<R>, target: impl Into<String>) -> Self {
+        Self {
+            inner: TargetEmitter::new(app, target),
+        }
+    }
+
+    pub fn target(&self) -> &str {
+        self.inner.target()
+    }
+}
+
 impl<R: Runtime> FrontendEmitter for TauriTargetEmitter<R> {
     fn emit<P: Serialize + Clone>(&self, event: &str, payload: P) -> Result<(), String> {
-        self.app
-            .emit_to(&self.target, event, payload)
-            .map_err(|error| error.to_string())
+        FrontendEmitter::emit(&self.inner, event, payload)
     }
 }
 
@@ -520,6 +569,25 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingTargetBackend(Arc<Mutex<Vec<(String, String, serde_json::Value)>>>);
+
+    impl TargetEmissionBackend for RecordingTargetBackend {
+        fn emit_to<P: Serialize + Clone>(
+            &self,
+            target: &str,
+            event: &str,
+            payload: P,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push((
+                target.into(),
+                event.into(),
+                serde_json::to_value(payload).unwrap(),
+            ));
+            Ok(())
+        }
+    }
+
     fn tool() -> ToolDefinition {
         ToolDefinition {
             id: "notes.write".into(),
@@ -610,6 +678,23 @@ mod tests {
         assert!(request.cancellation.is_cancelled());
         assert!(registry.complete(&id));
         assert!(!registry.cancel(&id));
+    }
+
+    #[test]
+    fn targeted_emitter_passes_the_configured_recipient_to_the_production_route() {
+        let backend = RecordingTargetBackend::default();
+        let emitter = TargetEmitter::new(backend.clone(), "main");
+        emitter
+            .emit("approval", serde_json::json!({"approvalId": "opaque"}))
+            .unwrap();
+        assert_eq!(
+            backend.0.lock().unwrap().as_slice(),
+            [(
+                "main".into(),
+                "approval".into(),
+                serde_json::json!({"approvalId": "opaque"})
+            )]
+        );
     }
 
     #[test]

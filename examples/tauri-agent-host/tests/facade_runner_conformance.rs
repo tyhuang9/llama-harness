@@ -12,18 +12,15 @@ use llama_harness::{
 };
 use serde::Serialize;
 
-const MAIN: &str = "main";
-
 #[derive(Clone, Default)]
-struct TargetEmitter(Arc<Mutex<Vec<(String, String, serde_json::Value)>>>);
+struct EventRecorder(Arc<Mutex<Vec<(String, serde_json::Value)>>>);
 
-impl FrontendEmitter for TargetEmitter {
+impl FrontendEmitter for EventRecorder {
     fn emit<P: Serialize + Clone>(&self, event: &str, payload: P) -> Result<(), String> {
-        self.0.lock().unwrap().push((
-            MAIN.into(),
-            event.into(),
-            serde_json::to_value(payload).unwrap(),
-        ));
+        self.0
+            .lock()
+            .unwrap()
+            .push((event.into(), serde_json::to_value(payload).unwrap()));
         Ok(())
     }
 }
@@ -96,8 +93,8 @@ fn request(tool_id: &str) -> RunRequest {
 fn runner(
     tool: StateTool,
     responses: impl IntoIterator<Item = llama_harness::mock::MockStep>,
-    router: Arc<ApprovalRouter<TargetEmitter>>,
-    emitter: TargetEmitter,
+    router: Arc<ApprovalRouter<EventRecorder>>,
+    emitter: EventRecorder,
 ) -> AgentRunner {
     let mut tools = ToolRegistry::default();
     tools.register(Arc::new(tool)).unwrap();
@@ -109,16 +106,16 @@ fn runner(
         .build()
 }
 
-async fn approval_id_after(emitter: &TargetEmitter, previous_count: usize) -> String {
+async fn approval_id_after(emitter: &EventRecorder, previous_count: usize) -> String {
     for _ in 0..100 {
         let approval = {
             let records = emitter.0.lock().unwrap();
             let approvals = records
                 .iter()
-                .filter(|(_, event, _)| event == DEFAULT_APPROVAL_EVENT_NAME)
+                .filter(|(event, _)| event == DEFAULT_APPROVAL_EVENT_NAME)
                 .collect::<Vec<_>>();
             (approvals.len() > previous_count).then(|| {
-                approvals.last().unwrap().2["approvalId"]
+                approvals.last().unwrap().1["approvalId"]
                     .as_str()
                     .unwrap()
                     .to_owned()
@@ -132,19 +129,19 @@ async fn approval_id_after(emitter: &TargetEmitter, previous_count: usize) -> St
     panic!("approval event was not emitted")
 }
 
-fn approval_count(emitter: &TargetEmitter) -> usize {
+fn approval_count(emitter: &EventRecorder) -> usize {
     emitter
         .0
         .lock()
         .unwrap()
         .iter()
-        .filter(|(_, event, _)| event == DEFAULT_APPROVAL_EVENT_NAME)
+        .filter(|(event, _)| event == DEFAULT_APPROVAL_EVENT_NAME)
         .count()
 }
 
 #[tokio::test]
-async fn facade_only_read_and_granted_write_follow_main_window_contract() {
-    let emitter = TargetEmitter::default();
+async fn facade_runner_read_and_granted_write_follow_approval_contract() {
+    let emitter = EventRecorder::default();
     let router = Arc::new(ApprovalRouter::new(emitter.clone()));
     let state = Arc::new(Mutex::new(vec![]));
     let read = tool("notes.read", true, Arc::clone(&state));
@@ -187,17 +184,11 @@ async fn facade_only_read_and_granted_write_follow_main_window_contract() {
     assert!(!router.respond(&id, true, "replay"));
     assert_eq!(task.await.unwrap().status, RunStatus::Completed);
     assert_eq!(*state.lock().unwrap(), ["notes.read", "notes.write"]);
-    assert!(emitter
-        .0
-        .lock()
-        .unwrap()
-        .iter()
-        .all(|(target, _, _)| target == MAIN));
 }
 
 #[tokio::test]
-async fn facade_only_denial_and_cancellation_leave_no_write_and_clear_host_state() {
-    let emitter = TargetEmitter::default();
+async fn facade_runner_denial_and_cancellation_leave_no_write_and_clear_host_state() {
+    let emitter = EventRecorder::default();
     let router = Arc::new(ApprovalRouter::with_settings(
         emitter.clone(),
         DEFAULT_APPROVAL_EVENT_NAME,
