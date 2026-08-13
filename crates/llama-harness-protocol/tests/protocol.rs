@@ -11,6 +11,14 @@ fn fixture(name: &str) -> String {
         .expect("fixture must be checked in")
 }
 
+fn normalized_text_fixture(name: &str) -> String {
+    normalize_line_endings(&fixture(name))
+}
+
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 fn protocol_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -33,7 +41,7 @@ fn serializes_the_client_hello_golden_fixture() {
 
     assert_eq!(
         serde_json::to_string_pretty(&message).unwrap() + "\n",
-        fixture("client_hello.json")
+        normalized_text_fixture("client_hello.json")
     );
     assert_eq!(
         decode_line(fixture("client_hello.json").as_bytes()).unwrap(),
@@ -62,11 +70,25 @@ fn serializes_the_runtime_hello_golden_fixture() {
 
     assert_eq!(
         serde_json::to_string_pretty(&message).unwrap() + "\n",
-        fixture("runtime_hello.json")
+        normalized_text_fixture("runtime_hello.json")
     );
     assert_eq!(
         decode_line(fixture("runtime_hello.json").as_bytes()).unwrap(),
         message
+    );
+}
+
+#[test]
+fn text_fixture_normalization_accepts_only_windows_line_endings() {
+    let normalized = fixture("client_hello.json");
+    let windows_checkout_copy = normalized.replace('\n', "\r\n");
+
+    assert_eq!(normalize_line_endings(&windows_checkout_copy), normalized);
+    assert_ne!(
+        normalize_line_endings(
+            &windows_checkout_copy.replace("\"type\": \"client_hello\"", "\"type\": \"ping\"",)
+        ),
+        normalized
     );
 }
 
