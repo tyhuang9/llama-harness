@@ -35,13 +35,7 @@
           <a href="#runs">Runs and events</a>
           <div class="nav-group">Integrations</div>
           <a href="#integrations">Use the same engine anywhere</a>
-          <a href="guides/typescript-sdk.html">TypeScript SDK</a>
-          <a href="guides/python-sdk.html">Python SDK</a>
-          <a href="guides/tauri.html">Tauri integration</a>
-          <div class="nav-group">Resources</div>
-          <a href="guides/architecture.html">Architecture</a>
-          <a href="guides/security.html">Security</a>
-          <a href="guides/releasing.html">Releasing</a>
+          <a href="#resources">Resources</a>
         </nav>
         <div class="sidebar-foot">API version <strong>v1</strong><br />Runtime protocol is JSONL over stdio.</div>
       </aside>
@@ -49,7 +43,7 @@
       <main class="content">
         <section class="hero" id="overview">
           <div class="eyebrow">LOCAL AGENT RUNTIME · API REFERENCE</div>
-          <h1>Build controlled agent workflows.</h1>
+          <h1>Build controlled agent workflows</h1>
           <p class="lede">llama-harness gives your application one canonical runner for model loops, tools, policy, approvals, limits, cancellation, and causal events.</p>
           <div class="hero-actions">
             <a class="button primary" href="#quickstart">Start building <span aria-hidden="true">→</span></a>
@@ -62,7 +56,7 @@
 
         <section class="notice" id="quickstart">
           <div class="notice-icon" aria-hidden="true">i</div>
-          <div><strong>Available from Git today.</strong><br />The Rust facade is not published to crates.io yet. Pin a reviewed Git revision for pre-release integrations.</div>
+          <div><strong>Available from Git today</strong><br />The Rust facade is not published to crates.io yet. Pin a reviewed Git revision for pre-release integrations.</div>
           <a href="guides/integrating-note.html">Integration guide →</a>
         </section>
 
@@ -94,6 +88,19 @@ println!(<span class="str">"{}"</span>, result.final_output.unwrap_or_default())
         <section class="section integrations" id="integrations">
           <div class="section-heading"><div><div class="eyebrow">INTEGRATIONS</div><h2>Use the same engine anywhere</h2></div></div>
           <div class="integration-grid"><article><span class="integration-tag">Node / TypeScript</span><h3>Managed child runtime</h3><p>Start the Rust runtime only when your client calls <code>HarnessClient.start()</code>. Tools, policy, and approvals stay in the host process.</p><a href="guides/typescript-sdk.html">TypeScript SDK guide →</a></article><article><span class="integration-tag">Python</span><h3>Asyncio-native SDK</h3><p>Use an async context manager, typed callbacks, ordered events, cancellation, and an explicit runtime path.</p><a href="guides/python-sdk.html">Python SDK guide →</a></article><article><span class="integration-tag">Tauri</span><h3>Embedded Rust backend</h3><p>Keep capabilities in the Rust backend and forward structured events plus opaque approval IDs to the webview.</p><a href="guides/tauri.html">Tauri guide →</a></article></div>
+        </section>
+
+        <section class="section" id="resources">
+          <div class="section-heading"><div><div class="eyebrow">RESOURCES</div><h2>Resources</h2></div></div>
+          <p>Browse the guides for SDK clients, embedded integrations, runtime architecture, security controls, and release workflows.</p>
+          <ul class="resource-list">
+            <li><a href="guides/typescript-sdk.html"><span><strong>TypeScript SDK</strong><small>Run llama-harness from Node and TypeScript clients.</small></span><span aria-hidden="true">&rarr;</span></a></li>
+            <li><a href="guides/python-sdk.html"><span><strong>Python SDK</strong><small>Use the asyncio-native client with ordered events.</small></span><span aria-hidden="true">&rarr;</span></a></li>
+            <li><a href="guides/tauri.html"><span><strong>Tauri integration</strong><small>Embed the Rust runtime behind a desktop webview.</small></span><span aria-hidden="true">&rarr;</span></a></li>
+            <li><a href="guides/architecture.html"><span><strong>Architecture</strong><small>Understand the runner, protocol, and event flow.</small></span><span aria-hidden="true">&rarr;</span></a></li>
+            <li><a href="guides/security.html"><span><strong>Security</strong><small>Review capability boundaries and fail-closed controls.</small></span><span aria-hidden="true">&rarr;</span></a></li>
+            <li><a href="guides/releasing.html"><span><strong>Releasing</strong><small>Prepare reviewed builds and publish release artifacts.</small></span><span aria-hidden="true">&rarr;</span></a></li>
+          </ul>
         </section>
 
         <footer class="footer"><span>llama-harness · API reference v1</span><span><a href="https://github.com/tyhuang9/llama-harness">GitHub</a> · <a href="guides/releasing.html">Releases</a></span></footer>

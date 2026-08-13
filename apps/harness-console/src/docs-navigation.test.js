@@ -27,18 +27,44 @@ afterEach(() => {
 });
 
 describe("documentation navigation", () => {
-  it("maps every in-page sidebar item to an existing section and guide items to rendered HTML", () => {
+  it("maps every sidebar item to an existing in-page section", () => {
     const { document } = loadDocs();
     const links = [...document.querySelectorAll(".side-nav a")];
-    const inPage = links.filter((link) => link.getAttribute("href").startsWith("#"));
+    const expected = new Map([
+      ["#overview", "Build controlled agent workflows"],
+      ["#quickstart", "Available from Git today"],
+      ["#api", "AgentRunner"],
+      ["#tools", "Tools, policy, and approvals"],
+      ["#runs", "Runs and events"],
+      ["#integrations", "Use the same engine anywhere"],
+      ["#resources", "Resources"],
+    ]);
 
     expect(docsHtml).not.toMatch(/<a[^>]*class="[^"]*\bactive\b/);
-    expect(inPage.map((link) => link.getAttribute("href"))).toEqual(["#overview", "#quickstart", "#api", "#tools", "#runs", "#integrations"]);
-    inPage.forEach((link) => expect(document.querySelector(link.getAttribute("href"))).not.toBeNull());
-    expect(document.querySelector('.side-nav a[href="#api"]')?.textContent).toBe("AgentRunner");
-    expect(document.querySelector('.side-nav a[href="#integrations"]')?.textContent).toBe("Use the same engine anywhere");
-    expect(links.filter((link) => /SDK|Tauri integration/.test(link.textContent)).map((link) => link.getAttribute("href")))
-      .toEqual(["guides/typescript-sdk.html", "guides/python-sdk.html", "guides/tauri.html"]);
+    expect(links.map((link) => link.getAttribute("href"))).toEqual([...expected.keys()]);
+    links.forEach((link) => {
+      const href = link.getAttribute("href");
+      expect(href).toMatch(/^#/);
+      const target = document.querySelector(href);
+      expect(target).not.toBeNull();
+      const targetText = target.matches(".notice")
+        ? target.querySelector("strong")?.textContent.trim()
+        : target.querySelector("h1, h2")?.textContent.trim();
+      expect(link.textContent.trim()).toBe(expected.get(href));
+      expect(targetText).toBe(expected.get(href));
+    });
+    expect(links.some((link) => link.getAttribute("href").startsWith("guides/"))).toBe(false);
+    const resourceList = document.querySelector("#resources .resource-list");
+    expect(resourceList?.tagName).toBe("UL");
+    const resourceItems = [...resourceList.children];
+    expect(resourceItems).toHaveLength(6);
+    resourceItems.forEach((item) => {
+      expect(item.tagName).toBe("LI");
+      expect(item.querySelectorAll(":scope > a")).toHaveLength(1);
+    });
+    ["typescript-sdk", "python-sdk", "tauri", "architecture", "security", "releasing"].forEach((guide) => {
+      expect(document.querySelector(`main a[href="guides/${guide}.html"]`)).not.toBeNull();
+    });
     expect(activeLinks(document)).toHaveLength(1);
     expect(activeLinks(document)[0].getAttribute("aria-current")).toBe("location");
   });
@@ -46,7 +72,7 @@ describe("documentation navigation", () => {
   it("uses the hash and 80px reading threshold to maintain exactly one active entry", () => {
     const window = loadDocs("#api");
     const { document } = window;
-    const positions = { overview: -300, quickstart: -160, api: -20, tools: 81, runs: 500, integrations: 700 };
+    const positions = { overview: -300, quickstart: -160, api: -20, tools: 81, runs: 500, integrations: 700, resources: 900 };
     Object.entries(positions).forEach(([id, top]) => {
       document.getElementById(id).getBoundingClientRect = () => ({ top });
     });
@@ -70,6 +96,16 @@ describe("documentation navigation", () => {
     window.dispatchEvent(new window.Event("scroll"));
     expect(activeLinks(document)).toHaveLength(1);
     expect(activeLinks(document)[0].getAttribute("href")).toBe("#integrations");
+    expect(activeLinks(document)[0].getAttribute("aria-current")).toBe("location");
+    document.getElementById("resources").getBoundingClientRect = () => ({ top: 81 });
+    window.dispatchEvent(new window.Event("scroll"));
+    expect(activeLinks(document)).toHaveLength(1);
+    expect(activeLinks(document)[0].getAttribute("href")).toBe("#integrations");
+
+    document.getElementById("resources").getBoundingClientRect = () => ({ top: 80 });
+    window.dispatchEvent(new window.Event("scroll"));
+    expect(activeLinks(document)).toHaveLength(1);
+    expect(activeLinks(document)[0].getAttribute("href")).toBe("#resources");
     expect(activeLinks(document)[0].getAttribute("aria-current")).toBe("location");
     expect(document.querySelectorAll('.side-nav a:not([href^="#"])[aria-current]')).toHaveLength(0);
   });
@@ -119,10 +155,10 @@ describe("documentation navigation", () => {
     const window = loadDocs();
     const { document } = window;
     const search = document.getElementById("doc-search");
-    search.value = "security";
+    search.value = "events";
     search.dispatchEvent(new window.Event("input", { bubbles: true }));
 
-    expect(document.querySelector('.side-nav a[href="guides/security.html"]').hidden).toBe(false);
+    expect(document.querySelector('.side-nav a[href="#runs"]').hidden).toBe(false);
     expect(document.querySelector('.side-nav a[href="#api"]').hidden).toBe(true);
   });
 });
