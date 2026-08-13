@@ -33,6 +33,7 @@ pub mod mock {
     };
 }
 
+pub use async_trait::async_trait;
 pub use llama_harness_core::{
     load_agent_manifest, load_agent_manifest_path, AgentDefinition, AgentLimits, AgentManifest,
     AgentManifestError, AgentRunner, AgentRunnerBuilder, AllowAllPolicy, ApprovalHandler,
@@ -42,6 +43,7 @@ pub use llama_harness_core::{
     RunRequest, RunResult, RunStatus, SafeDefaultPolicy, Tool, ToolCall, ToolCallContext,
     ToolDefinition, ToolRegistry, ToolResult, ToolRisk, Usage, AGENT_MANIFEST_VERSION,
 };
+pub use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "ollama")]
 pub use llama_harness_ollama::{
