@@ -3475,10 +3475,7 @@ dependencies = [
 name = "tauri-agent-host"
 version = "0.1.0"
 dependencies = [
- "llama-harness-core",
- "llama-harness-tauri",
- "tauri",
- "tokio-util",
+ "llama-harness",
 ]
 
 [[package]]

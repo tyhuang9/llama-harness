@@ -20,6 +20,8 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+pub use tauri::{AppHandle as TauriAppHandle, Runtime as TauriRuntime};
+
 /// Event name used by [`TauriEventSink`] unless a host supplies another name.
 pub const DEFAULT_RUN_EVENT_NAME: &str = "llama-harness://run-event";
 /// Event name used by [`ApprovalRouter`] unless a host supplies another name.
@@ -31,9 +33,50 @@ pub trait FrontendEmitter: Send + Sync + Clone + 'static {
     fn emit<P: Serialize + Clone>(&self, event: &str, payload: P) -> Result<(), String>;
 }
 
-/// [`FrontendEmitter`] implementation backed by a Tauri app handle.
+/// Broadcast [`FrontendEmitter`] implementation backed by a Tauri app handle.
+///
+/// This compatibility adapter sends every payload to every webview. Do not use
+/// it for sensitive multi-window run or approval events; use
+/// [`TauriTargetEmitter`] with an explicit window label instead.
 pub struct TauriEmitter<R: Runtime> {
     app: AppHandle<R>,
+}
+
+/// [`FrontendEmitter`] implementation that sends every payload to one named
+/// Tauri target through [`Emitter::emit_to`].
+pub struct TauriTargetEmitter<R: Runtime> {
+    app: AppHandle<R>,
+    target: String,
+}
+
+impl<R: Runtime> Clone for TauriTargetEmitter<R> {
+    fn clone(&self) -> Self {
+        Self {
+            app: self.app.clone(),
+            target: self.target.clone(),
+        }
+    }
+}
+
+impl<R: Runtime> TauriTargetEmitter<R> {
+    pub fn new(app: AppHandle<R>, target: impl Into<String>) -> Self {
+        Self {
+            app,
+            target: target.into(),
+        }
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+}
+
+impl<R: Runtime> FrontendEmitter for TauriTargetEmitter<R> {
+    fn emit<P: Serialize + Clone>(&self, event: &str, payload: P) -> Result<(), String> {
+        self.app
+            .emit_to(&self.target, event, payload)
+            .map_err(|error| error.to_string())
+    }
 }
 
 impl<R: Runtime> Clone for TauriEmitter<R> {
@@ -205,6 +248,27 @@ struct PendingApprovalEntry {
     sender: oneshot::Sender<ApprovalRecord>,
 }
 
+/// Bounded approval-routing configuration. Defaults are intentionally small
+/// enough to fail closed when a host loses its approval surface.
+#[derive(Clone, Debug)]
+pub struct ApprovalRouterSettings {
+    pub max_pending: usize,
+    pub timeout: std::time::Duration,
+    pub max_approval_id_bytes: usize,
+    pub max_reason_bytes: usize,
+}
+
+impl Default for ApprovalRouterSettings {
+    fn default() -> Self {
+        Self {
+            max_pending: 64,
+            timeout: std::time::Duration::from_secs(5 * 60),
+            max_approval_id_bytes: 128,
+            max_reason_bytes: 1024,
+        }
+    }
+}
+
 /// Turns canonical approval requests into frontend events while preserving a
 /// Rust-owned, opaque correlation ID. It never grants an approval by default.
 #[derive(Clone)]
@@ -212,6 +276,7 @@ pub struct ApprovalRouter<E: FrontendEmitter> {
     emitter: E,
     event_name: String,
     pending: Arc<Mutex<HashMap<String, PendingApprovalEntry>>>,
+    settings: ApprovalRouterSettings,
 }
 
 impl<E: FrontendEmitter> ApprovalRouter<E> {
@@ -220,16 +285,39 @@ impl<E: FrontendEmitter> ApprovalRouter<E> {
     }
 
     pub fn with_event_name(emitter: E, event_name: impl Into<String>) -> Self {
+        Self::with_settings(emitter, event_name, ApprovalRouterSettings::default())
+    }
+
+    pub fn with_settings(
+        emitter: E,
+        event_name: impl Into<String>,
+        settings: ApprovalRouterSettings,
+    ) -> Self {
         Self {
             emitter,
             event_name: event_name.into(),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            settings,
         }
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Supplies a user's decision for an emitted approval. Returns false for a
     /// stale, cancelled, or previously consumed request.
     pub fn respond(&self, approval_id: &str, granted: bool, reason: impl Into<String>) -> bool {
+        if approval_id.len() > self.settings.max_approval_id_bytes {
+            return false;
+        }
+        let reason = reason.into();
+        if reason.len() > self.settings.max_reason_bytes {
+            return false;
+        }
         let entry = self
             .pending
             .lock()
@@ -243,7 +331,7 @@ impl<E: FrontendEmitter> ApprovalRouter<E> {
                         call_id: String::new(),
                         tool_id: String::new(),
                         granted,
-                        reason: reason.into(),
+                        reason,
                     })
                     .is_ok()
             })
@@ -312,16 +400,25 @@ impl<E: FrontendEmitter> ApprovalHandler for ApprovalRouter<E> {
     ) -> Result<ApprovalRecord, HarnessError> {
         let approval_id = Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
+        {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.len() >= self.settings.max_pending {
+                return Err(HarnessError::ResourceLimit(format!(
+                    "pending approvals exceed {}",
+                    self.settings.max_pending
+                )));
+            }
+            pending.insert(
                 approval_id.clone(),
                 PendingApprovalEntry {
                     run_id: context.run_id.clone(),
                     sender,
                 },
             );
+        }
         let payload = PendingApproval {
             approval_id: approval_id.clone(),
             run_id: context.run_id.clone(),
@@ -339,14 +436,16 @@ impl<E: FrontendEmitter> ApprovalHandler for ApprovalRouter<E> {
                 "could not emit approval request: {error}"
             )));
         }
-        let record = tokio::select! {
-            result = receiver => result.map_err(|_| HarnessError::Cancelled)?,
-            _ = request.cancellation.cancelled() => return Err(HarnessError::Cancelled),
+        let outcome = tokio::select! {
+            result = receiver => result.map_err(|_| HarnessError::Cancelled),
+            _ = request.cancellation.cancelled() => Err(HarnessError::Cancelled),
+            _ = tokio::time::sleep(self.settings.timeout) => Err(HarnessError::TimedOut("approval response".into())),
         };
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&approval_id);
+        let record = outcome?;
         Ok(ApprovalRecord {
             call_id: context.call_id.clone(),
             tool_id: context.tool_id.clone(),
@@ -484,6 +583,71 @@ mod tests {
         assert!(record.granted);
         assert_eq!(record.call_id, "call");
         assert!(!router.respond(&id, true, "duplicate"));
+    }
+
+    #[tokio::test]
+    async fn approval_router_fails_closed_on_capacity_timeout_and_cancellation() {
+        let emitter = TestEmitter::default();
+        let router = ApprovalRouter::with_settings(
+            emitter,
+            DEFAULT_APPROVAL_EVENT_NAME,
+            ApprovalRouterSettings {
+                max_pending: 1,
+                timeout: std::time::Duration::from_millis(50),
+                ..ApprovalRouterSettings::default()
+            },
+        );
+        let context = ToolCallContext {
+            run_id: "run".into(),
+            trace_id: "trace".into(),
+            call_id: "call".into(),
+            tool_id: "notes.write".into(),
+        };
+        let request = RunRequest::new(AgentDefinition::new("agent", "Agent", "1", "mock"), "hello");
+        let definition = tool();
+        let arguments = serde_json::json!({});
+        let waiting = router.approve_with_context(&context, &definition, &arguments, &request);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(router.pending_count(), 1);
+        assert!(matches!(
+            router
+                .approve_with_context(&context, &definition, &arguments, &request)
+                .await,
+            Err(HarnessError::ResourceLimit(_))
+        ));
+        assert!(matches!(waiting.await, Err(HarnessError::TimedOut(_))));
+        assert_eq!(router.pending_count(), 0);
+
+        let cancelling = router.approve_with_context(&context, &definition, &arguments, &request);
+        tokio::pin!(cancelling);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut cancelling)
+                .await
+                .is_err()
+        );
+        request.cancellation.cancel();
+        assert!(matches!(cancelling.await, Err(HarnessError::Cancelled)));
+        assert_eq!(router.pending_count(), 0);
+    }
+
+    #[test]
+    fn approval_router_rejects_oversize_response_fields() {
+        let router = ApprovalRouter::with_settings(
+            TestEmitter::default(),
+            DEFAULT_APPROVAL_EVENT_NAME,
+            ApprovalRouterSettings {
+                max_approval_id_bytes: 2,
+                max_reason_bytes: 2,
+                ..ApprovalRouterSettings::default()
+            },
+        );
+        assert!(!router.respond("too-long", true, "ok"));
+        assert!(!router.respond("ok", true, "too-long"));
     }
 
     #[test]

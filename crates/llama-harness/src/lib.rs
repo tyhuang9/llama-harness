@@ -34,12 +34,13 @@ pub mod mock {
 }
 
 pub use llama_harness_core::{
-    AgentDefinition, AgentLimits, AgentRunner, AgentRunnerBuilder, AllowAllPolicy, ApprovalHandler,
+    load_agent_manifest, load_agent_manifest_path, AgentDefinition, AgentLimits, AgentManifest,
+    AgentManifestError, AgentRunner, AgentRunnerBuilder, AllowAllPolicy, ApprovalHandler,
     ApprovalRecord, DenyApproval, EventRecord, EventSink, GenerationOptions, HarnessError,
     InMemoryEventSink, JsonMap, Message, ModelCapabilities, ModelInfo, ModelProvider, ModelRequest,
     ModelResponse, PolicyDecision, PolicyEngine, ProviderHealth, RunError, RunEvent, RunOverrides,
-    RunRequest, RunResult, RunStatus, SafeDefaultPolicy, Tool, ToolCall, ToolDefinition,
-    ToolRegistry, ToolResult, ToolRisk, Usage,
+    RunRequest, RunResult, RunStatus, SafeDefaultPolicy, Tool, ToolCall, ToolCallContext,
+    ToolDefinition, ToolRegistry, ToolResult, ToolRisk, Usage, AGENT_MANIFEST_VERSION,
 };
 
 #[cfg(feature = "ollama")]
@@ -68,3 +69,23 @@ pub use llama_harness_protocol as protocol;
 
 #[cfg(feature = "tauri")]
 pub use llama_harness_tauri as tauri;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn facade_exports_manifest_and_tool_call_contracts() {
+        let manifest: AgentManifest =
+            load_agent_manifest(r#"{"version":1,"agents":[]}"#, Some("json")).unwrap();
+        assert_eq!(manifest.version, AGENT_MANIFEST_VERSION);
+        let _: Result<AgentManifest, AgentManifestError> = load_agent_manifest_path("missing.yaml");
+        let context = ToolCallContext {
+            run_id: "run".into(),
+            trace_id: "trace".into(),
+            call_id: "call".into(),
+            tool_id: "tool".into(),
+        };
+        assert_eq!(context.run_id, "run");
+    }
+}

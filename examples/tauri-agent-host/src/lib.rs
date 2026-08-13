@@ -6,19 +6,26 @@
 
 use std::sync::Arc;
 
-use llama_harness_core::{EventSink, RunRequest};
-use llama_harness_tauri::{ApprovalRouter, RunRegistry, TauriEmitter, TauriEventSink};
-use tauri::{AppHandle, Runtime};
+use llama_harness::{
+    tauri::{
+        ApprovalRouter, RunRegistry, RunRegistryError, TauriAppHandle, TauriEventSink,
+        TauriRuntime, TauriTargetEmitter,
+    },
+    EventSink, RunRequest,
+};
 
-pub struct EmbeddedAgentHost<R: Runtime> {
+/// The only window permitted to receive run and approval payloads.
+pub const MAIN_WINDOW_LABEL: &str = "main";
+
+pub struct EmbeddedAgentHost<R: TauriRuntime> {
     pub runs: Arc<RunRegistry>,
-    pub approvals: Arc<ApprovalRouter<TauriEmitter<R>>>,
-    pub events: Arc<TauriEventSink<TauriEmitter<R>>>,
+    pub approvals: Arc<ApprovalRouter<TauriTargetEmitter<R>>>,
+    pub events: Arc<TauriEventSink<TauriTargetEmitter<R>>>,
 }
 
-impl<R: Runtime> EmbeddedAgentHost<R> {
-    pub fn new(app: AppHandle<R>) -> Self {
-        let emitter = TauriEmitter::new(app);
+impl<R: TauriRuntime> EmbeddedAgentHost<R> {
+    pub fn new(app: TauriAppHandle<R>) -> Self {
+        let emitter = TauriTargetEmitter::new(app, MAIN_WINDOW_LABEL);
         Self {
             runs: Arc::new(RunRegistry::default()),
             approvals: Arc::new(ApprovalRouter::new(emitter.clone())),
@@ -28,10 +35,7 @@ impl<R: Runtime> EmbeddedAgentHost<R> {
 
     /// Register before starting `AgentRunner::run`; expose this ID to a Tauri
     /// cancellation command, then call `runs.complete` when the future ends.
-    pub fn register(
-        &self,
-        request: &mut RunRequest,
-    ) -> Result<String, llama_harness_tauri::RunRegistryError> {
+    pub fn register(&self, request: &mut RunRequest) -> Result<String, RunRegistryError> {
         self.runs.register(request)
     }
 
