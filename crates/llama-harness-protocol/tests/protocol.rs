@@ -80,7 +80,7 @@ fn serializes_the_runtime_hello_golden_fixture() {
 
 #[test]
 fn text_fixture_normalization_accepts_only_windows_line_endings() {
-    let normalized = fixture("client_hello.json");
+    let normalized = normalized_text_fixture("client_hello.json");
     let windows_checkout_copy = normalized.replace('\n', "\r\n");
 
     assert_eq!(normalize_line_endings(&windows_checkout_copy), normalized);
