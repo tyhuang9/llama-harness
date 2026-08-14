@@ -17,6 +17,11 @@ cancellation, `FanoutEventSink` for event forwarding plus local SQLite, and
 `trace_database_path` for a contained `.sqlite` filename beneath the app data
 directory. See `examples/tauri-agent-host` for a minimal composition helper.
 
+Use `TauriTargetEmitter` with the explicit `main` label for both run events
+and approvals. Widgets, previews, and auxiliary windows must never receive
+sensitive run or approval payloads. `TauriEmitter` remains only as a broadcast
+compatibility adapter and is unsuitable for these multi-window channels.
+
 Implement narrow Tauri commands in the application: one to cancel a known run,
 and one to return `{ approvalId, granted, reason }`. Do not expose arbitrary
 tool invocation, raw trace reads, database paths, or model endpoint selection

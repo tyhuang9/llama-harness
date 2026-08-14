@@ -19,6 +19,7 @@ export const GUIDES = {
   "evaluations.md": "evaluations.html",
   "integrating-note.md": "integrating-note.html",
   "migration.md": "migration.html",
+  "note-embedding-dependencies.md": "note-embedding-dependencies.html",
   "MILESTONES.md": "milestones.html",
   "observability.md": "observability.html",
   "promptfoo-integration.md": "promptfoo-integration.html",

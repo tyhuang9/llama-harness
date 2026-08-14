@@ -20,6 +20,21 @@ It runs formatting, linting, tests, docs, and `cargo package --list` for each pu
 
 Continuous verification runs the Rust checks on Windows, macOS, and Linux; blocks Rust advisory, license, and source-policy failures; and tests, builds, and inspects both SDK packages. The developer console's npm audit is reported but does not block a runtime release: its current Vite/esbuild and nanoid findings are development-tooling-only and are tracked separately in `TODO.md`.
 
+Executable GitHub Actions are pinned to reviewed 40-character commit SHAs; the
+nearby version comment is informational. Pins were resolved from each official
+repository with `git ls-remote https://github.com/<owner>/<action>.git
+refs/tags/<major>` on 2026-08-13. The pinned commits are: checkout
+`11d5960a326750d5838078e36cf38b85af677262`, setup-node
+`49933ea5288caeca8642d1e84afbd3f7d6820020`, setup-python
+`a26af69be951a213d495a4c3e4e4022e16d87065`, upload-artifact
+`ea165f8d65b6e75b540449e92b4886f43607fa02`, download-artifact
+`d3f86a106a0bac45b974a628896c90dbdf5c8093`, configure-pages
+`983d7736d9b0ae728b81ab479565c72886d7745b`, upload-pages-artifact
+`56afc609e74202658d3ffba0e8f6dda462b719fa`, deploy-pages
+`d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e`, and rust-toolchain stable action
+`4360b52568e2003a75bf9bc1d59f33a8e3fc893c`. Review and update each SHA
+deliberately when upgrading the corresponding action.
+
 The helper deliberately does not claim that `cargo publish --dry-run` can completely validate the very first release: crates with unpublished first-party dependencies cannot be resolved by crates.io until their dependencies exist. After the dependency crates have been staged or published in order, run `cargo publish --dry-run --package <crate>` for each crate before the actual publication command.
 
 ## Publication order
@@ -41,10 +56,17 @@ The workflow defaults to validation mode. Set its `publish` input only after a r
 For a local platform rehearsal without publishing, run:
 
 ```powershell
-python -m pip install build wheel
+python -m pip install build==1.5.0 wheel==0.48.0
 pwsh -File scripts/validate_release.ps1 -Platform win32-x64 -Target x86_64-pc-windows-msvc -Executable llama-harness-runtime.exe
 ```
 
 Inspect `release-stage/local/artifacts/release-manifest.json` and `checksums.sha256`; the helper rejects a mismatch before returning successfully.
+
+Both continuous and manual release validation install cargo-deny 0.20.2 and
+block advisory, license, and source-policy failures. The narrow unmaintained
+advisory exceptions in `deny.toml` are split by their verified Tauri paths:
+Linux GTK3/proc-macro dependencies and `tauri-utils -> urlpattern -> unic-*`.
+The Tauri integration maintainers own them; re-review on every Tauri or
+urlpattern upgrade and immediately if any advisory severity changes.
 
 A Tauri application receives compiled Rust dependencies inside its own installer; Ollama remains a separately installed local inference service.

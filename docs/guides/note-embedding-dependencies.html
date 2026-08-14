@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="description" content="Note embedding dependency evidence guide for llama-harness." /><title>Note embedding dependency evidence | llama-harness</title><link rel="stylesheet" href="../styles.css" /></head>
+<body class="guide-page"><a class="skip-link" href="#guide-content">Skip to guide content</a><header class="topbar guide-header"><a class="brand" href="../index.html" aria-label="llama-harness documentation home"><span class="brand-mark" aria-hidden="true">lh</span><span>llama-harness</span></a><a class="guide-back-link" href="../index.html">Back to docs</a></header><main id="guide-content" class="guide-main" tabindex="-1"><article class="guide-article"><p class="guide-source">Guide source: <code>note-embedding-dependencies.md</code></p><h1 id="note-embedding-dependency-evidence">Note embedding dependency evidence</h1>
+      <p>This is reproducible pre-integration evidence for embedding the facade-only Tauri host into Note. Note was inspected read-only; this work does not modify Note or align package versions.</p>
+      <h2 id="reviewed-inputs">Reviewed inputs</h2>
+      <ul><li>llama-harness revision: <code>d5f7c0ed5691a974bef1150dbe3b9e57c86ab454</code></li><li>llama-harness <code>Cargo.lock</code> SHA-256: <code>5ff6bb7126cd08809c24aa37137b57ec3a21eaaf25b43aa22f1725b3950ed9a3</code></li><li>Note revision: <code>855695adad798a82a768207b6c8e19651cfd0234</code></li><li>Note <code>backend/src-tauri/Cargo.lock</code> SHA-256: <code>2d07ff9c8327bbb925f722cbee6fa023003aedbe89c2d9915231ae57055c0653</code></li><li>target used for comparison: <code>x86_64-pc-windows-msvc</code></li></ul>
+      <p>Set repository locations explicitly; no personal absolute path is part of the procedure:</p>
+      <pre><code class="language-powershell">$HARNESS_REPO = Resolve-Path &lt;llama-harness-checkout&gt;
+$NOTE_REPO = Resolve-Path &lt;note-checkout&gt;
+$NOTE_MANIFEST = Join-Path $NOTE_REPO &quot;backend/src-tauri/Cargo.toml&quot;
+
+git -C $HARNESS_REPO rev-parse HEAD
+Get-FileHash -Algorithm SHA256 (Join-Path $HARNESS_REPO &quot;Cargo.lock&quot;)
+git -C $NOTE_REPO rev-parse HEAD
+Get-FileHash -Algorithm SHA256 (Join-Path $NOTE_REPO &quot;backend/src-tauri/Cargo.lock&quot;)
+
+cargo tree --manifest-path $NOTE_MANIFEST --locked --target x86_64-pc-windows-msvc -p note -i reqwest@0.13.4
+cargo tree --manifest-path $NOTE_MANIFEST --locked --target x86_64-pc-windows-msvc -p note -e features -i reqwest@0.13.4
+cargo tree --manifest-path $NOTE_MANIFEST --locked --target x86_64-pc-windows-msvc -p note -i rustls@0.23.42
+cargo tree --manifest-path (Join-Path $HARNESS_REPO &quot;Cargo.toml&quot;) --locked --target x86_64-pc-windows-msvc -p llama-harness-ollama -i reqwest@0.12.28
+cargo tree --manifest-path (Join-Path $HARNESS_REPO &quot;Cargo.toml&quot;) --locked --target x86_64-pc-windows-msvc -p llama-harness-ollama -e features -i reqwest@0.12.28
+cargo tree --manifest-path (Join-Path $HARNESS_REPO &quot;Cargo.toml&quot;) --locked --target x86_64-pc-windows-msvc -p llama-harness-ollama -i rustls@0.23.43
+
+$noteTree = cargo tree --manifest-path $NOTE_MANIFEST --locked --target x86_64-pc-windows-msvc -p note --all-features --prefix none --format '{p}'
+$harnessTree = cargo tree --manifest-path (Join-Path $HARNESS_REPO &quot;Cargo.toml&quot;) --locked --target x86_64-pc-windows-msvc -p llama-harness --all-features --prefix none --format '{p}'
+[pscustomobject]@{
+  TreeEntries = @($noteTree).Count
+  UniquePackages = @($noteTree | Sort-Object -Unique).Count
+}
+[pscustomobject]@{
+  TreeEntries = @($harnessTree).Count
+  UniquePackages = @($harnessTree | Sort-Object -Unique).Count
+}</code></pre>
+      <h2 id="recorded-result-and-decision">Recorded result and decision</h2>
+      <p>Recorded on 2026-08-13: Note directly selects <code>reqwest 0.13.4</code> with <code>json</code>, <code>rustls</code>, and <code>stream</code>, resolving <code>rustls 0.23.42</code>. llama-harness Ollama directly selects <code>reqwest 0.12.28</code> with <code>json</code>, <code>rustls-tls</code>, and <code>stream</code>, resolving <code>rustls 0.23.43</code>. The package-rooted, all-feature target trees had 459 unique Note packages (1,233 tree entries) and 405 unique facade packages (953 tree entries) before embedding.</p>
+      <p>Cargo permits the two reqwest minor lines, so both reqwest facades and their version-specific dependencies would coexist when harness is embedded in Note. This branch does not claim a combined binary or target-size measurement because it does not build a modified Note. Aligning reqwest safely requires an Ollama client API and behavior review, plus a combined Note build; that dependency upgrade is proposed as a separate follow-up rather than broad churn in the Tauri boundary branch. Re-run this evidence after either recorded revision, lockfile, direct networking dependency, target, or feature set changes.</p></article></main><footer class="guide-footer"><a href="../index.html">Back to documentation</a></footer></body>
+</html>

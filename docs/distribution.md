@@ -20,3 +20,9 @@ platforms must set `LLAMA_HARNESS_RUNTIME_PATH` to a reviewed local executable
 until a matching artifact is released. Artifact provenance consists of the
 workflow run, `checksums.sha256`, and `release-manifest.json`; verify all three
 before installation or registry upload.
+
+Linux runtime packages and wheels declare a glibc 2.35 minimum. They are built
+and executed on the pinned Ubuntu 22.04 runner, and `readelf` must show no
+required GLIBC symbol newer than 2.35 before the wheel is tagged
+`manylinux_2_35_x86_64`. This proves the declared floor for that build; it does
+not claim compatibility with older glibc releases or non-glibc Linux systems.

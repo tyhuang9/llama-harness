@@ -6,8 +6,18 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+observability = ["llama-harness/observability"]
+
 [dependencies]
-llama-harness-core = { version = "0.1.0", path = "../../crates/llama-harness-core" }
-llama-harness-tauri = { version = "0.1.0", path = "../../crates/llama-harness-tauri" }
-tauri = { version = "2", default-features = false, features = [] }
-tokio-util = "0.7"
+llama-harness = { version = "0.1.0", path = "../../crates/llama-harness", features = ["tauri"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[[test]]
+name = "facade_observability_conformance"
+required-features = ["observability"]
