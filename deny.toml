@@ -22,6 +22,11 @@ ignore = [
 [licenses]
 version = 2
 confidence-threshold = 0.8
+# `LGPL-2.1-or-later` enters through Tauri's GTK/glib Linux dependency path.
+# Linux builds dynamically link those compatible system libraries, preserving a
+# recipient's ability to replace/relink them. Release distributions must retain
+# the applicable LGPL license and copyright notices; reassess this allowance if
+# a Tauri/GTK change bundles or statically links the libraries.
 allow = [
   "0BSD",
   "Apache-2.0",

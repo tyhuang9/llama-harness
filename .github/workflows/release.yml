@@ -138,6 +138,7 @@ jobs:
         with:
           name: llama-harness-release-manifest
           path: release-artifacts/
+          if-no-files-found: error
       - name: Publication gate
         if: ${{ inputs.publish }}
         run: |

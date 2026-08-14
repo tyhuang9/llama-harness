@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -10,12 +11,14 @@ import warnings
 import zipfile
 from pathlib import Path
 import re
+from unittest import mock
 
 from scripts.inspect_npm_package import SDK_FILES, inspect_npm_package
 from scripts.inspect_python_packages import PACKAGE_FILES, inspect_wheel
 from scripts.inspect_release_artifacts import PLATFORMS, inspect_release_artifacts
 from scripts.validate_release_version import validate_release_version
 from scripts.verify_elf_compatibility import required_glibc_versions
+from scripts.write_release_manifest import main as write_release_manifest
 
 
 VERSION = "1.2.3"
@@ -194,6 +197,52 @@ class ReleaseSetTests(unittest.TestCase):
 
 
 class InputAndAbiTests(unittest.TestCase):
+    def test_manifest_writer_rejects_missing_and_non_directory_artifact_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for artifacts in (root / "missing", root / "artifact-file"):
+                if artifacts.name == "artifact-file":
+                    artifacts.write_text("not a directory", encoding="utf-8")
+                output = root / f"{artifacts.name}.json"
+                with self.subTest(artifacts=artifacts), self.assertRaisesRegex(
+                    SystemExit, "cannot scan release artifacts"
+                ), mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "write_release_manifest.py",
+                        "--artifacts",
+                        str(artifacts),
+                        "--version",
+                        VERSION,
+                        "--output",
+                        str(output),
+                    ],
+                ):
+                    write_release_manifest()
+
+    def test_manifest_writer_reports_artifact_scan_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            with self.assertRaisesRegex(SystemExit, "cannot scan release artifacts"), mock.patch.object(
+                Path, "iterdir", side_effect=PermissionError("access denied")
+            ), mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "write_release_manifest.py",
+                    "--artifacts",
+                    str(artifacts),
+                    "--version",
+                    VERSION,
+                    "--output",
+                    str(root / "release-manifest.json"),
+                ],
+            ):
+                write_release_manifest()
+
     def test_release_version_rejects_shell_and_package_metacharacters(self) -> None:
         for value in ("1.2.3; whoami", "1.2", "01.2.3", "1.2.3-alpha", "$(whoami)", "1.2.3/path"):
             with self.subTest(value=value), self.assertRaises(ValueError):
