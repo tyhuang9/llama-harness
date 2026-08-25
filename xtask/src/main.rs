@@ -553,7 +553,7 @@ fn run_consumer_example(consumer: &Path, target: &Path) -> CheckResult {
             OsString::from("--locked"),
             OsString::from("--target-dir"),
             target.as_os_str().to_owned(),
-            OsString::from("--all-features"),
+            OsString::from("--no-default-features"),
             OsString::from("--example"),
             OsString::from("realistic"),
         ],
