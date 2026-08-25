@@ -125,3 +125,5 @@ let _tool = ReadStatus(
 See the [embedding guide](https://github.com/tyhuang9/llama-harness/blob/main/docs/embedding.md)
 and [security guide](https://github.com/tyhuang9/llama-harness/blob/main/docs/security.md)
 for complete integration guidance.
+
+This crate is licensed under the MIT License; see `LICENSE`.
