@@ -33,17 +33,25 @@ exposure is suspected.
 
 Run both validation gates against `SOURCE_COMMIT` before any publish action:
 
-```bash
+```powershell
+pwsh -File scripts/release/check-rust-release.ps1 -Version 0.1.0
 cargo run --locked -p xtask -- release-check
 ```
 
-The helper runs formatting, linting, tests, and Rust documentation, creates all
-six `.crate` archives, rejects unexpected, unsafe, or oversized archive
-contents, and checks extracted packages with the supported facade feature
-configurations. Also manually dispatch `.github/workflows/release.yml` with
-`publish` left `false`, confirm the requested version and generated artifacts,
-and review its Rust release-validation result. That workflow validates sidecar
-and SDK artifacts as well; it does not publish Cargo crates.
+The preflight validates the exact six-crate set, unified version, Rust 1.88
+MSRV, nonempty changelog entry, clean worktree, and source commit. The helper
+runs formatting, linting, tests, and Rust documentation, creates all six
+`.crate` archives, rejects unexpected, unsafe, or oversized archive contents,
+and checks extracted packages with the supported facade feature configurations.
+
+Manually dispatch `.github/workflows/release-rust.yml` from `main` with version
+`0.1.0`. Confirm every portable platform, publishable-crate platform, package,
+policy, documentation, API, and fresh Rust 1.88 job passes against
+`SOURCE_COMMIT`. This workflow has read-only repository permissions, receives
+no registry credentials, uploads no release artifacts, and cannot publish,
+tag, create a release, or change owners. Sidecar and SDK validation remains in
+the separate `.github/workflows/release.yml` workflow and cannot block this
+Rust release gate.
 
 Continuous verification runs the Rust checks on Windows, macOS, and Linux; blocks Rust advisory, license, and source-policy failures; and tests, builds, and inspects both SDK packages. The developer console's npm audit is reported but does not block a runtime release: its current Vite/esbuild and nanoid findings are development-tooling-only and are tracked separately in `TODO.md`.
 
@@ -75,18 +83,45 @@ page is available, and a fresh external consumer has built against it. Do not
 use workspace paths, Git dependencies, a `[patch.crates-io]` table, cached lock
 files, or `cargo update` to make a consumer pass.
 
-1. Publish `llama-harness-core`.
+1. Dry-run and publish `llama-harness-core`:
+
+   ```powershell
+   cargo publish --locked --dry-run --package llama-harness-core
+   cargo publish --locked --package llama-harness-core
+   ```
+
 2. Wait for `llama-harness-core = 0.1.0` to appear in the index, create a new
    temporary consumer with `llama-harness-core = "=0.1.0"`, and build it.
-   Then dry-run the next layer: `llama-harness-ollama`,
-   `llama-harness-observability`, and `llama-harness-tauri`.
+   Then dry-run and publish each next-layer crate:
+
+   ```powershell
+   cargo publish --locked --dry-run --package llama-harness-ollama
+   cargo publish --locked --dry-run --package llama-harness-observability
+   cargo publish --locked --dry-run --package llama-harness-tauri
+   cargo publish --locked --package llama-harness-ollama
+   cargo publish --locked --package llama-harness-observability
+   cargo publish --locked --package llama-harness-tauri
+   ```
+
 3. Publish `llama-harness-ollama`, `llama-harness-observability`, and
    `llama-harness-tauri`. Wait for all three exact versions to be index-visible,
    build fresh exact-version consumers for the newly available crates, and
-   dry-run `llama-harness-evals`.
+   dry-run and publish `llama-harness-evals`:
+
+   ```powershell
+   cargo publish --locked --dry-run --package llama-harness-evals
+   cargo publish --locked --package llama-harness-evals
+   ```
+
 4. Publish `llama-harness-evals`. Wait for its exact version to be index-visible,
-   build a fresh `llama-harness-evals = "=0.1.0"` consumer, and dry-run the
-   `llama-harness` facade.
+   build a fresh `llama-harness-evals = "=0.1.0"` consumer, then dry-run and
+   publish the `llama-harness` facade:
+
+   ```powershell
+   cargo publish --locked --dry-run --package llama-harness
+   cargo publish --locked --package llama-harness
+   ```
+
 5. Publish `llama-harness`. Wait for `llama-harness = 0.1.0` to be index-visible,
    then run the final facade consumer verification below.
 
@@ -113,10 +148,24 @@ Verify the published `0.1.0` documentation pages for all six crates:
 5. `https://docs.rs/llama-harness-evals/0.1.0`
 6. `https://docs.rs/llama-harness/0.1.0`
 
-Only after all six pages render, the backup owner is confirmed, and the final
-facade consumer passes, create the annotated `v0.1.0` tag pointing exactly to
-`SOURCE_COMMIT`. Create the GitHub release from that tag and use the checked-in
-`.github/releases/v0.1.0.md` notes without editing them in the release form.
+Add the approved backup crates.io login to all six crates, then verify each
+owner list. Repeat these two commands for every crate name:
+
+```powershell
+cargo owner --add <backup-login> llama-harness-core
+cargo owner --list llama-harness-core
+```
+
+Only after all six pages render, all six owner lists are confirmed, and the
+final facade consumer passes, create the annotated `v0.1.0` tag pointing
+exactly to `SOURCE_COMMIT`, push that tag, and create the GitHub release from
+the checked-in notes:
+
+```powershell
+git tag --annotate v0.1.0 $SOURCE_COMMIT --message "llama-harness v0.1.0"
+git push origin v0.1.0
+gh release create v0.1.0 --verify-tag --title "llama-harness v0.1.0" --notes-file .github/releases/v0.1.0.md
+```
 
 ### Failure handling and rollback boundaries
 
