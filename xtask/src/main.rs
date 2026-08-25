@@ -18,33 +18,26 @@ const FACADE_FEATURES: &[&str] = &["ollama", "observability", "evals", "tauri"];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PublishableCrate {
     name: &'static str,
-    directory: &'static str,
 }
 
 const PUBLISHABLE_CRATES: &[PublishableCrate] = &[
     PublishableCrate {
         name: "llama-harness-core",
-        directory: "crates/llama-harness-core",
     },
     PublishableCrate {
         name: "llama-harness-ollama",
-        directory: "crates/llama-harness-ollama",
     },
     PublishableCrate {
         name: "llama-harness-observability",
-        directory: "crates/llama-harness-observability",
     },
     PublishableCrate {
         name: "llama-harness-tauri",
-        directory: "crates/llama-harness-tauri",
     },
     PublishableCrate {
         name: "llama-harness-evals",
-        directory: "crates/llama-harness-evals",
     },
     PublishableCrate {
         name: "llama-harness",
-        directory: "crates/llama-harness",
     },
 ];
 
@@ -131,7 +124,6 @@ fn package_check(root: &Path) -> CheckResult {
 
 fn package_check_after_clean(root: &Path) -> CheckResult {
     let temporary = TemporaryDirectory::new("llama-harness-package-check")?;
-    let packaging_workspace = prepare_packaging_workspace(root, temporary.path())?;
     let package_target = temporary.path().join("package-target");
     let extraction_root = temporary.path().join("extracted");
     fs::create_dir_all(&package_target)
@@ -139,23 +131,21 @@ fn package_check_after_clean(root: &Path) -> CheckResult {
     fs::create_dir_all(&extraction_root)
         .map_err(|error| format!("failed to create {}: {error}", extraction_root.display()))?;
 
+    let mut package_arguments = vec![
+        OsString::from("package"),
+        OsString::from("--locked"),
+        OsString::from("--no-verify"),
+        OsString::from("--target-dir"),
+        package_target.as_os_str().to_owned(),
+    ];
+    for package in PUBLISHABLE_CRATES {
+        package_arguments.push(OsString::from("--package"));
+        package_arguments.push(OsString::from(package.name));
+    }
+    run_cargo(root, package_arguments)?;
+
     let mut extracted_packages = Vec::with_capacity(PUBLISHABLE_CRATES.len());
     for package in PUBLISHABLE_CRATES {
-        write_packaging_workspace_manifest(&packaging_workspace, &extracted_packages)?;
-        run_cargo(&packaging_workspace, ["generate-lockfile"])?;
-        run_cargo(
-            &packaging_workspace,
-            vec![
-                OsString::from("package"),
-                OsString::from("--locked"),
-                OsString::from("--no-verify"),
-                OsString::from("--package"),
-                OsString::from(package.name),
-                OsString::from("--target-dir"),
-                package_target.as_os_str().to_owned(),
-            ],
-        )?;
-
         let archive = package_target
             .join("package")
             .join(format!("{}-{PACKAGE_VERSION}.crate", package.name));
@@ -171,109 +161,6 @@ fn package_check_after_clean(root: &Path) -> CheckResult {
         ));
     }
     check_packaged_consumer(root, temporary.path(), &extracted_packages)
-}
-
-fn prepare_packaging_workspace(root: &Path, temporary_root: &Path) -> CheckResult<PathBuf> {
-    let staging = temporary_root.join("package-workspace");
-    fs::create_dir_all(&staging)
-        .map_err(|error| format!("failed to create {}: {error}", staging.display()))?;
-
-    for package in PUBLISHABLE_CRATES {
-        let source = root.join(package.directory);
-        let destination = staging.join(package.directory);
-        copy_tree(&source, &destination)?;
-
-        let manifest_path = destination.join("Cargo.toml");
-        let manifest = fs::read_to_string(&manifest_path)
-            .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?;
-        let rewritten = manifest_without_first_party_paths(&manifest)?;
-        fs::write(&manifest_path, rewritten)
-            .map_err(|error| format!("failed to write {}: {error}", manifest_path.display()))?;
-    }
-
-    Ok(staging)
-}
-
-fn manifest_without_first_party_paths(manifest: &str) -> CheckResult<String> {
-    let mut rewritten = String::with_capacity(manifest.len());
-    for line in manifest.lines() {
-        let trimmed = line.trim_start();
-        let is_first_party_dependency = PUBLISHABLE_CRATES
-            .iter()
-            .any(|package| trimmed.starts_with(&format!("{} = {{", package.name)));
-        if !is_first_party_dependency {
-            rewritten.push_str(line);
-            rewritten.push('\n');
-            continue;
-        }
-
-        let marker = ", path = \"";
-        let Some(path_start) = line.find(marker) else {
-            rewritten.push_str(line);
-            rewritten.push('\n');
-            continue;
-        };
-        let value_start = path_start + marker.len();
-        let value_end = line[value_start..]
-            .find('"')
-            .map(|offset| value_start + offset)
-            .ok_or_else(|| format!("unterminated first-party path dependency: {line}"))?;
-        let path = &line[value_start..value_end];
-        if !path.starts_with("../llama-harness") {
-            return Err(format!(
-                "refusing to rewrite unexpected first-party dependency path {path:?}"
-            ));
-        }
-
-        let mut rewritten_line = line.to_owned();
-        rewritten_line.replace_range(path_start..=value_end, "");
-        rewritten.push_str(&rewritten_line);
-        rewritten.push('\n');
-    }
-
-    if rewritten.contains("path = \"../llama-harness") {
-        return Err("staged package manifest still contains a workspace dependency path".into());
-    }
-    Ok(rewritten)
-}
-
-fn write_packaging_workspace_manifest(
-    packaging_workspace: &Path,
-    extracted_packages: &[(PublishableCrate, PathBuf)],
-) -> CheckResult {
-    let extracted_names = extracted_packages
-        .iter()
-        .map(|(package, _)| package.name)
-        .collect::<HashSet<_>>();
-    if extracted_names.len() != extracted_packages.len() {
-        return Err("packaging workspace received duplicate extracted crates".into());
-    }
-
-    let mut manifest = String::from("[workspace]\nmembers = [\n");
-    for package in PUBLISHABLE_CRATES {
-        if !extracted_names.contains(package.name) {
-            manifest.push_str(&format!("  \"{}\",\n", package.directory));
-        }
-    }
-    manifest.push_str(&format!(
-        "]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"{PACKAGE_VERSION}\"\nedition = \"2021\"\nlicense = \"MIT\"\nrust-version = \"1.88\"\nrepository = \"https://github.com/tyhuang9/llama-harness\"\nhomepage = \"https://github.com/tyhuang9/llama-harness\"\n\n[patch.crates-io]\n"
-    ));
-    for package in PUBLISHABLE_CRATES {
-        let path = extracted_packages
-            .iter()
-            .find(|(extracted, _)| extracted.name == package.name)
-            .map_or_else(
-                || packaging_workspace.join(package.directory),
-                |(_, path)| path.clone(),
-            );
-        let path = toml_path(&path);
-        manifest.push_str(&format!("{} = {{ path = \"{path}\" }}\n", package.name));
-    }
-
-    let manifest_path = packaging_workspace.join("Cargo.toml");
-    fs::write(&manifest_path, manifest)
-        .map_err(|error| format!("failed to write {}: {error}", manifest_path.display()))?;
-    Ok(())
 }
 
 fn toml_path(path: &Path) -> String {
@@ -857,41 +744,10 @@ mod tests {
         assert_eq!(names.len(), 6);
         assert!(names.contains("llama-harness"));
         assert!(names.contains("llama-harness-core"));
-        let directories = PUBLISHABLE_CRATES
-            .iter()
-            .map(|package| package.directory)
-            .collect::<HashSet<_>>();
-        assert_eq!(directories.len(), 6);
         assert_eq!(PUBLISHABLE_CRATES[0].name, "llama-harness-core");
         assert_eq!(PUBLISHABLE_CRATES[3].name, "llama-harness-tauri");
         assert_eq!(PUBLISHABLE_CRATES[4].name, "llama-harness-evals");
         assert_eq!(PUBLISHABLE_CRATES[5].name, "llama-harness");
-    }
-
-    #[test]
-    fn staged_manifests_use_registry_dependencies() {
-        let manifest = concat!(
-            "[dependencies]\n",
-            "llama-harness-core = { version = \"0.1.0\", path = \"../llama-harness-core\" }\n",
-            "llama-harness-evals = { version = \"0.1.0\", path = \"../llama-harness-evals\", optional = true }\n",
-            "serde = \"1\"\n",
-        );
-        let rewritten = manifest_without_first_party_paths(manifest)
-            .expect("first-party paths should be removed");
-        assert!(!rewritten.contains("path ="));
-        assert!(rewritten.contains("llama-harness-core = { version = \"0.1.0\" }"));
-        assert!(
-            rewritten.contains("llama-harness-evals = { version = \"0.1.0\", optional = true }")
-        );
-        assert!(rewritten.contains("serde = \"1\""));
-    }
-
-    #[test]
-    fn staged_manifest_rejects_unexpected_first_party_paths() {
-        let manifest = "llama-harness-core = { version = \"0.1.0\", path = \"C:/source/core\" }\n";
-        let error = manifest_without_first_party_paths(manifest)
-            .expect_err("an unexpected dependency path must not be rewritten");
-        assert!(error.contains("unexpected first-party dependency path"));
     }
 
     #[test]
