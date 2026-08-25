@@ -11,6 +11,7 @@ import warnings
 import zipfile
 from pathlib import Path
 import re
+import subprocess
 from unittest import mock
 
 from scripts.inspect_npm_package import SDK_FILES, inspect_npm_package
@@ -283,9 +284,13 @@ class InputAndAbiTests(unittest.TestCase):
         self.assertNotIn("upload-artifact", workflow)
         self.assertNotIn("llama-harness-runtime", workflow)
         self.assertNotIn("llama-harness-protocol", workflow)
+        self.assertIn("persist-credentials: false", workflow)
+        self.assertIn("SOURCE_COMMIT: ${{ github.sha }}", workflow)
+        self.assertIn("REVIEWED_SOURCE_COMMIT: ${{ inputs.source_commit }}", workflow)
 
         self.assertNotIn("AllowDirty", preflight)
         self.assertIn("git status --porcelain=v1 --untracked-files=all", preflight)
+        self.assertIn('$null -eq $_.publish', preflight)
         self.assertEqual(preflight.count('"llama-harness"'), 1)
         for crate in (
             "llama-harness-core",
@@ -313,6 +318,8 @@ class RustReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("cancel-in-progress: true", workflow)
         self.assertGreaterEqual(workflow.count("refs/heads/main"), 1)
         self.assertEqual(workflow.count("${{ inputs.version }}"), 1)
+        self.assertEqual(workflow.count("${{ inputs.source_commit }}"), 1)
+        self.assertEqual(workflow.count("${{ github.sha }}"), 1)
         self.assertIn("toolchain: stable", workflow)
         self.assertIn("toolchain: 1.88.0", workflow)
 
@@ -391,7 +398,40 @@ class RustReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("yyyy-MM-dd", script)
         self.assertIn("must not be empty", script)
         self.assertIn("git status --porcelain=v1 --untracked-files=all", script)
+        self.assertIn('$null -eq $_.publish', script)
+        self.assertIn("does not match reviewed source commit", script)
         self.assertNotIn("AllowDirty", script)
+
+    def test_rust_release_preflight_rejects_a_different_source_commit(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-File",
+                str(root / "scripts" / "release" / "check-rust-release.ps1"),
+                "-Version",
+                "0.1.0",
+                "-SourceCommit",
+                "0" * 40,
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match reviewed source commit", result.stdout + result.stderr)
+
+    def test_semver_gate_uses_the_latest_reachable_stable_release(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        script = (root / "scripts" / "semver" / "check-rust-semver.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('git tag --merged HEAD --list "v[0-9]*.[0-9]*.[0-9]*" --sort=-version:refname', script)
+        self.assertIn("--baseline-rev $comparisonTag", script)
+        self.assertIn('$null -eq $_.publish', script)
+        self.assertNotIn("--baseline-rev $expectedTag", script)
 
 
 if __name__ == "__main__":

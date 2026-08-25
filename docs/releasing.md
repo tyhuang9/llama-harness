@@ -34,7 +34,8 @@ exposure is suspected.
 Run both validation gates against `SOURCE_COMMIT` before any publish action:
 
 ```powershell
-pwsh -File scripts/release/check-rust-release.ps1 -Version 0.1.0
+$SOURCE_COMMIT = (git rev-parse HEAD).Trim()
+pwsh -File scripts/release/check-rust-release.ps1 -Version 0.1.0 -SourceCommit $SOURCE_COMMIT
 cargo run --locked -p xtask -- release-check
 ```
 
@@ -45,13 +46,14 @@ runs formatting, linting, tests, and Rust documentation, creates all six
 and checks extracted packages with the supported facade feature configurations.
 
 Manually dispatch `.github/workflows/release-rust.yml` from `main` with version
-`0.1.0`. Confirm every portable platform, publishable-crate platform, package,
-policy, documentation, API, and fresh Rust 1.88 job passes against
-`SOURCE_COMMIT`. This workflow has read-only repository permissions, receives
-no registry credentials, uploads no release artifacts, and cannot publish,
-tag, create a release, or change owners. Sidecar and SDK validation remains in
-the separate `.github/workflows/release.yml` workflow and cannot block this
-Rust release gate.
+`0.1.0` and the exact 40-character `SOURCE_COMMIT`. The workflow rejects a
+different current `main` commit. Confirm every portable platform,
+publishable-crate platform, package, policy, documentation, API, and fresh Rust
+1.88 job passes against that commit. This workflow has read-only repository
+permissions, receives no registry credentials, uploads no release artifacts,
+and cannot publish, tag, create a release, or change owners. Sidecar and SDK
+validation remains in the separate `.github/workflows/release.yml` workflow and
+cannot block this Rust release gate.
 
 Continuous verification runs the Rust checks on Windows, macOS, and Linux; blocks Rust advisory, license, and source-policy failures; and tests, builds, and inspects both SDK packages. The developer console's npm audit is reported but does not block a runtime release: its current Vite/esbuild and nanoid findings are development-tooling-only and are tracked separately in `TODO.md`.
 
@@ -77,53 +79,67 @@ the preceding layer is available in the crates.io index.
 
 ### Publication and registry checks
 
-Publish manually in this exact dependency order. A layer is complete only when
+Publish manually in the following exact dependency order. A layer is complete only when
 the exact `0.1.0` package is resolvable from the crates.io index, its package
 page is available, and a fresh external consumer has built against it. Do not
 use workspace paths, Git dependencies, a `[patch.crates-io]` table, cached lock
 files, or `cargo update` to make a consumer pass.
 
-1. Dry-run and publish `llama-harness-core`:
+Immediately before every dry-run and publish command below, rerun the preflight
+and confirm it still reports `SOURCE_COMMIT`:
 
-   ```powershell
-   cargo publish --locked --dry-run --package llama-harness-core
-   cargo publish --locked --package llama-harness-core
-   ```
+```powershell
+pwsh -File scripts/release/check-rust-release.ps1 -Version 0.1.0 -SourceCommit $SOURCE_COMMIT
+```
 
-2. Wait for `llama-harness-core = 0.1.0` to appear in the index, create a new
-   temporary consumer with `llama-harness-core = "=0.1.0"`, and build it.
-   Then dry-run and publish each next-layer crate:
+#### 1. Core
 
-   ```powershell
-   cargo publish --locked --dry-run --package llama-harness-ollama
-   cargo publish --locked --dry-run --package llama-harness-observability
-   cargo publish --locked --dry-run --package llama-harness-tauri
-   cargo publish --locked --package llama-harness-ollama
-   cargo publish --locked --package llama-harness-observability
-   cargo publish --locked --package llama-harness-tauri
-   ```
+Dry-run and publish `llama-harness-core`:
 
-3. Publish `llama-harness-ollama`, `llama-harness-observability`, and
-   `llama-harness-tauri`. Wait for all three exact versions to be index-visible,
-   build fresh exact-version consumers for the newly available crates, and
-   dry-run and publish `llama-harness-evals`:
+```powershell
+cargo publish --locked --dry-run --package llama-harness-core
+cargo publish --locked --package llama-harness-core
+```
 
-   ```powershell
-   cargo publish --locked --dry-run --package llama-harness-evals
-   cargo publish --locked --package llama-harness-evals
-   ```
+#### 2. Direct core integrations
 
-4. Publish `llama-harness-evals`. Wait for its exact version to be index-visible,
-   build a fresh `llama-harness-evals = "=0.1.0"` consumer, then dry-run and
-   publish the `llama-harness` facade:
+Wait for `llama-harness-core = 0.1.0` to appear in the index, create a new
+temporary consumer with `llama-harness-core = "=0.1.0"`, and build it. Then
+dry-run and publish each direct integration:
 
-   ```powershell
-   cargo publish --locked --dry-run --package llama-harness
-   cargo publish --locked --package llama-harness
-   ```
+```powershell
+cargo publish --locked --dry-run --package llama-harness-ollama
+cargo publish --locked --dry-run --package llama-harness-observability
+cargo publish --locked --dry-run --package llama-harness-tauri
+cargo publish --locked --package llama-harness-ollama
+cargo publish --locked --package llama-harness-observability
+cargo publish --locked --package llama-harness-tauri
+```
 
-5. Publish `llama-harness`. Wait for `llama-harness = 0.1.0` to be index-visible,
-   then run the final facade consumer verification below.
+#### 3. Evaluations
+
+Wait for all three integration versions to be index-visible, build fresh
+exact-version consumers for each newly available crate, then dry-run and
+publish `llama-harness-evals`:
+
+```powershell
+cargo publish --locked --dry-run --package llama-harness-evals
+cargo publish --locked --package llama-harness-evals
+```
+
+#### 4. Facade
+
+Wait for `llama-harness-evals = 0.1.0` to be index-visible, build a fresh
+`llama-harness-evals = "=0.1.0"` consumer, then dry-run and publish the
+`llama-harness` facade:
+
+```powershell
+cargo publish --locked --dry-run --package llama-harness
+cargo publish --locked --package llama-harness
+```
+
+Wait for `llama-harness = 0.1.0` to be index-visible, then run the final facade
+consumer verification below.
 
 For every dry-run, use the exact package selected for the next layer, for
 example `cargo publish --dry-run --package llama-harness-evals`. Only run the

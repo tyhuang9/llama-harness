@@ -78,6 +78,21 @@ test("checked-in guides exactly match the deterministic renderer", () => {
   assert.match(embedding, /href="tauri\.html"/);
 });
 
+test("release guide preserves executable Cargo publication commands", () => {
+  const guide = readFileSync(resolve(docs, "guides", "releasing.html"), "utf8");
+  const powershellBlocks = [...guide.matchAll(/<pre><code class="language-powershell">([\s\S]*?)<\/code><\/pre>/g)]
+    .map((match) => decodeHtml(match[1]));
+  const publishCommands = powershellBlocks
+    .flatMap((block) => block.split("\n"))
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("cargo publish "));
+
+  assert.equal(publishCommands.length, 12);
+  assert.ok(publishCommands.includes("cargo publish --locked --dry-run --package llama-harness-core"));
+  assert.ok(publishCommands.includes("cargo publish --locked --package llama-harness"));
+  assert.doesNotMatch(guide, /<p>```powershell/);
+});
+
 test("internal rendered-guide fragments resolve to generated heading IDs", () => {
   assert.equal(resolveGuideHref("./architecture.md#runtime-choices", "test.md"), "architecture.html#runtime-choices");
   for (const output of Object.values(GUIDES)) {

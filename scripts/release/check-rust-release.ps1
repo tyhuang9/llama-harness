@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
-    [string]$Version
+    [string]$Version,
+    [Parameter(Mandatory)]
+    [ValidatePattern('^[0-9a-fA-F]{40}$')]
+    [string]$SourceCommit
 )
 
 Set-StrictMode -Version Latest
@@ -31,7 +34,7 @@ try {
     $metadata = $metadataJson | ConvertFrom-Json
     $publishable = @(
         $metadata.packages |
-            Where-Object { @($_.publish) -contains "crates-io" }
+            Where-Object { $null -eq $_.publish -or @($_.publish) -contains "crates-io" }
     )
     $actualCrates = @($publishable | ForEach-Object { [string]$_.name } | Sort-Object)
     $differences = @(Compare-Object $expectedCrates $actualCrates)
@@ -102,6 +105,14 @@ try {
         throw "The $Version changelog section must not be empty."
     }
 
+    $headCommit = (& git rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $headCommit -notmatch '^[0-9a-f]{40}$') {
+        throw "Unable to resolve the exact source commit for the release."
+    }
+    if ($headCommit -cne $SourceCommit.ToLowerInvariant()) {
+        throw "HEAD $headCommit does not match reviewed source commit $SourceCommit."
+    }
+
     $workingTree = @(& git status --porcelain=v1 --untracked-files=all)
     if ($LASTEXITCODE -ne 0) {
         throw "Unable to inspect the Git working tree (exit code $LASTEXITCODE)."
@@ -111,11 +122,7 @@ try {
         throw "Rust release validation requires a clean Git working tree:`n$preview"
     }
 
-    $sourceCommit = (& git rev-parse HEAD).Trim()
-    if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
-        throw "Unable to resolve the exact source commit for the release."
-    }
-    Write-Host "Validated Rust release $Version at $sourceCommit."
+    Write-Host "Validated Rust release $Version at $headCommit."
     Write-Host "Published crates: $($actualCrates -join ', ')"
     Write-Host "MSRV: Rust $expectedRustVersion"
 }
