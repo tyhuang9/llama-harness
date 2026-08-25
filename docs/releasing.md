@@ -58,7 +58,12 @@ the exact release.
 
 The release workflow at `.github/workflows/release.yml` is manual-dispatch only. It builds `llama-harness-runtime` for supported Windows x64, macOS arm64, and Linux x64 targets, generates checksums and a machine-readable manifest, and stages a matching platform-specific npm runtime package plus Python wheel. It does not build model images, pull models, or package Ollama.
 
-The workflow defaults to validation mode. Set its `publish` input only after a reviewer confirms the version, generated manifest, checksums, package contents, registry credentials, and release notes. Keep the publication order: Rust dependencies first, runtime artifacts next, npm/PyPI SDK packages after their corresponding artifacts, then the facade. Registry publication remains an operator action; no normal CI job publishes packages.
+The workflow defaults to validation mode. Set its `publish` input only after a
+reviewer confirms the version, generated manifest, checksums, package contents,
+registry credentials, and release notes. The deferred SDK sequence is separate:
+publish runtime artifacts first, then the matching npm/PyPI packages. It neither
+precedes nor blocks the Cargo sequence above. Each sequence requires its own
+explicit human authorization; no normal CI job publishes packages.
 
 For a local platform rehearsal without publishing, run:
 
