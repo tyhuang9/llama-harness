@@ -508,11 +508,7 @@ fn check_packaged_consumer(
         )?;
     }
     run_consumer_check(&consumer, &target, &["--all-features"])?;
-    run_consumer_check(
-        &consumer,
-        &target,
-        &["--all-features", "--example", "realistic"],
-    )?;
+    run_consumer_example(&consumer, &target)?;
     Ok(())
 }
 
@@ -547,6 +543,21 @@ fn run_consumer_check(consumer: &Path, target: &Path, extra: &[&str]) -> CheckRe
     ];
     arguments.extend(extra.iter().map(OsString::from));
     run_cargo(consumer, arguments)
+}
+
+fn run_consumer_example(consumer: &Path, target: &Path) -> CheckResult {
+    run_cargo(
+        consumer,
+        [
+            OsString::from("run"),
+            OsString::from("--locked"),
+            OsString::from("--target-dir"),
+            target.as_os_str().to_owned(),
+            OsString::from("--all-features"),
+            OsString::from("--example"),
+            OsString::from("realistic"),
+        ],
+    )
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> CheckResult {
