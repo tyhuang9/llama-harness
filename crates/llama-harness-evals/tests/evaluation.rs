@@ -90,31 +90,21 @@ impl EvalExecutor for RecordingExecutor {
 }
 
 fn run_result(model: &str) -> RunResult {
-    RunResult {
-        id: "run-1".into(),
-        status: RunStatus::Completed,
-        final_output: Some(r#"{"done":true,"message":"done"}"#.into()),
-        model: model.into(),
-        tool_calls: vec![ToolCall {
-            id: "call-1".into(),
-            tool_id: "update_task".into(),
-            arguments_json: r#"{"id":"task-123","status":"completed"}"#.into(),
-        }],
-        policy_decisions: vec![],
-        approvals: vec![llama_harness_core::ApprovalRecord {
-            call_id: "call-1".into(),
-            tool_id: "update_task".into(),
-            granted: true,
-            reason: "test".into(),
-        }],
-        errors: vec![],
-        duration_ms: 50,
-        trace_id: "trace-1".into(),
-        model_call_limit_reached: false,
-        tool_call_limit_reached: false,
-        repeated_tool_call_limit_reached: false,
-        cancelled: false,
-    }
+    let mut result = RunResult::new("run-1", RunStatus::Completed, model, "trace-1");
+    result.final_output = Some(r#"{"done":true,"message":"done"}"#.into());
+    result.tool_calls = vec![ToolCall::new(
+        "call-1",
+        "update_task",
+        r#"{"id":"task-123","status":"completed"}"#,
+    )];
+    result.approvals = vec![llama_harness_core::ApprovalRecord::new(
+        "call-1",
+        "update_task",
+        true,
+        "test",
+    )];
+    result.duration_ms = 50;
+    result
 }
 
 #[test]
@@ -224,16 +214,16 @@ async fn regression_export_and_replay_use_explicit_fixture_data_not_trace_payloa
     let store = SqliteEventSink::open_in_memory(TraceStoreConfig::default()).unwrap();
     store
         .append_with_raw(
-            &EventRecord {
-                run_id: "run-1".into(),
-                trace_id: "trace-1".into(),
-                sequence: 1,
-                timestamp_ms: 1,
-                event: RunEvent::ModelRequested {
+            &EventRecord::new(
+                "run-1",
+                "trace-1",
+                1,
+                1,
+                RunEvent::ModelRequested {
                     call_number: 1,
                     model: "ollama:small".into(),
                 },
-            },
+            ),
             Some(&json!({"request": "private trace payload"})),
         )
         .unwrap();

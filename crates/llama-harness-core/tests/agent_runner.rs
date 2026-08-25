@@ -5,7 +5,7 @@ use llama_harness_core::{
     GenerationOptions, HarnessError, InMemoryEventSink, JsonMap, Message, MessageRole,
     ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, PolicyDecision,
     PolicyEngine, ProviderHealth, RunEvent, RunOverrides, RunRequest, RunStatus, Tool, ToolCall,
-    ToolDefinition, ToolRegistry, ToolResult, ToolRisk, Usage,
+    ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
 };
 use serde_json::{json, Value};
 use std::{
@@ -44,11 +44,7 @@ fn request() -> RunRequest {
 }
 
 fn call(id: &str, tool_id: &str, arguments_json: &str) -> ToolCall {
-    ToolCall {
-        id: id.into(),
-        tool_id: tool_id.into(),
-        arguments_json: arguments_json.into(),
-    }
+    ToolCall::new(id, tool_id, arguments_json)
 }
 
 #[tokio::test]
@@ -69,12 +65,9 @@ async fn host_supplied_run_and_trace_ids_preserve_external_correlation() {
 }
 
 fn response(final_output: Option<&str>, tool_calls: Vec<ToolCall>) -> ModelResponse {
-    ModelResponse {
-        model: "mock-model".into(),
-        final_output: final_output.map(str::to_owned),
-        tool_calls,
-        usage: Usage::default(),
-    }
+    let mut response = ModelResponse::new("mock-model").with_tool_calls(tool_calls);
+    response.final_output = final_output.map(str::to_owned);
+    response
 }
 
 enum ToolBehavior {
@@ -214,12 +207,12 @@ impl ApprovalHandler for TestApproval {
         _: &RunRequest,
     ) -> Result<ApprovalRecord, HarnessError> {
         match &self.0 {
-            ApprovalBehavior::Grant(granted) => Ok(ApprovalRecord {
-                call_id: String::new(),
-                tool_id: tool.id.clone(),
-                granted: *granted,
-                reason: "test approval".into(),
-            }),
+            ApprovalBehavior::Grant(granted) => Ok(ApprovalRecord::new(
+                "",
+                tool.id.clone(),
+                *granted,
+                "test approval",
+            )),
             ApprovalBehavior::Error(error) => Err(error.clone()),
             ApprovalBehavior::Pending => pending().await,
         }
@@ -239,10 +232,7 @@ impl ModelProvider for PendingProvider {
     }
 
     async fn health(&self) -> Result<ProviderHealth, HarnessError> {
-        Ok(ProviderHealth {
-            healthy: true,
-            detail: None,
-        })
+        Ok(ProviderHealth::healthy())
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError> {

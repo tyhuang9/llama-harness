@@ -3,12 +3,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AssertionFailure {
     pub rule: String,
     pub message: String,
 }
 
+impl AssertionFailure {
+    /// Creates one failed evaluation assertion.
+    pub fn new(rule: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            rule: rule.into(),
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct EvaluationCaseResult {
     pub suite_id: String,
     pub case_id: String,
@@ -38,7 +50,37 @@ pub struct EvaluationCaseResult {
     pub unresolved_items: Option<Value>,
 }
 
+impl EvaluationCaseResult {
+    /// Creates an empty case result for an evaluator or adapter to populate.
+    pub fn new(
+        suite_id: impl Into<String>,
+        case_id: impl Into<String>,
+        model: impl Into<String>,
+        repetition: u32,
+    ) -> Self {
+        Self {
+            suite_id: suite_id.into(),
+            case_id: case_id.into(),
+            model: model.into(),
+            repetition,
+            passed: false,
+            failures: Vec::new(),
+            run_id: None,
+            trace_id: None,
+            status: None,
+            duration_ms: None,
+            model_calls: None,
+            tool_calls: None,
+            agent_version: None,
+            prompt_version: None,
+            final_state: None,
+            unresolved_items: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct EvaluationReport {
     pub format_version: u32,
     pub id: String,
@@ -48,6 +90,22 @@ pub struct EvaluationReport {
 }
 
 impl EvaluationReport {
+    /// Creates a version-one evaluation report.
+    pub fn new(
+        id: impl Into<String>,
+        suite_id: impl Into<String>,
+        suite_version: u32,
+        results: Vec<EvaluationCaseResult>,
+    ) -> Self {
+        Self {
+            format_version: 1,
+            id: id.into(),
+            suite_id: suite_id.into(),
+            suite_version,
+            results,
+        }
+    }
+
     pub fn passed_count(&self) -> usize {
         self.results.iter().filter(|result| result.passed).count()
     }

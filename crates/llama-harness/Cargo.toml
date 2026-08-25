@@ -7,7 +7,7 @@ rust-version.workspace = true
 description = "Rust-native framework for building controlled agentic workflows"
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+readme = "README.md"
 documentation = "https://docs.rs/llama-harness"
 keywords = ["agents", "llm", "ollama", "tools"]
 categories = ["development-tools", "asynchronous"]
@@ -18,9 +18,7 @@ default = []
 ollama = ["dep:llama-harness-ollama"]
 observability = ["dep:llama-harness-observability"]
 evals = ["dep:llama-harness-evals"]
-protocol = ["dep:llama-harness-protocol"]
 tauri = ["dep:llama-harness-tauri"]
-full = ["ollama", "observability", "evals", "protocol", "tauri"]
 
 [dependencies]
 async-trait = "0.1"
@@ -28,9 +26,12 @@ llama-harness-core = { version = "0.1.0", path = "../llama-harness-core" }
 llama-harness-evals = { version = "0.1.0", path = "../llama-harness-evals", optional = true }
 llama-harness-observability = { version = "0.1.0", path = "../llama-harness-observability", optional = true }
 llama-harness-ollama = { version = "0.1.0", path = "../llama-harness-ollama", optional = true }
-llama-harness-protocol = { version = "0.1.0", path = "../llama-harness-protocol", optional = true }
 llama-harness-tauri = { version = "0.1.0", path = "../llama-harness-tauri", optional = true }
+serde_json = "1"
 tokio-util = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+all-features = true

@@ -1,8 +1,10 @@
 use clap::{Parser, ValueEnum};
-use llama_harness_core::{ModelProvider, RunResult};
-use llama_harness_evals::load_suite_path;
-use llama_harness_observability::{SqliteEventSink, TraceStoreConfig, TraceStoreError};
-use llama_harness_ollama::{OllamaProvider, DEFAULT_OLLAMA_BASE_URL};
+use llama_harness::{
+    evals::{load_suite_path, EvalError},
+    observability::{SqliteEventSink, TraceStoreConfig, TraceStoreError},
+    ollama::{OllamaProvider, DEFAULT_OLLAMA_BASE_URL},
+    EventSink, HarnessError, ModelProvider, RunEvent, RunResult,
+};
 use local_task_agent::{
     build_runtime, default_tasks, scripted_provider, MockScenario, Task, TaskStore, TaskStoreError,
 };
@@ -43,7 +45,7 @@ enum Provider {
 #[derive(Debug, Error)]
 enum ExampleError {
     #[error(transparent)]
-    Harness(#[from] llama_harness_core::HarnessError),
+    Harness(#[from] HarnessError),
     #[error(transparent)]
     Store(#[from] TaskStoreError),
     #[error(transparent)]
@@ -51,7 +53,7 @@ enum ExampleError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    Eval(#[from] llama_harness_evals::EvalError),
+    Eval(#[from] EvalError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("invalid Promptfoo adapter request: {0}")]
@@ -133,13 +135,11 @@ async fn run_promptfoo_adapter() -> Result<(), ExampleError> {
         .build()?;
     let health = provider.health().await?;
     if !health.healthy {
-        return Err(ExampleError::Harness(
-            llama_harness_core::HarnessError::Provider(
-                health
-                    .detail
-                    .unwrap_or_else(|| "Ollama is unavailable".into()),
-            ),
-        ));
+        return Err(ExampleError::Harness(HarnessError::Provider(
+            health
+                .detail
+                .unwrap_or_else(|| "Ollama is unavailable".into()),
+        )));
     }
     if !provider
         .list_models()
@@ -167,7 +167,7 @@ async fn run_promptfoo_adapter() -> Result<(), ExampleError> {
         Arc::clone(&store),
         model.clone(),
         grant_approval,
-        Arc::clone(&trace) as Arc<dyn llama_harness_core::EventSink>,
+        Arc::clone(&trace) as Arc<dyn EventSink>,
     )?;
     if case.id == "limit-stop" {
         runtime.agent.limits.max_model_calls = 1;
@@ -179,12 +179,7 @@ async fn run_promptfoo_adapter() -> Result<(), ExampleError> {
             export
                 .events
                 .iter()
-                .filter(|event| {
-                    matches!(
-                        event.record.event,
-                        llama_harness_core::RunEvent::ModelRequested { .. }
-                    )
-                })
+                .filter(|event| matches!(event.record.event, RunEvent::ModelRequested { .. }))
                 .count() as u32
         })
         .unwrap_or_default();
@@ -220,13 +215,11 @@ async fn run(arguments: Arguments) -> Result<(), ExampleError> {
                 .build()?;
             let health = provider.health().await?;
             if !health.healthy {
-                return Err(ExampleError::Harness(
-                    llama_harness_core::HarnessError::Provider(
-                        health
-                            .detail
-                            .unwrap_or_else(|| "Ollama is unavailable".into()),
-                    ),
-                ));
+                return Err(ExampleError::Harness(HarnessError::Provider(
+                    health
+                        .detail
+                        .unwrap_or_else(|| "Ollama is unavailable".into()),
+                )));
             }
             let installed = provider.list_models().await?;
             if !installed.iter().any(|candidate| candidate.id == model) {
@@ -247,7 +240,7 @@ async fn run(arguments: Arguments) -> Result<(), ExampleError> {
         Arc::clone(&store),
         model.clone(),
         !arguments.deny_approval,
-        Arc::clone(&trace) as Arc<dyn llama_harness_core::EventSink>,
+        Arc::clone(&trace) as Arc<dyn EventSink>,
     )?;
     let result = runtime.run(arguments.input, Some(model)).await?;
     println!("{}", serde_json::to_string_pretty(&result)?);

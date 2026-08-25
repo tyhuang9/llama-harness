@@ -22,6 +22,7 @@ pub use suite::{
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum EvalError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

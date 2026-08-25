@@ -29,7 +29,7 @@
 /// Scripted provider utilities intended for deterministic tests and examples.
 pub mod mock {
     pub use llama_harness_core::mock::{
-        final_response, tool_response, MockModelProvider, MockStep,
+        error_response, final_response, tool_response, MockModelProvider, MockStep,
     };
 }
 
@@ -38,39 +38,39 @@ pub use llama_harness_core::{
     load_agent_manifest, load_agent_manifest_path, AgentDefinition, AgentLimits, AgentManifest,
     AgentManifestError, AgentRunner, AgentRunnerBuilder, AllowAllPolicy, ApprovalHandler,
     ApprovalRecord, DenyApproval, EventRecord, EventSink, GenerationOptions, HarnessError,
-    InMemoryEventSink, JsonMap, Message, ModelCapabilities, ModelInfo, ModelProvider, ModelRequest,
-    ModelResponse, PolicyDecision, PolicyEngine, ProviderHealth, RunError, RunEvent, RunOverrides,
-    RunRequest, RunResult, RunStatus, SafeDefaultPolicy, Tool, ToolCall, ToolCallContext,
-    ToolDefinition, ToolRegistry, ToolResult, ToolRisk, Usage, AGENT_MANIFEST_VERSION,
+    InMemoryEventSink, JsonMap, Message, MessageRole, ModelCapabilities, ModelInfo, ModelProvider,
+    ModelRequest, ModelResponse, PolicyDecision, PolicyEngine, ProviderHealth, RunError, RunEvent,
+    RunOverrides, RunRequest, RunResult, RunStatus, SafeDefaultPolicy, Tool, ToolCall,
+    ToolCallContext, ToolDefinition, ToolRegistry, ToolResult, ToolRisk, Usage,
+    AGENT_MANIFEST_VERSION,
 };
+pub use serde_json;
+pub use serde_json::Value as JsonValue;
 pub use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "ollama")]
-pub use llama_harness_ollama::{
-    OllamaEventStream, OllamaProvider, OllamaProviderBuilder, OllamaStreamEvent,
-    DEFAULT_OLLAMA_BASE_URL, DEFAULT_REQUEST_TIMEOUT,
-};
+/// Direct, loopback-only Ollama provider integration.
+pub mod ollama {
+    pub use llama_harness_ollama::*;
+}
 
 #[cfg(feature = "observability")]
-pub use llama_harness_observability::{
-    AppendOutcome, ExportedRun, PersistedEvent, RedactionConfig, RetentionPolicy, RetentionResult,
-    RunListQuery, RunSummary, SqliteEventSink, TraceStoreConfig, TraceStoreError, REDACTED_VALUE,
-};
+/// Redacted local SQLite observability integration.
+pub mod observability {
+    pub use llama_harness_observability::*;
+}
 
 #[cfg(feature = "evals")]
-pub use llama_harness_evals::{
-    evaluate_expectations, evaluate_suite, export_regression_case, is_json_subset, load_suite,
-    load_suite_path, replay_regression, AssertionFailure, EvalCase, EvalDefaults, EvalError,
-    EvalExecutionRequest, EvalExecutor, EvalExpected, EvalFixture, EvalObservation, EvalSuite,
-    EvaluationCaseResult, EvaluationReport, ExpectedFailure, ExpectedToolCall, RegressionCase,
-    RegressionSource, SUPPORTED_SUITE_VERSION,
-};
-
-#[cfg(feature = "protocol")]
-pub use llama_harness_protocol as protocol;
+/// Deterministic evaluation and regression contracts.
+pub mod evals {
+    pub use llama_harness_evals::*;
+}
 
 #[cfg(feature = "tauri")]
-pub use llama_harness_tauri as tauri;
+/// Embedded Tauri event, approval, cancellation, and path helpers.
+pub mod tauri {
+    pub use llama_harness_tauri::*;
+}
 
 #[cfg(test)]
 mod tests {
@@ -82,12 +82,7 @@ mod tests {
             load_agent_manifest(r#"{"version":1,"agents":[]}"#, Some("json")).unwrap();
         assert_eq!(manifest.version, AGENT_MANIFEST_VERSION);
         let _: Result<AgentManifest, AgentManifestError> = load_agent_manifest_path("missing.yaml");
-        let context = ToolCallContext {
-            run_id: "run".into(),
-            trace_id: "trace".into(),
-            call_id: "call".into(),
-            tool_id: "tool".into(),
-        };
+        let context = ToolCallContext::new("run", "trace", "call", "tool");
         assert_eq!(context.run_id, "run");
     }
 }

@@ -239,48 +239,41 @@ pub fn normalize_observations(
                     run: response.run,
                 };
                 let failures = evaluate_expectations(&case.expected, &harness_observation);
-                EvaluationCaseResult {
-                    suite_id: suite.id.clone(),
-                    case_id: case.id.clone(),
-                    model: observation.model,
-                    repetition: observation.repetition,
-                    passed: failures.is_empty(),
-                    failures,
-                    run_id: Some(harness_observation.run.id.clone()),
-                    trace_id: Some(harness_observation.run.trace_id.clone()),
-                    status: Some(harness_observation.run.status.clone()),
-                    duration_ms: Some(harness_observation.run.duration_ms),
-                    model_calls: Some(harness_observation.model_calls),
-                    tool_calls: Some(harness_observation.run.tool_calls.len() as u32),
-                    agent_version: harness_observation.agent_version,
-                    prompt_version: harness_observation.prompt_version,
-                    final_state: harness_observation.final_state,
-                    unresolved_items: harness_observation.unresolved_items,
-                }
+                let mut result = EvaluationCaseResult::new(
+                    suite.id.clone(),
+                    case.id.clone(),
+                    observation.model,
+                    observation.repetition,
+                );
+                result.passed = failures.is_empty();
+                result.failures = failures;
+                result.run_id = Some(harness_observation.run.id.clone());
+                result.trace_id = Some(harness_observation.run.trace_id.clone());
+                result.status = Some(harness_observation.run.status.clone());
+                result.duration_ms = Some(harness_observation.run.duration_ms);
+                result.model_calls = Some(harness_observation.model_calls);
+                result.tool_calls = Some(harness_observation.run.tool_calls.len() as u32);
+                result.agent_version = harness_observation.agent_version;
+                result.prompt_version = harness_observation.prompt_version;
+                result.final_state = harness_observation.final_state;
+                result.unresolved_items = harness_observation.unresolved_items;
+                result
             }
-            None => EvaluationCaseResult {
-                suite_id: suite.id.clone(),
-                case_id: case.id.clone(),
-                model: observation.model,
-                repetition: observation.repetition,
-                passed: false,
-                failures: vec![llama_harness_evals::AssertionFailure {
-                    rule: "executor".into(),
-                    message: observation
+            None => {
+                let mut result = EvaluationCaseResult::new(
+                    suite.id.clone(),
+                    case.id.clone(),
+                    observation.model,
+                    observation.repetition,
+                );
+                result.failures = vec![llama_harness_evals::AssertionFailure::new(
+                    "executor",
+                    observation
                         .error
                         .unwrap_or_else(|| "Promptfoo provider did not record a response".into()),
-                }],
-                run_id: None,
-                trace_id: None,
-                status: None,
-                duration_ms: None,
-                model_calls: None,
-                tool_calls: None,
-                agent_version: None,
-                prompt_version: None,
-                final_state: None,
-                unresolved_items: None,
-            },
+                )];
+                result
+            }
         };
         results.push(result);
     }
@@ -289,13 +282,12 @@ pub fn normalize_observations(
             "Promptfoo produced no provider observations; inspect the raw result artifact".into(),
         ));
     }
-    let report = EvaluationReport {
-        format_version: 1,
-        id: format!("promptfoo-{}", uuid::Uuid::new_v4()),
-        suite_id: suite.id,
-        suite_version: suite.version,
+    let report = EvaluationReport::new(
+        format!("promptfoo-{}", uuid::Uuid::new_v4()),
+        suite.id,
+        suite.version,
         results,
-    };
+    );
     fs::write(
         report_path,
         serde_json::to_string_pretty(&report)
@@ -375,19 +367,24 @@ mod tests {
         let suite_path = root.join("suite.yaml");
         fs::write(&suite_path, "version: 1\nid: suite\nname: Suite\nagent: local-task-agent\nmodels: [ollama:qwen3]\ncases:\n  - id: case-a\n    input: hello\n    expected: {status: completed}\n").unwrap();
         let observations = root.join("observations.jsonl");
-        fs::write(&observations, format!("{}\n", json!({
-            "case_id": "case-a", "model": "ollama:qwen3", "repetition": 1,
-            "response": {
-                "output": "hello", "model_calls": 1, "final_state": {"tasks": []},
-                "agent_version": "1", "prompt_version": "prompt-1",
-                "run": RunResult {
-                    id: "run-1".to_owned(), status: RunStatus::Completed, final_output: Some("hello".to_owned()),
-                    model: "qwen3".to_owned(), tool_calls: Vec::new(), policy_decisions: Vec::new(), approvals: Vec::new(),
-                    errors: Vec::new(), duration_ms: 12, trace_id: "trace-1".to_owned(),
-                    model_call_limit_reached: false, tool_call_limit_reached: false, repeated_tool_call_limit_reached: false, cancelled: false,
-                }
-            }
-        }))).unwrap();
+        let mut run = RunResult::new("run-1", RunStatus::Completed, "qwen3", "trace-1");
+        run.final_output = Some("hello".to_owned());
+        run.duration_ms = 12;
+        fs::write(
+            &observations,
+            format!(
+                "{}\n",
+                json!({
+                    "case_id": "case-a", "model": "ollama:qwen3", "repetition": 1,
+                    "response": {
+                        "output": "hello", "model_calls": 1, "final_state": {"tasks": []},
+                        "agent_version": "1", "prompt_version": "prompt-1",
+                        "run": run
+                    }
+                })
+            ),
+        )
+        .unwrap();
         let report =
             normalize_observations(&suite_path, &observations, root.join("report.json")).unwrap();
         assert!(report.results[0].passed);

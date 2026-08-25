@@ -14,13 +14,10 @@ use std::{
 
 use async_trait::async_trait;
 use llama_harness_core::{
-    agent::{AgentDefinition, RunOverrides, RunRequest},
-    event::{EventRecord, EventSink, RunEvent},
-    limits::{AgentLimits, GenerationOptions},
-    message::{Message, MessageRole},
-    policy::{ApprovalHandler, ApprovalRecord, PolicyDecision, PolicyEngine},
-    tool::{Tool, ToolCallContext, ToolDefinition, ToolRegistry, ToolResult, ToolRisk},
-    AgentRunner, HarnessError, ModelProvider,
+    AgentDefinition, AgentLimits, AgentRunner, ApprovalHandler, ApprovalRecord, EventRecord,
+    EventSink, GenerationOptions, HarnessError, Message, MessageRole, ModelProvider,
+    PolicyDecision, PolicyEngine, RunEvent, RunOverrides, RunRequest, Tool, ToolCallContext,
+    ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
 };
 use llama_harness_ollama::OllamaProvider;
 use llama_harness_protocol::{
@@ -306,6 +303,13 @@ async fn run_start(
                             },
                         })
                     }
+                    _ => ProtocolMessage::RunFailed(RunFailed {
+                        run_sequence: sequence,
+                        error: WireRunError {
+                            code: "unsupported_run_status".into(),
+                            message: "runtime does not support this run status".into(),
+                        },
+                    }),
                 };
                 let _ = state.send(Envelope::new(
                     Uuid::new_v4().to_string(),
@@ -563,11 +567,9 @@ impl Tool for BridgeTool {
             )
             .await?;
         match response {
-            CallbackResponse::Tool(result) => Ok(ToolResult {
-                ok: result.ok,
-                output: result.output,
-                error: result.error,
-            }),
+            CallbackResponse::Tool(result) => {
+                Ok(ToolResult::new(result.ok, result.output, result.error))
+            }
             _ => Err(HarnessError::Tool("callback kind mismatch".into())),
         }
     }
@@ -636,12 +638,12 @@ impl ApprovalHandler for BridgeApproval {
         _: &serde_json::Value,
         _: &RunRequest,
     ) -> Result<ApprovalRecord, HarnessError> {
-        Ok(ApprovalRecord {
-            call_id: String::new(),
-            tool_id: tool.id.clone(),
-            granted: false,
-            reason: "no approval handler configured".into(),
-        })
+        Ok(ApprovalRecord::new(
+            "",
+            tool.id.clone(),
+            false,
+            "no approval handler configured",
+        ))
     }
     async fn approve_with_context(
         &self,
@@ -668,12 +670,12 @@ impl ApprovalHandler for BridgeApproval {
             )
             .await?;
         match response {
-            CallbackResponse::Approval { granted, reason } => Ok(ApprovalRecord {
-                call_id: context.call_id.clone(),
-                tool_id: context.tool_id.clone(),
+            CallbackResponse::Approval { granted, reason } => Ok(ApprovalRecord::new(
+                context.call_id.clone(),
+                context.tool_id.clone(),
                 granted,
                 reason,
-            }),
+            )),
             _ => Err(HarnessError::Approval("callback kind mismatch".into())),
         }
     }
@@ -685,7 +687,9 @@ struct RuntimeEventSink {
 impl EventSink for RuntimeEventSink {
     fn emit(&self, record: EventRecord) {
         let run_sequence = self.state.next_sequence(&record.run_id);
-        let event = to_wire_event(record.event);
+        let Some(event) = to_wire_event(record.event) else {
+            return;
+        };
         let envelope = Envelope::new(
             Uuid::new_v4().to_string(),
             Some(record.run_id),
@@ -1015,24 +1019,32 @@ fn to_core_overrides(overrides: WireRunOverrides) -> RunOverrides {
     }
 }
 fn to_core_message(message: WireMessage) -> Message {
-    Message {
-        role: match message.role {
+    let WireMessage {
+        role,
+        content,
+        tool_call_id,
+        tool_calls,
+    } = message;
+    let message = Message::new(
+        match role {
             WireMessageRole::System => MessageRole::System,
             WireMessageRole::User => MessageRole::User,
             WireMessageRole::Assistant => MessageRole::Assistant,
             WireMessageRole::Tool => MessageRole::Tool,
         },
-        content: message.content,
-        tool_call_id: message.tool_call_id,
-        tool_calls: message
-            .tool_calls
+        content,
+    )
+    .with_tool_calls(
+        tool_calls
             .into_iter()
-            .map(|call| llama_harness_core::ToolCall {
-                id: call.id,
-                tool_id: call.tool_id,
-                arguments_json: call.arguments_json,
+            .map(|call| {
+                llama_harness_core::ToolCall::new(call.id, call.tool_id, call.arguments_json)
             })
             .collect(),
+    );
+    match tool_call_id {
+        Some(tool_call_id) => message.with_tool_call_id(tool_call_id),
+        None => message,
     }
 }
 fn to_core_tool_definition(definition: WireToolDefinition) -> ToolDefinition {
@@ -1060,6 +1072,7 @@ fn to_wire_tool_definition(definition: ToolDefinition) -> WireToolDefinition {
             ToolRisk::Low => WireToolRisk::Low,
             ToolRisk::Medium => WireToolRisk::Medium,
             ToolRisk::High => WireToolRisk::High,
+            _ => WireToolRisk::High,
         },
         idempotent: definition.idempotent,
         read_only: definition.read_only,
@@ -1084,8 +1097,8 @@ fn to_core_policy(decision: WirePolicyDecision) -> PolicyDecision {
         }
     }
 }
-fn to_wire_event(event: RunEvent) -> llama_harness_protocol::WireRunEvent {
-    match event {
+fn to_wire_event(event: RunEvent) -> Option<llama_harness_protocol::WireRunEvent> {
+    Some(match event {
         RunEvent::Started { trace_id, .. } => {
             llama_harness_protocol::WireRunEvent::Started { trace_id }
         }
@@ -1132,7 +1145,8 @@ fn to_wire_event(event: RunEvent) -> llama_harness_protocol::WireRunEvent {
         RunEvent::Completed { status } => llama_harness_protocol::WireRunEvent::Completed {
             status: to_wire_status(status),
         },
-    }
+        _ => return None,
+    })
 }
 fn to_wire_policy(decision: PolicyDecision) -> WirePolicyDecision {
     match decision {
@@ -1141,6 +1155,9 @@ fn to_wire_policy(decision: PolicyDecision) -> WirePolicyDecision {
         PolicyDecision::RequireApproval { reason } => {
             WirePolicyDecision::RequireApproval { reason }
         }
+        _ => WirePolicyDecision::Deny {
+            reason: "runtime does not support this policy decision".into(),
+        },
     }
 }
 fn to_wire_status(status: llama_harness_core::RunStatus) -> WireRunStatus {
@@ -1149,6 +1166,7 @@ fn to_wire_status(status: llama_harness_core::RunStatus) -> WireRunStatus {
         llama_harness_core::RunStatus::Failed => WireRunStatus::Failed,
         llama_harness_core::RunStatus::Cancelled => WireRunStatus::Cancelled,
         llama_harness_core::RunStatus::LimitReached => WireRunStatus::LimitReached,
+        _ => WireRunStatus::Failed,
     }
 }
 fn to_wire_result(result: llama_harness_core::RunResult) -> WireRunResult {

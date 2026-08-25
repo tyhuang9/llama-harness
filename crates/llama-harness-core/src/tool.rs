@@ -10,14 +10,31 @@ use std::{collections::HashMap, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ToolCall {
     pub id: String,
     pub tool_id: String,
     pub arguments_json: String,
 }
 
+impl ToolCall {
+    /// Creates a model-requested tool call from its wire-level JSON arguments.
+    pub fn new(
+        id: impl Into<String>,
+        tool_id: impl Into<String>,
+        arguments_json: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            tool_id: tool_id.into(),
+            arguments_json: arguments_json.into(),
+        }
+    }
+}
+
 /// Immutable correlation data for one validated tool call.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ToolCallContext {
     pub run_id: String,
     pub trace_id: String,
@@ -25,8 +42,26 @@ pub struct ToolCallContext {
     pub tool_id: String,
 }
 
+impl ToolCallContext {
+    /// Creates immutable correlation data for one validated tool invocation.
+    pub fn new(
+        run_id: impl Into<String>,
+        trace_id: impl Into<String>,
+        call_id: impl Into<String>,
+        tool_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            trace_id: trace_id.into(),
+            call_id: call_id.into(),
+            tool_id: tool_id.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ToolRisk {
     Low,
     Medium,
@@ -44,7 +79,49 @@ pub struct ToolDefinition {
     pub read_only: bool,
 }
 
+impl ToolDefinition {
+    /// Creates a tool declaration with conservative mutation defaults.
+    ///
+    /// New definitions are high-risk, non-idempotent, and state-changing until
+    /// the application explicitly declares otherwise.
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        arguments_schema: Value,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            description: description.into(),
+            arguments_schema,
+            risk: ToolRisk::High,
+            idempotent: false,
+            read_only: false,
+        }
+    }
+
+    /// Declares the tool's application-assessed risk level.
+    pub fn with_risk(mut self, risk: ToolRisk) -> Self {
+        self.risk = risk;
+        self
+    }
+
+    /// Declares whether repeating the same invocation is safe.
+    pub fn with_idempotent(mut self, idempotent: bool) -> Self {
+        self.idempotent = idempotent;
+        self
+    }
+
+    /// Declares whether the tool is guaranteed not to change application state.
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ToolResult {
     pub ok: bool,
     pub output: Value,
@@ -53,6 +130,11 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    /// Creates a tool result from an adapter's explicit semantic fields.
+    pub fn new(ok: bool, output: Value, error: Option<String>) -> Self {
+        Self { ok, output, error }
+    }
+
     pub fn success(output: Value) -> Self {
         Self {
             ok: true,

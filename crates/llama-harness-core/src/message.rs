@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageRole {
     System,
     User,
@@ -11,6 +12,7 @@ pub enum MessageRole {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct Message {
     pub role: MessageRole,
     pub content: String,
@@ -21,49 +23,46 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn user(content: impl Into<String>) -> Self {
+    /// Creates a transcript message without tool correlation data.
+    pub fn new(role: MessageRole, content: impl Into<String>) -> Self {
         Self {
-            role: MessageRole::User,
+            role,
             content: content.into(),
             tool_call_id: None,
             tool_calls: vec![],
         }
+    }
+
+    /// Associates this message with the tool call it answers.
+    pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(tool_call_id.into());
+        self
+    }
+
+    /// Associates model-requested tool calls with this message.
+    pub fn with_tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
+        self.tool_calls = tool_calls;
+        self
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new(MessageRole::User, content)
     }
 
     pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::System,
-            content: content.into(),
-            tool_call_id: None,
-            tool_calls: vec![],
-        }
+        Self::new(MessageRole::System, content)
     }
 
     pub(crate) fn assistant(content: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
-            content: content.into(),
-            tool_call_id: None,
-            tool_calls: vec![],
-        }
+        Self::new(MessageRole::Assistant, content)
     }
 
     pub(crate) fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            tool_call_id: None,
-            tool_calls,
-        }
+        Self::new(MessageRole::Assistant, "").with_tool_calls(tool_calls)
     }
 
     pub(crate) fn tool(call_id: String, result: &ToolResult) -> Result<Self, serde_json::Error> {
-        Ok(Self {
-            role: MessageRole::Tool,
-            content: serde_json::to_string(result)?,
-            tool_call_id: Some(call_id),
-            tool_calls: vec![],
-        })
+        Ok(Self::new(MessageRole::Tool, serde_json::to_string(result)?).with_tool_call_id(call_id))
     }
 
     pub(crate) fn transcript_bytes(&self) -> u64 {

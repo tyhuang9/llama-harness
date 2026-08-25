@@ -12,6 +12,7 @@ pub const AGENT_MANIFEST_VERSION: u32 = 1;
 /// remain responsible for mapping a listed definition to their own tools,
 /// policy, approval handler, and model provider.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[non_exhaustive]
 pub struct AgentManifest {
     pub version: u32,
     #[serde(default)]
@@ -19,6 +20,7 @@ pub struct AgentManifest {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AgentManifestError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -31,6 +33,14 @@ pub enum AgentManifestError {
 }
 
 impl AgentManifest {
+    /// Creates a manifest for the current supported format version.
+    pub fn new(agents: Vec<AgentDefinition>) -> Self {
+        Self {
+            version: AGENT_MANIFEST_VERSION,
+            agents,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), AgentManifestError> {
         if self.version != AGENT_MANIFEST_VERSION {
             return Err(AgentManifestError::Invalid(format!(

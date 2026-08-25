@@ -10,6 +10,7 @@ pub type OllamaEventStream =
     Pin<Box<dyn Stream<Item = Result<OllamaStreamEvent, HarnessError>> + Send>>;
 
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum OllamaStreamEvent {
     TextDelta { content: String },
     ToolCall { call: ToolCall },

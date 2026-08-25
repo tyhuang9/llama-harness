@@ -273,6 +273,7 @@ impl RunRegistry {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RunRegistryError {
     #[error("run {0} is already registered")]
     DuplicateRun(String),
@@ -283,6 +284,7 @@ pub enum RunRegistryError {
 /// [`ApprovalRouter::respond`].
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct PendingApproval {
     pub approval_id: String,
     pub run_id: String,
@@ -390,12 +392,7 @@ impl<E: FrontendEmitter> ApprovalRouter<E> {
             .map(|entry| {
                 entry
                     .sender
-                    .send(ApprovalRecord {
-                        call_id: String::new(),
-                        tool_id: String::new(),
-                        granted,
-                        reason,
-                    })
+                    .send(ApprovalRecord::new("", "", granted, reason))
                     .is_ok()
             })
             .unwrap_or(false)
@@ -446,12 +443,12 @@ impl<E: FrontendEmitter> ApprovalHandler for ApprovalRouter<E> {
         _: &serde_json::Value,
         _: &RunRequest,
     ) -> Result<ApprovalRecord, HarnessError> {
-        Ok(ApprovalRecord {
-            call_id: String::new(),
-            tool_id: tool.id.clone(),
-            granted: false,
-            reason: "approval routing requires a tool call context".into(),
-        })
+        Ok(ApprovalRecord::new(
+            "",
+            tool.id.clone(),
+            false,
+            "approval routing requires a tool call context",
+        ))
     }
 
     async fn approve_with_context(
@@ -505,12 +502,12 @@ impl<E: FrontendEmitter> ApprovalHandler for ApprovalRouter<E> {
             _ = tokio::time::sleep(self.settings.timeout) => Err(HarnessError::TimedOut("approval response".into())),
         };
         let record = outcome?;
-        Ok(ApprovalRecord {
-            call_id: context.call_id.clone(),
-            tool_id: context.tool_id.clone(),
-            granted: record.granted,
-            reason: record.reason,
-        })
+        Ok(ApprovalRecord::new(
+            context.call_id.clone(),
+            context.tool_id.clone(),
+            record.granted,
+            record.reason,
+        ))
     }
 }
 
@@ -538,6 +535,7 @@ pub fn trace_database_path(
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TracePathError {
     #[error("trace database file name must be one relative file name")]
     InvalidFileName,
@@ -639,11 +637,7 @@ mod tests {
         tools.register(Arc::new(NoopTool(tool()))).unwrap();
         Arc::new(
             AgentRunner::builder(Arc::new(MockModelProvider::scripted([tool_response(
-                ToolCall {
-                    id: "call".into(),
-                    tool_id: "notes.write".into(),
-                    arguments_json: "{}".into(),
-                },
+                ToolCall::new("call", "notes.write", "{}"),
             )])))
             .tools(tools)
             .policy(Arc::new(ApprovalPolicy))
@@ -745,16 +739,16 @@ mod tests {
             Arc::clone(&first) as Arc<dyn EventSink>,
             Arc::clone(&second) as Arc<dyn EventSink>,
         ]);
-        let record = EventRecord {
-            run_id: "run".into(),
-            trace_id: "trace".into(),
-            sequence: 1,
-            timestamp_ms: 1,
-            event: RunEvent::Started {
+        let record = EventRecord::new(
+            "run",
+            "trace",
+            1,
+            1,
+            RunEvent::Started {
                 run_id: "run".into(),
                 trace_id: "trace".into(),
             },
-        };
+        );
         sink.emit(record.clone());
         assert_eq!(first.events(), vec![record.clone()]);
         assert_eq!(second.events(), vec![record]);
@@ -764,12 +758,7 @@ mod tests {
     async fn approval_router_uses_opaque_one_time_ids() {
         let emitter = TestEmitter::default();
         let router = ApprovalRouter::new(emitter.clone());
-        let context = ToolCallContext {
-            run_id: "run".into(),
-            trace_id: "trace".into(),
-            call_id: "call".into(),
-            tool_id: "notes.write".into(),
-        };
+        let context = ToolCallContext::new("run", "trace", "call", "notes.write");
         let request = RunRequest::new(AgentDefinition::new("agent", "Agent", "1", "mock"), "hello");
         let definition = tool();
         let arguments = serde_json::json!({"title":"One"});
@@ -801,12 +790,7 @@ mod tests {
                 ..ApprovalRouterSettings::default()
             },
         );
-        let context = ToolCallContext {
-            run_id: "run".into(),
-            trace_id: "trace".into(),
-            call_id: "call".into(),
-            tool_id: "notes.write".into(),
-        };
+        let context = ToolCallContext::new("run", "trace", "call", "notes.write");
         let request = RunRequest::new(AgentDefinition::new("agent", "Agent", "1", "mock"), "hello");
         let definition = tool();
         let arguments = serde_json::json!({});

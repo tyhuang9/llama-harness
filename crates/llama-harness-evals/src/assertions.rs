@@ -269,11 +269,11 @@ fn evaluate_expected_failure(
         expected
             .code
             .as_ref()
-            .map_or(true, |code| error.code == *code)
+            .is_none_or(|code| error.code == *code)
             && expected
                 .message_contains
                 .as_ref()
-                .map_or(true, |message| error.message.contains(message))
+                .is_none_or(|message| error.message.contains(message))
     });
     if !matching {
         failure(

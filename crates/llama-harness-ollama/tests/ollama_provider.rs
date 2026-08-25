@@ -21,21 +21,18 @@ struct CapturedRequest {
 }
 
 fn request(cancellation: CancellationToken) -> ModelRequest {
-    ModelRequest {
-        model: "qwen3:8b".into(),
-        messages: vec![
-            Message::system("Be concise."),
-            Message::user("Inspect tasks"),
-        ],
-        tools: vec![],
-        generation: GenerationOptions {
-            temperature: Some(0.2),
-            top_p: Some(0.9),
-            max_output_tokens: Some(64),
-        },
-        metadata: Default::default(),
-        cancellation,
-    }
+    let mut request = ModelRequest::new("qwen3:8b");
+    request.messages = vec![
+        Message::system("Be concise."),
+        Message::user("Inspect tasks"),
+    ];
+    request.generation = GenerationOptions {
+        temperature: Some(0.2),
+        top_p: Some(0.9),
+        max_output_tokens: Some(64),
+    };
+    request.cancellation = cancellation;
+    request
 }
 
 fn tool() -> ToolDefinition {
@@ -227,16 +224,13 @@ async fn malformed_tool_arguments_are_preserved_for_model_recovery() {
     .await;
     let provider = provider(&base_url);
     let mut model_request = request(CancellationToken::new());
-    model_request.messages.push(Message {
-        role: MessageRole::Assistant,
-        content: String::new(),
-        tool_call_id: None,
-        tool_calls: vec![ToolCall {
-            id: "original-call".into(),
-            tool_id: "list_tasks".into(),
-            arguments_json: "{not valid JSON".into(),
-        }],
-    });
+    model_request.messages.push(
+        Message::new(MessageRole::Assistant, "").with_tool_calls(vec![ToolCall::new(
+            "original-call",
+            "list_tasks",
+            "{not valid JSON",
+        )]),
+    );
 
     provider.complete(model_request).await.unwrap();
 

@@ -1,4 +1,4 @@
-use llama_harness_evals::{
+use llama_harness::evals::{
     evaluate_suite, export_regression_case, load_suite_path, replay_regression, RegressionSource,
 };
 use local_task_agent::TaskAgentEvalExecutor;

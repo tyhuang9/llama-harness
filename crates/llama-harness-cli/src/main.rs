@@ -554,8 +554,7 @@ fn filter_report(
     case_id: Option<&str>,
 ) -> EvaluationReport {
     report.results.retain(|result| {
-        (!failed_only || !result.passed)
-            && case_id.map_or(true, |case_id| result.case_id == case_id)
+        (!failed_only || !result.passed) && case_id.is_none_or(|case_id| result.case_id == case_id)
     });
     report
 }
@@ -588,53 +587,29 @@ mod tests {
     use serde_json::json;
 
     fn report() -> EvaluationReport {
-        EvaluationReport {
-            format_version: 1,
-            id: "report-1".into(),
-            suite_id: "suite".into(),
-            suite_version: 1,
-            results: vec![
-                EvaluationCaseResult {
-                    suite_id: "suite".into(),
-                    case_id: "passing".into(),
-                    model: "ollama:model".into(),
-                    repetition: 1,
-                    passed: true,
-                    failures: vec![],
-                    run_id: Some("run-pass".into()),
-                    trace_id: Some("trace-pass".into()),
-                    status: Some(RunStatus::Completed),
-                    duration_ms: Some(10),
-                    model_calls: Some(1),
-                    tool_calls: Some(0),
-                    agent_version: Some("1".into()),
-                    prompt_version: Some("1".into()),
-                    final_state: None,
-                    unresolved_items: None,
-                },
-                EvaluationCaseResult {
-                    suite_id: "suite".into(),
-                    case_id: "failing".into(),
-                    model: "ollama:model".into(),
-                    repetition: 1,
-                    passed: false,
-                    failures: vec![AssertionFailure {
-                        rule: "status".into(),
-                        message: "expected completed".into(),
-                    }],
-                    run_id: Some("run-fail".into()),
-                    trace_id: Some("trace-fail".into()),
-                    status: Some(RunStatus::Failed),
-                    duration_ms: Some(20),
-                    model_calls: Some(2),
-                    tool_calls: Some(1),
-                    agent_version: Some("1".into()),
-                    prompt_version: Some("1".into()),
-                    final_state: None,
-                    unresolved_items: None,
-                },
-            ],
-        }
+        let mut passing = EvaluationCaseResult::new("suite", "passing", "ollama:model", 1);
+        passing.passed = true;
+        passing.run_id = Some("run-pass".into());
+        passing.trace_id = Some("trace-pass".into());
+        passing.status = Some(RunStatus::Completed);
+        passing.duration_ms = Some(10);
+        passing.model_calls = Some(1);
+        passing.tool_calls = Some(0);
+        passing.agent_version = Some("1".into());
+        passing.prompt_version = Some("1".into());
+
+        let mut failing = EvaluationCaseResult::new("suite", "failing", "ollama:model", 1);
+        failing.failures = vec![AssertionFailure::new("status", "expected completed")];
+        failing.run_id = Some("run-fail".into());
+        failing.trace_id = Some("trace-fail".into());
+        failing.status = Some(RunStatus::Failed);
+        failing.duration_ms = Some(20);
+        failing.model_calls = Some(2);
+        failing.tool_calls = Some(1);
+        failing.agent_version = Some("1".into());
+        failing.prompt_version = Some("1".into());
+
+        EvaluationReport::new("report-1", "suite", 1, vec![passing, failing])
     }
 
     #[test]
@@ -691,16 +666,16 @@ mod tests {
         let store = SqliteEventSink::open_in_memory(TraceStoreConfig::default()).unwrap();
         store
             .append_with_raw(
-                &EventRecord {
-                    run_id: "run-1".into(),
-                    trace_id: "trace-1".into(),
-                    sequence: 1,
-                    timestamp_ms: 1,
-                    event: RunEvent::ModelRequested {
+                &EventRecord::new(
+                    "run-1",
+                    "trace-1",
+                    1,
+                    1,
+                    RunEvent::ModelRequested {
                         call_number: 1,
                         model: "ollama:model".into(),
                     },
-                },
+                ),
                 Some(&json!({"authorization": "private credential"})),
             )
             .unwrap();

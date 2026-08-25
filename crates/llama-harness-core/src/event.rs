@@ -6,6 +6,7 @@ use std::{
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct EventRecord {
     pub run_id: String,
     pub trace_id: String,
@@ -16,8 +17,28 @@ pub struct EventRecord {
     pub event: RunEvent,
 }
 
+impl EventRecord {
+    /// Creates one ordered event record for a run and trace.
+    pub fn new(
+        run_id: impl Into<String>,
+        trace_id: impl Into<String>,
+        sequence: u64,
+        timestamp_ms: u64,
+        event: RunEvent,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            trace_id: trace_id.into(),
+            sequence,
+            timestamp_ms,
+            event,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RunEvent {
     Started {
         run_id: String,

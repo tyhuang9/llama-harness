@@ -1,5 +1,5 @@
 use llama_harness_core::{
-    GenerationOptions, Message, MessageRole, ToolCall, ToolDefinition, Usage,
+    GenerationOptions, HarnessError, Message, MessageRole, ToolCall, ToolDefinition, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -98,25 +98,33 @@ pub(crate) fn chat_request(
     generation: &GenerationOptions,
     keep_alive: Option<&str>,
     stream: bool,
-) -> ChatRequest {
-    ChatRequest {
+) -> Result<ChatRequest, HarnessError> {
+    Ok(ChatRequest {
         model,
-        messages: messages.iter().map(wire_message).collect(),
+        messages: messages
+            .iter()
+            .map(wire_message)
+            .collect::<Result<Vec<_>, _>>()?,
         stream,
         keep_alive: keep_alive.map(str::to_owned),
         tools: (!tools.is_empty()).then(|| tools.iter().map(wire_tool).collect()),
         options: options(generation),
-    }
+    })
 }
 
-fn wire_message(message: &Message) -> WireMessage {
+fn wire_message(message: &Message) -> Result<WireMessage, HarnessError> {
     let role = match message.role {
         MessageRole::System => "system",
         MessageRole::User => "user",
         MessageRole::Assistant => "assistant",
         MessageRole::Tool => "tool",
+        _ => {
+            return Err(HarnessError::InvalidRequest(
+                "unsupported message role for the Ollama provider".into(),
+            ))
+        }
     };
-    WireMessage {
+    Ok(WireMessage {
         role,
         content: message.content.clone(),
         tool_calls: message
@@ -133,7 +141,7 @@ fn wire_message(message: &Message) -> WireMessage {
                 },
             })
             .collect(),
-    }
+    })
 }
 
 fn wire_tool(tool: &ToolDefinition) -> WireToolDefinition {
@@ -162,20 +170,22 @@ pub(crate) fn tool_calls(calls: &[WireToolCall]) -> Vec<ToolCall> {
     calls
         .iter()
         .enumerate()
-        .map(|(index, call)| ToolCall {
-            id: format!("ollama-{index}"),
-            tool_id: call.function.name.clone(),
-            arguments_json: match &call.function.arguments {
-                Value::String(arguments) => arguments.clone(),
-                value => serde_json::to_string(value).unwrap_or_else(|_| "null".into()),
-            },
+        .map(|(index, call)| {
+            ToolCall::new(
+                format!("ollama-{index}"),
+                call.function.name.clone(),
+                match &call.function.arguments {
+                    Value::String(arguments) => arguments.clone(),
+                    value => serde_json::to_string(value).unwrap_or_else(|_| "null".into()),
+                },
+            )
         })
         .collect()
 }
 
 pub(crate) fn usage(response: &ChatResponse) -> Usage {
-    Usage {
-        input_tokens: response.prompt_eval_count.unwrap_or_default(),
-        output_tokens: response.eval_count.unwrap_or_default(),
-    }
+    Usage::new(
+        response.prompt_eval_count.unwrap_or_default(),
+        response.eval_count.unwrap_or_default(),
+    )
 }
