@@ -63,17 +63,17 @@ if ($ValidateOnly) {
     return
 }
 
-& git rev-parse --verify --quiet "refs/tags/$expectedTag" | Out-Null
-$tagStatus = $LASTEXITCODE
-if ($tagStatus -eq 1) {
+$matchingTags = @(& git tag --list $expectedTag)
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to inspect baseline tag $expectedTag (git exit code $LASTEXITCODE)."
+}
+$tagExists = @($matchingTags | Where-Object { $_ -eq $expectedTag }).Count -eq 1
+if (-not $tagExists) {
     if ($RecordInitialBaseline) {
         Record-InitialBaseline
         return
     }
     throw "Cannot run cargo-semver-checks before baseline tag $expectedTag exists."
-}
-if ($tagStatus -ne 0) {
-    throw "Unable to inspect baseline tag $expectedTag (git exit code $tagStatus)."
 }
 if ($RecordInitialBaseline) {
     throw "Baseline tag $expectedTag already exists; run cargo-semver-checks instead of recording an initial baseline."
