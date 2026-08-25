@@ -1,0 +1,156 @@
+name: Rust crates release validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact stable SemVer already recorded in Cargo metadata and CHANGELOG.md
+        required: true
+        default: 0.1.0
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-release-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portable:
+    name: Portable facade / stable / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-14, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action, reviewed 2026-08-13
+        with:
+          toolchain: stable
+      - name: Reject Tauri from the portable facade graph
+        shell: pwsh
+        run: |
+          $tree = cargo tree --locked --package llama-harness --no-default-features --features "ollama,observability,evals"
+          if ($tree -match '(?m)(llama-harness-tauri|tauri) v') {
+            throw "The portable facade dependency graph unexpectedly contains Tauri."
+          }
+      - name: Test the portable facade
+        run: cargo test --locked --package llama-harness --all-targets --no-default-features --features ollama,observability,evals
+
+  publishable:
+    name: Six publishable crates / stable / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-14, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Linux Tauri build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libwebkit2gtk-4.1-dev
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action, reviewed 2026-08-13
+        with:
+          toolchain: stable
+      - name: Test only the six crates in the Rust release
+        run: >-
+          cargo test --locked --all-targets --all-features
+          --package llama-harness-core
+          --package llama-harness-ollama
+          --package llama-harness-observability
+          --package llama-harness-tauri
+          --package llama-harness-evals
+          --package llama-harness
+
+  release-gate:
+    name: Package, policy, docs, and API gate
+    runs-on: ubuntu-22.04
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Reject manual validation away from main
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and $env:GITHUB_REF -ne "refs/heads/main") {
+            throw "Manual Rust release validation must run from refs/heads/main."
+          }
+      - name: Install Linux Tauri build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libwebkit2gtk-4.1-dev
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action, reviewed 2026-08-13
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Validate the requested version, crate set, MSRV, changelog, and source tree
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_VERSION) {
+            scripts/release/check-rust-release.ps1 -Version $env:RELEASE_VERSION
+          } else {
+            scripts/release/check-rust-release.ps1
+          }
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Block Rust advisory, license, and source-policy failures
+        run: cargo deny check advisories licenses sources
+      - name: Format, lint, test, document, package, inspect, and test extracted consumers
+        run: cargo run --locked --package xtask -- release-check
+      - name: Enforce complete warning-free public documentation
+        env:
+          RUSTDOCFLAGS: -D warnings -D rustdoc::broken_intra_doc_links -D missing_docs
+        run: >-
+          cargo doc --locked --no-deps --all-features
+          --package llama-harness-core
+          --package llama-harness-ollama
+          --package llama-harness-observability
+          --package llama-harness-tauri
+          --package llama-harness-evals
+          --package llama-harness
+      - name: Detect the released API baseline
+        id: baseline_tag
+        shell: pwsh
+        run: |
+          $tag = @(git tag --list v0.1.0)
+          if ($LASTEXITCODE -ne 0) { throw "Unable to inspect the v0.1.0 tag." }
+          "exists=$($tag -contains 'v0.1.0')".ToLowerInvariant() | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+      - name: Validate the recorded initial API baseline
+        if: steps.baseline_tag.outputs.exists != 'true'
+        shell: pwsh
+        run: scripts/semver/check-rust-semver.ps1 -RecordInitialBaseline
+      - name: Install pinned cargo-semver-checks after v0.1.0
+        if: steps.baseline_tag.outputs.exists == 'true'
+        run: cargo install cargo-semver-checks --version 0.49.0 --locked
+      - name: Enforce API compatibility after v0.1.0
+        if: steps.baseline_tag.outputs.exists == 'true'
+        shell: pwsh
+        run: scripts/semver/check-rust-semver.ps1
+
+  msrv:
+    name: Rust 1.88 / fresh resolution
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Linux Tauri build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libwebkit2gtk-4.1-dev
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action, reviewed 2026-08-13
+        with:
+          toolchain: 1.88.0
+      - name: Resolve from scratch and check only the six released crates
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath Cargo.lock
+          cargo generate-lockfile
+          cargo check --all-targets --all-features `
+            --package llama-harness-core `
+            --package llama-harness-ollama `
+            --package llama-harness-observability `
+            --package llama-harness-tauri `
+            --package llama-harness-evals `
+            --package llama-harness

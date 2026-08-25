@@ -267,6 +267,132 @@ class InputAndAbiTests(unittest.TestCase):
                     if "${{ inputs.version }}" in line:
                         self.assertEqual(line.strip(), "RELEASE_VERSION: ${{ inputs.version }}")
 
+    def test_rust_release_workflow_is_validation_only_and_independent(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github" / "workflows" / "release-rust.yml").read_text(encoding="utf-8")
+        preflight = (root / "scripts" / "release" / "check-rust-release.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertIn('refs/heads/main', workflow)
+        self.assertIn("toolchain: 1.88.0", workflow)
+        self.assertIn("cargo run --locked --package xtask -- release-check", workflow)
+        self.assertNotIn("cargo publish", workflow)
+        self.assertNotIn("cargo owner", workflow)
+        self.assertNotIn("gh release", workflow)
+        self.assertNotIn("secrets.", workflow)
+        self.assertNotIn("upload-artifact", workflow)
+        self.assertNotIn("llama-harness-runtime", workflow)
+        self.assertNotIn("llama-harness-protocol", workflow)
+
+        self.assertNotIn("AllowDirty", preflight)
+        self.assertIn("git status --porcelain=v1 --untracked-files=all", preflight)
+        self.assertEqual(preflight.count('"llama-harness"'), 1)
+        for crate in (
+            "llama-harness-core",
+            "llama-harness-evals",
+            "llama-harness-observability",
+            "llama-harness-ollama",
+            "llama-harness-tauri",
+        ):
+            self.assertIn(f'"{crate}"', preflight)
+
+
+class RustReleaseWorkflowTests(unittest.TestCase):
+    def test_rust_release_workflow_is_read_only_and_complete(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github" / "workflows" / "release-rust.yml").read_text(encoding="utf-8")
+
+        self.assertIn("pull_request:", workflow)
+        self.assertRegex(workflow, r"workflow_dispatch:\s+inputs:\s+version:")
+        self.assertRegex(
+            workflow,
+            r"version:\s+description:[^\n]+\s+required: true[\s\S]*?\s+type: string",
+        )
+        self.assertRegex(workflow, r"permissions:\s+contents: read")
+        self.assertIn("concurrency:", workflow)
+        self.assertIn("cancel-in-progress: true", workflow)
+        self.assertGreaterEqual(workflow.count("refs/heads/main"), 1)
+        self.assertEqual(workflow.count("${{ inputs.version }}"), 1)
+        self.assertIn("toolchain: stable", workflow)
+        self.assertIn("toolchain: 1.88.0", workflow)
+
+        required_commands = (
+            "scripts/release/check-rust-release.ps1",
+            "cargo deny check advisories licenses sources",
+            "cargo run --locked --package xtask -- release-check",
+            "scripts/semver/check-rust-semver.ps1",
+            "cargo generate-lockfile",
+            "cargo check --all-targets --all-features",
+        )
+        for command in required_commands:
+            with self.subTest(command=command):
+                self.assertIn(command, workflow)
+
+        documented_crates = set(
+            re.findall(r"--package (llama-harness(?:-[a-z]+)?)", workflow)
+        )
+        self.assertEqual(
+            documented_crates,
+            {
+                "llama-harness-core",
+                "llama-harness-ollama",
+                "llama-harness-observability",
+                "llama-harness-evals",
+                "llama-harness-tauri",
+                "llama-harness",
+            },
+        )
+
+        forbidden = (
+            "cargo publish",
+            "secrets.",
+            "contents: write",
+            "packages: write",
+            "id-token: write",
+            "upload-artifact",
+            "download-artifact",
+            "git push",
+            "gh release",
+            "actions/setup-node",
+            "actions/setup-python",
+            "sdks/",
+            "apps/harness-console",
+            "llama-harness-runtime",
+        )
+        for value in forbidden:
+            with self.subTest(forbidden=value):
+                self.assertNotIn(value, workflow)
+
+    def test_rust_release_preflight_has_exact_metadata_contract(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        script = (root / "scripts" / "release" / "check-rust-release.ps1").read_text(encoding="utf-8")
+        crate_block = re.search(
+            r"\$expectedCrates = @\((.*?)\)\s*\|\s*Sort-Object\s*\$stableVersionPattern",
+            script,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(crate_block)
+        crates = set(re.findall(r'"(llama-harness(?:-[a-z]+)?)"', crate_block.group(1)))
+        self.assertEqual(
+            crates,
+            {
+                "llama-harness-core",
+                "llama-harness-ollama",
+                "llama-harness-observability",
+                "llama-harness-evals",
+                "llama-harness-tauri",
+                "llama-harness",
+            },
+        )
+        self.assertIn("cargo metadata --locked --format-version 1 --no-deps", script)
+        self.assertIn('$expectedRustVersion = "1.88"', script)
+        self.assertIn("exact stable SemVer", script)
+        self.assertIn("Unreleased", script)
+        self.assertIn("yyyy-MM-dd", script)
+        self.assertIn("must not be empty", script)
+        self.assertIn("git status --porcelain=v1 --untracked-files=all", script)
+        self.assertNotIn("AllowDirty", script)
+
 
 if __name__ == "__main__":
     unittest.main()
