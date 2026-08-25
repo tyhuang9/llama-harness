@@ -251,7 +251,9 @@ fn write_packaging_workspace_manifest(
 
     let mut manifest = String::from("[workspace]\nmembers = [\n");
     for package in PUBLISHABLE_CRATES {
-        manifest.push_str(&format!("  \"{}\",\n", package.directory));
+        if !extracted_names.contains(package.name) {
+            manifest.push_str(&format!("  \"{}\",\n", package.directory));
+        }
     }
     manifest.push_str(&format!(
         "]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"{PACKAGE_VERSION}\"\nedition = \"2021\"\nlicense = \"MIT\"\nrust-version = \"1.88\"\nrepository = \"https://github.com/tyhuang9/llama-harness\"\nhomepage = \"https://github.com/tyhuang9/llama-harness\"\n\n[patch.crates-io]\n"
