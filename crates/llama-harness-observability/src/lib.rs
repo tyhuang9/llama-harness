@@ -2,6 +2,8 @@
 //!
 //! This crate persists structured causal events, never model chain-of-thought.
 
+#![deny(missing_docs)]
+
 mod redaction;
 mod sqlite;
 

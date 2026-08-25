@@ -9,25 +9,37 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+/// A JSON object map used for application-defined metadata and context.
 pub type JsonMap = serde_json::Map<String, Value>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+/// Describes an agent and its runtime defaults.
 pub struct AgentDefinition {
+    /// Stable identifier for the agent.
     pub id: String,
+    /// Human-readable agent name.
     pub name: String,
+    /// Application-defined agent version.
     pub version: String,
     #[serde(default)]
+    /// System instructions supplied to the model.
     pub system_instructions: String,
+    /// Default model identifier used for runs.
     pub default_model: String,
     #[serde(default)]
+    /// Tool IDs the agent may use.
     pub tool_allowlist: Vec<String>,
     #[serde(default)]
+    /// Resource and payload limits for runs.
     pub limits: AgentLimits,
     #[serde(default)]
+    /// Default generation settings for model calls.
     pub generation: GenerationOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional JSON schema for validating final output.
     pub output_schema: Option<Value>,
     #[serde(default)]
+    /// Application-defined agent metadata.
     pub metadata: JsonMap,
 }
 
@@ -55,32 +67,46 @@ impl AgentDefinition {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+/// Per-run settings that override an agent's defaults.
 pub struct RunOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional model identifier for this run.
     pub model: Option<String>,
     #[serde(default)]
+    /// Generation settings for this run.
     pub generation: GenerationOptions,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// Input and host context for one agent run.
 pub struct RunRequest {
+    /// Agent definition to execute.
     pub agent: AgentDefinition,
+    /// User or application input presented to the agent.
     pub input: String,
     #[serde(default)]
+    /// Structured context supplied by the host application.
     pub application_context: JsonMap,
     #[serde(default)]
+    /// Previous transcript messages supplied to the run.
     pub history: Vec<Message>,
     #[serde(default)]
+    /// Application-defined request metadata.
     pub metadata: JsonMap,
     #[serde(default)]
+    /// Per-run model and generation overrides.
     pub overrides: RunOverrides,
     #[serde(default)]
+    /// Evaluation metadata associated with the run.
     pub evaluation: JsonMap,
     #[serde(skip, default = "CancellationToken::new")]
+    /// Cooperative cancellation token for the run.
     pub cancellation: CancellationToken,
     #[serde(skip)]
+    /// Optional externally supplied run identifier.
     pub run_id: Option<String>,
     #[serde(skip)]
+    /// Optional externally supplied trace identifier.
     pub trace_id: Option<String>,
 }
 
@@ -119,34 +145,54 @@ impl RunRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
+/// Terminal state reported for an agent run.
 pub enum RunStatus {
+    /// The run completed successfully.
     Completed,
+    /// The run failed after starting.
     Failed,
+    /// The run was cancelled.
     Cancelled,
+    /// A configured resource limit stopped the run.
     LimitReached,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
+/// Result and telemetry captured for one agent run.
 pub struct RunResult {
+    /// Run identifier used for correlation.
     pub id: String,
+    /// Terminal status of the run.
     pub status: RunStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Final assistant output, when one was produced.
     pub final_output: Option<String>,
+    /// Model identifier selected for the run.
     pub model: String,
     #[serde(default)]
+    /// Tool calls requested by the model.
     pub tool_calls: Vec<ToolCall>,
     #[serde(default)]
+    /// Policy decisions recorded during the run.
     pub policy_decisions: Vec<PolicyDecision>,
     #[serde(default)]
+    /// Approval records recorded during the run.
     pub approvals: Vec<ApprovalRecord>,
     #[serde(default)]
+    /// Errors captured during execution.
     pub errors: Vec<RunError>,
+    /// Elapsed run duration in milliseconds.
     pub duration_ms: u64,
+    /// Trace identifier used for correlation.
     pub trace_id: String,
+    /// Whether the model-call limit stopped the run.
     pub model_call_limit_reached: bool,
+    /// Whether the tool-call limit stopped the run.
     pub tool_call_limit_reached: bool,
+    /// Whether the repeated-identical-tool-call limit stopped the run.
     pub repeated_tool_call_limit_reached: bool,
+    /// Whether cancellation stopped the run.
     pub cancelled: bool,
 }
 

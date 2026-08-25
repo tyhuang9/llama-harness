@@ -20,6 +20,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// Executes agent runs against a model provider and registered tools.
 pub struct AgentRunner {
     provider: Arc<dyn ModelProvider>,
     tools: ToolRegistry,
@@ -28,6 +29,7 @@ pub struct AgentRunner {
     events: Arc<dyn EventSink>,
 }
 
+/// Configures an [`AgentRunner`] and its policy, approval, tool, and event integrations.
 pub struct AgentRunnerBuilder {
     provider: Arc<dyn ModelProvider>,
     tools: ToolRegistry,
@@ -37,6 +39,7 @@ pub struct AgentRunnerBuilder {
 }
 
 impl AgentRunner {
+    /// Starts building a runner with conservative policy and in-memory event defaults.
     pub fn builder(provider: Arc<dyn ModelProvider>) -> AgentRunnerBuilder {
         AgentRunnerBuilder {
             provider,
@@ -617,26 +620,31 @@ impl AgentRunner {
 }
 
 impl AgentRunnerBuilder {
+    /// Replaces the tool registry used by the runner.
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = tools;
         self
     }
 
+    /// Replaces the policy engine used for tool decisions.
     pub fn policy(mut self, policy: Arc<dyn PolicyEngine>) -> Self {
         self.policy = policy;
         self
     }
 
+    /// Replaces the approval handler used for approval-gated tools.
     pub fn approvals(mut self, approvals: Arc<dyn ApprovalHandler>) -> Self {
         self.approvals = approvals;
         self
     }
 
+    /// Replaces the event sink that receives run lifecycle events.
     pub fn event_sink(mut self, events: Arc<dyn EventSink>) -> Self {
         self.events = events;
         self
     }
 
+    /// Builds the configured runner.
     pub fn build(self) -> AgentRunner {
         AgentRunner {
             provider: self.provider,

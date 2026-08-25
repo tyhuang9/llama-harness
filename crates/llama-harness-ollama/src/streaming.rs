@@ -6,15 +6,31 @@ use reqwest::Response;
 use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
 
+/// A stream of typed events decoded from Ollama's newline-delimited response.
 pub type OllamaEventStream =
     Pin<Box<dyn Stream<Item = Result<OllamaStreamEvent, HarnessError>> + Send>>;
 
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
+/// Events emitted while Ollama produces a streamed chat response.
 pub enum OllamaStreamEvent {
-    TextDelta { content: String },
-    ToolCall { call: ToolCall },
-    Completed { model: String, usage: Usage },
+    /// A fragment of assistant text.
+    TextDelta {
+        /// Text received in this response fragment.
+        content: String,
+    },
+    /// A tool call decoded from the response.
+    ToolCall {
+        /// The normalized tool call.
+        call: ToolCall,
+    },
+    /// The response completed and includes final usage information.
+    Completed {
+        /// Model name reported by Ollama.
+        model: String,
+        /// Token usage reported by Ollama.
+        usage: Usage,
+    },
 }
 
 pub(crate) fn stream_response(

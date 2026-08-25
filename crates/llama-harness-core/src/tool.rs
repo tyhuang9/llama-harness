@@ -11,9 +11,13 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
+/// A tool invocation requested by a model.
 pub struct ToolCall {
+    /// Provider- or model-generated call identifier.
     pub id: String,
+    /// Registered tool identifier.
     pub tool_id: String,
+    /// JSON-encoded arguments supplied to the tool.
     pub arguments_json: String,
 }
 
@@ -35,10 +39,15 @@ impl ToolCall {
 /// Immutable correlation data for one validated tool call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
+/// Immutable correlation data for one tool invocation.
 pub struct ToolCallContext {
+    /// Identifier of the run containing the call.
     pub run_id: String,
+    /// Trace identifier associated with the run.
     pub trace_id: String,
+    /// Identifier of the tool call.
     pub call_id: String,
+    /// Identifier of the registered tool.
     pub tool_id: String,
 }
 
@@ -62,20 +71,32 @@ impl ToolCallContext {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
+/// Application-assessed risk level for a tool.
 pub enum ToolRisk {
+    /// Low-impact tool operation.
     Low,
+    /// Moderate-impact tool operation.
     Medium,
+    /// High-impact tool operation.
     High,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// Description and safety metadata for a registered tool.
 pub struct ToolDefinition {
+    /// Stable tool identifier used in allowlists and calls.
     pub id: String,
+    /// Human-readable tool name.
     pub name: String,
+    /// Human-readable description presented to the model.
     pub description: String,
+    /// JSON Schema for validating tool arguments.
     pub arguments_schema: Value,
+    /// Application-assessed risk level.
     pub risk: ToolRisk,
+    /// Whether repeating the same call is safe.
     pub idempotent: bool,
+    /// Whether the tool is guaranteed not to change state.
     pub read_only: bool,
 }
 
@@ -122,10 +143,14 @@ impl ToolDefinition {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
+/// Result returned by a tool execution.
 pub struct ToolResult {
+    /// Whether the tool execution succeeded.
     pub ok: bool,
+    /// JSON output returned by the tool.
     pub output: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional error detail for a failed execution.
     pub error: Option<String>,
 }
 
@@ -135,6 +160,7 @@ impl ToolResult {
         Self { ok, output, error }
     }
 
+    /// Creates a successful result with the supplied JSON output.
     pub fn success(output: Value) -> Self {
         Self {
             ok: true,
@@ -143,6 +169,7 @@ impl ToolResult {
         }
     }
 
+    /// Creates a failed result with a null output and error message.
     pub fn failure(message: impl Into<String>) -> Self {
         Self {
             ok: false,
@@ -153,7 +180,9 @@ impl ToolResult {
 }
 
 #[async_trait]
+/// Interface implemented by tools executable by the runner.
 pub trait Tool: Send + Sync {
+    /// Returns the tool's declaration and validation metadata.
     fn definition(&self) -> &ToolDefinition;
     /// Cancellation is cooperative and cannot undo external effects already started by a tool.
     async fn execute(
@@ -181,11 +210,13 @@ struct RegisteredTool {
 }
 
 #[derive(Default)]
+/// Registry of tools and their compiled argument validators.
 pub struct ToolRegistry {
     tools: HashMap<String, RegisteredTool>,
 }
 
 impl ToolRegistry {
+    /// Validates and registers a tool, rejecting duplicate IDs and invalid schemas.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), HarnessError> {
         let id = tool.definition().id.trim().to_owned();
         if id.is_empty() {
@@ -218,6 +249,7 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Returns a registered tool by ID.
     pub fn get(&self, id: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(id).map(|entry| Arc::clone(&entry.tool))
     }

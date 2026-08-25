@@ -6,18 +6,36 @@ use serde_json::Value;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 #[non_exhaustive]
+/// Policy outcome for a proposed tool call.
 pub enum PolicyDecision {
-    Allow { reason: String },
-    Deny { reason: String },
-    RequireApproval { reason: String },
+    /// Permit the tool call without approval.
+    Allow {
+        /// Explanation for allowing the call.
+        reason: String,
+    },
+    /// Reject the tool call.
+    Deny {
+        /// Explanation for denying the call.
+        reason: String,
+    },
+    /// Pause for an approval decision before execution.
+    RequireApproval {
+        /// Explanation for requiring approval.
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
+/// Record of an approval decision for a tool call.
 pub struct ApprovalRecord {
+    /// Identifier of the related tool call.
     pub call_id: String,
+    /// Identifier of the related tool.
     pub tool_id: String,
+    /// Whether approval was granted.
     pub granted: bool,
+    /// Explanation for the approval result.
     pub reason: String,
 }
 
@@ -39,7 +57,9 @@ impl ApprovalRecord {
 }
 
 #[async_trait]
+/// Evaluates whether proposed tool calls may proceed.
 pub trait PolicyEngine: Send + Sync {
+    /// Decides the policy outcome for a proposed tool call.
     async fn decide(
         &self,
         tool: &ToolDefinition,
@@ -60,7 +80,9 @@ pub trait PolicyEngine: Send + Sync {
 }
 
 #[async_trait]
+/// Handles approval requests for policy-gated tool calls.
 pub trait ApprovalHandler: Send + Sync {
+    /// Decides whether a proposed tool call is approved.
     async fn approve(
         &self,
         tool: &ToolDefinition,
@@ -80,6 +102,7 @@ pub trait ApprovalHandler: Send + Sync {
     }
 }
 
+/// Policy implementation that allows every tool call.
 pub struct AllowAllPolicy;
 
 #[async_trait]
@@ -119,6 +142,7 @@ impl PolicyEngine for SafeDefaultPolicy {
     }
 }
 
+/// Approval implementation that denies every approval request.
 pub struct DenyApproval;
 
 #[async_trait]

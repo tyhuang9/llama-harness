@@ -8,34 +8,53 @@ use serde::{Deserialize, Serialize};
 /// back from a trace database: a trace ID is evidence only, not a fixture source.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+/// Explicit regression input that can be replayed without trace reconstruction.
 pub struct RegressionCase {
+    /// Version of the regression case format.
     pub version: u32,
+    /// Identifier of the source suite.
     pub source_suite_id: String,
+    /// Identifier of the source case.
     pub source_case_id: String,
+    /// Identifier of the agent to execute.
     pub agent_id: String,
     #[serde(default)]
+    /// Optional agent implementation version.
     pub agent_version: Option<String>,
     #[serde(default)]
+    /// Optional prompt version.
     pub prompt_version: Option<String>,
     #[serde(default)]
+    /// Optional prompt replacement.
     pub prompt_override: Option<String>,
+    /// Model to use for replay.
     pub model: String,
     #[serde(default)]
+    /// Trace identifier retained as provenance only.
     pub source_trace_id: Option<String>,
+    /// Explicit case and fixture inputs for replay.
     pub case: EvalCase,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Provenance and execution metadata used to create a regression case.
 pub struct RegressionSource {
+    /// Identifier of the source suite.
     pub suite_id: String,
+    /// Identifier of the agent.
     pub agent_id: String,
+    /// Optional agent implementation version.
     pub agent_version: Option<String>,
+    /// Optional prompt version.
     pub prompt_version: Option<String>,
+    /// Optional prompt replacement.
     pub prompt_override: Option<String>,
+    /// Model used for the source result.
     pub model: String,
 }
 
 impl RegressionCase {
+    /// Validates the regression format, provenance, and embedded case.
     pub fn validate(&self) -> Result<(), EvalError> {
         if self.version != 1 {
             return Err(EvalError::InvalidSuite(format!(
@@ -61,6 +80,7 @@ impl RegressionCase {
     }
 }
 
+/// Builds a replayable regression case from an evaluated case result.
 pub fn export_regression_case(
     source: RegressionSource,
     case: &EvalCase,
@@ -87,6 +107,7 @@ pub fn export_regression_case(
     Ok(regression)
 }
 
+/// Re-executes a validated regression case through an application executor.
 pub async fn replay_regression(
     regression: &RegressionCase,
     executor: &dyn EvalExecutor,

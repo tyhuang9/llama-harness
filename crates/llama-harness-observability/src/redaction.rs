@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+/// Replacement text used by the default redaction configuration.
 pub const REDACTED_VALUE: &str = "[REDACTED]";
 
 /// Redaction rules applied before any event or raw payload is serialized for persistence.
@@ -9,6 +10,7 @@ pub struct RedactionConfig {
     pub key_fragments: Vec<String>,
     /// Literal secret values to remove anywhere they occur in a string.
     pub secret_values: Vec<String>,
+    /// Text substituted for redacted keys and secret values.
     pub replacement: String,
 }
 
@@ -31,6 +33,7 @@ impl Default for RedactionConfig {
 }
 
 impl RedactionConfig {
+    /// Recursively redacts matching object keys and configured secret values.
     pub fn redact(&self, value: &Value) -> Value {
         match value {
             Value::Object(values) => Value::Object(

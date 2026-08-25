@@ -12,33 +12,52 @@ use uuid::Uuid;
 /// mutable fixture state unless an application explicitly chooses to do so.
 #[async_trait]
 pub trait EvalExecutor: Send + Sync {
+    /// Executes one evaluation request and returns its observable result.
     async fn execute(&self, request: EvalExecutionRequest) -> Result<EvalObservation, EvalError>;
 }
 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
+/// Inputs supplied to an application-owned evaluation executor.
 pub struct EvalExecutionRequest {
+    /// Identifier of the suite being evaluated.
     pub suite_id: String,
+    /// Identifier of the agent under test.
     pub agent_id: String,
+    /// Optional agent implementation version.
     pub agent_version: Option<String>,
+    /// Optional prompt version used for the execution.
     pub prompt_version: Option<String>,
+    /// Optional prompt replacement for the case.
     pub prompt_override: Option<String>,
+    /// Evaluation case to execute.
     pub case: EvalCase,
+    /// Isolated fixture supplied to the application executor.
     pub fixture: Option<EvalFixture>,
+    /// Model selected for this execution.
     pub model: String,
+    /// One-based repetition number within the evaluation.
     pub repetition: u32,
 }
 
 #[derive(Clone, Debug)]
+/// Observable output returned by an evaluation executor.
 pub struct EvalObservation {
+    /// Canonical result produced by the agent runner.
     pub run: RunResult,
+    /// Number of model calls made during the run.
     pub model_calls: u32,
+    /// Optional application-owned final state snapshot.
     pub final_state: Option<Value>,
+    /// Optional application-owned unresolved-items snapshot.
     pub unresolved_items: Option<Value>,
+    /// Agent version observed by the executor.
     pub agent_version: Option<String>,
+    /// Prompt version observed by the executor.
     pub prompt_version: Option<String>,
 }
 
+/// Executes every suite case for the selected models and repetitions.
 pub async fn evaluate_suite(
     suite: &EvalSuite,
     executor: &dyn EvalExecutor,

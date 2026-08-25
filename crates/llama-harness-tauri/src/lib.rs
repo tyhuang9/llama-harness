@@ -3,6 +3,8 @@
 //! The helpers compose with the canonical embedded [`llama_harness_core::AgentRunner`].
 //! They do not start a daemon or move tool execution into a webview.
 
+#![deny(missing_docs)]
+
 use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
@@ -30,6 +32,7 @@ pub const DEFAULT_APPROVAL_EVENT_NAME: &str = "llama-harness://approval-requeste
 /// Emits serializable payloads to a frontend. The small trait keeps the routing
 /// and approval helpers testable without creating a Tauri application.
 pub trait FrontendEmitter: Send + Sync + Clone + 'static {
+    /// Emits a serializable payload under an application-defined event name.
     fn emit<P: Serialize + Clone>(&self, event: &str, payload: P) -> Result<(), String>;
 }
 
@@ -111,12 +114,14 @@ impl<R: Runtime> Clone for TauriTargetEmitter<R> {
 }
 
 impl<R: Runtime> TauriTargetEmitter<R> {
+    /// Creates an emitter that targets one named Tauri window or webview.
     pub fn new(app: AppHandle<R>, target: impl Into<String>) -> Self {
         Self {
             inner: TargetEmitter::new(app, target),
         }
     }
 
+    /// Returns the configured Tauri target label.
     pub fn target(&self) -> &str {
         self.inner.target()
     }
@@ -137,6 +142,7 @@ impl<R: Runtime> Clone for TauriEmitter<R> {
 }
 
 impl<R: Runtime> TauriEmitter<R> {
+    /// Creates a broadcast emitter backed by a Tauri application handle.
     pub fn new(app: AppHandle<R>) -> Self {
         Self { app }
     }
@@ -159,10 +165,12 @@ pub struct TauriEventSink<E: FrontendEmitter> {
 }
 
 impl<E: FrontendEmitter> TauriEventSink<E> {
+    /// Creates a sink using [`DEFAULT_RUN_EVENT_NAME`].
     pub fn new(emitter: E) -> Self {
         Self::with_event_name(emitter, DEFAULT_RUN_EVENT_NAME)
     }
 
+    /// Creates a sink that emits records under a custom event name.
     pub fn with_event_name(emitter: E, event_name: impl Into<String>) -> Self {
         Self {
             emitter,
@@ -200,6 +208,7 @@ pub struct FanoutEventSink {
 }
 
 impl FanoutEventSink {
+    /// Creates a sink that forwards each record to all supplied sinks.
     pub fn new(sinks: impl IntoIterator<Item = Arc<dyn EventSink>>) -> Self {
         Self {
             sinks: sinks.into_iter().collect(),
@@ -252,6 +261,7 @@ impl RunRegistry {
             .is_some()
     }
 
+    /// Removes a completed run from the registry and reports whether it existed.
     pub fn complete(&self, run_id: &str) -> bool {
         self.runs
             .lock()
@@ -260,6 +270,7 @@ impl RunRegistry {
             .is_some()
     }
 
+    /// Requests cancellation for every registered run.
     pub fn cancel_all(&self) {
         for token in self
             .runs
@@ -274,8 +285,10 @@ impl RunRegistry {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
+/// Errors returned while registering embedded runs.
 pub enum RunRegistryError {
     #[error("run {0} is already registered")]
+    /// The requested run ID is already active.
     DuplicateRun(String),
 }
 
@@ -286,11 +299,17 @@ pub enum RunRegistryError {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct PendingApproval {
+    /// Opaque identifier returned to the frontend for response routing.
     pub approval_id: String,
+    /// Run that requested approval.
     pub run_id: String,
+    /// Trace containing the approval request.
     pub trace_id: String,
+    /// Tool-call identifier requiring approval.
     pub call_id: String,
+    /// Definition of the tool awaiting approval.
     pub tool: ToolDefinition,
+    /// Arguments proposed for the tool call.
     pub arguments: serde_json::Value,
 }
 
@@ -317,9 +336,13 @@ impl Drop for PendingApprovalGuard {
 /// enough to fail closed when a host loses its approval surface.
 #[derive(Clone, Debug)]
 pub struct ApprovalRouterSettings {
+    /// Maximum number of approvals waiting for a response.
     pub max_pending: usize,
+    /// Maximum time to wait for a frontend response.
     pub timeout: std::time::Duration,
+    /// Maximum accepted approval identifier length in bytes.
     pub max_approval_id_bytes: usize,
+    /// Maximum accepted response reason length in bytes.
     pub max_reason_bytes: usize,
 }
 
@@ -345,14 +368,17 @@ pub struct ApprovalRouter<E: FrontendEmitter> {
 }
 
 impl<E: FrontendEmitter> ApprovalRouter<E> {
+    /// Creates a router using [`DEFAULT_APPROVAL_EVENT_NAME`] and default limits.
     pub fn new(emitter: E) -> Self {
         Self::with_event_name(emitter, DEFAULT_APPROVAL_EVENT_NAME)
     }
 
+    /// Creates a router using a custom event name and default limits.
     pub fn with_event_name(emitter: E, event_name: impl Into<String>) -> Self {
         Self::with_settings(emitter, event_name, ApprovalRouterSettings::default())
     }
 
+    /// Creates a router with a custom event name and bounded settings.
     pub fn with_settings(
         emitter: E,
         event_name: impl Into<String>,
@@ -366,6 +392,7 @@ impl<E: FrontendEmitter> ApprovalRouter<E> {
         }
     }
 
+    /// Returns the number of approvals currently awaiting a response.
     pub fn pending_count(&self) -> usize {
         self.pending
             .lock()
@@ -424,6 +451,7 @@ impl<E: FrontendEmitter> ApprovalRouter<E> {
         cancelled
     }
 
+    /// Cancels all pending approvals and returns the number removed.
     pub fn cancel_all(&self) -> usize {
         let mut pending = self
             .pending
@@ -536,10 +564,13 @@ pub fn trace_database_path(
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
+/// Errors returned while constructing a trace database path.
 pub enum TracePathError {
     #[error("trace database file name must be one relative file name")]
+    /// The supplied name is empty, absolute, nested, or otherwise invalid.
     InvalidFileName,
     #[error("trace database must use the .sqlite extension")]
+    /// The supplied name does not use the `.sqlite` extension.
     UnsupportedExtension,
 }
 

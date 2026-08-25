@@ -13,7 +13,9 @@ use serde::Deserialize;
 use std::{net::IpAddr, time::Duration};
 use tokio_util::sync::CancellationToken;
 
+/// Default loopback URL used by [`OllamaProviderBuilder`].
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+/// Default timeout applied to Ollama HTTP requests.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
@@ -48,11 +50,13 @@ impl Default for OllamaProviderBuilder {
 }
 
 impl OllamaProviderBuilder {
+    /// Sets the loopback URL for the Ollama server.
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
+    /// Sets the timeout for each Ollama HTTP request.
     pub fn request_timeout(mut self, request_timeout: Duration) -> Self {
         self.request_timeout = request_timeout;
         self
@@ -64,21 +68,25 @@ impl OllamaProviderBuilder {
         self
     }
 
+    /// Sets the maximum size of a non-streaming response body in bytes.
     pub fn max_response_bytes(mut self, max_response_bytes: usize) -> Self {
         self.max_response_bytes = max_response_bytes;
         self
     }
 
+    /// Sets the maximum total size of a streaming response in bytes.
     pub fn max_stream_bytes(mut self, max_stream_bytes: usize) -> Self {
         self.max_stream_bytes = max_stream_bytes;
         self
     }
 
+    /// Sets the maximum size of one newline-delimited streaming response line.
     pub fn max_stream_line_bytes(mut self, max_stream_line_bytes: usize) -> Self {
         self.max_stream_line_bytes = max_stream_line_bytes;
         self
     }
 
+    /// Validates the configuration and constructs an Ollama provider.
     pub fn build(self) -> Result<OllamaProvider, HarnessError> {
         if self.request_timeout.is_zero() {
             return Err(HarnessError::InvalidRequest(
@@ -112,6 +120,7 @@ impl OllamaProviderBuilder {
 }
 
 #[derive(Clone)]
+/// A direct provider for a loopback Ollama server.
 pub struct OllamaProvider {
     http: Client,
     base_url: Url,
@@ -122,14 +131,17 @@ pub struct OllamaProvider {
 }
 
 impl OllamaProvider {
+    /// Creates a builder initialized with the crate defaults.
     pub fn builder() -> OllamaProviderBuilder {
         OllamaProviderBuilder::default()
     }
 
+    /// Creates a provider using the crate defaults.
     pub fn new() -> Result<Self, HarnessError> {
         Self::builder().build()
     }
 
+    /// Returns the validated base URL used for Ollama requests.
     pub fn base_url(&self) -> &Url {
         &self.base_url
     }
