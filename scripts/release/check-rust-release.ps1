@@ -94,11 +94,12 @@ try {
     $nextHeading = [Regex]::Match($changelog.Substring($bodyStart), "(?m)^##\s+")
     $bodyLength = if ($nextHeading.Success) { $nextHeading.Index } else { $changelog.Length - $bodyStart }
     $releaseBody = $changelog.Substring($bodyStart, $bodyLength)
+    $releaseBody = [Regex]::Replace($releaseBody, '(?s)<!--.*?(?:-->|$)', '')
     $meaningfulBody = @(
         $releaseBody -split "`r?`n" |
             Where-Object {
                 $line = $_.Trim()
-                $line -and -not $line.StartsWith("<!--") -and -not $line.StartsWith("-->")
+                $line
             }
     )
     if ($meaningfulBody.Count -eq 0) {

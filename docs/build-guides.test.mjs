@@ -87,9 +87,20 @@ test("release guide preserves executable Cargo publication commands", () => {
     .map((line) => line.trim())
     .filter((line) => line.startsWith("cargo publish "));
 
-  assert.equal(publishCommands.length, 12);
-  assert.ok(publishCommands.includes("cargo publish --locked --dry-run --package llama-harness-core"));
-  assert.ok(publishCommands.includes("cargo publish --locked --package llama-harness"));
+  assert.deepEqual(publishCommands, [
+    "cargo publish --locked --dry-run --package llama-harness-core",
+    "cargo publish --locked --package llama-harness-core",
+    "cargo publish --locked --dry-run --package llama-harness-ollama",
+    "cargo publish --locked --dry-run --package llama-harness-observability",
+    "cargo publish --locked --dry-run --package llama-harness-tauri",
+    "cargo publish --locked --package llama-harness-ollama",
+    "cargo publish --locked --package llama-harness-observability",
+    "cargo publish --locked --package llama-harness-tauri",
+    "cargo publish --locked --dry-run --package llama-harness-evals",
+    "cargo publish --locked --package llama-harness-evals",
+    "cargo publish --locked --dry-run --package llama-harness",
+    "cargo publish --locked --package llama-harness",
+  ]);
   assert.doesNotMatch(guide, /<p>```powershell/);
 });
 

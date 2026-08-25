@@ -303,6 +303,47 @@ class InputAndAbiTests(unittest.TestCase):
 
 
 class RustReleaseWorkflowTests(unittest.TestCase):
+    @staticmethod
+    def run_preflight(root: Path, source_commit: str, version: str = "0.1.0") -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-File",
+                str(root / "scripts" / "release" / "check-rust-release.ps1"),
+                "-Version",
+                version,
+                "-SourceCommit",
+                source_commit,
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    @staticmethod
+    def clone_repository(root: Path, destination: Path) -> str:
+        subprocess.run(
+            ["git", "clone", "--quiet", "--no-hardlinks", str(root), str(destination)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        source_preflight = root / "scripts" / "release" / "check-rust-release.ps1"
+        cloned_preflight = destination / "scripts" / "release" / "check-rust-release.ps1"
+        cloned_preflight.write_text(source_preflight.read_text(encoding="utf-8"), encoding="utf-8")
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=destination,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+
     def test_rust_release_workflow_is_read_only_and_complete(self) -> None:
         root = Path(__file__).resolve().parents[2]
         workflow = (root / ".github" / "workflows" / "release-rust.yml").read_text(encoding="utf-8")
@@ -404,25 +445,74 @@ class RustReleaseWorkflowTests(unittest.TestCase):
 
     def test_rust_release_preflight_rejects_a_different_source_commit(self) -> None:
         root = Path(__file__).resolve().parents[2]
-        result = subprocess.run(
-            [
-                "pwsh",
-                "-NoProfile",
-                "-File",
-                str(root / "scripts" / "release" / "check-rust-release.ps1"),
-                "-Version",
-                "0.1.0",
-                "-SourceCommit",
-                "0" * 40,
-            ],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        result = self.run_preflight(root, "0" * 40)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not match reviewed source commit", result.stdout + result.stderr)
+
+    def test_rust_release_preflight_rejects_metadata_changelog_and_tree_drift(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        cases = (
+            (
+                "default-publish crate",
+                lambda clone: (clone / "crates" / "llama-harness-protocol" / "Cargo.toml").write_text(
+                    (clone / "crates" / "llama-harness-protocol" / "Cargo.toml")
+                    .read_text(encoding="utf-8")
+                    .replace("publish = false\n", ""),
+                    encoding="utf-8",
+                ),
+                "Expected exactly the six supported crates.io packages",
+            ),
+            (
+                "MSRV mismatch",
+                lambda clone: (clone / "Cargo.toml").write_text(
+                    (clone / "Cargo.toml").read_text(encoding="utf-8").replace(
+                        'rust-version = "1.88"', 'rust-version = "1.89"'
+                    ),
+                    encoding="utf-8",
+                ),
+                "Every published crate must declare Rust 1.88",
+            ),
+            (
+                "duplicate changelog",
+                lambda clone: (clone / "CHANGELOG.md").write_text(
+                    (clone / "CHANGELOG.md").read_text(encoding="utf-8")
+                    + "\n## 0.1.0 — Unreleased\n\n- Duplicate.\n",
+                    encoding="utf-8",
+                ),
+                "exactly one level-two heading",
+            ),
+            (
+                "empty changelog",
+                lambda clone: (clone / "CHANGELOG.md").write_text(
+                    "# Changelog\n\n## 0.1.0 — Unreleased\n\n## Versioning policy\n\nPolicy.\n",
+                    encoding="utf-8",
+                ),
+                "must not be empty",
+            ),
+            (
+                "comment-only changelog",
+                lambda clone: (clone / "CHANGELOG.md").write_text(
+                    "# Changelog\n\n## 0.1.0 — Unreleased\n\n<!--\nplaceholder\n-->\n\n"
+                    "## Versioning policy\n\nPolicy.\n",
+                    encoding="utf-8",
+                ),
+                "must not be empty",
+            ),
+            (
+                "dirty tree",
+                lambda clone: (clone / "untracked-release-file").write_text("dirty", encoding="utf-8"),
+                "requires a clean Git working tree",
+            ),
+        )
+
+        for name, mutate, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                clone = Path(directory) / "repository"
+                source_commit = self.clone_repository(root, clone)
+                mutate(clone)
+                result = self.run_preflight(clone, source_commit)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stdout + result.stderr)
 
     def test_semver_gate_uses_the_latest_reachable_stable_release(self) -> None:
         root = Path(__file__).resolve().parents[2]
