@@ -6,7 +6,11 @@ No package or release artifact is published by this repository's normal CI check
 
 Create a crates.io account and token, verify intended package-name availability, and store the token only in the protected CI secret store. Published crates.io versions are immutable: correct a bad release with a new version or, when appropriate, yank it; yanking does not delete the published source package.
 
-The initial publishable Rust crates use a unified `0.1.0` version. The development-only Promptfoo integration, scripted test runtime, examples, developer console, and release helper are intentionally not published. The CLI is also local-only while it depends on development-only Promptfoo support.
+The initial publishable Rust crates use a unified `0.1.0` version:
+`llama-harness-core`, `llama-harness-ollama`, `llama-harness-observability`,
+`llama-harness-tauri`, `llama-harness-evals`, and the `llama-harness` facade.
+Protocol/runtime, SDKs, Promptfoo integration, scripted runtime, examples,
+developer console, CLI, and release helper are not published in this milestone.
 
 ## Local release verification
 
@@ -42,10 +46,13 @@ The helper deliberately does not claim that `cargo publish --dry-run` can comple
 The order follows workspace dependencies and is verified by the release checklist:
 
 1. `llama-harness-core`
-2. `llama-harness-protocol`
-3. `llama-harness-evals`, `llama-harness-observability`, and `llama-harness-ollama`
-4. `llama-harness-runtime` and `llama-harness-tauri`
-5. `llama-harness`
+2. `llama-harness-ollama`, `llama-harness-observability`, and `llama-harness-tauri`
+3. `llama-harness-evals`
+4. `llama-harness`
+
+The Rust release is validated and operated independently of the deferred SDK
+artifact workflow. No workflow publishes until a human explicitly authorizes
+the exact release.
 
 ## Sidecar SDK distribution
 

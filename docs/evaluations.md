@@ -1,6 +1,11 @@
 # Deterministic evaluations and replay
 
-`llama-harness-evals` defines a provider-neutral YAML or JSON evaluation suite and evaluates it through an application-supplied `EvalExecutor`. The executor owns fixture construction, sandboxed application tools, policies, approvals, and the `AgentRunner` instance. This keeps evaluations on the same runtime path as an application while avoiding a generic shell, filesystem, or database tool.
+The optional `llama_harness::evals` module exposes provider-neutral YAML or JSON
+evaluation suites and evaluates them through an application-supplied
+`EvalExecutor`. The executor owns fixture construction, sandboxed application
+tools, policies, approvals, and the `AgentRunner` instance. This keeps
+evaluations on the same runtime path as an application while avoiding a generic
+shell, filesystem, or database tool.
 
 ## Suite format
 
@@ -48,7 +53,7 @@ cargo run -p llama-harness-cli -- eval validate path/to/suite.yaml
 An embedding app executes its real controlled loop by implementing `EvalExecutor` and calling:
 
 ```rust
-let report = llama_harness_evals::evaluate_suite(
+let report = llama_harness::evals::evaluate_suite(
     &suite,
     &application_executor,
     &model_overrides,

@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="description" content="Deterministic evaluations and replay guide for llama-harness." /><title>Deterministic evaluations and replay | llama-harness</title><link rel="stylesheet" href="../styles.css" /></head>
 <body class="guide-page"><a class="skip-link" href="#guide-content">Skip to guide content</a><header class="topbar guide-header"><a class="brand" href="../index.html" aria-label="llama-harness documentation home"><span class="brand-mark" aria-hidden="true">lh</span><span>llama-harness</span></a><a class="guide-back-link" href="../index.html">Back to docs</a></header><main id="guide-content" class="guide-main" tabindex="-1"><article class="guide-article"><p class="guide-source">Guide source: <code>evaluations.md</code></p><h1 id="deterministic-evaluations-and-replay">Deterministic evaluations and replay</h1>
-      <p><code>llama-harness-evals</code> defines a provider-neutral YAML or JSON evaluation suite and evaluates it through an application-supplied <code>EvalExecutor</code>. The executor owns fixture construction, sandboxed application tools, policies, approvals, and the <code>AgentRunner</code> instance. This keeps evaluations on the same runtime path as an application while avoiding a generic shell, filesystem, or database tool.</p>
+      <p>The optional <code>llama_harness::evals</code> module exposes provider-neutral YAML or JSON evaluation suites and evaluates them through an application-supplied <code>EvalExecutor</code>. The executor owns fixture construction, sandboxed application tools, policies, approvals, and the <code>AgentRunner</code> instance. This keeps evaluations on the same runtime path as an application while avoiding a generic shell, filesystem, or database tool.</p>
       <h2 id="suite-format">Suite format</h2>
       <p>Suites use version <code>1</code>, a stable suite and agent ID, one or more model IDs, defaults, and explicit cases. Each case can provide an isolated fixture, input, history/context, agent or prompt-version/override, tags, and deterministic expectations.</p>
       <pre><code class="language-yaml">version: 1
@@ -35,7 +35,7 @@ cases:
       <p>Validate a local suite without needing Ollama, a GPU, or an application fixture adapter:</p>
       <pre><code class="language-bash">cargo run -p llama-harness-cli -- eval validate path/to/suite.yaml</code></pre>
       <p>An embedding app executes its real controlled loop by implementing <code>EvalExecutor</code> and calling:</p>
-      <pre><code class="language-rust">let report = llama_harness_evals::evaluate_suite(
+      <pre><code class="language-rust">let report = llama_harness::evals::evaluate_suite(
     &amp;suite,
     &amp;application_executor,
     &amp;model_overrides,
