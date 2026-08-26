@@ -20,7 +20,11 @@ Run the release helper from a clean checkout:
 cargo run -p xtask -- release-check
 ```
 
-It runs formatting, linting, tests, docs, and `cargo package --list` for each publishable crate. `cargo package --list` exposes exactly what a crates.io source package would contain without publishing it.
+It runs formatting, linting, tests, and docs, then creates all six `.crate`
+archives together. The helper rejects unexpected, unsafe, or oversized archive
+contents and compiles a standalone facade consumer from the extracted packages
+across the supported feature configurations. The realistic consumer example is
+also run without publishing anything.
 
 Continuous verification runs the Rust checks on Windows, macOS, and Linux; blocks Rust advisory, license, and source-policy failures; and tests, builds, and inspects both SDK packages. The developer console's npm audit is reported but does not block a runtime release: its current Vite/esbuild and nanoid findings are development-tooling-only and are tracked separately in `TODO.md`.
 

@@ -20,12 +20,17 @@ const DEFAULT_MAX_RAW_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_QUERY_LIMIT: u32 = 1_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Configuration for a local SQLite trace store.
 pub struct TraceStoreConfig {
     /// Raw payloads are disabled by default. Structured causal events are always persisted.
     pub persist_raw_payloads: bool,
+    /// Maximum serialized size of a structured event in bytes.
     pub max_event_bytes: usize,
+    /// Maximum serialized size of an optional raw payload in bytes.
     pub max_raw_payload_bytes: usize,
+    /// SQLite busy timeout used while opening and writing the database.
     pub busy_timeout: Duration,
+    /// Redaction rules applied before persistence.
     pub redaction: RedactionConfig,
 }
 
@@ -43,88 +48,135 @@ impl Default for TraceStoreConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
+/// Result of appending an event to a trace store.
 pub enum AppendOutcome {
+    /// The event was inserted into the store.
     Inserted,
+    /// An identical event was already present.
     Duplicate,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
+/// A stored event and its optional raw payload.
 pub struct PersistedEvent {
+    /// The canonical event record.
     pub record: EventRecord,
+    /// The optional redacted raw payload stored with the event.
     pub raw_payload: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
+/// Aggregate information for one persisted run.
 pub struct RunSummary {
+    /// Application-visible run identifier.
     pub run_id: String,
+    /// Trace identifier shared by the run's events.
     pub trace_id: String,
+    /// Timestamp of the earliest event in milliseconds since the Unix epoch.
     pub started_at_ms: u64,
+    /// Timestamp of the latest event in milliseconds since the Unix epoch.
     pub updated_at_ms: u64,
+    /// Number of persisted events for the run.
     pub event_count: u64,
+    /// Terminal status, when a completion event has been persisted.
     pub status: Option<RunStatus>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Filters and pagination for listing persisted runs.
 pub struct RunListQuery {
+    /// Optional trace identifier filter.
     pub trace_id: Option<String>,
+    /// Optional terminal status filter.
     pub status: Option<RunStatus>,
+    /// Optional inclusive lower bound for event timestamps.
     pub started_after_ms: Option<u64>,
+    /// Optional inclusive upper bound for event timestamps.
     pub started_before_ms: Option<u64>,
+    /// Maximum number of summaries to return; zero selects the default limit.
     pub limit: u32,
+    /// Number of summaries to skip before returning results.
     pub offset: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Age and count limits for deleting old trace data.
 pub struct RetentionPolicy {
+    /// Delete events older than this age relative to the supplied current time.
     pub max_age_ms: Option<u64>,
+    /// Keep at most this many most-recent runs.
     pub max_runs: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
+/// Counts returned by a retention operation.
 pub struct RetentionResult {
+    /// Number of events deleted by the retention operation.
     pub events_deleted: u64,
+    /// Number of runs deleted by the retention operation.
     pub runs_deleted: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
+/// Serializable export of one run and its events.
 pub struct ExportedRun {
+    /// Application-visible run identifier.
     pub run_id: String,
+    /// Trace identifier shared by the exported events.
     pub trace_id: String,
+    /// Events included in the export, ordered by sequence.
     pub events: Vec<PersistedEventExport>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
+/// Serializable representation of one exported event.
 pub struct PersistedEventExport {
+    /// The canonical event record.
     pub record: EventRecord,
+    /// The optional redacted raw payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_payload: Option<Value>,
 }
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
+/// Errors returned by trace-store operations.
 pub enum TraceStoreError {
     #[error("SQLite error: {0}")]
+    /// The SQLite operation failed.
     Sqlite(#[from] rusqlite::Error),
     #[error("serialization error: {0}")]
+    /// A record or payload could not be serialized or decoded.
     Serialization(#[from] serde_json::Error),
     #[error("invalid trace store configuration: {0}")]
+    /// The store configuration or query parameters are invalid.
     InvalidConfiguration(String),
     #[error("trace record is invalid: {0}")]
+    /// A record does not satisfy the store's invariants.
     InvalidRecord(String),
     #[error("trace payload exceeds configured limit: {0}")]
+    /// A serialized event or payload exceeds its configured size limit.
     ResourceLimit(String),
     #[error("conflicting event for run {run_id} sequence {sequence}")]
-    Conflict { run_id: String, sequence: u64 },
+    /// An existing sequence contains different event data.
+    Conflict {
+        /// Run containing the conflicting event.
+        run_id: String,
+        /// Sequence number occupied by different event data.
+        sequence: u64,
+    },
     #[error("trace store mutex is poisoned")]
+    /// A store lock was poisoned by a failed thread.
     Poisoned,
 }
 
 #[derive(Clone)]
+/// Thread-safe SQLite-backed event sink and trace query interface.
 pub struct SqliteEventSink {
     inner: Arc<StoreInner>,
 }
@@ -136,6 +188,7 @@ struct StoreInner {
 }
 
 impl SqliteEventSink {
+    /// Opens or creates a trace database and applies the current schema.
     pub fn open(path: impl AsRef<Path>, config: TraceStoreConfig) -> Result<Self, TraceStoreError> {
         validate_config(&config)?;
         let mut connection = Connection::open(path)?;
@@ -146,6 +199,7 @@ impl SqliteEventSink {
     /// Opens an existing trace database for inspection without changing its schema or
     /// SQLite journal settings. This is intended for local developer tooling that
     /// must never create a database or mutate a project's trace store while reading it.
+    /// Opens an existing trace database without creating or migrating it.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, TraceStoreError> {
         let config = TraceStoreConfig::default();
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -153,6 +207,7 @@ impl SqliteEventSink {
         Ok(Self::from_connection(connection, config))
     }
 
+    /// Opens an in-memory trace database using the supplied configuration.
     pub fn open_in_memory(config: TraceStoreConfig) -> Result<Self, TraceStoreError> {
         validate_config(&config)?;
         let mut connection = Connection::open_in_memory()?;
@@ -176,6 +231,7 @@ impl SqliteEventSink {
         self.append_with_raw(record, None)
     }
 
+    /// Appends one event and optional raw payload in a single transaction.
     pub fn append_with_raw(
         &self,
         record: &EventRecord,
@@ -209,6 +265,7 @@ impl SqliteEventSink {
         Ok(outcomes)
     }
 
+    /// Returns persisted events for a run in sequence order.
     pub fn events_for_run(
         &self,
         run_id: &str,
@@ -231,6 +288,7 @@ impl SqliteEventSink {
         rows.map(|row| decode_persisted_event(row?)).collect()
     }
 
+    /// Lists run summaries matching the supplied filters.
     pub fn list_runs(&self, query: RunListQuery) -> Result<Vec<RunSummary>, TraceStoreError> {
         let limit = checked_limit(query.limit)?;
         let mut sql = String::from(
@@ -289,6 +347,7 @@ impl SqliteEventSink {
             .map_err(TraceStoreError::from)
     }
 
+    /// Exports all events for a run, or `None` when the run is unknown.
     pub fn export_run(&self, run_id: &str) -> Result<Option<ExportedRun>, TraceStoreError> {
         let event_count = self.event_count_for_run(run_id)?;
         if event_count == 0 {
@@ -318,12 +377,14 @@ impl SqliteEventSink {
         }))
     }
 
+    /// Serializes a run export as pretty-printed JSON.
     pub fn export_run_json(&self, run_id: &str) -> Result<Option<String>, TraceStoreError> {
         self.export_run(run_id)?
             .map(|export| serde_json::to_string_pretty(&export).map_err(TraceStoreError::from))
             .transpose()
     }
 
+    /// Deletes events according to the supplied age and run-count policy.
     pub fn apply_retention(
         &self,
         policy: &RetentionPolicy,
@@ -365,6 +426,7 @@ impl SqliteEventSink {
         Ok(result)
     }
 
+    /// Deletes all events belonging to a run and returns the number removed.
     pub fn delete_run(&self, run_id: &str) -> Result<u64, TraceStoreError> {
         let connection = self.connection()?;
         Ok(connection.execute(
@@ -383,6 +445,7 @@ impl SqliteEventSink {
         from_sql_integer(count).map_err(TraceStoreError::from)
     }
 
+    /// Reclaims unused SQLite pages after deletions.
     pub fn compact(&self) -> Result<(), TraceStoreError> {
         let connection = self.connection()?;
         connection.execute_batch("VACUUM")?;

@@ -1,6 +1,7 @@
 use crate::{AssertionFailure, EvalExpected, EvalObservation, ExpectedFailure, ExpectedToolCall};
 use serde_json::Value;
 
+/// Evaluates all configured expectations against one observed run.
 pub fn evaluate_expectations(
     expected: &EvalExpected,
     observation: &EvalObservation,
@@ -209,6 +210,7 @@ pub fn evaluate_expectations(
     failures
 }
 
+/// Returns whether every value in `expected` is present in `actual`.
 pub fn is_json_subset(expected: &Value, actual: &Value) -> bool {
     match (expected, actual) {
         (Value::Object(expected), Value::Object(actual)) => {

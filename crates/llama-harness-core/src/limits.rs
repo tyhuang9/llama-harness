@@ -14,23 +14,37 @@ const DEFAULT_MAX_JSON_DEPTH: u32 = 64;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+/// Resource and payload limits applied to an agent run.
 pub struct AgentLimits {
+    /// Maximum number of model calls in one run.
     pub max_model_calls: u32,
+    /// Maximum number of tool calls in one run.
     pub max_tool_calls: u32,
+    /// Maximum number of identical consecutive tool calls.
     pub max_identical_tool_calls: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional wall-clock limit for the complete run, in milliseconds.
     pub max_run_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional wall-clock limit for each model call, in milliseconds.
     pub max_model_call_duration_ms: Option<u64>,
+    /// Maximum number of structured-output repair attempts.
     pub max_output_repairs: u32,
     /// Retry budget per logical model turn. Only `RetryableProvider` errors qualify.
     pub max_provider_retries: u32,
+    /// Maximum input transcript size in bytes.
     pub max_input_bytes: u64,
+    /// Maximum serialized model request size in bytes.
     pub max_request_payload_bytes: u64,
+    /// Maximum serialized model response size in bytes.
     pub max_model_response_bytes: u64,
+    /// Maximum serialized tool argument size in bytes.
     pub max_tool_arguments_bytes: u64,
+    /// Maximum serialized tool result size in bytes.
     pub max_tool_result_bytes: u64,
+    /// Maximum transcript size in bytes.
     pub max_transcript_bytes: u64,
+    /// Maximum nesting depth for JSON values.
     pub max_json_depth: u32,
 }
 
@@ -56,12 +70,16 @@ impl Default for AgentLimits {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+/// Optional sampling and output-token settings for model generation.
 pub struct GenerationOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Sampling temperature, when supported by the provider.
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Nucleus sampling probability, when supported by the provider.
     pub top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Maximum number of output tokens, when supported by the provider.
     pub max_output_tokens: Option<u32>,
 }
 

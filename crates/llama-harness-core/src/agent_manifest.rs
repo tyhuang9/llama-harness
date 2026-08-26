@@ -14,21 +14,28 @@ pub const AGENT_MANIFEST_VERSION: u32 = 1;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[non_exhaustive]
 pub struct AgentManifest {
+    /// On-disk manifest format version.
     pub version: u32,
     #[serde(default)]
+    /// Agent definitions included in the manifest.
     pub agents: Vec<AgentDefinition>,
 }
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
+/// Errors returned while loading or validating an agent manifest.
 pub enum AgentManifestError {
     #[error("I/O error: {0}")]
+    /// The manifest could not be read from disk.
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
+    /// JSON parsing failed.
     Json(#[from] serde_json::Error),
     #[error("YAML error: {0}")]
+    /// YAML parsing failed.
     Yaml(#[from] serde_yaml::Error),
     #[error("invalid agent manifest: {0}")]
+    /// The manifest contents violate the runtime contract.
     Invalid(String),
 }
 
@@ -41,6 +48,7 @@ impl AgentManifest {
         }
     }
 
+    /// Validates the manifest version, agent definitions, and uniqueness rules.
     pub fn validate(&self) -> Result<(), AgentManifestError> {
         if self.version != AGENT_MANIFEST_VERSION {
             return Err(AgentManifestError::Invalid(format!(

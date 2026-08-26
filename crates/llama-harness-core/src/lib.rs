@@ -1,11 +1,14 @@
 //! Embedded, provider-neutral agent runtime for application-owned integrations.
 
+#![deny(missing_docs)]
+
 mod agent;
 mod agent_manifest;
 mod error;
 mod event;
 mod limits;
 mod message;
+/// Deterministic mock provider and scripted response helpers.
 pub mod mock;
 mod model;
 mod policy;

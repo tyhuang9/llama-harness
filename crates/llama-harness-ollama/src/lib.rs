@@ -1,5 +1,7 @@
 //! Direct, loopback-only Ollama integration for the embedded Llama Harness runtime.
 
+#![deny(missing_docs)]
+
 mod provider;
 mod streaming;
 mod wire;

@@ -4,21 +4,31 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
+/// Role of a message in the agent transcript.
 pub enum MessageRole {
+    /// System instructions or context.
     System,
+    /// User-provided input.
     User,
+    /// Assistant or model output.
     Assistant,
+    /// Tool result correlated to a tool call.
     Tool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
+/// A message in the agent transcript.
 pub struct Message {
+    /// Role that produced the message.
     pub role: MessageRole,
+    /// Text content of the message.
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Tool call ID for a tool-result message.
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Tool calls requested by an assistant message.
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -45,10 +55,12 @@ impl Message {
         self
     }
 
+    /// Creates a user message.
     pub fn user(content: impl Into<String>) -> Self {
         Self::new(MessageRole::User, content)
     }
 
+    /// Creates a system message.
     pub fn system(content: impl Into<String>) -> Self {
         Self::new(MessageRole::System, content)
     }

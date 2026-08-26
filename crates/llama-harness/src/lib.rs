@@ -26,6 +26,8 @@
 //! # }
 //! ```
 
+#![deny(missing_docs)]
+
 /// Scripted provider utilities intended for deterministic tests and examples.
 pub mod mock {
     pub use llama_harness_core::mock::{

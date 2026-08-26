@@ -7,13 +7,17 @@ use std::{
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
+/// An ordered event emitted during a run.
 pub struct EventRecord {
+    /// Identifier of the run that emitted the event.
     pub run_id: String,
+    /// Trace identifier associated with the run.
     pub trace_id: String,
     /// Monotonic within one run, starting at one.
     pub sequence: u64,
     /// Milliseconds since the Unix epoch. Never decreases within one emitter.
     pub timestamp_ms: u64,
+    /// Event payload.
     pub event: RunEvent,
 }
 
@@ -39,55 +43,87 @@ impl EventRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
+/// Lifecycle event emitted by the runner.
 pub enum RunEvent {
+    /// A run has started.
     Started {
+        /// Identifier of the started run.
         run_id: String,
+        /// Trace identifier for the started run.
         trace_id: String,
     },
+    /// The runner is requesting a model completion.
     ModelRequested {
+        /// One-based model call number.
         call_number: u32,
+        /// Model identifier being called.
         model: String,
     },
+    /// A retryable provider error caused another model call to be scheduled.
     ModelRetrying {
+        /// Number of the next model call.
         next_call_number: u32,
+        /// Reason the previous call will be retried.
         reason: String,
     },
+    /// The model returned a response.
     ModelResponded {
+        /// Model call number that returned.
         call_number: u32,
     },
+    /// A tool call was rejected before execution.
     ToolRejected {
+        /// Identifier of the rejected call.
         call_id: String,
+        /// Identifier of the rejected tool.
         tool_id: String,
+        /// Reason for rejection.
         reason: String,
     },
+    /// A policy decision was recorded for a tool call.
     PolicyDecided {
+        /// Identifier of the related tool call.
         call_id: String,
+        /// Policy outcome.
         decision: PolicyDecision,
     },
+    /// Approval was requested for a tool call.
     ApprovalRequested {
+        /// Identifier of the tool call awaiting approval.
         call_id: String,
+        /// Identifier of the tool requiring approval.
         tool_id: String,
     },
+    /// A tool call finished execution.
     ToolCompleted {
+        /// Identifier of the completed call.
         call_id: String,
+        /// Identifier of the completed tool.
         tool_id: String,
+        /// Whether the tool returned a successful result.
         ok: bool,
     },
+    /// The run reached a terminal status.
     Completed {
+        /// Terminal run status.
         status: RunStatus,
     },
 }
 
+/// Receives ordered events from an agent runner.
 pub trait EventSink: Send + Sync {
+    /// Records one emitted event.
     fn emit(&self, record: EventRecord);
 }
 
 #[derive(Default)]
+/// Thread-safe in-memory event collector.
 pub struct InMemoryEventSink {
     events: Mutex<Vec<EventRecord>>,
 }
 
 impl InMemoryEventSink {
+    /// Returns a snapshot of all events collected so far.
     pub fn events(&self) -> Vec<EventRecord> {
         self.events
             .lock()

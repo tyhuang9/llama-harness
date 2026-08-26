@@ -5,14 +5,21 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
+/// Request sent from the runner to a model provider.
 pub struct ModelRequest {
+    /// Model identifier requested for completion.
     pub model: String,
+    /// Transcript messages sent to the model.
     pub messages: Vec<Message>,
+    /// Tools available to the model for this request.
     pub tools: Vec<ToolDefinition>,
+    /// Generation settings for this request.
     pub generation: GenerationOptions,
     #[serde(default)]
+    /// Provider-specific request metadata.
     pub metadata: JsonMap,
     #[serde(skip)]
+    /// Cooperative cancellation token for the request.
     pub cancellation: CancellationToken,
 }
 
@@ -32,13 +39,18 @@ impl ModelRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
+/// Response returned by a model provider.
 pub struct ModelResponse {
+    /// Model identifier that produced the response.
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Final assistant text, when present.
     pub final_output: Option<String>,
     #[serde(default)]
+    /// Tool calls requested by the model.
     pub tool_calls: Vec<crate::ToolCall>,
     #[serde(default)]
+    /// Token usage reported by the provider.
     pub usage: Usage,
 }
 
@@ -74,8 +86,11 @@ impl ModelResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[non_exhaustive]
+/// Token usage reported for a model call.
 pub struct Usage {
+    /// Number of input tokens.
     pub input_tokens: u64,
+    /// Number of output tokens.
     pub output_tokens: u64,
 }
 
@@ -91,9 +106,13 @@ impl Usage {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[non_exhaustive]
+/// Capabilities advertised by a model provider.
 pub struct ModelCapabilities {
+    /// Whether the model can request tools.
     pub supports_tools: bool,
+    /// Whether the provider supports streaming responses.
     pub supports_streaming: bool,
+    /// Whether the model supports structured output.
     pub supports_structured_output: bool,
 }
 
@@ -114,9 +133,12 @@ impl ModelCapabilities {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
+/// Inventory metadata for one available model.
 pub struct ModelInfo {
+    /// Provider-specific model identifier.
     pub id: String,
     #[serde(default)]
+    /// Capabilities reported for the model.
     pub capabilities: ModelCapabilities,
 }
 
@@ -138,9 +160,12 @@ impl ModelInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
+/// Health status reported by a model provider.
 pub struct ProviderHealth {
+    /// Whether the provider is currently healthy.
     pub healthy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional diagnostic detail about the health state.
     pub detail: Option<String>,
 }
 
@@ -168,10 +193,16 @@ impl ProviderHealth {
 }
 
 #[async_trait]
+/// Interface implemented by model backends used by the runner.
 pub trait ModelProvider: Send + Sync {
+    /// Returns the stable provider identifier.
     fn id(&self) -> &str;
+    /// Returns capabilities shared by the provider's models.
     fn capabilities(&self) -> ModelCapabilities;
+    /// Checks provider health.
     async fn health(&self) -> Result<ProviderHealth, HarnessError>;
+    /// Lists models available from the provider.
     async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError>;
+    /// Completes one model request.
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError>;
 }

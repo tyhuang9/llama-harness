@@ -1,0 +1,19 @@
+[package]
+name = "llama-harness-packaged-consumer"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+ollama = ["llama-harness/ollama"]
+observability = ["llama-harness/observability"]
+evals = ["llama-harness/evals"]
+tauri = ["llama-harness/tauri"]
+
+[dependencies]
+llama-harness = "=0.1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

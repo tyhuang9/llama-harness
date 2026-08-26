@@ -7,11 +7,15 @@ use std::{collections::VecDeque, sync::Mutex};
 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
+/// One scripted response or failure for the mock provider.
 pub enum MockStep {
+    /// Return a model response.
     Response(ModelResponse),
+    /// Return a harness error.
     Error(HarnessError),
 }
 
+/// Deterministic model provider backed by a scripted queue.
 pub struct MockModelProvider {
     id: String,
     steps: Mutex<VecDeque<MockStep>>,
@@ -19,6 +23,7 @@ pub struct MockModelProvider {
 }
 
 impl MockModelProvider {
+    /// Creates a mock provider that consumes the supplied steps in order.
     pub fn scripted(steps: impl IntoIterator<Item = MockStep>) -> Self {
         Self {
             id: "mock".into(),
@@ -27,6 +32,7 @@ impl MockModelProvider {
         }
     }
 
+    /// Returns the model requests received by the provider.
     pub fn requests(&self) -> Vec<ModelRequest> {
         self.requests
             .lock()
@@ -84,6 +90,7 @@ impl ModelProvider for MockModelProvider {
     }
 }
 
+/// Creates a scripted successful final response from the mock model.
 pub fn final_response(output: impl Into<String>) -> MockStep {
     MockStep::Response(ModelResponse {
         model: "mock-model".into(),
@@ -93,6 +100,7 @@ pub fn final_response(output: impl Into<String>) -> MockStep {
     })
 }
 
+/// Creates a scripted response containing a tool call.
 pub fn tool_response(call: crate::ToolCall) -> MockStep {
     MockStep::Response(ModelResponse {
         model: "mock-model".into(),
