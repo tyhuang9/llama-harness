@@ -103,11 +103,3 @@ The complete end-user documentation is published with
 The `0.1` release supports Rust applications through the `llama-harness`
 facade. TypeScript, Python, and sidecar distribution remain future work and do
 not affect the Rust crate.
-
-## Logo and brand
-
-The white llama and burgundy harness are the official project mark. The
-[brand board](docs/assets/llama-harness-brand-board.png) records the source
-artwork, wordmark treatment, and color palette; the reusable transparent
-[mascot asset](docs/assets/llama-harness-logo.png) is sized for documentation
-and project surfaces.
