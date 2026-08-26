@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { GUIDES, MAX_INLINE_DEPTH, MAX_INLINE_LENGTH, MAX_LINE_LENGTH, MAX_SOURCE_BYTES, SUPPORTED_MARKDOWN, checkOrWrite, headingSlug, renderInline, renderMarkdown, resolveGuideHref } from "./build-guides.mjs";
 
@@ -9,6 +9,7 @@ const docs = dirname(fileURLToPath(import.meta.url));
 const index = readFileSync(resolve(docs, "index.html"), "utf8");
 const guideFiles = readdirSync(resolve(docs, "guides"));
 const styles = readFileSync(resolve(docs, "styles.css"), "utf8");
+const script = readFileSync(resolve(docs, "script.js"), "utf8");
 
 const decodeHtml = (value) => value.replace(/&(amp|lt|gt|quot);/g, (_, name) => ({ amp: "&", lt: "<", gt: ">", quot: '"' })[name]);
 const words = (value) => (value.toLowerCase().match(/[\p{L}\p{N}_-]+/gu) ?? []).filter((word) => /[\p{L}\p{N}]/u.test(word));
@@ -38,6 +39,9 @@ test("every Markdown source has a checked-in rendered guide", () => {
     const guide = readFileSync(guidePath, "utf8");
     assert.match(guide, /^<!doctype html>/i);
     assert.match(guide, /href="\.\.\/styles\.css"/);
+    assert.match(guide, /<meta name="theme-color" content="#36141c" \/>/);
+    assert.match(guide, /<link rel="icon" type="image\/png" href="\.\.\/assets\/favicon\.png" \/>/);
+    assert.match(guide, /<span class="brand-mark" aria-hidden="true"><img src="\.\.\/assets\/favicon\.png" alt="" \/><\/span>/);
     assert.match(guide, /<article class="guide-article">/);
     assert.match(guide, /<main id="guide-content" class="guide-main" tabindex="-1">/);
     assert.match(guide, new RegExp(`Guide source: <code>${source.replace(".", "\\.")}</code>`));
@@ -59,16 +63,106 @@ test("every Markdown source has a checked-in rendered guide", () => {
 
     const tableCount = (markdown.match(/^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$/gm) ?? []).length;
     assert.equal((guide.match(/class="guide-table-wrap" tabindex="0" role="region" aria-label="Documentation table"/g) ?? []).length, tableCount);
+    assert.ok(tableCount <= 1, `${source} does not repeat the generic Documentation table landmark`);
   }
   assert.deepEqual(guideFiles.sort(), Object.values(GUIDES).sort());
-  assert.match(styles, /\.guide-article th\{color:#596477\}/);
+  assert.match(styles, /\.guide-article th\s*\{[\s\S]*?color: var\(--muted\);[\s\S]*?\}/);
 });
 
 test("index links only to checked-in local HTML and keeps external Markdown external", () => {
   const hrefs = [...index.matchAll(/href="([^"]+)"/g)].map((match) => match[1]);
   assert.equal(hrefs.filter((href) => !/^[a-z][a-z0-9+.-]*:/i.test(href) && href.endsWith(".md")).length, 0);
   for (const href of hrefs.filter((href) => href.startsWith("guides/"))) assert.ok(existsSync(resolve(docs, href)), `${href} exists`);
-  assert.ok(hrefs.includes("https://github.com/tyhuang9/llama-harness/blob/main/protocol/compatibility/v1.md"));
+});
+
+test("every local page link, fragment, stylesheet, script, and image resolves inside docs", () => {
+  const pages = ["index.html", ...guideFiles.map((name) => `guides/${name}`)];
+  for (const page of pages) {
+    const pagePath = resolve(docs, page);
+    const html = readFileSync(pagePath, "utf8");
+    for (const match of html.matchAll(/\b(?:href|src)="([^"]+)"/g)) {
+      const reference = decodeHtml(match[1]);
+      assert.doesNotMatch(reference, /^(?:javascript|data):|^\/\//i, `${page} rejects unsafe reference ${reference}`);
+      if (/^(?:https?:|mailto:)/i.test(reference)) continue;
+
+      const hashIndex = reference.indexOf("#");
+      const pathPart = (hashIndex >= 0 ? reference.slice(0, hashIndex) : reference).split("?")[0];
+      const fragment = hashIndex >= 0 ? decodeURIComponent(reference.slice(hashIndex + 1)) : "";
+      const targetPath = pathPart ? resolve(dirname(pagePath), decodeURIComponent(pathPart)) : pagePath;
+      const docsRelative = relative(docs, targetPath);
+
+      assert.ok(docsRelative && !docsRelative.startsWith("..") && !isAbsolute(docsRelative), `${page} keeps ${reference} inside docs`);
+      assert.ok(existsSync(targetPath), `${page} local reference ${reference} exists`);
+      assert.ok(lstatSync(targetPath).isFile() && !lstatSync(targetPath).isSymbolicLink(), `${page} local reference ${reference} is a regular file`);
+      if (fragment) {
+        const target = readFileSync(targetPath, "utf8");
+        assert.ok(target.includes(`id="${fragment}"`), `${page} fragment ${reference} resolves`);
+      }
+    }
+  }
+});
+
+test("landing page is accessible, Rust-first, and uses the approved brand", () => {
+  assert.equal((index.match(/<h1\b/g) ?? []).length, 1);
+  assert.match(index, /<a class="skip-link" href="#main-content">/);
+  assert.match(index, /<div class="docs-shell" id="top">/);
+  assert.match(index, /<aside class="sidebar" id="sidebar">/);
+  assert.match(index, /<aside class="toc" aria-label="On this page">/);
+  assert.match(index, /<main class="content" id="main-content" tabindex="-1">/);
+  assert.match(index, /<label class="header-search" for="doc-search">/);
+  assert.match(index, /id="filter-status" class="filter-status" aria-live="polite"/);
+  assert.ok(index.indexOf('id="filter-status"') < index.indexOf('<aside class="sidebar"'), "filter status remains available when the mobile drawer is closed");
+  assert.match(index, /<link rel="icon" type="image\/png" href="assets\/favicon\.png" \/>/);
+  assert.match(index, /<span class="brand-mark" aria-hidden="true"><img src="assets\/favicon\.png" alt="" \/><\/span>/);
+  assert.match(index, /<div class="brand-card" aria-label="llama-harness — Run local\. Connect any model\.">/);
+  assert.match(index, /<img src="assets\/llama-harness-logo\.png" alt="" \/>/);
+  assert.match(styles, /--brand-burgundy: #36141c;/);
+  assert.match(styles, /--brand-plum: #6d4b55;/);
+  assert.match(styles, /--brand-off-white: #f2f4f7;/);
+  assert.match(styles, /--brand-charcoal: #171a20;/);
+  assert.match(styles, /--brand-slate: #8b93a1;/);
+  assert.doesNotMatch(styles, /#(?:176b4d|0f513a|edf7f2|b9ddcd|174c39)/i);
+  assert.match(index, /d9f7a84a579a36cd1987c5eeeb30764be70aa8ce/);
+
+  for (const guide of ["embedding", "tools-and-policies", "observability", "evaluations", "tauri", "security", "architecture"]) {
+    assert.match(index, new RegExp(`href="guides/${guide}\\.html"`), `${guide} guide is promoted`);
+  }
+
+  assert.doesNotMatch(index, /href="guides\/(?:typescript-sdk|python-sdk|protocol|developer-console)\.html"/);
+  assert.doesNotMatch(index, /class="(?:hero|brand-stage)"/);
+  assert.doesNotMatch(index, /9953d6c/);
+  assert.match(styles, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(script, /Copy failed/);
+  assert.match(script, /setAttribute\('aria-live', 'polite'\)/);
+  assert.match(script, /event\.key === '\/'/);
+  assert.match(script, /sideLinks\.find\(\(link\) => !link\.hidden\)\?\.focus/);
+  assert.match(script, /target\?\.focus\(\{ preventScroll: true \}\)/);
+  assert.match(styles, /\.toc-nav a\.active\s*\{[\s\S]*?font-weight: 700;[\s\S]*?text-decoration: underline;/);
+});
+
+test("landing page local fragments and social preview resolve", () => {
+  const ids = new Set([...index.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]));
+  const localFragments = [...index.matchAll(/href="#([^"]+)"/g)].map((match) => decodeURIComponent(match[1]));
+  for (const fragment of localFragments) assert.ok(ids.has(fragment), `#${fragment} resolves to a landing-page id`);
+
+  const socialImage = resolve(docs, "og.png");
+  assert.ok(existsSync(socialImage), "the social preview image is checked in");
+  assert.ok(lstatSync(socialImage).isFile() && !lstatSync(socialImage).isSymbolicLink(), "the social preview is a regular file");
+  assert.ok(lstatSync(socialImage).size > 0, "the social preview is not empty");
+  const socialBytes = readFileSync(socialImage);
+  assert.equal(socialBytes.readUInt32BE(16), 1200, "the social preview has the recommended width");
+  assert.equal(socialBytes.readUInt32BE(20), 630, "the social preview has the recommended height");
+  for (const asset of ["assets/favicon.png", "assets/llama-harness-logo.png", "assets/llama-harness-brand-board.png"]) {
+    const assetPath = resolve(docs, asset);
+    assert.ok(existsSync(assetPath), `${asset} is checked in`);
+    assert.ok(lstatSync(assetPath).isFile() && !lstatSync(assetPath).isSymbolicLink(), `${asset} is a regular file`);
+    assert.ok(lstatSync(assetPath).size > 0, `${asset} is not empty`);
+  }
+  assert.match(index, /<meta property="og:image" content="https:\/\/tyhuang9\.github\.io\/llama-harness\/og\.png" \/>/);
+  assert.match(index, /<meta property="og:image:alt" content="[^"]+" \/>/);
+  assert.match(index, /<meta name="twitter:card" content="summary_large_image" \/>/);
+  assert.match(index, /<meta name="twitter:image" content="https:\/\/tyhuang9\.github\.io\/llama-harness\/og\.png" \/>/);
+  assert.match(index, /<meta name="twitter:image:alt" content="[^"]+" \/>/);
 });
 
 test("checked-in guides exactly match the deterministic renderer", () => {

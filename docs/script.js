@@ -1,42 +1,88 @@
 const menu = document.querySelector('.menu-button');
 const sidebar = document.querySelector('.sidebar');
+const search = document.querySelector('#doc-search');
+const filterStatus = document.querySelector('#filter-status');
+const sideLinks = [...document.querySelectorAll('.side-nav a')];
+const navSections = [...document.querySelectorAll('.nav-section')];
+const copyStatus = document.createElement('span');
 
-function closeSidebar() {
+copyStatus.className = 'sr-only';
+copyStatus.setAttribute('aria-live', 'polite');
+document.body.append(copyStatus);
+
+function closeSidebar({ restoreFocus = true } = {}) {
   if (!sidebar.classList.contains('open')) return;
   sidebar.classList.remove('open');
   menu?.setAttribute('aria-expanded', 'false');
-  menu?.focus({ preventScroll: true });
+  if (restoreFocus) menu?.focus({ preventScroll: true });
 }
 
 menu?.addEventListener('click', () => {
-  const open = sidebar.classList.toggle('open');
-  menu.setAttribute('aria-expanded', String(open));
+  if (sidebar.classList.contains('open')) {
+    closeSidebar({ restoreFocus: false });
+    return;
+  }
+  sidebar.classList.add('open');
+  menu.setAttribute('aria-expanded', 'true');
+  sideLinks.find((link) => !link.hidden)?.focus({ preventScroll: true });
 });
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') closeSidebar();
+  if (event.key === '/' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    const editable = event.target instanceof HTMLInputElement
+      || event.target instanceof HTMLTextAreaElement
+      || event.target?.isContentEditable;
+    if (!editable) {
+      event.preventDefault();
+      search?.focus();
+    }
+  }
+});
+
+window.addEventListener('resize', () => {
+  if (window.matchMedia('(min-width: 901px)').matches) closeSidebar({ restoreFocus: false });
 });
 
 document.querySelectorAll('.copy').forEach((button) => {
   button.addEventListener('click', async () => {
     const value = button.dataset.copy;
     if (!value) return;
-    await navigator.clipboard.writeText(value);
     const original = button.textContent;
-    button.textContent = 'Copied';
-    window.setTimeout(() => { button.textContent = original; }, 1400);
+    button.disabled = true;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable');
+      await navigator.clipboard.writeText(value);
+      button.textContent = 'Copied';
+      copyStatus.textContent = 'Copied to clipboard.';
+    } catch {
+      button.textContent = 'Copy failed';
+      copyStatus.textContent = 'Unable to copy. Select the command or code manually.';
+    }
+    window.setTimeout(() => {
+      button.textContent = original;
+      copyStatus.textContent = '';
+      button.disabled = false;
+    }, 1800);
   });
 });
 
-const search = document.querySelector('#doc-search');
 search?.addEventListener('input', () => {
   const query = search.value.trim().toLowerCase();
-  document.querySelectorAll('.side-nav a').forEach((link) => {
+  let visible = 0;
+  sideLinks.forEach((link) => {
     link.hidden = Boolean(query) && !link.textContent.toLowerCase().includes(query);
+    if (!link.hidden) visible += 1;
   });
+  navSections.forEach((section) => {
+    section.hidden = ![...section.querySelectorAll('a')].some((link) => !link.hidden);
+  });
+  if (filterStatus) filterStatus.textContent = query
+    ? `${visible} matching ${visible === 1 ? 'link' : 'links'}.`
+    : '';
 });
 
-const inPageLinks = [...document.querySelectorAll('.side-nav a[href^="#"]')];
+const inPageLinks = [...document.querySelectorAll('.side-nav a[href^="#"], .toc-nav a[href^="#"]')];
 const sections = inPageLinks
   .map((link) => ({ link, section: document.querySelector(link.getAttribute('href')) }))
   .filter(({ section }) => section);
@@ -65,6 +111,10 @@ window.addEventListener('hashchange', () => setActiveLink(window.location.hash) 
 window.addEventListener('scroll', updateActiveLink, { passive: true });
 
 inPageLinks.forEach((link) => link.addEventListener('click', () => {
-  setActiveLink(link.getAttribute('href'));
-  closeSidebar();
+  const hash = link.getAttribute('href');
+  const target = document.querySelector(hash);
+  const drawerWasOpen = sidebar.classList.contains('open');
+  setActiveLink(hash);
+  closeSidebar({ restoreFocus: false });
+  if (drawerWasOpen) window.requestAnimationFrame(() => target?.focus({ preventScroll: true }));
 }));
