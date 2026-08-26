@@ -1,101 +1,109 @@
+<div align="center">
+
+<!-- Logo / brand area: replace this text lockup with approved artwork when ready. -->
+
 # llama-harness
 
-`llama-harness` is a Rust-native framework for controlled local agentic
-workflows. One canonical `AgentRunner` owns model/tool looping, validation,
-policy, approvals, limits, cancellation, and causal events.
+**A Rust library for local agent workflows that stay under your application's control.**
 
-**[Read the API documentation →](https://tyhuang9.github.io/llama-harness/)**
+[Documentation](https://tyhuang9.github.io/llama-harness/) ·
+[Rust API](https://docs.rs/llama-harness) ·
+[Examples](examples/local-task-agent) ·
+[License](LICENSE)
 
-The documentation site is a Stripe-inspired, searchable API reference for the
-core runner, tool controls, sidecar SDKs, Tauri integration, and release path.
+</div>
 
-Rust and Tauri applications embed that engine directly through the
-`llama-harness` facade. The Rust 0.1 release is independent of the deferred
-Node/TypeScript and Python sidecar distribution. It is not a daemon, HTTP
-listener, hosted service, control plane, model downloader, or universal shell.
+`llama-harness` runs the model-and-tool loop inside your Rust application. It
+handles validation, limits, cancellation, approvals, and ordered events while
+your application keeps ownership of its tools, data, policy, and UI.
 
-## Packages
+## What you get
 
-- `llama-harness`: intentional public Rust facade with opt-in `ollama`,
-  `observability`, `evals`, and `tauri` features.
-- `llama-harness-core`: provider-neutral canonical engine.
-- `llama-harness-ollama`: direct loopback-only Ollama provider; no model pulls.
-- `llama-harness-observability`: optional redacted local SQLite events.
-- `llama-harness-evals`: deterministic versioned evaluation contracts.
-- `llama-harness-protocol` and `llama-harness-runtime`: deferred, non-published
-  child-sidecar work for future non-Rust SDK distribution.
-- `llama-harness-tauri`: embedded event, approval, cancellation, and trace-path
-  helpers for a Tauri Rust backend.
-- `sdks/typescript` and `sdks/python`: managed child-sidecar SDKs.
+- One bounded `AgentRunner` for model calls and tool execution.
+- Application-defined providers, tools, policy, approvals, and event sinks.
+- Fail-closed defaults for state-changing tools and callback failures.
+- Optional Ollama, SQLite observability, evaluation, and Tauri integrations.
 
-The CLI, Promptfoo adapter, scripted test runtime, examples, and developer
-console are development/local tools and are not published framework packages.
+## Install
 
-## Rust quick start
-
-The minimum supported Rust version is 1.88. Default features are empty; enable
-only the named integration modules your application needs.
+The supported facade has no default features. Enable only what your application
+uses:
 
 ```toml
 [dependencies]
 llama-harness = { version = "0.1.0", features = ["ollama"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+If crates.io indexing is still in progress, pin the reviewed `0.1.0` source:
+
+```toml
+llama-harness = { git = "https://github.com/tyhuang9/llama-harness", rev = "d9f7a84a579a36cd1987c5eeeb30764be70aa8ce", features = ["ollama"] }
+```
+
+Minimum supported Rust version: **1.88**.
+
+| Feature | Adds |
+| --- | --- |
+| `ollama` | A loopback-only provider for an existing local Ollama service |
+| `observability` | Redacted, local SQLite run and event storage |
+| `evals` | Deterministic evaluation and replay contracts |
+| `tauri` | Tauri event, approval, cancellation, and trace helpers |
+
+## Quick start with Ollama
+
+Ollama and the selected model must already be installed and running locally.
 
 ```rust
 use std::sync::Arc;
-use llama_harness::{mock::{final_response, MockModelProvider}, AgentDefinition, AgentRunner, RunRequest};
 
-# async fn example() -> Result<(), llama_harness::HarnessError> {
-let runner = AgentRunner::builder(Arc::new(MockModelProvider::scripted([final_response("done")]))).build();
-let result = runner.run(RunRequest::new(AgentDefinition::new("example", "Example", "1", "mock-model"), "Reply with done")).await?;
-assert_eq!(result.final_output.as_deref(), Some("done"));
-# Ok(()) }
+use llama_harness::{
+    ollama::OllamaProvider, AgentDefinition, AgentRunner, RunRequest,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), llama_harness::HarnessError> {
+    let provider = Arc::new(OllamaProvider::new()?);
+    let runner = AgentRunner::builder(provider).build();
+    let agent = AgentDefinition::new("assistant", "Assistant", "1", "qwen3:8b");
+
+    let result = runner
+        .run(RunRequest::new(agent, "Explain why the sky is blue."))
+        .await?;
+
+    println!("{}", result.final_output.unwrap_or_default());
+    Ok(())
+}
 ```
 
-For a runnable task-agent reference:
+## Your application stays in charge
 
-```bash
-cargo run -p local-task-agent -- --trace-db local-task-agent-traces.sqlite
-cargo run -p llama-harness-cli -- eval validate evals/local-task-agent/suite.yaml
-```
+The harness does not become your control plane. Your application decides which
+tools exist, what data they can access, which calls need approval, how events
+are displayed, and when a run should stop. The library supplies the reusable
+loop and enforces the boundaries you configure.
 
-Ollama is opt-in, must already run locally, and is limited to loopback URLs.
+## Documentation
 
-## SDK and Tauri quick start
+- [Start embedding the runner](docs/embedding.md)
+- [Define tools, policy, and approvals](docs/tools-and-policies.md)
+- [Add local observability](docs/observability.md)
+- [Build deterministic evaluations](docs/evaluations.md)
+- [Integrate with Tauri](docs/tauri.md)
+- [Review the security model](docs/security.md)
+- [Understand the architecture](docs/architecture.md)
 
-The TypeScript and Python SDKs remain workspace prototypes; see their guides for
-managed child-sidecar integration details.
+The complete end-user documentation is published with
+[GitHub Pages](https://tyhuang9.github.io/llama-harness/).
 
-Tauri hosts should use the embedded Rust facade and optional `tauri` feature;
-the frontend receives structured events and opaque one-time approval IDs, never
-direct tool capability. See the linked guides below.
+## Project scope
 
-## Guides
+The `0.1` release supports Rust applications through the `llama-harness`
+facade. TypeScript, Python, and sidecar distribution remain future work and do
+not affect the Rust crate.
 
-- [API documentation](https://tyhuang9.github.io/llama-harness/) (GitHub Pages)
+## Logo and brand
 
-- [Architecture](docs/architecture.md) and [embedding](docs/embedding.md)
-- [Protocol compatibility](protocol/compatibility/v1.md) and [SDK architecture](docs/sdk-architecture.md)
-- [TypeScript SDK](docs/typescript-sdk.md) and [Python SDK](docs/python-sdk.md)
-- [Tauri integration](docs/tauri.md) and [Note integration](docs/integrating-note.md)
-- [Tools and policies](docs/tools-and-policies.md), [observability](docs/observability.md), and [security](docs/security.md)
-- [Distribution](docs/distribution.md), [releasing](docs/releasing.md), and [migration](docs/migration.md)
-
-## Verification
-
-```bash
-cargo fmt --check --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo doc --workspace --all-features --no-deps
-cargo run -p xtask -- protocol-check
-cargo run -p xtask -- release-check
-
-npm --prefix sdks/typescript run test
-npm --prefix sdks/typescript run pack:dry-run
-python -m build sdks/python
-python scripts/inspect_python_packages.py
-```
-
-Rust publication is a separate, manual, review-gated operation. Normal CI does
-not publish crates, binaries, models, or hosted-service artifacts.
+The official logo and broader brand system are intentionally still open. The
+text name and temporary `lh` mark reserve their place in the README and docs so
+approved artwork can be added later without restructuring either entry point.
