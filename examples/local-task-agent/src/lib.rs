@@ -3,20 +3,20 @@
 //! The example registers only task tools. It has no generic shell, filesystem, or
 //! database tool, and uses a local in-memory task store for every runtime instance.
 
-use async_trait::async_trait;
-use llama_harness_core::{
+use llama_harness::{
+    async_trait,
+    evals::{EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation},
     load_agent_manifest,
     mock::{final_response, tool_response, MockModelProvider},
-    AgentDefinition, AgentRunner, ApprovalHandler, ApprovalRecord, EventSink, GenerationOptions,
-    HarnessError, InMemoryEventSink, JsonMap, ModelProvider, PolicyDecision, PolicyEngine,
-    RunOverrides, RunRequest, Tool, ToolCall, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    AgentDefinition, AgentRunner, ApprovalHandler, ApprovalRecord, CancellationToken, EventSink,
+    GenerationOptions, HarnessError, InMemoryEventSink, JsonMap, ModelProvider, PolicyDecision,
+    PolicyEngine, RunOverrides, RunRequest, RunResult, Tool, ToolCall, ToolDefinition,
+    ToolRegistry, ToolResult, ToolRisk,
 };
-use llama_harness_evals::{EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
 
 pub const LIST_TASKS_TOOL: &str = "list_tasks";
 pub const CREATE_TASK_TOOL: &str = "create_task";
@@ -253,16 +253,16 @@ impl ApprovalHandler for StaticApproval {
         _: &Value,
         _: &RunRequest,
     ) -> Result<ApprovalRecord, HarnessError> {
-        Ok(ApprovalRecord {
-            call_id: String::new(),
-            tool_id: tool.id.clone(),
-            granted: self.grant,
-            reason: if self.grant {
-                "example approval granted".into()
+        Ok(ApprovalRecord::new(
+            "",
+            tool.id.clone(),
+            self.grant,
+            if self.grant {
+                "example approval granted"
             } else {
-                "example approval denied".into()
+                "example approval denied"
             },
-        })
+        ))
     }
 }
 
@@ -323,7 +323,7 @@ impl TaskAgentRuntime {
         &self,
         input: impl Into<String>,
         model: Option<String>,
-    ) -> Result<llama_harness_core::RunResult, HarnessError> {
+    ) -> Result<RunResult, HarnessError> {
         self.runner
             .run(RunRequest {
                 agent: self.agent.clone(),
@@ -364,31 +364,21 @@ pub fn scripted_provider(scenario: MockScenario) -> MockModelProvider {
         MockScenario::CompleteExisting => "Updated the existing task after approval.",
     };
     let step = match scenario {
-        MockScenario::CompleteExisting => Some(ToolCall {
-            id: "update-1".into(),
-            tool_id: UPDATE_TASK_TOOL.into(),
-            arguments_json: r#"{"id":"task-1","status":"completed"}"#.into(),
-        }),
-        MockScenario::ListDuplicate => Some(ToolCall {
-            id: "list-1".into(),
-            tool_id: LIST_TASKS_TOOL.into(),
-            arguments_json: "{}".into(),
-        }),
-        MockScenario::CreateNew => Some(ToolCall {
-            id: "create-1".into(),
-            tool_id: CREATE_TASK_TOOL.into(),
-            arguments_json: r#"{"title":"Schedule dentist appointment"}"#.into(),
-        }),
-        MockScenario::DisallowedTool => Some(ToolCall {
-            id: "bad-1".into(),
-            tool_id: "delete_all_tasks".into(),
-            arguments_json: "{}".into(),
-        }),
-        MockScenario::MalformedArguments => Some(ToolCall {
-            id: "bad-json-1".into(),
-            tool_id: CREATE_TASK_TOOL.into(),
-            arguments_json: "{not-json".into(),
-        }),
+        MockScenario::CompleteExisting => Some(ToolCall::new(
+            "update-1",
+            UPDATE_TASK_TOOL,
+            r#"{"id":"task-1","status":"completed"}"#,
+        )),
+        MockScenario::ListDuplicate => Some(ToolCall::new("list-1", LIST_TASKS_TOOL, "{}")),
+        MockScenario::CreateNew => Some(ToolCall::new(
+            "create-1",
+            CREATE_TASK_TOOL,
+            r#"{"title":"Schedule dentist appointment"}"#,
+        )),
+        MockScenario::DisallowedTool => Some(ToolCall::new("bad-1", "delete_all_tasks", "{}")),
+        MockScenario::MalformedArguments => {
+            Some(ToolCall::new("bad-json-1", CREATE_TASK_TOOL, "{not-json"))
+        }
         MockScenario::Ambiguous => None,
     };
     match step {

@@ -16,6 +16,7 @@ pub trait EvalExecutor: Send + Sync {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct EvalExecutionRequest {
     pub suite_id: String,
     pub agent_id: String,

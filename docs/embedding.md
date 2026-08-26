@@ -23,11 +23,14 @@ cargo run -p local-task-agent -- \
 
 ```rust
 use std::sync::Arc;
-use llama_harness_core::{AgentRunner, EventSink, ModelProvider};
-use llama_harness_observability::{SqliteEventSink, TraceStoreConfig};
+use llama_harness::{
+    observability::{SqliteEventSink, TraceStoreConfig},
+    ollama::OllamaProvider,
+    AgentRunner, EventSink, ModelProvider,
+};
 
 let provider: Arc<dyn ModelProvider> = Arc::new(
-    llama_harness_ollama::OllamaProvider::new()?
+    OllamaProvider::new()?
 );
 let traces = Arc::new(SqliteEventSink::open("traces.sqlite", TraceStoreConfig::default())?);
 
@@ -55,7 +58,11 @@ not transfer tools, provider credentials, or a mutable trace path to the webview
 
 ## Deterministic evaluation
 
-Implement `llama_harness_evals::EvalExecutor` in the application to build a fresh fixture sandbox and real runtime for every case. The local-task-agent example provides `TaskAgentEvalExecutor` and `evals/local-task-agent/suite.yaml`; its mock-provider evaluation tests need no network, GPU, Promptfoo, or Ollama.
+Enable the facade's `evals` feature and implement
+`llama_harness::evals::EvalExecutor` in the application to build a fresh fixture
+sandbox and real runtime for every case. The local-task-agent example provides
+`TaskAgentEvalExecutor` and `evals/local-task-agent/suite.yaml`; its mock-provider
+evaluation tests need no network, GPU, Promptfoo, or Ollama.
 
 ```bash
 cargo test -p local-task-agent

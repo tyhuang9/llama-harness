@@ -2,12 +2,24 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RunError {
     pub code: String,
     pub message: String,
 }
 
+impl RunError {
+    /// Creates a stable, serializable run error.
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HarnessError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),

@@ -11,14 +11,9 @@ name = "local-task-agent"
 path = "src/main.rs"
 
 [dependencies]
-async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
-llama-harness-core = { version = "0.1.0", path = "../../crates/llama-harness-core" }
-llama-harness-evals = { version = "0.1.0", path = "../../crates/llama-harness-evals" }
-llama-harness-observability = { version = "0.1.0", path = "../../crates/llama-harness-observability" }
-llama-harness-ollama = { version = "0.1.0", path = "../../crates/llama-harness-ollama" }
+llama-harness = { version = "0.1.0", path = "../../crates/llama-harness", default-features = false, features = ["ollama", "observability", "evals"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tokio-util = "0.7"

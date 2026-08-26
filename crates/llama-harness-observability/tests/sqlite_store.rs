@@ -18,13 +18,7 @@ fn record(
     timestamp_ms: u64,
     event: RunEvent,
 ) -> EventRecord {
-    EventRecord {
-        run_id: run_id.into(),
-        trace_id: trace_id.into(),
-        sequence,
-        timestamp_ms,
-        event,
-    }
+    EventRecord::new(run_id, trace_id, sequence, timestamp_ms, event)
 }
 
 fn started(run_id: &str, trace_id: &str, timestamp_ms: u64) -> EventRecord {

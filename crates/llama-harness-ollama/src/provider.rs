@@ -152,7 +152,7 @@ impl OllamaProvider {
             &request.generation,
             self.keep_alive.as_deref(),
             true,
-        );
+        )?;
         let response = self
             .send(
                 self.http.post(self.endpoint("api/chat")?).json(&body),
@@ -245,11 +245,7 @@ impl ModelProvider for OllamaProvider {
     }
 
     fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities {
-            supports_tools: true,
-            supports_streaming: true,
-            supports_structured_output: false,
-        }
+        ModelCapabilities::new(true, true, false)
     }
 
     async fn health(&self) -> Result<ProviderHealth, HarnessError> {
@@ -259,14 +255,11 @@ impl ModelProvider for OllamaProvider {
         }
 
         match self.get_json::<Version>("api/version").await {
-            Ok(version) => Ok(ProviderHealth {
-                healthy: true,
-                detail: version.version.map(|version| format!("Ollama {version}")),
-            }),
-            Err(error) => Ok(ProviderHealth {
-                healthy: false,
-                detail: Some(error.to_string()),
-            }),
+            Ok(version) => Ok(ProviderHealth::new(
+                true,
+                version.version.map(|version| format!("Ollama {version}")),
+            )),
+            Err(error) => Ok(ProviderHealth::unhealthy(error.to_string())),
         }
     }
 
@@ -275,10 +268,7 @@ impl ModelProvider for OllamaProvider {
         Ok(response
             .models
             .into_iter()
-            .map(|model| ModelInfo {
-                id: model.name,
-                capabilities: self.capabilities(),
-            })
+            .map(|model| ModelInfo::new(model.name).with_capabilities(self.capabilities()))
             .collect())
     }
 
@@ -294,7 +284,7 @@ impl ModelProvider for OllamaProvider {
             &request.generation,
             self.keep_alive.as_deref(),
             false,
-        );
+        )?;
         let response = self
             .send(
                 self.http.post(self.endpoint("api/chat")?).json(&body),
@@ -316,12 +306,12 @@ impl ModelProvider for OllamaProvider {
         let final_output = message.and_then(|message| {
             (!message.content.is_empty() || tool_calls.is_empty()).then(|| message.content.clone())
         });
-        Ok(ModelResponse {
-            model: response.model.clone().unwrap_or(requested_model),
-            final_output,
-            tool_calls,
-            usage: usage(&response),
-        })
+        let mut model_response =
+            ModelResponse::new(response.model.clone().unwrap_or(requested_model))
+                .with_tool_calls(tool_calls)
+                .with_usage(usage(&response));
+        model_response.final_output = final_output;
+        Ok(model_response)
     }
 }
 

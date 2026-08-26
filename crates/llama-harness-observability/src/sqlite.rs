@@ -42,18 +42,21 @@ impl Default for TraceStoreConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AppendOutcome {
     Inserted,
     Duplicate,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct PersistedEvent {
     pub record: EventRecord,
     pub raw_payload: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RunSummary {
     pub run_id: String,
     pub trace_id: String,
@@ -80,12 +83,14 @@ pub struct RetentionPolicy {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RetentionResult {
     pub events_deleted: u64,
     pub runs_deleted: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ExportedRun {
     pub run_id: String,
     pub trace_id: String,
@@ -93,6 +98,7 @@ pub struct ExportedRun {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct PersistedEventExport {
     pub record: EventRecord,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,6 +106,7 @@ pub struct PersistedEventExport {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TraceStoreError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
@@ -626,6 +633,7 @@ fn event_kind(event: &RunEvent) -> &'static str {
         RunEvent::ApprovalRequested { .. } => "approval.requested",
         RunEvent::ToolCompleted { .. } => "tool.completed",
         RunEvent::Completed { .. } => "run.completed",
+        _ => "run.unknown",
     }
 }
 
@@ -642,6 +650,7 @@ fn status_text(status: &RunStatus) -> &'static str {
         RunStatus::Failed => "failed",
         RunStatus::Cancelled => "cancelled",
         RunStatus::LimitReached => "limit_reached",
+        _ => "unknown",
     }
 }
 

@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use llama_harness::{
     mock::{final_response, MockModelProvider},
-    AgentDefinition, AgentRunner, RedactionConfig, RunEvent, RunRequest, RunStatus,
-    SqliteEventSink, TraceStoreConfig, REDACTED_VALUE,
+    observability::{RedactionConfig, SqliteEventSink, TraceStoreConfig, REDACTED_VALUE},
+    AgentDefinition, AgentRunner, RunEvent, RunRequest, RunStatus,
 };
 
 #[tokio::test]

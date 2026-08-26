@@ -1,6 +1,10 @@
 # Architecture
 
-`llama-harness-core` is the canonical Rust engine. A Rust or Tauri host embeds it directly; Node and Python hosts start `llama-harness-runtime` only as a private JSONL child process. Neither mode starts a daemon, HTTP listener, or shared control plane.
+`llama-harness-core` is the canonical Rust engine. Rust and Tauri hosts consume
+it through the supported `llama-harness` facade and its named optional modules.
+The protocol/runtime workspace crates remain deferred non-Rust adapter work;
+they are not part of the Rust 0.1 publication. No mode starts a daemon, HTTP
+listener, or shared control plane.
 
 The host supplies a `ModelProvider`, its own `Tool` implementations, a policy engine, an approval callback, and (optionally) an event sink such as the local SQLite store in `llama-harness-observability`. The sidecar is a thin process boundary around the same `AgentRunner`; it never reimplements model/tool looping or owns application authorization.
 
@@ -8,7 +12,12 @@ The controlled `AgentRunner` validates an `AgentDefinition` and `RunRequest`, re
 
 The core library keeps only the data needed while a run is active. Persistence is deliberately an optional dependency: `llama-harness-observability` provides a local, redacted SQLite `EventSink`, while hosts decide whether they want to attach it. Raw payloads are off by default and must be explicitly enabled.
 
-`ModelProvider` is provider-neutral: it exposes health, inventory, capabilities, and bounded cancellable completion. The scripted mock in `llama_harness_core::mock` keeps tests independent of a network, GPU, or Ollama installation. `llama-harness-ollama` supplies the direct loopback Ollama provider, defaulting to `http://127.0.0.1:11434`; it does not require LiteLLM or any Harness daemon.
+`ModelProvider` is provider-neutral: it exposes health, inventory, capabilities,
+and bounded cancellable completion. The scripted mock in `llama_harness::mock`
+keeps tests independent of a network, GPU, or Ollama installation. The
+`llama_harness::ollama` module supplies the direct loopback Ollama provider,
+defaulting to `http://127.0.0.1:11434`; it does not require LiteLLM or a Harness
+daemon.
 
 Tool argument schemas use JSON Schema validation. `ToolDefinition` also declares risk, idempotency, and read-only metadata, but applications remain responsible for the actual side effects and authorization behind a tool.
 

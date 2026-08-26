@@ -6,7 +6,11 @@ No package or release artifact is published by this repository's normal CI check
 
 Create a crates.io account and token, verify intended package-name availability, and store the token only in the protected CI secret store. Published crates.io versions are immutable: correct a bad release with a new version or, when appropriate, yank it; yanking does not delete the published source package.
 
-The initial publishable Rust crates use a unified `0.1.0` version. The development-only Promptfoo integration, scripted test runtime, examples, developer console, and release helper are intentionally not published. The CLI is also local-only while it depends on development-only Promptfoo support.
+The initial publishable Rust crates use a unified `0.1.0` version:
+`llama-harness-core`, `llama-harness-ollama`, `llama-harness-observability`,
+`llama-harness-tauri`, `llama-harness-evals`, and the `llama-harness` facade.
+Protocol/runtime, SDKs, Promptfoo integration, scripted runtime, examples,
+developer console, CLI, and release helper are not published in this milestone.
 
 ## Local release verification
 
@@ -42,16 +46,24 @@ The helper deliberately does not claim that `cargo publish --dry-run` can comple
 The order follows workspace dependencies and is verified by the release checklist:
 
 1. `llama-harness-core`
-2. `llama-harness-protocol`
-3. `llama-harness-evals`, `llama-harness-observability`, and `llama-harness-ollama`
-4. `llama-harness-runtime` and `llama-harness-tauri`
-5. `llama-harness`
+2. `llama-harness-ollama`, `llama-harness-observability`, and `llama-harness-tauri`
+3. `llama-harness-evals`
+4. `llama-harness`
+
+The Rust release is validated and operated independently of the deferred SDK
+artifact workflow. No workflow publishes until a human explicitly authorizes
+the exact release.
 
 ## Sidecar SDK distribution
 
 The release workflow at `.github/workflows/release.yml` is manual-dispatch only. It builds `llama-harness-runtime` for supported Windows x64, macOS arm64, and Linux x64 targets, generates checksums and a machine-readable manifest, and stages a matching platform-specific npm runtime package plus Python wheel. It does not build model images, pull models, or package Ollama.
 
-The workflow defaults to validation mode. Set its `publish` input only after a reviewer confirms the version, generated manifest, checksums, package contents, registry credentials, and release notes. Keep the publication order: Rust dependencies first, runtime artifacts next, npm/PyPI SDK packages after their corresponding artifacts, then the facade. Registry publication remains an operator action; no normal CI job publishes packages.
+The workflow defaults to validation mode. Set its `publish` input only after a
+reviewer confirms the version, generated manifest, checksums, package contents,
+registry credentials, and release notes. The deferred SDK sequence is separate:
+publish runtime artifacts first, then the matching npm/PyPI packages. It neither
+precedes nor blocks the Cargo sequence above. Each sequence requires its own
+explicit human authorization; no normal CI job publishes packages.
 
 For a local platform rehearsal without publishing, run:
 

@@ -11,7 +11,7 @@ readme.workspace = true
 documentation = "https://docs.rs/llama-harness-protocol"
 keywords = ["agents", "protocol", "sdk"]
 categories = ["development-tools", "encoding"]
-publish = ["crates-io"]
+publish = false
 
 [dependencies]
 schemars = { version = "1", features = ["derive"] }

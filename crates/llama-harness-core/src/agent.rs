@@ -118,6 +118,7 @@ impl RunRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RunStatus {
     Completed,
     Failed,
@@ -126,6 +127,7 @@ pub enum RunStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RunResult {
     pub id: String,
     pub status: RunStatus,
@@ -146,4 +148,31 @@ pub struct RunResult {
     pub tool_call_limit_reached: bool,
     pub repeated_tool_call_limit_reached: bool,
     pub cancelled: bool,
+}
+
+impl RunResult {
+    /// Creates an empty run result that adapters and evaluation fixtures can populate.
+    pub fn new(
+        id: impl Into<String>,
+        status: RunStatus,
+        model: impl Into<String>,
+        trace_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            status,
+            final_output: None,
+            model: model.into(),
+            tool_calls: Vec::new(),
+            policy_decisions: Vec::new(),
+            approvals: Vec::new(),
+            errors: Vec::new(),
+            duration_ms: 0,
+            trace_id: trace_id.into(),
+            model_call_limit_reached: false,
+            tool_call_limit_reached: false,
+            repeated_tool_call_limit_reached: false,
+            cancelled: false,
+        }
+    }
 }

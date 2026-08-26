@@ -12,11 +12,14 @@ cargo run -p llama-harness-cli -- inspect run &lt;run-id&gt; --db local-task-age
   --trace-db local-task-agent-traces.sqlite</code></pre>
       <h2 id="application-setup">Application setup</h2>
       <pre><code class="language-rust">use std::sync::Arc;
-use llama_harness_core::{AgentRunner, EventSink, ModelProvider};
-use llama_harness_observability::{SqliteEventSink, TraceStoreConfig};
+use llama_harness::{
+    observability::{SqliteEventSink, TraceStoreConfig},
+    ollama::OllamaProvider,
+    AgentRunner, EventSink, ModelProvider,
+};
 
 let provider: Arc&lt;dyn ModelProvider&gt; = Arc::new(
-    llama_harness_ollama::OllamaProvider::new()?
+    OllamaProvider::new()?
 );
 let traces = Arc::new(SqliteEventSink::open(&quot;traces.sqlite&quot;, TraceStoreConfig::default())?);
 
@@ -33,7 +36,7 @@ let runner = AgentRunner::builder(provider)
       <p>Use proposal/commit tools for sensitive mutations when appropriate: an application can let a model generate a proposal, validate and preview it, collect user approval, then expose a narrowly scoped commit tool. Cancellation and timeouts stop future runner work but cannot roll back an external side effect already started by a tool; application tools must remain idempotent or use application-level idempotency keys where needed.</p>
       <p>For a Tauri host, enable the facade's <code>tauri</code> feature and read <a href="tauri.html"><code>tauri.md</code></a>. It forwards structured events, maps frontend approvals through opaque one-time identifiers, and registers cancellation tokens; it does not transfer tools, provider credentials, or a mutable trace path to the webview.</p>
       <h2 id="deterministic-evaluation">Deterministic evaluation</h2>
-      <p>Implement <code>llama_harness_evals::EvalExecutor</code> in the application to build a fresh fixture sandbox and real runtime for every case. The local-task-agent example provides <code>TaskAgentEvalExecutor</code> and <code>evals/local-task-agent/suite.yaml</code>; its mock-provider evaluation tests need no network, GPU, Promptfoo, or Ollama.</p>
+      <p>Enable the facade's <code>evals</code> feature and implement <code>llama_harness::evals::EvalExecutor</code> in the application to build a fresh fixture sandbox and real runtime for every case. The local-task-agent example provides <code>TaskAgentEvalExecutor</code> and <code>evals/local-task-agent/suite.yaml</code>; its mock-provider evaluation tests need no network, GPU, Promptfoo, or Ollama.</p>
       <pre><code class="language-bash">cargo test -p local-task-agent
 cargo run -p llama-harness-cli -- eval validate evals/local-task-agent/suite.yaml</code></pre>
       <p>The optional real example smoke test is enabled only when requested:</p>

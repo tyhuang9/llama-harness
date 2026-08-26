@@ -148,11 +148,7 @@ async fn facade_runner_read_and_granted_write_follow_approval_contract() {
     let result = runner(
         read,
         [
-            tool_response(ToolCall {
-                id: "read-call".into(),
-                tool_id: "notes.read".into(),
-                arguments_json: "{}".into(),
-            }),
+            tool_response(ToolCall::new("read-call", "notes.read", "{}")),
             final_response("done"),
         ],
         Arc::clone(&router),
@@ -168,11 +164,7 @@ async fn facade_runner_read_and_granted_write_follow_approval_contract() {
     let runner = Arc::new(runner(
         write,
         [
-            tool_response(ToolCall {
-                id: "write-call".into(),
-                tool_id: "notes.write".into(),
-                arguments_json: "{}".into(),
-            }),
+            tool_response(ToolCall::new("write-call", "notes.write", "{}")),
             final_response("done"),
         ],
         Arc::clone(&router),
@@ -201,11 +193,7 @@ async fn facade_runner_denial_and_cancellation_leave_no_write_and_clear_host_sta
     let denied = Arc::new(runner(
         tool("notes.write", false, Arc::clone(&state)),
         [
-            tool_response(ToolCall {
-                id: "deny".into(),
-                tool_id: "notes.write".into(),
-                arguments_json: "{}".into(),
-            }),
+            tool_response(ToolCall::new("deny", "notes.write", "{}")),
             final_response("done"),
         ],
         Arc::clone(&router),
@@ -223,11 +211,7 @@ async fn facade_runner_denial_and_cancellation_leave_no_write_and_clear_host_sta
     let approvals_before = approval_count(&emitter);
     let cancelling = Arc::new(runner(
         tool("notes.write", false, Arc::clone(&state)),
-        [tool_response(ToolCall {
-            id: "cancel".into(),
-            tool_id: "notes.write".into(),
-            arguments_json: "{}".into(),
-        })],
+        [tool_response(ToolCall::new("cancel", "notes.write", "{}"))],
         Arc::clone(&router),
         emitter.clone(),
     ));

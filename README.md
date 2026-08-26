@@ -9,21 +9,21 @@ policy, approvals, limits, cancellation, and causal events.
 The documentation site is a Stripe-inspired, searchable API reference for the
 core runner, tool controls, sidecar SDKs, Tauri integration, and release path.
 
-Rust and Tauri applications embed that engine directly. Node/TypeScript and
-Python applications may use a private `llama-harness-runtime` JSONL child
-process that wraps the same engine. It is not a daemon, HTTP listener, hosted
-service, control plane, model downloader, or universal shell.
+Rust and Tauri applications embed that engine directly through the
+`llama-harness` facade. The Rust 0.1 release is independent of the deferred
+Node/TypeScript and Python sidecar distribution. It is not a daemon, HTTP
+listener, hosted service, control plane, model downloader, or universal shell.
 
 ## Packages
 
 - `llama-harness`: intentional public Rust facade with opt-in `ollama`,
-  `observability`, `evals`, `protocol`, and `tauri` features.
+  `observability`, `evals`, and `tauri` features.
 - `llama-harness-core`: provider-neutral canonical engine.
 - `llama-harness-ollama`: direct loopback-only Ollama provider; no model pulls.
 - `llama-harness-observability`: optional redacted local SQLite events.
 - `llama-harness-evals`: deterministic versioned evaluation contracts.
-- `llama-harness-protocol` and `llama-harness-runtime`: versioned child-sidecar
-  contract and runtime for non-Rust SDKs.
+- `llama-harness-protocol` and `llama-harness-runtime`: deferred, non-published
+  child-sidecar work for future non-Rust SDK distribution.
 - `llama-harness-tauri`: embedded event, approval, cancellation, and trace-path
   helpers for a Tauri Rust backend.
 - `sdks/typescript` and `sdks/python`: managed child-sidecar SDKs.
@@ -32,6 +32,14 @@ The CLI, Promptfoo adapter, scripted test runtime, examples, and developer
 console are development/local tools and are not published framework packages.
 
 ## Rust quick start
+
+The minimum supported Rust version is 1.88. Default features are empty; enable
+only the named integration modules your application needs.
+
+```toml
+[dependencies]
+llama-harness = { version = "0.1.0", features = ["ollama"] }
+```
 
 ```rust
 use std::sync::Arc;
@@ -55,12 +63,8 @@ Ollama is opt-in, must already run locally, and is limited to loopback URLs.
 
 ## SDK and Tauri quick start
 
-The TypeScript and Python SDKs start a process only in `start()`, route host
-tools/policy/approval callbacks over correlated JSONL messages, expose ordered
-events, and fail closed on missing approval or callback errors. Give them an
-explicit `runtimePath`, `LLAMA_HARNESS_RUNTIME_PATH`, or the matching
-package-owned platform runtime. They never download a binary or search arbitrary
-`PATH` entries.
+The TypeScript and Python SDKs remain workspace prototypes; see their guides for
+managed child-sidecar integration details.
 
 Tauri hosts should use the embedded Rust facade and optional `tauri` feature;
 the frontend receives structured events and opaque one-time approval IDs, never
@@ -93,6 +97,5 @@ python -m build sdks/python
 python scripts/inspect_python_packages.py
 ```
 
-The manual-only release workflow builds supported runtime artifacts, staged
-platform SDK packages, checksums, and a machine-readable manifest. Normal CI
-does not publish Rust, npm, Python, binary, model, or hosted-service artifacts.
+Rust publication is a separate, manual, review-gated operation. Normal CI does
+not publish crates, binaries, models, or hosted-service artifacts.

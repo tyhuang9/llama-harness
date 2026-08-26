@@ -1,6 +1,8 @@
-use llama_harness_core::{EventSink, InMemoryEventSink, ModelProvider, RunStatus};
-use llama_harness_observability::{SqliteEventSink, TraceStoreConfig};
-use llama_harness_ollama::OllamaProvider;
+use llama_harness::{
+    observability::{SqliteEventSink, TraceStoreConfig},
+    ollama::OllamaProvider,
+    EventSink, InMemoryEventSink, ModelProvider, RunResult, RunStatus,
+};
 use local_task_agent::{
     build_runtime, default_tasks, scripted_provider, MockScenario, TaskStore, CREATE_TASK_TOOL,
     UPDATE_TASK_TOOL,
@@ -11,11 +13,7 @@ use std::sync::Arc;
 async fn run_with_memory_events(
     scenario: MockScenario,
     grant_approval: bool,
-) -> (
-    llama_harness_core::RunResult,
-    Arc<TaskStore>,
-    Arc<InMemoryEventSink>,
-) {
+) -> (RunResult, Arc<TaskStore>, Arc<InMemoryEventSink>) {
     let provider = Arc::new(scripted_provider(scenario));
     let store = Arc::new(TaskStore::new(default_tasks()).unwrap());
     let events = Arc::new(InMemoryEventSink::default());
@@ -41,7 +39,7 @@ async fn updates_existing_task_only_after_approval() {
     assert!(result.approvals[0].granted);
     assert!(events.events().iter().any(|event| matches!(
         event.event,
-        llama_harness_core::RunEvent::ApprovalRequested { ref tool_id, .. } if tool_id == UPDATE_TASK_TOOL
+        llama_harness::RunEvent::ApprovalRequested { ref tool_id, .. } if tool_id == UPDATE_TASK_TOOL
     )));
 }
 

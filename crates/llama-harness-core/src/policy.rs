@@ -5,6 +5,7 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PolicyDecision {
     Allow { reason: String },
     Deny { reason: String },
@@ -12,11 +13,29 @@ pub enum PolicyDecision {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ApprovalRecord {
     pub call_id: String,
     pub tool_id: String,
     pub granted: bool,
     pub reason: String,
+}
+
+impl ApprovalRecord {
+    /// Creates an approval decision for one tool call.
+    pub fn new(
+        call_id: impl Into<String>,
+        tool_id: impl Into<String>,
+        granted: bool,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool_id: tool_id.into(),
+            granted,
+            reason: reason.into(),
+        }
+    }
 }
 
 #[async_trait]

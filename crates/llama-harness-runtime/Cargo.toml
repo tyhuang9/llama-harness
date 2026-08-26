@@ -11,7 +11,7 @@ readme.workspace = true
 documentation = "https://docs.rs/llama-harness-runtime"
 keywords = ["agents", "sidecar", "sdk"]
 categories = ["development-tools", "asynchronous"]
-publish = ["crates-io"]
+publish = false
 
 [[bin]]
 name = "llama-harness-runtime"

@@ -1,9 +1,13 @@
 # Distribution
 
 Rust users depend on the `llama-harness` facade and explicitly enable only the
-features they need. `core` is always embedded; `ollama`, `observability`,
-`evals`, `protocol`, and `tauri` are optional. The CLI, Promptfoo adapter,
-examples, console, and scripted test sidecar are deliberately not published.
+features they need. The facade's core exports are always available; `ollama`,
+`observability`, `evals`, and `tauri` are optional named modules. These six Rust-facing crates
+are the 0.1 publication set. The CLI, protocol/runtime sidecar, Promptfoo
+adapter, examples, console, and scripted test sidecar are not published.
+
+The Rust release requires Rust 1.88 and is validated independently of the
+deferred Node/TypeScript and Python package work described below.
 
 Node distribution is two artifacts: `@llama-harness/sdk` plus exactly one
 matching `@llama-harness/runtime-<platform>-<arch>` package containing the

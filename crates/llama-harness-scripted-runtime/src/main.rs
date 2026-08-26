@@ -18,11 +18,11 @@ struct ScriptedProviderFactory;
 impl ProviderFactory for ScriptedProviderFactory {
     fn create(&self, _: &ProviderConfiguration) -> Result<Arc<dyn ModelProvider>, HarnessError> {
         Ok(Arc::new(MockModelProvider::scripted([
-            tool_response(ToolCall {
-                id: "scripted-call-1".into(),
-                tool_id: "notes.search".into(),
-                arguments_json: r#"{"query":"harness"}"#.into(),
-            }),
+            tool_response(ToolCall::new(
+                "scripted-call-1",
+                "notes.search",
+                r#"{"query":"harness"}"#,
+            )),
             final_response("scripted sidecar completed after host tool callback"),
         ])))
     }

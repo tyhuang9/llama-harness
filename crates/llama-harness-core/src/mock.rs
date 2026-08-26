@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use std::{collections::VecDeque, sync::Mutex};
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum MockStep {
     Response(ModelResponse),
     Error(HarnessError),
@@ -99,4 +100,9 @@ pub fn tool_response(call: crate::ToolCall) -> MockStep {
         tool_calls: vec![call],
         usage: Usage::default(),
     })
+}
+
+/// Creates a scripted provider failure.
+pub fn error_response(error: HarnessError) -> MockStep {
+    MockStep::Error(error)
 }
