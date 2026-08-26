@@ -34,7 +34,7 @@ if ($LASTEXITCODE -ne 0) {
 $metadata = $metadataJson | ConvertFrom-Json
 $publishableCrates = @(
     $metadata.packages |
-        Where-Object { @($_.publish) -contains "crates-io" } |
+        Where-Object { $null -eq $_.publish -or @($_.publish) -contains "crates-io" } |
         ForEach-Object { [string]$_.name }
 )
 
@@ -79,9 +79,18 @@ if ($RecordInitialBaseline) {
     throw "Baseline tag $expectedTag already exists; run cargo-semver-checks instead of recording an initial baseline."
 }
 
+$releaseTags = @(
+    & git tag --merged HEAD --list "v[0-9]*.[0-9]*.[0-9]*" --sort=-version:refname |
+        Where-Object { $_ -match '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' }
+)
+if ($LASTEXITCODE -ne 0 -or $releaseTags.Count -eq 0) {
+    throw "Unable to resolve the latest stable release tag for SemVer comparison."
+}
+$comparisonTag = $releaseTags[0]
+Write-Host "Comparing the public Rust API with latest release $comparisonTag."
 foreach ($crate in $recordedCrates) {
-    Write-Host "+ cargo semver-checks --package $crate --baseline-rev $expectedTag"
-    & cargo semver-checks --package $crate --baseline-rev $expectedTag
+    Write-Host "+ cargo semver-checks --package $crate --baseline-rev $comparisonTag"
+    & cargo semver-checks --package $crate --baseline-rev $comparisonTag
     if ($LASTEXITCODE -ne 0) {
         throw "cargo-semver-checks failed for $crate with exit code $LASTEXITCODE."
     }

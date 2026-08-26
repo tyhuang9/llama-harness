@@ -88,33 +88,40 @@ fn protocol_check(root: &Path) -> CheckResult {
 
 fn release_check(root: &Path) -> CheckResult {
     ensure_clean_tree(root)?;
-    run_cargo(root, ["fmt", "--check", "--all"])?;
+    run_cargo(root, publishable_cargo_arguments(["fmt", "--check"], []))?;
     run_cargo(
         root,
-        [
-            "clippy",
-            "--locked",
-            "--workspace",
-            "--all-targets",
-            "--all-features",
-            "--",
-            "-D",
-            "warnings",
-        ],
+        publishable_cargo_arguments(
+            ["clippy", "--locked", "--all-targets", "--all-features"],
+            ["--", "-D", "warnings"],
+        ),
     )?;
-    run_cargo(root, ["test", "--locked", "--workspace", "--all-features"])?;
+    run_cargo(
+        root,
+        publishable_cargo_arguments(["test", "--locked", "--all-targets", "--all-features"], []),
+    )?;
     run_cargo_with_env(
         root,
-        [
-            "doc",
-            "--locked",
-            "--workspace",
-            "--all-features",
-            "--no-deps",
-        ],
-        [("RUSTDOCFLAGS", "-D warnings")],
+        publishable_cargo_arguments(["doc", "--locked", "--all-features", "--no-deps"], []),
+        [(
+            "RUSTDOCFLAGS",
+            "-D warnings -D rustdoc::broken_intra_doc_links -D missing_docs",
+        )],
     )?;
     package_check_after_clean(root)
+}
+
+fn publishable_cargo_arguments<const P: usize, const S: usize>(
+    prefix: [&str; P],
+    suffix: [&str; S],
+) -> Vec<OsString> {
+    let mut arguments = prefix.into_iter().map(OsString::from).collect::<Vec<_>>();
+    for package in PUBLISHABLE_CRATES {
+        arguments.push(OsString::from("--package"));
+        arguments.push(OsString::from(package.name));
+    }
+    arguments.extend(suffix.into_iter().map(OsString::from));
+    arguments
 }
 
 fn package_check(root: &Path) -> CheckResult {
@@ -759,6 +766,29 @@ mod tests {
         assert_eq!(PUBLISHABLE_CRATES[3].name, "llama-harness-tauri");
         assert_eq!(PUBLISHABLE_CRATES[4].name, "llama-harness-evals");
         assert_eq!(PUBLISHABLE_CRATES[5].name, "llama-harness");
+    }
+
+    #[test]
+    fn release_commands_select_only_the_publishable_crates() {
+        let arguments = publishable_cargo_arguments(["test", "--locked"], ["--all-features"])
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|argument| *argument == "--package")
+                .count(),
+            6
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--workspace"));
+        assert!(!arguments.iter().any(|argument| argument == "--all"));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument == "llama-harness-runtime"));
+        for package in PUBLISHABLE_CRATES {
+            assert!(arguments.iter().any(|argument| argument == package.name));
+        }
     }
 
     #[test]

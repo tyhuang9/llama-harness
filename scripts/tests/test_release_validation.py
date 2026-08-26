@@ -11,6 +11,7 @@ import warnings
 import zipfile
 from pathlib import Path
 import re
+import subprocess
 from unittest import mock
 
 from scripts.inspect_npm_package import SDK_FILES, inspect_npm_package
@@ -266,6 +267,261 @@ class InputAndAbiTests(unittest.TestCase):
                 for line in text.splitlines():
                     if "${{ inputs.version }}" in line:
                         self.assertEqual(line.strip(), "RELEASE_VERSION: ${{ inputs.version }}")
+
+    def test_rust_release_workflow_is_validation_only_and_independent(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github" / "workflows" / "release-rust.yml").read_text(encoding="utf-8")
+        preflight = (root / "scripts" / "release" / "check-rust-release.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertIn('refs/heads/main', workflow)
+        self.assertIn("toolchain: 1.88.0", workflow)
+        self.assertIn("cargo run --locked --package xtask -- release-check", workflow)
+        self.assertNotIn("cargo publish", workflow)
+        self.assertNotIn("cargo owner", workflow)
+        self.assertNotIn("gh release", workflow)
+        self.assertNotIn("secrets.", workflow)
+        self.assertNotIn("upload-artifact", workflow)
+        self.assertNotIn("llama-harness-runtime", workflow)
+        self.assertNotIn("llama-harness-protocol", workflow)
+        self.assertIn("persist-credentials: false", workflow)
+        self.assertIn("SOURCE_COMMIT: ${{ github.sha }}", workflow)
+        self.assertIn("REVIEWED_SOURCE_COMMIT: ${{ inputs.source_commit }}", workflow)
+
+        self.assertNotIn("AllowDirty", preflight)
+        self.assertIn("git status --porcelain=v1 --untracked-files=all", preflight)
+        self.assertIn('$null -eq $_.publish', preflight)
+        self.assertEqual(preflight.count('"llama-harness"'), 1)
+        for crate in (
+            "llama-harness-core",
+            "llama-harness-evals",
+            "llama-harness-observability",
+            "llama-harness-ollama",
+            "llama-harness-tauri",
+        ):
+            self.assertIn(f'"{crate}"', preflight)
+
+
+class RustReleaseWorkflowTests(unittest.TestCase):
+    @staticmethod
+    def run_preflight(root: Path, source_commit: str, version: str = "0.1.0") -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-File",
+                str(root / "scripts" / "release" / "check-rust-release.ps1"),
+                "-Version",
+                version,
+                "-SourceCommit",
+                source_commit,
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    @staticmethod
+    def clone_repository(root: Path, destination: Path) -> str:
+        subprocess.run(
+            ["git", "clone", "--quiet", "--no-hardlinks", str(root), str(destination)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        source_preflight = root / "scripts" / "release" / "check-rust-release.ps1"
+        cloned_preflight = destination / "scripts" / "release" / "check-rust-release.ps1"
+        cloned_preflight.write_text(source_preflight.read_text(encoding="utf-8"), encoding="utf-8")
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=destination,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+
+    def test_rust_release_workflow_is_read_only_and_complete(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github" / "workflows" / "release-rust.yml").read_text(encoding="utf-8")
+
+        self.assertIn("pull_request:", workflow)
+        self.assertRegex(workflow, r"workflow_dispatch:\s+inputs:\s+version:")
+        self.assertRegex(
+            workflow,
+            r"version:\s+description:[^\n]+\s+required: true[\s\S]*?\s+type: string",
+        )
+        self.assertRegex(workflow, r"permissions:\s+contents: read")
+        self.assertIn("concurrency:", workflow)
+        self.assertIn("cancel-in-progress: true", workflow)
+        self.assertGreaterEqual(workflow.count("refs/heads/main"), 1)
+        self.assertEqual(workflow.count("${{ inputs.version }}"), 1)
+        self.assertEqual(workflow.count("${{ inputs.source_commit }}"), 1)
+        self.assertEqual(workflow.count("${{ github.sha }}"), 1)
+        self.assertIn("toolchain: stable", workflow)
+        self.assertIn("toolchain: 1.88.0", workflow)
+
+        required_commands = (
+            "scripts/release/check-rust-release.ps1",
+            "cargo deny check advisories licenses sources",
+            "cargo run --locked --package xtask -- release-check",
+            "scripts/semver/check-rust-semver.ps1",
+            "cargo generate-lockfile",
+            "cargo check --all-targets --all-features",
+        )
+        for command in required_commands:
+            with self.subTest(command=command):
+                self.assertIn(command, workflow)
+
+        documented_crates = set(
+            re.findall(r"--package (llama-harness(?:-[a-z]+)?)", workflow)
+        )
+        self.assertEqual(
+            documented_crates,
+            {
+                "llama-harness-core",
+                "llama-harness-ollama",
+                "llama-harness-observability",
+                "llama-harness-evals",
+                "llama-harness-tauri",
+                "llama-harness",
+            },
+        )
+
+        forbidden = (
+            "cargo publish",
+            "secrets.",
+            "contents: write",
+            "packages: write",
+            "id-token: write",
+            "upload-artifact",
+            "download-artifact",
+            "git push",
+            "gh release",
+            "actions/setup-node",
+            "actions/setup-python",
+            "sdks/",
+            "apps/harness-console",
+            "llama-harness-runtime",
+        )
+        for value in forbidden:
+            with self.subTest(forbidden=value):
+                self.assertNotIn(value, workflow)
+
+    def test_rust_release_preflight_has_exact_metadata_contract(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        script = (root / "scripts" / "release" / "check-rust-release.ps1").read_text(encoding="utf-8")
+        crate_block = re.search(
+            r"\$expectedCrates = @\((.*?)\)\s*\|\s*Sort-Object\s*\$stableVersionPattern",
+            script,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(crate_block)
+        crates = set(re.findall(r'"(llama-harness(?:-[a-z]+)?)"', crate_block.group(1)))
+        self.assertEqual(
+            crates,
+            {
+                "llama-harness-core",
+                "llama-harness-ollama",
+                "llama-harness-observability",
+                "llama-harness-evals",
+                "llama-harness-tauri",
+                "llama-harness",
+            },
+        )
+        self.assertIn("cargo metadata --locked --format-version 1 --no-deps", script)
+        self.assertIn('$expectedRustVersion = "1.88"', script)
+        self.assertIn("exact stable SemVer", script)
+        self.assertIn("Unreleased", script)
+        self.assertIn("yyyy-MM-dd", script)
+        self.assertIn("must not be empty", script)
+        self.assertIn("git status --porcelain=v1 --untracked-files=all", script)
+        self.assertIn('$null -eq $_.publish', script)
+        self.assertIn("does not match reviewed source commit", script)
+        self.assertNotIn("AllowDirty", script)
+
+    def test_rust_release_preflight_rejects_a_different_source_commit(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        result = self.run_preflight(root, "0" * 40)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match reviewed source commit", result.stdout + result.stderr)
+
+    def test_rust_release_preflight_rejects_metadata_changelog_and_tree_drift(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        cases = (
+            (
+                "default-publish crate",
+                lambda clone: (clone / "crates" / "llama-harness-protocol" / "Cargo.toml").write_text(
+                    (clone / "crates" / "llama-harness-protocol" / "Cargo.toml")
+                    .read_text(encoding="utf-8")
+                    .replace("publish = false\n", ""),
+                    encoding="utf-8",
+                ),
+                "Expected exactly the six supported crates.io packages",
+            ),
+            (
+                "MSRV mismatch",
+                lambda clone: (clone / "Cargo.toml").write_text(
+                    (clone / "Cargo.toml").read_text(encoding="utf-8").replace(
+                        'rust-version = "1.88"', 'rust-version = "1.89"'
+                    ),
+                    encoding="utf-8",
+                ),
+                "Every published crate must declare Rust 1.88",
+            ),
+            (
+                "duplicate changelog",
+                lambda clone: (clone / "CHANGELOG.md").write_text(
+                    (clone / "CHANGELOG.md").read_text(encoding="utf-8")
+                    + "\n## 0.1.0 — Unreleased\n\n- Duplicate.\n",
+                    encoding="utf-8",
+                ),
+                "exactly one level-two heading",
+            ),
+            (
+                "empty changelog",
+                lambda clone: (clone / "CHANGELOG.md").write_text(
+                    "# Changelog\n\n## 0.1.0 — Unreleased\n\n## Versioning policy\n\nPolicy.\n",
+                    encoding="utf-8",
+                ),
+                "must not be empty",
+            ),
+            (
+                "comment-only changelog",
+                lambda clone: (clone / "CHANGELOG.md").write_text(
+                    "# Changelog\n\n## 0.1.0 — Unreleased\n\n<!--\nplaceholder\n-->\n\n"
+                    "## Versioning policy\n\nPolicy.\n",
+                    encoding="utf-8",
+                ),
+                "must not be empty",
+            ),
+            (
+                "dirty tree",
+                lambda clone: (clone / "untracked-release-file").write_text("dirty", encoding="utf-8"),
+                "requires a clean Git working tree",
+            ),
+        )
+
+        for name, mutate, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                clone = Path(directory) / "repository"
+                source_commit = self.clone_repository(root, clone)
+                mutate(clone)
+                result = self.run_preflight(clone, source_commit)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stdout + result.stderr)
+
+    def test_semver_gate_uses_the_latest_reachable_stable_release(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        script = (root / "scripts" / "semver" / "check-rust-semver.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('git tag --merged HEAD --list "v[0-9]*.[0-9]*.[0-9]*" --sort=-version:refname', script)
+        self.assertIn("--baseline-rev $comparisonTag", script)
+        self.assertIn('$null -eq $_.publish', script)
+        self.assertNotIn("--baseline-rev $expectedTag", script)
 
 
 if __name__ == "__main__":
