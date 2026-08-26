@@ -24,7 +24,7 @@ menu?.addEventListener('click', () => {
   }
   sidebar.classList.add('open');
   menu.setAttribute('aria-expanded', 'true');
-  sideLinks[0]?.focus({ preventScroll: true });
+  sideLinks.find((link) => !link.hidden)?.focus({ preventScroll: true });
 });
 
 document.addEventListener('keydown', (event) => {
@@ -111,6 +111,10 @@ window.addEventListener('hashchange', () => setActiveLink(window.location.hash) 
 window.addEventListener('scroll', updateActiveLink, { passive: true });
 
 inPageLinks.forEach((link) => link.addEventListener('click', () => {
-  setActiveLink(link.getAttribute('href'));
+  const hash = link.getAttribute('href');
+  const target = document.querySelector(hash);
+  const drawerWasOpen = sidebar.classList.contains('open');
+  setActiveLink(hash);
   closeSidebar({ restoreFocus: false });
+  if (drawerWasOpen) window.requestAnimationFrame(() => target?.focus({ preventScroll: true }));
 }));

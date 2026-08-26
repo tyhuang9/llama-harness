@@ -30,20 +30,23 @@
         <span class="brand-label">Docs</span>
       </a>
 
-      <label class="header-search" for="doc-search">
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="m21 21-4.35-4.35m2.35-5.15a7.5 7.5 0 1 1-15 0 7.5 7.5 0 0 1 15 0Z" />
-        </svg>
-        <span class="sr-only">Filter documentation sections</span>
-        <input
-          id="doc-search"
-          type="search"
-          placeholder="Filter this page"
-          autocomplete="off"
-          aria-describedby="filter-status"
-        />
-        <kbd aria-hidden="true">/</kbd>
-      </label>
+      <div class="search-wrap">
+        <label class="header-search" for="doc-search">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m21 21-4.35-4.35m2.35-5.15a7.5 7.5 0 1 1-15 0 7.5 7.5 0 0 1 15 0Z" />
+          </svg>
+          <span class="sr-only">Filter navigation links</span>
+          <input
+            id="doc-search"
+            type="search"
+            placeholder="Filter navigation"
+            autocomplete="off"
+            aria-describedby="filter-status"
+          />
+          <kbd aria-hidden="true">/</kbd>
+        </label>
+        <div id="filter-status" class="filter-status" aria-live="polite"></div>
+      </div>
 
       <nav class="topnav" aria-label="Project links">
         <a href="https://docs.rs/llama-harness">Rust API</a>
@@ -59,30 +62,35 @@
       <aside class="sidebar" id="sidebar">
         <nav class="side-nav" aria-label="Documentation navigation">
           <div class="nav-section">
-            <div class="nav-heading">Get started</div>
-            <a href="#overview">Introduction</a>
-            <a href="#installation">Installation</a>
-            <a href="#quickstart">Quick start</a>
+            <h2 class="nav-heading">Get started</h2>
+            <ul>
+              <li><a href="#overview">Introduction</a></li>
+              <li><a href="#installation">Installation</a></li>
+              <li><a href="#quickstart">Quick start</a></li>
+            </ul>
           </div>
           <div class="nav-section">
-            <div class="nav-heading">Use the library</div>
-            <a href="#ownership">Application ownership</a>
-            <a href="#concepts">Core concepts</a>
-            <a href="#features">Cargo features</a>
+            <h2 class="nav-heading">Use the library</h2>
+            <ul>
+              <li><a href="#ownership">Application ownership</a></li>
+              <li><a href="#concepts">Core concepts</a></li>
+              <li><a href="#features">Cargo features</a></li>
+            </ul>
           </div>
           <div class="nav-section">
-            <div class="nav-heading">Guides</div>
-            <a href="guides/embedding.html">Embedding</a>
-            <a href="guides/tools-and-policies.html">Tools and policies</a>
-            <a href="guides/observability.html">Observability</a>
-            <a href="guides/evaluations.html">Evaluations</a>
-            <a href="guides/tauri.html">Tauri</a>
-            <a href="guides/security.html">Security</a>
-            <a href="guides/architecture.html">Architecture</a>
+            <h2 class="nav-heading">Guides</h2>
+            <ul>
+              <li><a href="guides/embedding.html">Embedding</a></li>
+              <li><a href="guides/tools-and-policies.html">Tools and policies</a></li>
+              <li><a href="guides/observability.html">Observability</a></li>
+              <li><a href="guides/evaluations.html">Evaluations</a></li>
+              <li><a href="guides/tauri.html">Tauri</a></li>
+              <li><a href="guides/security.html">Security</a></li>
+              <li><a href="guides/architecture.html">Architecture</a></li>
+            </ul>
           </div>
         </nav>
 
-        <div id="filter-status" class="filter-status" aria-live="polite"></div>
         <div class="sidebar-meta">
           <div><span>Crate</span><strong>0.1.0</strong></div>
           <div><span>Minimum Rust</span><strong>1.88</strong></div>
@@ -95,7 +103,7 @@
 
       <main class="content" id="main-content" tabindex="-1">
         <article class="docs-article">
-          <header class="doc-intro" id="overview">
+          <header class="doc-intro" id="overview" tabindex="-1">
             <div class="breadcrumbs" aria-label="Breadcrumb">
               <span>Documentation</span><span aria-hidden="true">/</span><span>Rust</span>
             </div>
@@ -111,7 +119,7 @@
             </div>
           </header>
 
-          <section class="doc-section" id="installation">
+          <section class="doc-section" id="installation" tabindex="-1">
             <div class="section-kicker">Installation</div>
             <h2>Add the supported facade</h2>
             <p>
@@ -154,7 +162,7 @@ tokio = { version = <span class="str">"1"</span>, features = [<span class="str">
             </aside>
           </section>
 
-          <section class="doc-section" id="quickstart">
+          <section class="doc-section" id="quickstart" tabindex="-1">
             <div class="section-kicker">Quick start</div>
             <h2>Run a local Ollama model</h2>
             <p>
@@ -193,7 +201,7 @@ tokio = { version = <span class="str">"1"</span>, features = [<span class="str">
             </div>
           </section>
 
-          <section class="doc-section" id="ownership">
+          <section class="doc-section" id="ownership" tabindex="-1">
             <div class="section-kicker">Architecture</div>
             <h2>Your application stays in charge</h2>
             <p>
@@ -223,7 +231,7 @@ tokio = { version = <span class="str">"1"</span>, features = [<span class="str">
             </div>
           </section>
 
-          <section class="doc-section" id="concepts">
+          <section class="doc-section" id="concepts" tabindex="-1">
             <div class="section-kicker">Reference</div>
             <h2>Core concepts</h2>
             <div class="definition-list">
@@ -250,7 +258,7 @@ tokio = { version = <span class="str">"1"</span>, features = [<span class="str">
             </div>
           </section>
 
-          <section class="doc-section" id="features">
+          <section class="doc-section" id="features" tabindex="-1">
             <div class="section-kicker">Cargo</div>
             <h2>Optional features</h2>
             <p>The provider-neutral facade has no default features.</p>
@@ -267,7 +275,7 @@ tokio = { version = <span class="str">"1"</span>, features = [<span class="str">
             </div>
           </section>
 
-          <section class="doc-section" id="guides">
+          <section class="doc-section" id="guides" tabindex="-1">
             <div class="section-kicker">Next steps</div>
             <h2>Implementation guides</h2>
             <div class="guide-grid">
@@ -288,8 +296,8 @@ tokio = { version = <span class="str">"1"</span>, features = [<span class="str">
       </main>
 
       <aside class="toc" aria-label="On this page">
-        <div class="toc-title">On this page</div>
-        <nav class="toc-nav">
+        <div class="toc-title" id="toc-title">On this page</div>
+        <nav class="toc-nav" aria-labelledby="toc-title">
           <a href="#overview">Introduction</a>
           <a href="#installation">Installation</a>
           <a href="#quickstart">Quick start</a>

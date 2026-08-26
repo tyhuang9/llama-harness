@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { GUIDES, MAX_INLINE_DEPTH, MAX_INLINE_LENGTH, MAX_LINE_LENGTH, MAX_SOURCE_BYTES, SUPPORTED_MARKDOWN, checkOrWrite, headingSlug, renderInline, renderMarkdown, resolveGuideHref } from "./build-guides.mjs";
 
@@ -60,6 +60,7 @@ test("every Markdown source has a checked-in rendered guide", () => {
 
     const tableCount = (markdown.match(/^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$/gm) ?? []).length;
     assert.equal((guide.match(/class="guide-table-wrap" tabindex="0" role="region" aria-label="Documentation table"/g) ?? []).length, tableCount);
+    assert.ok(tableCount <= 1, `${source} does not repeat the generic Documentation table landmark`);
   }
   assert.deepEqual(guideFiles.sort(), Object.values(GUIDES).sort());
   assert.match(styles, /\.guide-article th\{color:#596477\}/);
@@ -71,6 +72,33 @@ test("index links only to checked-in local HTML and keeps external Markdown exte
   for (const href of hrefs.filter((href) => href.startsWith("guides/"))) assert.ok(existsSync(resolve(docs, href)), `${href} exists`);
 });
 
+test("every local page link, fragment, stylesheet, script, and image resolves inside docs", () => {
+  const pages = ["index.html", ...guideFiles.map((name) => `guides/${name}`)];
+  for (const page of pages) {
+    const pagePath = resolve(docs, page);
+    const html = readFileSync(pagePath, "utf8");
+    for (const match of html.matchAll(/\b(?:href|src)="([^"]+)"/g)) {
+      const reference = decodeHtml(match[1]);
+      assert.doesNotMatch(reference, /^(?:javascript|data):|^\/\//i, `${page} rejects unsafe reference ${reference}`);
+      if (/^(?:https?:|mailto:)/i.test(reference)) continue;
+
+      const hashIndex = reference.indexOf("#");
+      const pathPart = (hashIndex >= 0 ? reference.slice(0, hashIndex) : reference).split("?")[0];
+      const fragment = hashIndex >= 0 ? decodeURIComponent(reference.slice(hashIndex + 1)) : "";
+      const targetPath = pathPart ? resolve(dirname(pagePath), decodeURIComponent(pathPart)) : pagePath;
+      const docsRelative = relative(docs, targetPath);
+
+      assert.ok(docsRelative && !docsRelative.startsWith("..") && !isAbsolute(docsRelative), `${page} keeps ${reference} inside docs`);
+      assert.ok(existsSync(targetPath), `${page} local reference ${reference} exists`);
+      assert.ok(lstatSync(targetPath).isFile() && !lstatSync(targetPath).isSymbolicLink(), `${page} local reference ${reference} is a regular file`);
+      if (fragment) {
+        const target = readFileSync(targetPath, "utf8");
+        assert.ok(target.includes(`id="${fragment}"`), `${page} fragment ${reference} resolves`);
+      }
+    }
+  }
+});
+
 test("landing page is accessible, Rust-first, and reserves the brand surface", () => {
   assert.equal((index.match(/<h1\b/g) ?? []).length, 1);
   assert.match(index, /<a class="skip-link" href="#main-content">/);
@@ -80,6 +108,7 @@ test("landing page is accessible, Rust-first, and reserves the brand surface", (
   assert.match(index, /<main class="content" id="main-content" tabindex="-1">/);
   assert.match(index, /<label class="header-search" for="doc-search">/);
   assert.match(index, /id="filter-status" class="filter-status" aria-live="polite"/);
+  assert.ok(index.indexOf('id="filter-status"') < index.indexOf('<aside class="sidebar"'), "filter status remains available when the mobile drawer is closed");
   assert.match(index, /aria-label="Reserved area for the llama-harness logo and brand system"/);
   assert.match(index, /d9f7a84a579a36cd1987c5eeeb30764be70aa8ce/);
 
@@ -94,6 +123,9 @@ test("landing page is accessible, Rust-first, and reserves the brand surface", (
   assert.match(script, /Copy failed/);
   assert.match(script, /setAttribute\('aria-live', 'polite'\)/);
   assert.match(script, /event\.key === '\/'/);
+  assert.match(script, /sideLinks\.find\(\(link\) => !link\.hidden\)\?\.focus/);
+  assert.match(script, /target\?\.focus\(\{ preventScroll: true \}\)/);
+  assert.match(styles, /\.toc-nav a\.active\s*\{[\s\S]*?font-weight: 700;[\s\S]*?text-decoration: underline;/);
 });
 
 test("landing page local fragments and social preview resolve", () => {
