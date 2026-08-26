@@ -3,108 +3,303 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="llama-harness API reference and integration guide." />
-    <title>llama-harness API reference</title>
+    <meta name="description" content="Build bounded, application-owned agent workflows in Rust with llama-harness." />
+    <meta name="theme-color" content="#ffffff" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="llama-harness — controlled local agents in Rust" />
+    <meta property="og:description" content="A Rust library for bounded model and tool loops that stay under your application's control." />
+    <meta property="og:url" content="https://tyhuang9.github.io/llama-harness/" />
+    <meta property="og:image" content="https://tyhuang9.github.io/llama-harness/og.png" />
+    <meta property="og:image:alt" content="llama-harness — Controlled local agents in Rust" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="llama-harness — controlled local agents in Rust" />
+    <meta name="twitter:description" content="A Rust library for bounded model and tool loops that stay under your application's control." />
+    <meta name="twitter:image" content="https://tyhuang9.github.io/llama-harness/og.png" />
+    <meta name="twitter:image:alt" content="llama-harness — Controlled local agents in Rust" />
+    <title>llama-harness documentation</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+
     <header class="topbar">
-      <a class="brand" href="#top" aria-label="llama-harness home">
+      <a class="brand" href="#top" aria-label="llama-harness documentation home">
+        <!-- Reserved logo / brand asset slot. Replace the temporary mark when approved. -->
         <span class="brand-mark" aria-hidden="true">lh</span>
-        <span>llama-harness</span>
+        <span class="brand-name">llama-harness</span>
+        <span class="brand-label">Docs</span>
       </a>
-      <nav class="topnav" aria-label="Primary navigation">
-        <a href="#api">API reference</a>
+
+      <label class="header-search" for="doc-search">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m21 21-4.35-4.35m2.35-5.15a7.5 7.5 0 1 1-15 0 7.5 7.5 0 0 1 15 0Z" />
+        </svg>
+        <span class="sr-only">Filter documentation sections</span>
+        <input
+          id="doc-search"
+          type="search"
+          placeholder="Filter this page"
+          autocomplete="off"
+          aria-describedby="filter-status"
+        />
+        <kbd aria-hidden="true">/</kbd>
+      </label>
+
+      <nav class="topnav" aria-label="Project links">
+        <a href="https://docs.rs/llama-harness">Rust API</a>
         <a href="https://github.com/tyhuang9/llama-harness">GitHub</a>
-        <a class="top-button" href="#quickstart">Get started</a>
       </nav>
-      <button class="menu-button" type="button" aria-expanded="false" aria-controls="sidebar">Menu</button>
+      <button class="menu-button" type="button" aria-expanded="false" aria-controls="sidebar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+        <span>Menu</span>
+      </button>
     </header>
 
-    <div class="layout" id="top">
+    <div class="docs-shell" id="top">
       <aside class="sidebar" id="sidebar">
-        <div class="sidebar-kicker">Documentation</div>
-        <label class="search-label" for="doc-search">Search docs</label>
-        <input id="doc-search" class="search" type="search" placeholder="Search" />
         <nav class="side-nav" aria-label="Documentation navigation">
-          <a href="#overview">Build controlled agent workflows</a>
-          <a href="#quickstart">Available from Git today</a>
-          <div class="nav-group">Core API</div>
-          <a href="#api">AgentRunner</a>
-          <a href="#tools">Tools, policy, and approvals</a>
-          <a href="#runs">Runs and events</a>
-          <div class="nav-group">Integrations</div>
-          <a href="#integrations">Use the same engine anywhere</a>
-          <a href="#resources">Resources</a>
+          <div class="nav-section">
+            <div class="nav-heading">Get started</div>
+            <a href="#overview">Introduction</a>
+            <a href="#installation">Installation</a>
+            <a href="#quickstart">Quick start</a>
+          </div>
+          <div class="nav-section">
+            <div class="nav-heading">Use the library</div>
+            <a href="#ownership">Application ownership</a>
+            <a href="#concepts">Core concepts</a>
+            <a href="#features">Cargo features</a>
+          </div>
+          <div class="nav-section">
+            <div class="nav-heading">Guides</div>
+            <a href="guides/embedding.html">Embedding</a>
+            <a href="guides/tools-and-policies.html">Tools and policies</a>
+            <a href="guides/observability.html">Observability</a>
+            <a href="guides/evaluations.html">Evaluations</a>
+            <a href="guides/tauri.html">Tauri</a>
+            <a href="guides/security.html">Security</a>
+            <a href="guides/architecture.html">Architecture</a>
+          </div>
         </nav>
-        <div class="sidebar-foot">API version <strong>v1</strong><br />Runtime protocol is JSONL over stdio.</div>
+
+        <div id="filter-status" class="filter-status" aria-live="polite"></div>
+        <div class="sidebar-meta">
+          <div><span>Crate</span><strong>0.1.0</strong></div>
+          <div><span>Minimum Rust</span><strong>1.88</strong></div>
+        </div>
+        <div class="brand-placeholder" aria-label="Reserved area for the llama-harness logo and brand system">
+          <span aria-hidden="true">lh</span>
+          <div><strong>Brand space</strong><small>Logo and wordmark reserved</small></div>
+        </div>
       </aside>
 
-      <main class="content">
-        <section class="hero" id="overview">
-          <div class="eyebrow">LOCAL AGENT RUNTIME · API REFERENCE</div>
-          <h1>Build controlled agent workflows</h1>
-          <p class="lede">llama-harness gives your application one canonical runner for model loops, tools, policy, approvals, limits, cancellation, and causal events.</p>
-          <div class="hero-actions">
-            <a class="button primary" href="#quickstart">Start building <span aria-hidden="true">→</span></a>
-            <a class="button secondary" href="https://github.com/tyhuang9/llama-harness">View on GitHub</a>
-          </div>
-          <div class="install-strip" aria-label="Install from Git">
-            <span class="prompt">$</span><code>cargo add llama-harness --git https://github.com/tyhuang9/llama-harness --rev 9953d6c</code><button class="copy" type="button" data-copy="cargo add llama-harness --git https://github.com/tyhuang9/llama-harness --rev 9953d6c">Copy</button>
-          </div>
-        </section>
+      <main class="content" id="main-content" tabindex="-1">
+        <article class="docs-article">
+          <header class="doc-intro" id="overview">
+            <div class="breadcrumbs" aria-label="Breadcrumb">
+              <span>Documentation</span><span aria-hidden="true">/</span><span>Rust</span>
+            </div>
+            <div class="intro-label">Rust library · 0.1</div>
+            <h1>llama-harness for Rust</h1>
+            <p class="lede">
+              Build bounded local agent workflows without handing control of
+              tools, policy, data, or user experience to a framework.
+            </p>
+            <div class="intro-links">
+              <a class="button primary" href="#installation">Install the crate</a>
+              <a class="button secondary" href="guides/embedding.html">Embedding guide</a>
+            </div>
+          </header>
 
-        <section class="notice" id="quickstart">
-          <div class="notice-icon" aria-hidden="true">i</div>
-          <div><strong>Available from Git today</strong><br />The Rust facade is not published to crates.io yet. Pin a reviewed Git revision for pre-release integrations.</div>
-          <a href="guides/integrating-note.html">Integration guide →</a>
-        </section>
+          <section class="doc-section" id="installation">
+            <div class="section-kicker">Installation</div>
+            <h2>Add the supported facade</h2>
+            <p>
+              Use <code>llama-harness</code> as the single application
+              dependency. Default features are empty, so integrations are
+              always explicit.
+            </p>
+            <div class="code-block" role="region" aria-label="Cargo dependencies">
+              <div class="code-toolbar">
+                <span>Cargo.toml</span>
+                <button
+                  class="copy"
+                  type="button"
+                  data-copy='[dependencies]&#10;llama-harness = { version = "0.1.0", features = ["ollama"] }&#10;tokio = { version = "1", features = ["macros", "rt-multi-thread"] }'
+                  aria-label="Copy Cargo dependencies"
+                >Copy</button>
+              </div>
+              <pre><code><span class="muted-code">[dependencies]</span>
+llama-harness = { version = <span class="str">"0.1.0"</span>, features = [<span class="str">"ollama"</span>] }
+tokio = { version = <span class="str">"1"</span>, features = [<span class="str">"macros"</span>, <span class="str">"rt-multi-thread"</span>] }</code></pre>
+            </div>
+            <aside class="callout" aria-label="Publication status">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v5m0 3.5v.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" /></svg>
+              <div>
+                <strong>Crates.io indexing is in progress.</strong>
+                <p>
+                  Until the facade is indexed, pin the reviewed release source
+                  at <code>d9f7a84</code>.
+                </p>
+                <div class="inline-command">
+                  <code>git = "https://github.com/tyhuang9/llama-harness", rev = "d9f7a84a579a36cd1987c5eeeb30764be70aa8ce"</code>
+                  <button
+                    class="copy compact"
+                    type="button"
+                    data-copy='git = "https://github.com/tyhuang9/llama-harness", rev = "d9f7a84a579a36cd1987c5eeeb30764be70aa8ce"'
+                    aria-label="Copy the reviewed Git source"
+                  >Copy</button>
+                </div>
+              </div>
+            </aside>
+          </section>
 
-        <section class="section" id="api">
-          <div class="section-heading"><div><div class="eyebrow">CORE API</div><h2>AgentRunner</h2></div><span class="badge">Rust</span></div>
-          <p>The embedded engine is the source of truth. Construct a runner in your Rust or Tauri process, register application-owned tools, and execute a bounded run.</p>
-          <div class="api-grid">
-            <div class="api-card"><div class="method">AgentRunner::builder</div><p>Configure the model provider, policy, approval handler, limits, and event sink.</p><a href="guides/embedding.html">Read embedding guide →</a></div>
-            <div class="api-card"><div class="method">runner.run(request)</div><p>Execute one agent request and receive a typed result with ordered causal events.</p><a href="guides/architecture.html">See architecture →</a></div>
-            <div class="api-card"><div class="method">runner.cancel(run_id)</div><p>Cancel a known run. Cancellation is propagated through pending model and callback waits.</p><a href="guides/tools-and-policies.html">Review controls →</a></div>
-          </div>
-          <div class="code-block" role="region" aria-label="Rust quickstart code"><div class="code-toolbar"><span>Rust</span><button class="copy" type="button" data-copy="let runner = AgentRunner::builder(provider).build();\nlet result = runner.run(request).await?;">Copy</button></div><pre><code><span class="kw">let</span> runner = AgentRunner::builder(provider).build();
-<span class="kw">let</span> result = runner.run(request).await?;
-println!(<span class="str">"{}"</span>, result.final_output.unwrap_or_default());</code></pre></div>
-        </section>
+          <section class="doc-section" id="quickstart">
+            <div class="section-kicker">Quick start</div>
+            <h2>Run a local Ollama model</h2>
+            <p>
+              Ollama and the selected model must already be installed and
+              running. The provider accepts loopback URLs only and does not
+              download models.
+            </p>
+            <ol class="steps">
+              <li><strong>Enable the <code>ollama</code> feature.</strong><span>This exposes <code>llama_harness::ollama</code>.</span></li>
+              <li><strong>Create a provider and runner.</strong><span>Your application can add tools, policy, approvals, and events.</span></li>
+              <li><strong>Execute a request.</strong><span>The runner returns a typed result and respects cancellation and limits.</span></li>
+            </ol>
+            <div class="code-block" role="region" aria-label="Rust Ollama quick start">
+              <div class="code-toolbar">
+                <span>Rust</span>
+                <button
+                  class="copy"
+                  type="button"
+                  data-copy='use std::sync::Arc;&#10;use llama_harness::{ollama::OllamaProvider, AgentDefinition, AgentRunner, RunRequest};&#10;&#10;let provider = Arc::new(OllamaProvider::new()?);&#10;let runner = AgentRunner::builder(provider).build();&#10;let agent = AgentDefinition::new("assistant", "Assistant", "1", "qwen3:8b");&#10;let result = runner.run(RunRequest::new(agent, "Say hello.")).await?;'
+                  aria-label="Copy Rust quick-start code"
+                >Copy</button>
+              </div>
+              <pre><code><span class="kw">use</span> std::sync::Arc;
+<span class="kw">use</span> llama_harness::{
+    ollama::OllamaProvider, AgentDefinition, AgentRunner, RunRequest,
+};
 
-        <section class="section" id="tools">
-          <div class="section-heading"><div><div class="eyebrow">CONTROL PLANE</div><h2>Tools, policy, and approvals</h2></div><span class="badge green">Fail closed</span></div>
-          <p>Tool schemas are validated before execution. Policy runs before approval, state-changing tools require explicit authorization, and callback failures terminate safely.</p>
-          <div class="table-wrap"><table><thead><tr><th>Concept</th><th>What it controls</th><th>Default</th></tr></thead><tbody><tr><td><code>Tool</code></td><td>Schema, arguments, read-only declaration, execution</td><td>Application-owned</td></tr><tr><td><code>PolicyEngine</code></td><td>Whether a proposed call is allowed</td><td>Read-only safe default</td></tr><tr><td><code>ApprovalHandler</code></td><td>User or host confirmation for risky actions</td><td>Deny if missing</td></tr><tr><td><code>AgentLimits</code></td><td>Calls, tokens, duration, output and input bounds</td><td>Explicit per run</td></tr></tbody></table></div>
-        </section>
+<span class="kw">let</span> provider = Arc::new(OllamaProvider::new()?);
+<span class="kw">let</span> runner = AgentRunner::builder(provider).build();
+<span class="kw">let</span> agent = AgentDefinition::new(
+    <span class="str">"assistant"</span>, <span class="str">"Assistant"</span>, <span class="str">"1"</span>, <span class="str">"qwen3:8b"</span>
+);
+<span class="kw">let</span> result = runner
+    .run(RunRequest::new(agent, <span class="str">"Say hello."</span>))
+    .await?;</code></pre>
+            </div>
+          </section>
 
-        <section class="section" id="runs">
-          <div class="section-heading"><div><div class="eyebrow">OBSERVABILITY</div><h2>Runs and events</h2></div><span class="badge">Ordered</span></div>
-          <p>Each run emits structured, ordered events. Attach a redacted local SQLite sink when you need trace inspection; chain-of-thought is never collected.</p>
-          <div class="resource-list"><a href="guides/observability.html"><span><strong>SqliteEventSink</strong><small>Persist redacted event records locally.</small></span><span>→</span></a><a href="https://github.com/tyhuang9/llama-harness/blob/main/protocol/compatibility/v1.md"><span><strong>Protocol v1</strong><small>Versioned JSONL envelopes for sidecar clients.</small></span><span>→</span></a></div>
-        </section>
+          <section class="doc-section" id="ownership">
+            <div class="section-kicker">Architecture</div>
+            <h2>Your application stays in charge</h2>
+            <p>
+              llama-harness runs inside your process. It provides the reusable
+              model-and-tool loop while keeping product and capability
+              decisions at the application boundary.
+            </p>
+            <div class="comparison">
+              <div>
+                <h3>Your application owns</h3>
+                <ul>
+                  <li>Tools and accessible data</li>
+                  <li>Policy and approval decisions</li>
+                  <li>Provider credentials and models</li>
+                  <li>User interface and event presentation</li>
+                </ul>
+              </div>
+              <div>
+                <h3>The harness manages</h3>
+                <ul>
+                  <li>Model and tool-call sequencing</li>
+                  <li>Schema validation and bounded retries</li>
+                  <li>Limits, deadlines, and cancellation</li>
+                  <li>Typed results and ordered causal events</li>
+                </ul>
+              </div>
+            </div>
+          </section>
 
-        <section class="section integrations" id="integrations">
-          <div class="section-heading"><div><div class="eyebrow">INTEGRATIONS</div><h2>Use the same engine anywhere</h2></div></div>
-          <div class="integration-grid"><article><span class="integration-tag">Node / TypeScript</span><h3>Managed child runtime</h3><p>Start the Rust runtime only when your client calls <code>HarnessClient.start()</code>. Tools, policy, and approvals stay in the host process.</p><a href="guides/typescript-sdk.html">TypeScript SDK guide →</a></article><article><span class="integration-tag">Python</span><h3>Asyncio-native SDK</h3><p>Use an async context manager, typed callbacks, ordered events, cancellation, and an explicit runtime path.</p><a href="guides/python-sdk.html">Python SDK guide →</a></article><article><span class="integration-tag">Tauri</span><h3>Embedded Rust backend</h3><p>Keep capabilities in the Rust backend and forward structured events plus opaque approval IDs to the webview.</p><a href="guides/tauri.html">Tauri guide →</a></article></div>
-        </section>
+          <section class="doc-section" id="concepts">
+            <div class="section-kicker">Reference</div>
+            <h2>Core concepts</h2>
+            <div class="definition-list">
+              <a href="guides/embedding.html">
+                <code>AgentRunner</code>
+                <span>Executes one bounded model-and-tool loop.</span>
+                <span aria-hidden="true">→</span>
+              </a>
+              <a href="https://docs.rs/llama-harness">
+                <code>ModelProvider</code>
+                <span>Connects the runner to Ollama or a custom provider.</span>
+                <span aria-hidden="true">→</span>
+              </a>
+              <a href="guides/tools-and-policies.html">
+                <code>Tool + PolicyEngine</code>
+                <span>Defines capabilities and checks every proposed call.</span>
+                <span aria-hidden="true">→</span>
+              </a>
+              <a href="guides/observability.html">
+                <code>EventSink</code>
+                <span>Receives structured events without hidden reasoning.</span>
+                <span aria-hidden="true">→</span>
+              </a>
+            </div>
+          </section>
 
-        <section class="section" id="resources">
-          <div class="section-heading"><div><div class="eyebrow">RESOURCES</div><h2>Resources</h2></div></div>
-          <p>Browse the guides for SDK clients, embedded integrations, runtime architecture, security controls, and release workflows.</p>
-          <ul class="resource-list">
-            <li><a href="guides/typescript-sdk.html"><span><strong>TypeScript SDK</strong><small>Run llama-harness from Node and TypeScript clients.</small></span><span aria-hidden="true">&rarr;</span></a></li>
-            <li><a href="guides/python-sdk.html"><span><strong>Python SDK</strong><small>Use the asyncio-native client with ordered events.</small></span><span aria-hidden="true">&rarr;</span></a></li>
-            <li><a href="guides/tauri.html"><span><strong>Tauri integration</strong><small>Embed the Rust runtime behind a desktop webview.</small></span><span aria-hidden="true">&rarr;</span></a></li>
-            <li><a href="guides/architecture.html"><span><strong>Architecture</strong><small>Understand the runner, protocol, and event flow.</small></span><span aria-hidden="true">&rarr;</span></a></li>
-            <li><a href="guides/security.html"><span><strong>Security</strong><small>Review capability boundaries and fail-closed controls.</small></span><span aria-hidden="true">&rarr;</span></a></li>
-            <li><a href="guides/releasing.html"><span><strong>Releasing</strong><small>Prepare reviewed builds and publish release artifacts.</small></span><span aria-hidden="true">&rarr;</span></a></li>
-          </ul>
-        </section>
+          <section class="doc-section" id="features">
+            <div class="section-kicker">Cargo</div>
+            <h2>Optional features</h2>
+            <p>The provider-neutral facade has no default features.</p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Feature</th><th>What it adds</th></tr></thead>
+                <tbody>
+                  <tr><td><code>ollama</code></td><td>Loopback-only provider for an existing local Ollama service.</td></tr>
+                  <tr><td><code>observability</code></td><td>Redacted local SQLite run and event storage.</td></tr>
+                  <tr><td><code>evals</code></td><td>Deterministic evaluation and replay contracts.</td></tr>
+                  <tr><td><code>tauri</code></td><td>Tauri event, approval, cancellation, and trace helpers.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
 
-        <footer class="footer"><span>llama-harness · API reference v1</span><span><a href="https://github.com/tyhuang9/llama-harness">GitHub</a> · <a href="guides/releasing.html">Releases</a></span></footer>
+          <section class="doc-section" id="guides">
+            <div class="section-kicker">Next steps</div>
+            <h2>Implementation guides</h2>
+            <div class="guide-grid">
+              <a href="guides/embedding.html"><strong>Embedding</strong><span>Build a facade-only Rust application.</span></a>
+              <a href="guides/tools-and-policies.html"><strong>Tools and policy</strong><span>Define capabilities and fail-closed authorization.</span></a>
+              <a href="guides/observability.html"><strong>Observability</strong><span>Persist redacted events locally.</span></a>
+              <a href="guides/evaluations.html"><strong>Evaluations</strong><span>Run deterministic suites and replays.</span></a>
+              <a href="guides/tauri.html"><strong>Tauri</strong><span>Keep desktop capabilities in the Rust backend.</span></a>
+              <a href="guides/security.html"><strong>Security</strong><span>Review boundaries, limits, and safe defaults.</span></a>
+            </div>
+          </section>
+
+          <footer class="footer">
+            <span>llama-harness · Rust 0.1</span>
+            <span><a href="https://github.com/tyhuang9/llama-harness">GitHub</a> · <a href="https://docs.rs/llama-harness">Rust API</a> · <a href="guides/security.html">Security</a></span>
+          </footer>
+        </article>
       </main>
+
+      <aside class="toc" aria-label="On this page">
+        <div class="toc-title">On this page</div>
+        <nav class="toc-nav">
+          <a href="#overview">Introduction</a>
+          <a href="#installation">Installation</a>
+          <a href="#quickstart">Quick start</a>
+          <a href="#ownership">Application ownership</a>
+          <a href="#concepts">Core concepts</a>
+          <a href="#features">Cargo features</a>
+          <a href="#guides">Implementation guides</a>
+        </nav>
+        <a class="toc-edit" href="https://github.com/tyhuang9/llama-harness/blob/main/docs/index.html">Edit this page</a>
+      </aside>
     </div>
     <script src="script.js"></script>
   </body>

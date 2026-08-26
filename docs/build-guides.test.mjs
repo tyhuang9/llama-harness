@@ -9,6 +9,7 @@ const docs = dirname(fileURLToPath(import.meta.url));
 const index = readFileSync(resolve(docs, "index.html"), "utf8");
 const guideFiles = readdirSync(resolve(docs, "guides"));
 const styles = readFileSync(resolve(docs, "styles.css"), "utf8");
+const script = readFileSync(resolve(docs, "script.js"), "utf8");
 
 const decodeHtml = (value) => value.replace(/&(amp|lt|gt|quot);/g, (_, name) => ({ amp: "&", lt: "<", gt: ">", quot: '"' })[name]);
 const words = (value) => (value.toLowerCase().match(/[\p{L}\p{N}_-]+/gu) ?? []).filter((word) => /[\p{L}\p{N}]/u.test(word));
@@ -68,7 +69,47 @@ test("index links only to checked-in local HTML and keeps external Markdown exte
   const hrefs = [...index.matchAll(/href="([^"]+)"/g)].map((match) => match[1]);
   assert.equal(hrefs.filter((href) => !/^[a-z][a-z0-9+.-]*:/i.test(href) && href.endsWith(".md")).length, 0);
   for (const href of hrefs.filter((href) => href.startsWith("guides/"))) assert.ok(existsSync(resolve(docs, href)), `${href} exists`);
-  assert.ok(hrefs.includes("https://github.com/tyhuang9/llama-harness/blob/main/protocol/compatibility/v1.md"));
+});
+
+test("landing page is accessible, Rust-first, and reserves the brand surface", () => {
+  assert.equal((index.match(/<h1\b/g) ?? []).length, 1);
+  assert.match(index, /<a class="skip-link" href="#main-content">/);
+  assert.match(index, /<div class="docs-shell" id="top">/);
+  assert.match(index, /<aside class="sidebar" id="sidebar">/);
+  assert.match(index, /<aside class="toc" aria-label="On this page">/);
+  assert.match(index, /<main class="content" id="main-content" tabindex="-1">/);
+  assert.match(index, /<label class="header-search" for="doc-search">/);
+  assert.match(index, /id="filter-status" class="filter-status" aria-live="polite"/);
+  assert.match(index, /aria-label="Reserved area for the llama-harness logo and brand system"/);
+  assert.match(index, /d9f7a84a579a36cd1987c5eeeb30764be70aa8ce/);
+
+  for (const guide of ["embedding", "tools-and-policies", "observability", "evaluations", "tauri", "security", "architecture"]) {
+    assert.match(index, new RegExp(`href="guides/${guide}\\.html"`), `${guide} guide is promoted`);
+  }
+
+  assert.doesNotMatch(index, /href="guides\/(?:typescript-sdk|python-sdk|protocol|developer-console)\.html"/);
+  assert.doesNotMatch(index, /class="(?:hero|brand-stage)"/);
+  assert.doesNotMatch(index, /9953d6c/);
+  assert.match(styles, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(script, /Copy failed/);
+  assert.match(script, /setAttribute\('aria-live', 'polite'\)/);
+  assert.match(script, /event\.key === '\/'/);
+});
+
+test("landing page local fragments and social preview resolve", () => {
+  const ids = new Set([...index.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]));
+  const localFragments = [...index.matchAll(/href="#([^"]+)"/g)].map((match) => decodeURIComponent(match[1]));
+  for (const fragment of localFragments) assert.ok(ids.has(fragment), `#${fragment} resolves to a landing-page id`);
+
+  const socialImage = resolve(docs, "og.png");
+  assert.ok(existsSync(socialImage), "the social preview image is checked in");
+  assert.ok(lstatSync(socialImage).isFile() && !lstatSync(socialImage).isSymbolicLink(), "the social preview is a regular file");
+  assert.ok(lstatSync(socialImage).size > 0, "the social preview is not empty");
+  assert.match(index, /<meta property="og:image" content="https:\/\/tyhuang9\.github\.io\/llama-harness\/og\.png" \/>/);
+  assert.match(index, /<meta property="og:image:alt" content="[^"]+" \/>/);
+  assert.match(index, /<meta name="twitter:card" content="summary_large_image" \/>/);
+  assert.match(index, /<meta name="twitter:image" content="https:\/\/tyhuang9\.github\.io\/llama-harness\/og\.png" \/>/);
+  assert.match(index, /<meta name="twitter:image:alt" content="[^"]+" \/>/);
 });
 
 test("checked-in guides exactly match the deterministic renderer", () => {
