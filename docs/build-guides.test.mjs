@@ -39,6 +39,9 @@ test("every Markdown source has a checked-in rendered guide", () => {
     const guide = readFileSync(guidePath, "utf8");
     assert.match(guide, /^<!doctype html>/i);
     assert.match(guide, /href="\.\.\/styles\.css"/);
+    assert.match(guide, /<meta name="theme-color" content="#36141c" \/>/);
+    assert.match(guide, /<link rel="icon" type="image\/png" href="\.\.\/assets\/favicon\.png" \/>/);
+    assert.match(guide, /<span class="brand-mark" aria-hidden="true"><img src="\.\.\/assets\/favicon\.png" alt="" \/><\/span>/);
     assert.match(guide, /<article class="guide-article">/);
     assert.match(guide, /<main id="guide-content" class="guide-main" tabindex="-1">/);
     assert.match(guide, new RegExp(`Guide source: <code>${source.replace(".", "\\.")}</code>`));
@@ -63,7 +66,7 @@ test("every Markdown source has a checked-in rendered guide", () => {
     assert.ok(tableCount <= 1, `${source} does not repeat the generic Documentation table landmark`);
   }
   assert.deepEqual(guideFiles.sort(), Object.values(GUIDES).sort());
-  assert.match(styles, /\.guide-article th\{color:#596477\}/);
+  assert.match(styles, /\.guide-article th\s*\{[\s\S]*?color: var\(--muted\);[\s\S]*?\}/);
 });
 
 test("index links only to checked-in local HTML and keeps external Markdown external", () => {
@@ -99,7 +102,7 @@ test("every local page link, fragment, stylesheet, script, and image resolves in
   }
 });
 
-test("landing page is accessible, Rust-first, and reserves the brand surface", () => {
+test("landing page is accessible, Rust-first, and uses the approved brand", () => {
   assert.equal((index.match(/<h1\b/g) ?? []).length, 1);
   assert.match(index, /<a class="skip-link" href="#main-content">/);
   assert.match(index, /<div class="docs-shell" id="top">/);
@@ -109,7 +112,16 @@ test("landing page is accessible, Rust-first, and reserves the brand surface", (
   assert.match(index, /<label class="header-search" for="doc-search">/);
   assert.match(index, /id="filter-status" class="filter-status" aria-live="polite"/);
   assert.ok(index.indexOf('id="filter-status"') < index.indexOf('<aside class="sidebar"'), "filter status remains available when the mobile drawer is closed");
-  assert.match(index, /aria-label="Reserved area for the llama-harness logo and brand system"/);
+  assert.match(index, /<link rel="icon" type="image\/png" href="assets\/favicon\.png" \/>/);
+  assert.match(index, /<span class="brand-mark" aria-hidden="true"><img src="assets\/favicon\.png" alt="" \/><\/span>/);
+  assert.match(index, /<div class="brand-card" aria-label="llama-harness — Run local\. Connect any model\.">/);
+  assert.match(index, /<img src="assets\/llama-harness-logo\.png" alt="" \/>/);
+  assert.match(styles, /--brand-burgundy: #36141c;/);
+  assert.match(styles, /--brand-plum: #6d4b55;/);
+  assert.match(styles, /--brand-off-white: #f2f4f7;/);
+  assert.match(styles, /--brand-charcoal: #171a20;/);
+  assert.match(styles, /--brand-slate: #8b93a1;/);
+  assert.doesNotMatch(styles, /#(?:176b4d|0f513a|edf7f2|b9ddcd|174c39)/i);
   assert.match(index, /d9f7a84a579a36cd1987c5eeeb30764be70aa8ce/);
 
   for (const guide of ["embedding", "tools-and-policies", "observability", "evaluations", "tauri", "security", "architecture"]) {
@@ -137,6 +149,15 @@ test("landing page local fragments and social preview resolve", () => {
   assert.ok(existsSync(socialImage), "the social preview image is checked in");
   assert.ok(lstatSync(socialImage).isFile() && !lstatSync(socialImage).isSymbolicLink(), "the social preview is a regular file");
   assert.ok(lstatSync(socialImage).size > 0, "the social preview is not empty");
+  const socialBytes = readFileSync(socialImage);
+  assert.equal(socialBytes.readUInt32BE(16), 1200, "the social preview has the recommended width");
+  assert.equal(socialBytes.readUInt32BE(20), 630, "the social preview has the recommended height");
+  for (const asset of ["assets/favicon.png", "assets/llama-harness-logo.png", "assets/llama-harness-brand-board.png"]) {
+    const assetPath = resolve(docs, asset);
+    assert.ok(existsSync(assetPath), `${asset} is checked in`);
+    assert.ok(lstatSync(assetPath).isFile() && !lstatSync(assetPath).isSymbolicLink(), `${asset} is a regular file`);
+    assert.ok(lstatSync(assetPath).size > 0, `${asset} is not empty`);
+  }
   assert.match(index, /<meta property="og:image" content="https:\/\/tyhuang9\.github\.io\/llama-harness\/og\.png" \/>/);
   assert.match(index, /<meta property="og:image:alt" content="[^"]+" \/>/);
   assert.match(index, /<meta name="twitter:card" content="summary_large_image" \/>/);

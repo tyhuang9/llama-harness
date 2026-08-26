@@ -1,24 +1,30 @@
 :root {
-  --ink: #171a19;
-  --ink-soft: #46504b;
-  --muted: #68736d;
-  --accent: #176b4d;
-  --accent-strong: #0f513a;
-  --accent-soft: #edf7f2;
-  --accent-line: #b9ddcd;
+  --brand-burgundy: #36141c;
+  --brand-plum: #6d4b55;
+  --brand-off-white: #f2f4f7;
+  --brand-charcoal: #171a20;
+  --brand-slate: #8b93a1;
+  --ink: var(--brand-charcoal);
+  --ink-soft: #454a54;
+  --muted: #606976;
+  --accent: var(--brand-plum);
+  --accent-strong: var(--brand-burgundy);
+  --accent-soft: #f7f1f3;
+  --accent-line: #d7c6cb;
+  --page: var(--brand-off-white);
   --surface: #ffffff;
-  --surface-soft: #f7f8f7;
-  --surface-code: #f4f6f5;
-  --line: #dfe4e1;
-  --line-strong: #c9d1cd;
-  --focus: #9b6a00;
+  --surface-soft: #f7f4f5;
+  --surface-code: var(--brand-off-white);
+  --line: #e1dadd;
+  --line-strong: #c8b9be;
+  --focus: var(--brand-burgundy);
   --topbar-height: 60px;
   --sidebar-width: 248px;
   --toc-width: 190px;
   --content-width: 820px;
   --radius: 8px;
   color-scheme: light;
-  font-family: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "SF Pro Text", "SF Pro Display", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
 }
 
@@ -34,7 +40,7 @@ html {
 
 body {
   margin: 0;
-  background: var(--surface);
+  background: var(--page);
   color: var(--ink);
   font-size: 16px;
   line-height: 1.65;
@@ -74,7 +80,7 @@ pre,
 code {
   border-radius: 4px;
   background: var(--surface-code);
-  color: #174c39;
+  color: var(--accent-strong);
   font-size: 0.88em;
 }
 
@@ -124,7 +130,7 @@ code {
   min-height: var(--topbar-height);
   padding: 0 24px;
   border-bottom: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.96);
+  background: rgba(242, 244, 247, 0.97);
   backdrop-filter: blur(10px);
 }
 
@@ -140,17 +146,20 @@ code {
 }
 
 .brand-mark {
-  display: grid;
+  display: block;
   width: 30px;
   height: 30px;
   margin-right: 9px;
-  place-items: center;
-  border: 1px solid var(--ink);
   border-radius: 6px;
-  background: var(--ink);
-  color: white;
-  font-size: 11px;
-  letter-spacing: -0.08em;
+  background: var(--brand-burgundy);
+  overflow: hidden;
+}
+
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .brand-label {
@@ -186,7 +195,7 @@ code {
 .header-search:focus-within {
   border-color: var(--accent);
   background: var(--surface);
-  box-shadow: 0 0 0 3px rgba(23, 107, 77, 0.12);
+  box-shadow: 0 0 0 3px rgba(54, 20, 28, 0.12);
 }
 
 .header-search svg {
@@ -207,7 +216,7 @@ code {
 }
 
 .header-search input::placeholder {
-  color: #626c67;
+  color: var(--muted);
 }
 
 .header-search kbd {
@@ -277,7 +286,7 @@ code {
   padding: 28px 22px 24px;
   overflow-y: auto;
   border-right: 1px solid var(--line);
-  background: var(--surface);
+  background: var(--surface-soft);
 }
 
 .nav-section + .nav-section {
@@ -286,7 +295,7 @@ code {
 
 .nav-heading {
   margin: 0 10px 7px;
-  color: #606963;
+  color: var(--muted);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.11em;
@@ -350,7 +359,7 @@ code {
   border: 1px solid var(--line-strong);
   border-radius: 6px;
   background: var(--surface);
-  box-shadow: 0 8px 20px rgba(20, 30, 25, 0.1);
+  box-shadow: 0 8px 20px rgba(54, 20, 28, 0.1);
   color: var(--ink-soft);
   font-size: 12px;
 }
@@ -381,41 +390,40 @@ code {
   color: var(--ink-soft);
 }
 
-.brand-placeholder {
+.brand-card {
   display: flex;
   align-items: center;
   gap: 10px;
   margin: 0 10px;
   padding: 10px;
-  border: 1px dashed var(--line-strong);
+  border: 1px solid var(--accent-line);
   border-radius: 7px;
+  background: var(--accent-soft);
   color: var(--muted);
 }
 
-.brand-placeholder > span {
-  display: grid;
-  flex: 0 0 28px;
-  height: 28px;
-  place-items: center;
-  border-radius: 5px;
-  background: var(--surface-code);
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 10px;
-  font-weight: 700;
+.brand-card > img {
+  flex: 0 0 42px;
+  width: 42px;
+  height: 42px;
+  padding: 3px;
+  border-radius: 7px;
+  background: var(--brand-burgundy);
+  object-fit: contain;
 }
 
-.brand-placeholder strong,
-.brand-placeholder small {
+.brand-card strong,
+.brand-card small {
   display: block;
   line-height: 1.35;
 }
 
-.brand-placeholder strong {
-  color: var(--ink-soft);
+.brand-card strong {
+  color: var(--accent-strong);
   font-size: 11px;
 }
 
-.brand-placeholder small {
+.brand-card small {
   margin-top: 2px;
   font-size: 10px;
 }
@@ -423,6 +431,7 @@ code {
 .content {
   min-width: 0;
   border-right: 1px solid var(--line);
+  background: var(--surface);
 }
 
 .docs-article {
@@ -458,6 +467,7 @@ h2,
 h3 {
   margin-top: 0;
   color: var(--ink);
+  font-family: "SF Pro Display", "SF Pro Text", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   letter-spacing: -0.025em;
   line-height: 1.2;
 }
@@ -514,7 +524,7 @@ h3 {
 }
 
 .button.secondary:hover {
-  border-color: #9aa59f;
+  border-color: var(--brand-slate);
   background: var(--surface-soft);
   color: var(--ink);
 }
@@ -545,7 +555,7 @@ h3 {
   overflow: hidden;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius);
-  background: #fbfcfb;
+  background: var(--surface);
 }
 
 .code-toolbar {
@@ -575,7 +585,7 @@ h3 {
 }
 
 .copy:hover {
-  border-color: #94a099;
+  border-color: var(--brand-slate);
   background: var(--surface-soft);
   color: var(--ink);
 }
@@ -593,8 +603,8 @@ h3 {
 .guide-article pre {
   margin: 0;
   overflow-x: auto;
-  background: #fbfcfb;
-  color: #26332d;
+  background: var(--surface);
+  color: var(--ink);
   font-size: 13px;
   line-height: 1.7;
   tab-size: 2;
@@ -613,15 +623,15 @@ h3 {
 }
 
 .kw {
-  color: #7a3f8f;
+  color: var(--brand-plum);
 }
 
 .str {
-  color: #9a4d24;
+  color: var(--brand-burgundy);
 }
 
 .muted-code {
-  color: #69746e;
+  color: var(--muted);
 }
 
 .callout {
@@ -665,7 +675,7 @@ h3 {
   min-width: 0;
   padding: 8px 10px;
   overflow-x: auto;
-  border: 1px solid rgba(23, 107, 77, 0.18);
+  border: 1px solid rgba(54, 20, 28, 0.18);
   background: rgba(255, 255, 255, 0.72);
   white-space: nowrap;
 }
@@ -815,7 +825,7 @@ td {
 
 th {
   background: var(--surface-soft);
-  color: #55605a;
+  color: var(--muted);
   font-size: 11px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -926,7 +936,7 @@ tr:last-child td {
 
 /* Generated Markdown guides share the same restrained documentation system. */
 .guide-page {
-  background: var(--surface);
+  background: var(--page);
 }
 
 .guide-header {
@@ -947,6 +957,7 @@ tr:last-child td {
   max-width: 820px;
   margin: 0 auto;
   padding: 56px 40px 72px;
+  background: var(--surface);
 }
 
 .guide-article {
@@ -992,7 +1003,7 @@ tr:last-child td {
 
 .guide-article code {
   padding: 2px 5px;
-  border: 1px solid rgba(23, 107, 77, 0.12);
+  border: 1px solid rgba(54, 20, 28, 0.12);
 }
 
 .guide-article pre {
@@ -1013,7 +1024,9 @@ tr:last-child td {
   color: var(--muted);
 }
 
-.guide-article th{color:#596477}
+.guide-article th {
+  color: var(--muted);
+}
 
 .guide-source {
   margin-bottom: 20px !important;
@@ -1026,6 +1039,7 @@ tr:last-child td {
   margin: 0 auto;
   padding: 24px 40px 42px;
   border-top: 1px solid var(--line);
+  background: var(--surface);
   color: var(--muted);
   font-size: 13px;
 }
@@ -1091,7 +1105,7 @@ tr:last-child td {
     height: auto;
     transform: translateX(-105%);
     visibility: hidden;
-    box-shadow: 18px 0 42px rgba(20, 30, 25, 0.12);
+    box-shadow: 18px 0 42px rgba(54, 20, 28, 0.12);
     transition: transform 0.2s ease, visibility 0s linear 0.2s;
   }
 

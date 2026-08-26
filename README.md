@@ -1,10 +1,12 @@
 <div align="center">
 
-<!-- Logo / brand area: replace this text lockup with approved artwork when ready. -->
+<img src="https://tyhuang9.github.io/llama-harness/assets/llama-harness-logo.png" alt="llama-harness mascot: a white llama wearing a burgundy harness" width="168" />
 
 # llama-harness
 
-**A Rust library for local agent workflows that stay under your application's control.**
+**Run local. Connect any model.**
+
+A Rust library for agent workflows that stay under your application's control.
 
 [Documentation](https://tyhuang9.github.io/llama-harness/) ·
 [Rust API](https://docs.rs/llama-harness) ·
@@ -104,6 +106,8 @@ not affect the Rust crate.
 
 ## Logo and brand
 
-The official logo and broader brand system are intentionally still open. The
-text name and temporary `lh` mark reserve their place in the README and docs so
-approved artwork can be added later without restructuring either entry point.
+The white llama and burgundy harness are the official project mark. The
+[brand board](docs/assets/llama-harness-brand-board.png) records the source
+artwork, wordmark treatment, and color palette; the reusable transparent
+[mascot asset](docs/assets/llama-harness-logo.png) is sized for documentation
+and project surfaces.
