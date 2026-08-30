@@ -29,7 +29,8 @@ pub use event::{EventRecord, EventSink, InMemoryEventSink, RunEvent};
 pub use limits::{AgentLimits, GenerationOptions};
 pub use message::{Message, MessageRole};
 pub use model::{
-    ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, ProviderHealth, Usage,
+    ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
+    ProviderCapabilityLimits, ProviderHealth, Usage,
 };
 pub use plan::{
     ExecutionPlan, PlanConcurrency, PlanNode, ResultBinding, ResultRef,
@@ -43,5 +44,6 @@ pub use policy::{
 };
 pub use runner::{AgentRunner, AgentRunnerBuilder};
 pub use tool::{
-    Tool, ToolCall, ToolCallContext, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    CancellationSafety, SpeculationPolicy, Tool, ToolCall, ToolCallContext, ToolCaller,
+    ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
 };

@@ -1048,19 +1048,20 @@ fn to_core_message(message: WireMessage) -> Message {
     }
 }
 fn to_core_tool_definition(definition: WireToolDefinition) -> ToolDefinition {
-    ToolDefinition {
-        id: definition.id,
-        name: definition.name,
-        description: definition.description,
-        arguments_schema: definition.arguments_schema,
-        risk: match definition.risk {
-            WireToolRisk::Low => ToolRisk::Low,
-            WireToolRisk::Medium => ToolRisk::Medium,
-            WireToolRisk::High => ToolRisk::High,
-        },
-        idempotent: definition.idempotent,
-        read_only: definition.read_only,
-    }
+    let risk = match definition.risk {
+        WireToolRisk::Low => ToolRisk::Low,
+        WireToolRisk::Medium => ToolRisk::Medium,
+        WireToolRisk::High => ToolRisk::High,
+    };
+    ToolDefinition::new(
+        definition.id,
+        definition.name,
+        definition.description,
+        definition.arguments_schema,
+    )
+    .with_risk(risk)
+    .with_idempotent(definition.idempotent)
+    .with_read_only(definition.read_only)
 }
 fn to_wire_tool_definition(definition: ToolDefinition) -> WireToolDefinition {
     WireToolDefinition {

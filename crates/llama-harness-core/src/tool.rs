@@ -6,7 +6,10 @@ use async_trait::async_trait;
 use jsonschema::Validator;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -81,6 +84,52 @@ pub enum ToolRisk {
     High,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Strength of a tool's cooperative cancellation guarantee.
+pub enum CancellationSafety {
+    /// The tool has made no cancellation-safety guarantee.
+    Unknown,
+    /// The tool observes cancellation, but work already started may still complete.
+    Cooperative,
+    /// Cancellation is guaranteed to prevent externally visible effects after it is observed.
+    Guaranteed,
+}
+
+impl Default for CancellationSafety {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Execution contexts permitted to invoke a tool through the core broker.
+pub enum ToolCaller {
+    /// A direct reactive model call.
+    Direct,
+    /// A node in a validated declarative plan.
+    DeclarativePlan,
+    /// A nested call from the optional programmatic sandbox.
+    Programmatic,
+    /// A shadow or committed speculative invocation.
+    Speculative,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Explicit policy controlling whether a tool may be invoked speculatively.
+pub enum SpeculationPolicy {
+    /// Speculative execution is prohibited.
+    #[default]
+    Disabled,
+    /// Speculative execution is permitted when all registry safety gates pass.
+    Enabled,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 /// Description and safety metadata for a registered tool.
 pub struct ToolDefinition {
@@ -92,12 +141,37 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema for validating tool arguments.
     pub arguments_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional JSON Schema describing successful tool output.
+    pub output_schema: Option<Value>,
     /// Application-assessed risk level.
     pub risk: ToolRisk,
     /// Whether repeating the same call is safe.
     pub idempotent: bool,
     /// Whether the tool is guaranteed not to change state.
     pub read_only: bool,
+    #[serde(default)]
+    /// Whether independent invocations may safely execute concurrently.
+    pub parallel_safe: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional key used to serialize tools that share an external resource.
+    pub concurrency_key: Option<String>,
+    #[serde(default)]
+    /// Strength of the tool's cooperative cancellation guarantee.
+    pub cancellation_safety: CancellationSafety,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Expected execution latency in milliseconds, when known.
+    pub expected_latency_ms: Option<u64>,
+    #[serde(default = "direct_caller_only")]
+    /// Execution contexts permitted to invoke the tool.
+    pub allowed_callers: BTreeSet<ToolCaller>,
+    #[serde(default)]
+    /// Explicit speculative-execution policy.
+    pub speculation_policy: SpeculationPolicy,
+}
+
+fn direct_caller_only() -> BTreeSet<ToolCaller> {
+    BTreeSet::from([ToolCaller::Direct])
 }
 
 impl ToolDefinition {
@@ -116,9 +190,16 @@ impl ToolDefinition {
             name: name.into(),
             description: description.into(),
             arguments_schema,
+            output_schema: None,
             risk: ToolRisk::High,
             idempotent: false,
             read_only: false,
+            parallel_safe: false,
+            concurrency_key: None,
+            cancellation_safety: CancellationSafety::Unknown,
+            expected_latency_ms: None,
+            allowed_callers: direct_caller_only(),
+            speculation_policy: SpeculationPolicy::Disabled,
         }
     }
 
@@ -137,6 +218,51 @@ impl ToolDefinition {
     /// Declares whether the tool is guaranteed not to change application state.
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Declares the JSON Schema expected for successful tool output.
+    pub fn with_output_schema(mut self, output_schema: Value) -> Self {
+        self.output_schema = Some(output_schema);
+        self
+    }
+
+    /// Declares whether independent invocations may execute concurrently.
+    pub fn with_parallel_safe(mut self, parallel_safe: bool) -> Self {
+        self.parallel_safe = parallel_safe;
+        self
+    }
+
+    /// Sets a key used to serialize calls sharing an external resource.
+    pub fn with_concurrency_key(mut self, concurrency_key: impl Into<String>) -> Self {
+        self.concurrency_key = Some(concurrency_key.into());
+        self
+    }
+
+    /// Declares the tool's cooperative cancellation guarantee.
+    pub fn with_cancellation_safety(mut self, cancellation_safety: CancellationSafety) -> Self {
+        self.cancellation_safety = cancellation_safety;
+        self
+    }
+
+    /// Declares expected execution latency in milliseconds.
+    pub fn with_expected_latency_ms(mut self, expected_latency_ms: u64) -> Self {
+        self.expected_latency_ms = Some(expected_latency_ms);
+        self
+    }
+
+    /// Replaces the set of execution contexts permitted to invoke the tool.
+    pub fn with_allowed_callers(
+        mut self,
+        allowed_callers: impl IntoIterator<Item = ToolCaller>,
+    ) -> Self {
+        self.allowed_callers = allowed_callers.into_iter().collect();
+        self
+    }
+
+    /// Declares the tool's explicit speculative-execution policy.
+    pub fn with_speculation_policy(mut self, speculation_policy: SpeculationPolicy) -> Self {
+        self.speculation_policy = speculation_policy;
         self
     }
 }
@@ -239,6 +365,20 @@ impl ToolRegistry {
         let validator = compile_trusted_schema(schema, |error| {
             HarnessError::InvalidTool(format!("invalid schema for {id}: {error}"))
         })?;
+        if let Some(output_schema) = &tool.definition().output_schema {
+            if serialized_len(output_schema)? > defaults.max_request_payload_bytes {
+                return Err(HarnessError::InvalidTool(format!(
+                    "output schema for {id} exceeds {} bytes",
+                    defaults.max_request_payload_bytes
+                )));
+            }
+            ensure_json_depth("tool output schema", output_schema, defaults.max_json_depth)
+                .map_err(|error| HarnessError::InvalidTool(error.to_string()))?;
+            compile_trusted_schema(output_schema, |error| {
+                HarnessError::InvalidTool(format!("invalid output schema for {id}: {error}"))
+            })?;
+        }
+        validate_scheduling_metadata(tool.definition(), &id)?;
         self.tools.insert(
             id,
             RegisteredTool {
@@ -275,4 +415,47 @@ impl ToolRegistry {
             .validate(arguments)
             .map_err(|error| HarnessError::InvalidArguments(error.to_string()))
     }
+}
+
+fn validate_scheduling_metadata(definition: &ToolDefinition, id: &str) -> Result<(), HarnessError> {
+    if definition.allowed_callers.is_empty() {
+        return Err(HarnessError::InvalidTool(format!(
+            "tool {id} must allow at least one caller"
+        )));
+    }
+    if definition
+        .concurrency_key
+        .as_ref()
+        .is_some_and(|key| key.trim().is_empty() || key.len() > 256)
+    {
+        return Err(HarnessError::InvalidTool(format!(
+            "tool {id} concurrency key must contain 1 to 256 bytes"
+        )));
+    }
+    if definition.expected_latency_ms == Some(0) {
+        return Err(HarnessError::InvalidTool(format!(
+            "tool {id} expected latency must be greater than zero"
+        )));
+    }
+
+    let speculative_caller = definition
+        .allowed_callers
+        .contains(&ToolCaller::Speculative);
+    let speculation_enabled = definition.speculation_policy == SpeculationPolicy::Enabled;
+    if speculative_caller != speculation_enabled {
+        return Err(HarnessError::InvalidTool(format!(
+            "tool {id} must enable both the speculative caller and speculation policy"
+        )));
+    }
+    if speculation_enabled
+        && (!definition.read_only
+            || !definition.idempotent
+            || !definition.parallel_safe
+            || definition.cancellation_safety != CancellationSafety::Guaranteed)
+    {
+        return Err(HarnessError::InvalidTool(format!(
+            "tool {id} is not eligible for speculative execution"
+        )));
+    }
+    Ok(())
 }

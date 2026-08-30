@@ -39,15 +39,16 @@ pub use async_trait::async_trait;
 pub use llama_harness_core::{
     load_agent_manifest, load_agent_manifest_path, AgentDefinition, AgentLimits, AgentManifest,
     AgentManifestError, AgentRunner, AgentRunnerBuilder, AllowAllPolicy, ApprovalHandler,
-    ApprovalRecord, DenyApproval, EventRecord, EventSink, ExecutionPlan, GenerationOptions,
-    HarnessError, InMemoryEventSink, JsonMap, Message, MessageRole, ModelCapabilities, ModelInfo,
-    ModelProvider, ModelRequest, ModelResponse, PlanConcurrency, PlanNode, PolicyDecision,
-    PolicyEngine, ProviderHealth, ResultBinding, ResultRef, RunError, RunEvent, RunOverrides,
-    RunRequest, RunResult, RunStatus, RunStrategy, SafeDefaultPolicy, Tool, ToolCall,
-    ToolCallContext, ToolDefinition, ToolRegistry, ToolResult, ToolRisk, Usage,
-    AGENT_MANIFEST_VERSION, MAX_EXECUTION_PLAN_BINDINGS, MAX_EXECUTION_PLAN_BYTES,
-    MAX_EXECUTION_PLAN_EDGES, MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES,
-    MAX_PLAN_ID_LENGTH, MAX_PLAN_JSON_DEPTH, MAX_PLAN_POINTER_LENGTH,
+    ApprovalRecord, CancellationSafety, DenyApproval, EventRecord, EventSink, ExecutionPlan,
+    GenerationOptions, HarnessError, InMemoryEventSink, JsonMap, Message, MessageRole,
+    ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, PlanConcurrency,
+    PlanNode, PolicyDecision, PolicyEngine, ProviderCapabilityLimits, ProviderHealth,
+    ResultBinding, ResultRef, RunError, RunEvent, RunOverrides, RunRequest, RunResult, RunStatus,
+    RunStrategy, SafeDefaultPolicy, SpeculationPolicy, Tool, ToolCall, ToolCallContext, ToolCaller,
+    ToolDefinition, ToolRegistry, ToolResult, ToolRisk, Usage, AGENT_MANIFEST_VERSION,
+    MAX_EXECUTION_PLAN_BINDINGS, MAX_EXECUTION_PLAN_BYTES, MAX_EXECUTION_PLAN_EDGES,
+    MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES, MAX_PLAN_ID_LENGTH, MAX_PLAN_JSON_DEPTH,
+    MAX_PLAN_POINTER_LENGTH,
 };
 pub use serde_json;
 pub use serde_json::Value as JsonValue;

@@ -36,15 +36,15 @@ fn request(cancellation: CancellationToken) -> ModelRequest {
 }
 
 fn tool() -> ToolDefinition {
-    ToolDefinition {
-        id: "list_tasks".into(),
-        name: "List tasks".into(),
-        description: "List the current tasks".into(),
-        arguments_schema: json!({"type":"object","additionalProperties":false}),
-        risk: ToolRisk::Low,
-        idempotent: true,
-        read_only: true,
-    }
+    ToolDefinition::new(
+        "list_tasks",
+        "List tasks",
+        "List the current tasks",
+        json!({"type":"object","additionalProperties":false}),
+    )
+    .with_risk(ToolRisk::Low)
+    .with_idempotent(true)
+    .with_read_only(true)
 }
 
 fn provider(base_url: &str) -> OllamaProvider {

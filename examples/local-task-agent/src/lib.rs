@@ -167,15 +167,10 @@ impl TaskTool {
         };
         Self {
             kind,
-            definition: ToolDefinition {
-                id: id.into(),
-                name: id.into(),
-                description: description.into(),
-                arguments_schema: schema,
-                risk,
-                idempotent,
-                read_only,
-            },
+            definition: ToolDefinition::new(id, id, description, schema)
+                .with_risk(risk)
+                .with_idempotent(idempotent)
+                .with_read_only(read_only),
             store,
         }
     }

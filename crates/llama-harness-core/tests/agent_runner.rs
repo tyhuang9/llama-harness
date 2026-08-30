@@ -85,15 +85,10 @@ struct TestTool {
 impl TestTool {
     fn read(id: &str, schema: Value) -> Self {
         Self {
-            definition: ToolDefinition {
-                id: id.into(),
-                name: id.into(),
-                description: "test tool".into(),
-                arguments_schema: schema,
-                risk: ToolRisk::Low,
-                idempotent: true,
-                read_only: true,
-            },
+            definition: ToolDefinition::new(id, id, "test tool", schema)
+                .with_risk(ToolRisk::Low)
+                .with_idempotent(true)
+                .with_read_only(true),
             calls: AtomicU32::new(0),
             behavior: ToolBehavior::Return(ToolResult::success(json!({"value": "ok"}))),
         }

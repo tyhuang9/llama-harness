@@ -52,6 +52,7 @@ impl ModelProvider for MockModelProvider {
             supports_tools: true,
             supports_streaming: false,
             supports_structured_output: true,
+            ..ModelCapabilities::default()
         }
     }
 

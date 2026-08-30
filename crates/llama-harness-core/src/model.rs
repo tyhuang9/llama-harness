@@ -114,6 +114,24 @@ pub struct ModelCapabilities {
     pub supports_streaming: bool,
     /// Whether the model supports structured output.
     pub supports_structured_output: bool,
+    #[serde(default)]
+    /// Whether the provider can constrain tool arguments with strict schemas.
+    pub supports_strict_tool_schemas: bool,
+    #[serde(default)]
+    /// Whether tool-call arguments may arrive incrementally while streaming.
+    pub supports_streaming_tool_arguments: bool,
+    #[serde(default)]
+    /// Whether the provider can return multiple tool calls in one response.
+    pub supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    /// Whether the provider can generate provider-native structured plans.
+    pub supports_structured_plans: bool,
+    #[serde(default)]
+    /// Whether the provider can generate programmatic tool workflows.
+    pub supports_programmatic_calling: bool,
+    #[serde(default)]
+    /// Provider-advertised resource limits for advanced calling features.
+    pub limits: ProviderCapabilityLimits,
 }
 
 impl ModelCapabilities {
@@ -127,7 +145,127 @@ impl ModelCapabilities {
             supports_tools,
             supports_streaming,
             supports_structured_output,
+            supports_strict_tool_schemas: false,
+            supports_streaming_tool_arguments: false,
+            supports_parallel_tool_calls: false,
+            supports_structured_plans: false,
+            supports_programmatic_calling: false,
+            limits: ProviderCapabilityLimits::default(),
         }
+    }
+
+    /// Declares support for strict tool schemas.
+    pub fn with_strict_tool_schemas(mut self, supported: bool) -> Self {
+        self.supports_strict_tool_schemas = supported;
+        self
+    }
+
+    /// Declares support for incrementally streamed tool arguments.
+    pub fn with_streaming_tool_arguments(mut self, supported: bool) -> Self {
+        self.supports_streaming_tool_arguments = supported;
+        self
+    }
+
+    /// Declares support for multiple tool calls in one model response.
+    pub fn with_parallel_tool_calls(mut self, supported: bool) -> Self {
+        self.supports_parallel_tool_calls = supported;
+        self
+    }
+
+    /// Declares support for provider-native structured plans.
+    pub fn with_structured_plans(mut self, supported: bool) -> Self {
+        self.supports_structured_plans = supported;
+        self
+    }
+
+    /// Declares support for programmatic tool workflows.
+    pub fn with_programmatic_calling(mut self, supported: bool) -> Self {
+        self.supports_programmatic_calling = supported;
+        self
+    }
+
+    /// Sets resource limits advertised by the provider.
+    pub fn with_limits(mut self, limits: ProviderCapabilityLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+#[non_exhaustive]
+/// Optional provider limits for advanced tool-calling capabilities.
+pub struct ProviderCapabilityLimits {
+    /// Maximum number of tools accepted in one request.
+    pub max_tools: Option<u32>,
+    /// Maximum total serialized tool-schema bytes accepted in one request.
+    pub max_tool_schema_bytes: Option<u64>,
+    /// Maximum parallel tool calls returned in one response.
+    pub max_parallel_tool_calls: Option<u32>,
+    /// Maximum streamed tool-argument bytes returned in one call.
+    pub max_streamed_argument_bytes: Option<u64>,
+    /// Maximum streamed tool calls returned in one response.
+    pub max_streamed_tool_calls: Option<u32>,
+    /// Maximum serialized structured-plan bytes.
+    pub max_plan_bytes: Option<u64>,
+    /// Maximum nodes in a structured plan.
+    pub max_plan_nodes: Option<u32>,
+    /// Maximum generated program bytes.
+    pub max_program_bytes: Option<u64>,
+}
+
+impl ProviderCapabilityLimits {
+    /// Creates an empty provider-limit declaration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the maximum number of tools accepted in one request.
+    pub fn with_max_tools(mut self, max_tools: u32) -> Self {
+        self.max_tools = Some(max_tools);
+        self
+    }
+
+    /// Sets the maximum total serialized tool-schema bytes in one request.
+    pub fn with_max_tool_schema_bytes(mut self, max_tool_schema_bytes: u64) -> Self {
+        self.max_tool_schema_bytes = Some(max_tool_schema_bytes);
+        self
+    }
+
+    /// Sets the maximum parallel tool calls returned in one response.
+    pub fn with_max_parallel_tool_calls(mut self, max_parallel_tool_calls: u32) -> Self {
+        self.max_parallel_tool_calls = Some(max_parallel_tool_calls);
+        self
+    }
+
+    /// Sets the maximum streamed argument bytes returned in one tool call.
+    pub fn with_max_streamed_argument_bytes(mut self, max_streamed_argument_bytes: u64) -> Self {
+        self.max_streamed_argument_bytes = Some(max_streamed_argument_bytes);
+        self
+    }
+
+    /// Sets the maximum streamed tool calls returned in one response.
+    pub fn with_max_streamed_tool_calls(mut self, max_streamed_tool_calls: u32) -> Self {
+        self.max_streamed_tool_calls = Some(max_streamed_tool_calls);
+        self
+    }
+
+    /// Sets the maximum serialized structured-plan bytes.
+    pub fn with_max_plan_bytes(mut self, max_plan_bytes: u64) -> Self {
+        self.max_plan_bytes = Some(max_plan_bytes);
+        self
+    }
+
+    /// Sets the maximum nodes in a structured plan.
+    pub fn with_max_plan_nodes(mut self, max_plan_nodes: u32) -> Self {
+        self.max_plan_nodes = Some(max_plan_nodes);
+        self
+    }
+
+    /// Sets the maximum generated program bytes.
+    pub fn with_max_program_bytes(mut self, max_program_bytes: u64) -> Self {
+        self.max_program_bytes = Some(max_program_bytes);
+        self
     }
 }
 
