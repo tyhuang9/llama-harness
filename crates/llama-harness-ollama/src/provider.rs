@@ -331,7 +331,14 @@ impl ModelProvider for OllamaProvider {
         Ok(Box::pin(async_stream::stream! {
             let mut call_index = 0_usize;
             while let Some(event) = events.next().await {
-                match event? {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+                match event {
                     crate::OllamaStreamEvent::TextDelta { content } => {
                         yield Ok(ModelStreamEvent::TextDelta { content });
                     }

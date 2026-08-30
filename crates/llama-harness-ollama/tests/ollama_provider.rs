@@ -370,6 +370,25 @@ async fn generic_provider_stream_maps_atomic_ollama_tool_calls_to_final_deltas()
 }
 
 #[tokio::test]
+async fn generic_provider_stream_preserves_adapter_errors() {
+    let (base_url, task) = server(vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot-json\n".to_vec(),
+    ])
+    .await;
+    let events = ModelProvider::stream(&provider(&base_url), request(CancellationToken::new()))
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert!(matches!(
+        events.as_slice(),
+        [Err(HarnessError::Provider(message))] if message.contains("decode")
+    ));
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn streaming_rejects_unbounded_or_incomplete_ndjson() {
     let (base_url, task) = server(vec![json_response(
         200,
