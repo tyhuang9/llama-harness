@@ -84,23 +84,18 @@ pub enum ToolRisk {
     High,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 /// Strength of a tool's cooperative cancellation guarantee.
 pub enum CancellationSafety {
     /// The tool has made no cancellation-safety guarantee.
+    #[default]
     Unknown,
     /// The tool observes cancellation, but work already started may still complete.
     Cooperative,
     /// Cancellation is guaranteed to prevent externally visible effects after it is observed.
     Guaranteed,
-}
-
-impl Default for CancellationSafety {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
