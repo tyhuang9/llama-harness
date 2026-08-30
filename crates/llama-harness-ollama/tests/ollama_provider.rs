@@ -374,6 +374,79 @@ async fn generic_provider_stream_maps_atomic_ollama_tool_calls_to_final_deltas()
 }
 
 #[tokio::test]
+async fn generic_provider_stream_preserves_parallel_atomic_tool_calls_in_order() {
+    let body = concat!(
+        "{\"model\":\"qwen3:8b\",\"message\":{\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"list_tasks\",\"arguments\":{}}},{\"function\":{\"name\":\"get_task\",\"arguments\":{\"id\":\"task-1\"}}}]},\"done\":false}\n",
+        "{\"model\":\"qwen3:8b\",\"done\":true,\"prompt_eval_count\":5,\"eval_count\":3}\n"
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n{body}"
+    )
+    .into_bytes();
+    let (base_url, task) = server(vec![response]).await;
+    let provider = provider(&base_url);
+    let mut stream_request = request(CancellationToken::new());
+    stream_request.tools = vec![
+        tool(),
+        ToolDefinition::new(
+            "get_task",
+            "Get task",
+            "Get one task",
+            json!({
+                "type":"object",
+                "required":["id"],
+                "properties":{"id":{"type":"string"}},
+                "additionalProperties":false
+            }),
+        ),
+    ];
+
+    assert!(provider.capabilities().supports_parallel_tool_calls);
+    let events = ModelProvider::stream(&provider, stream_request)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(events.len(), 3);
+    assert!(events.iter().all(Result::is_ok));
+    let deltas = events
+        .iter()
+        .filter_map(|event| match event.as_ref().unwrap() {
+            ModelStreamEvent::ToolCallDelta(delta) => Some(delta),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deltas.len(), 2);
+    assert_eq!(deltas[0].index, 0);
+    assert_eq!(deltas[0].tool_id.as_deref(), Some("list_tasks"));
+    assert_eq!(deltas[0].arguments_fragment, "{}");
+    assert_eq!(deltas[1].index, 1);
+    assert_eq!(deltas[1].tool_id.as_deref(), Some("get_task"));
+    assert_eq!(deltas[1].arguments_fragment, r#"{"id":"task-1"}"#);
+    assert!(deltas.iter().all(|delta| delta.is_final));
+    assert!(deltas.iter().all(|delta| delta
+        .call_id
+        .as_deref()
+        .is_some_and(|call_id| !call_id.is_empty())));
+    assert_ne!(deltas[0].call_id, deltas[1].call_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Ok(ModelStreamEvent::Completed { .. })))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        &events[2],
+        Ok(ModelStreamEvent::Completed { model, usage })
+            if model == "qwen3:8b" && usage.input_tokens == 5 && usage.output_tokens == 3
+    ));
+    let requests = task.await.unwrap();
+    assert_eq!(requests[0].path, "/api/chat");
+}
+
+#[tokio::test]
 async fn generic_provider_stream_preserves_adapter_errors() {
     let (base_url, task) = server(vec![
         b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot-json\n".to_vec(),
