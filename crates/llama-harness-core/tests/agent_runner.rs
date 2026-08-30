@@ -288,6 +288,8 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
     let result = runner.run(run_request).await.unwrap();
     assert_eq!(result.status, RunStatus::Completed);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(result.tool_calls[0].arguments_json, r#"{"key":"one"}"#);
+    assert_eq!(result.tool_calls[1].arguments_json, r#"{"key":"two"}"#);
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(
@@ -1244,6 +1246,11 @@ async fn invalid_argument_values_are_redacted_from_errors_events_and_transcript(
         .errors
         .iter()
         .all(|error| !error.message.contains(SECRET)));
+    assert_eq!(result.tool_calls.len(), 1);
+    assert_eq!(result.tool_calls[0].id, "invalid-secret");
+    assert_eq!(result.tool_calls[0].tool_id, "read");
+    assert_eq!(result.tool_calls[0].arguments_json, "{}");
+    assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
 
     let records = events.events();
     assert!(records.iter().any(|record| matches!(

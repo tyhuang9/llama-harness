@@ -236,15 +236,14 @@ impl AgentRunner {
                 break;
             }
 
-            messages.push(Message::assistant_tool_calls(
-                self.tool_calls_for_transcript(&request, &response.tool_calls),
-            ));
+            let recorded_calls = self.tool_calls_for_transcript(&request, &response.tool_calls);
+            messages.push(Message::assistant_tool_calls(recorded_calls.clone()));
             if let Err(error) = ensure_transcript(&messages, &request.agent.limits) {
                 apply_terminal_error(&mut result, error);
                 break;
             }
 
-            for call in response.tool_calls {
+            for (call, recorded_call) in response.tool_calls.into_iter().zip(recorded_calls) {
                 if let Err(error) =
                     check_stopped(&request.cancellation, deadline, "run deadline reached")
                 {
@@ -261,7 +260,7 @@ impl AgentRunner {
                     break 'run;
                 }
                 tool_calls += 1;
-                result.tool_calls.push(call.clone());
+                result.tool_calls.push(recorded_call);
 
                 if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes
                 {

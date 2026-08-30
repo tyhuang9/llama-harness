@@ -1215,3 +1215,86 @@ fn to_wire_result(result: llama_harness_core::RunResult) -> WireRunResult {
         cancelled: result.cancelled,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llama_harness_core::{
+        mock::{final_response, tool_response, MockModelProvider},
+        RunStatus, ToolCall,
+    };
+    use serde_json::{json, Value};
+    use std::sync::atomic::AtomicU32;
+
+    struct CountingTool {
+        definition: ToolDefinition,
+        calls: AtomicU32,
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn definition(&self) -> &ToolDefinition {
+            &self.definition
+        }
+
+        async fn execute(
+            &self,
+            _: Value,
+            _: CancellationToken,
+        ) -> Result<ToolResult, HarnessError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::success(Value::Null))
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_result_does_not_restore_rejected_argument_values() {
+        const SECRET: &str = "sentinel-runtime-argument-secret";
+        let tool = Arc::new(CountingTool {
+            definition: ToolDefinition::new(
+                "read",
+                "Read",
+                "Read",
+                json!({
+                    "type":"object",
+                    "required":["key"],
+                    "properties":{"key":{"type":"string","enum":["allowed"]}},
+                    "additionalProperties":false
+                }),
+            )
+            .with_risk(ToolRisk::Low)
+            .with_read_only(true)
+            .with_idempotent(true),
+            calls: AtomicU32::new(0),
+        });
+        let mut tools = ToolRegistry::default();
+        tools.register(tool.clone()).unwrap();
+        let provider = Arc::new(MockModelProvider::scripted([
+            tool_response(ToolCall::new(
+                "invalid-secret",
+                "read",
+                format!(r#"{{"key":"{SECRET}"}}"#),
+            )),
+            final_response("recovered"),
+        ]));
+        let mut agent = AgentDefinition::new("runtime-test", "Runtime test", "1", "mock-model");
+        agent.tool_allowlist = vec!["read".into()];
+
+        let result = AgentRunner::builder(provider)
+            .tools(tools)
+            .build()
+            .run(RunRequest::new(agent, "read"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
+        let wire = to_wire_result(result);
+        assert_eq!(wire.tool_calls.len(), 1);
+        assert_eq!(wire.tool_calls[0].id, "invalid-secret");
+        assert_eq!(wire.tool_calls[0].tool_id, "read");
+        assert_eq!(wire.tool_calls[0].arguments_json, "{}");
+        assert!(!serde_json::to_string(&wire).unwrap().contains(SECRET));
+    }
+}
