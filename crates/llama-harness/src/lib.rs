@@ -45,7 +45,9 @@ pub use llama_harness_core::{
     PolicyEngine, ProviderHealth, ResultBinding, ResultRef, RunError, RunEvent, RunOverrides,
     RunRequest, RunResult, RunStatus, RunStrategy, SafeDefaultPolicy, Tool, ToolCall,
     ToolCallContext, ToolDefinition, ToolRegistry, ToolResult, ToolRisk, Usage,
-    AGENT_MANIFEST_VERSION,
+    AGENT_MANIFEST_VERSION, MAX_EXECUTION_PLAN_BINDINGS, MAX_EXECUTION_PLAN_BYTES,
+    MAX_EXECUTION_PLAN_EDGES, MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES,
+    MAX_PLAN_ID_LENGTH, MAX_PLAN_JSON_DEPTH, MAX_PLAN_POINTER_LENGTH,
 };
 pub use serde_json;
 pub use serde_json::Value as JsonValue;

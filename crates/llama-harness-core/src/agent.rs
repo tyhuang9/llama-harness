@@ -14,16 +14,16 @@ pub type JsonMap = serde_json::Map<String, Value>;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-/// Strategy requested for an agent run.
+/// Strategy identifier used by planning and evaluation contracts.
 pub enum RunStrategy {
-    /// Allows the runtime to select the most appropriate supported strategy.
+    /// Evaluates adaptive strategy selection.
     #[default]
     Adaptive,
-    /// Executes the existing direct model-and-tool loop.
+    /// Evaluates direct model-and-tool execution.
     Direct,
-    /// Executes a declarative plan.
+    /// Evaluates declarative plan execution.
     DeclarativePlan,
-    /// Executes a programmatic orchestration strategy.
+    /// Evaluates programmatic orchestration.
     Programmatic,
 }
 
@@ -87,19 +87,9 @@ pub struct RunOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional model identifier for this run.
     pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Optional execution strategy for this run.
-    pub strategy: Option<RunStrategy>,
     #[serde(default)]
     /// Generation settings for this run.
     pub generation: GenerationOptions,
-}
-
-impl RunOverrides {
-    /// Returns the requested strategy, defaulting to adaptive selection.
-    pub fn resolved_strategy(&self) -> RunStrategy {
-        self.strategy.unwrap_or_default()
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

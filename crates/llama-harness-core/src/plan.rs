@@ -1,9 +1,27 @@
 use crate::HarnessError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// Maximum number of nodes accepted by the plan contract.
+pub const MAX_EXECUTION_PLAN_NODES: usize = 1_024;
+/// Maximum total number of dependency edges accepted by the plan contract.
+pub const MAX_EXECUTION_PLAN_EDGES: usize = 8_192;
+/// Maximum total number of result bindings accepted by the plan contract.
+pub const MAX_EXECUTION_PLAN_BINDINGS: usize = 8_192;
+/// Maximum serialized plan size in bytes.
+pub const MAX_EXECUTION_PLAN_BYTES: usize = 1_048_576;
+/// Maximum serialized arguments size for one node in bytes.
+pub const MAX_PLAN_ARGUMENT_BYTES: usize = 262_144;
+/// Maximum nesting depth accepted in node arguments.
+pub const MAX_PLAN_JSON_DEPTH: usize = 64;
+/// Maximum byte length for node and tool identifiers.
+pub const MAX_PLAN_ID_LENGTH: usize = 256;
+/// Maximum byte length for dependency references and JSON pointers.
+pub const MAX_PLAN_POINTER_LENGTH: usize = 1_024;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 /// A declarative, dependency-ordered set of tool invocations.
 pub struct ExecutionPlan {
     #[serde(default)]
@@ -23,8 +41,13 @@ impl ExecutionPlan {
         self
     }
 
-    /// Validates structural invariants without executing the plan.
+    /// Validates bounded structural invariants without executing the plan.
     pub fn validate(&self, max_nodes: usize) -> Result<(), HarnessError> {
+        if max_nodes > MAX_EXECUTION_PLAN_NODES {
+            return invalid(format!(
+                "requested maximum node count {max_nodes} exceeds library hard cap of {MAX_EXECUTION_PLAN_NODES}"
+            ));
+        }
         if self.nodes.len() > max_nodes {
             return invalid(format!(
                 "execution plan has {} nodes, exceeding maximum of {max_nodes}",
@@ -33,79 +56,81 @@ impl ExecutionPlan {
         }
 
         let mut node_indexes = BTreeMap::new();
+        let mut total_edges = 0usize;
+        let mut total_bindings = 0usize;
         for (index, node) in self.nodes.iter().enumerate() {
-            if node.id.trim().is_empty() {
-                return invalid(format!(
-                    "execution plan node at index {index} has an empty ID"
-                ));
-            }
-            if node.tool_id.trim().is_empty() {
-                return invalid(format!(
-                    "execution plan node '{}' has an empty tool ID",
-                    node.id
-                ));
-            }
+            validate_node_header(index, node)?;
             if node_indexes.insert(node.id.as_str(), index).is_some() {
                 return invalid(format!(
                     "execution plan contains duplicate node ID '{}'",
                     node.id
                 ));
             }
+            total_edges = total_edges
+                .checked_add(node.depends_on.len())
+                .ok_or_else(|| invalid_error("execution plan dependency count overflow"))?;
+            total_bindings = total_bindings
+                .checked_add(node.result_bindings.len())
+                .ok_or_else(|| invalid_error("execution plan binding count overflow"))?;
+        }
+        if total_edges > MAX_EXECUTION_PLAN_EDGES {
+            return invalid(format!(
+                "execution plan has {total_edges} dependency edges, exceeding library hard cap of {MAX_EXECUTION_PLAN_EDGES}"
+            ));
+        }
+        if total_bindings > MAX_EXECUTION_PLAN_BINDINGS {
+            return invalid(format!(
+                "execution plan has {total_bindings} result bindings, exceeding library hard cap of {MAX_EXECUTION_PLAN_BINDINGS}"
+            ));
         }
 
-        for node in &self.nodes {
+        let serialized_size = serde_json::to_vec(self)
+            .map_err(|error| {
+                invalid_error(format!("execution plan cannot be serialized: {error}"))
+            })?
+            .len();
+        if serialized_size > MAX_EXECUTION_PLAN_BYTES {
+            return invalid(format!(
+                "execution plan serialized size {serialized_size} bytes exceeds library hard cap of {MAX_EXECUTION_PLAN_BYTES} bytes"
+            ));
+        }
+
+        let mut indegrees = vec![0usize; self.nodes.len()];
+        let mut dependents = vec![Vec::new(); self.nodes.len()];
+        for (index, node) in self.nodes.iter().enumerate() {
             let mut dependencies = BTreeSet::new();
             for dependency in &node.depends_on {
+                validate_reference_length("dependency node ID", &node.id, dependency)?;
                 if dependency == &node.id {
                     return invalid(format!(
                         "execution plan node '{}' depends on itself",
                         node.id
                     ));
                 }
-                if !node_indexes.contains_key(dependency.as_str()) {
+                let Some(&dependency_index) = node_indexes.get(dependency.as_str()) else {
                     return invalid(format!(
                         "execution plan node '{}' depends on missing node '{dependency}'",
                         node.id
                     ));
-                }
+                };
                 if !dependencies.insert(dependency) {
                     return invalid(format!(
                         "execution plan node '{}' contains duplicate dependency '{dependency}'",
                         node.id
                     ));
                 }
+                indegrees[index] += 1;
+                dependents[dependency_index].push(index);
             }
-            for binding in &node.result_bindings {
-                if binding.target_pointer.is_empty() || !binding.target_pointer.starts_with('/') {
-                    return invalid(format!(
-                        "execution plan node '{}' has invalid binding target pointer '{}'",
-                        node.id, binding.target_pointer
-                    ));
-                }
-                if !valid_pointer(&binding.source.output_pointer) {
-                    return invalid(format!(
-                        "execution plan node '{}' has invalid source output pointer '{}'",
-                        node.id, binding.source.output_pointer
-                    ));
-                }
-                if !node_indexes.contains_key(binding.source.node_id.as_str()) {
-                    return invalid(format!(
-                        "execution plan node '{}' binds from missing node '{}'",
-                        node.id, binding.source.node_id
-                    ));
-                }
-            }
+            validate_bindings(node, &node_indexes)?;
         }
 
-        let mut states = vec![VisitState::Unvisited; self.nodes.len()];
-        for index in 0..self.nodes.len() {
-            visit(index, &self.nodes, &node_indexes, &mut states)?;
-        }
-
-        for node in &self.nodes {
-            let dependencies = transitive_dependencies(node, &self.nodes, &node_indexes);
+        let topological_order = topological_order(&self.nodes, &dependents, &mut indegrees)?;
+        let ancestors = compute_ancestors(&self.nodes, &node_indexes, &topological_order);
+        for (index, node) in self.nodes.iter().enumerate() {
             for binding in &node.result_bindings {
-                if !dependencies.contains(binding.source.node_id.as_str()) {
+                let source_index = node_indexes[binding.source.node_id.as_str()];
+                if !ancestors[index][source_index] {
                     return invalid(format!(
                         "execution plan node '{}' binds from node '{}' which is not a transitive dependency",
                         node.id, binding.source.node_id
@@ -119,6 +144,7 @@ impl ExecutionPlan {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 /// One tool invocation within an execution plan.
 pub struct PlanNode {
     /// Stable node identifier within the plan.
@@ -192,6 +218,7 @@ impl PlanNode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 /// Copies one dependency output value into a node's arguments.
 pub struct ResultBinding {
     /// Nonempty JSON pointer identifying the target within node arguments.
@@ -211,6 +238,7 @@ impl ResultBinding {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 /// Reference to a value in a plan node's output.
 pub struct ResultRef {
     /// Source node identifier.
@@ -241,66 +269,218 @@ pub enum PlanConcurrency {
     Serial,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum VisitState {
-    Unvisited,
-    Visiting,
-    Visited,
-}
-
-fn visit(
-    index: usize,
-    nodes: &[PlanNode],
-    node_indexes: &BTreeMap<&str, usize>,
-    states: &mut [VisitState],
-) -> Result<(), HarnessError> {
-    match states[index] {
-        VisitState::Visited => return Ok(()),
-        VisitState::Visiting => {
-            return invalid(format!(
-                "execution plan contains a dependency cycle involving node '{}'",
-                nodes[index].id
+fn validate_node_header(index: usize, node: &PlanNode) -> Result<(), HarnessError> {
+    if node.id.trim().is_empty() {
+        return invalid(format!(
+            "execution plan node at index {index} has an empty ID"
+        ));
+    }
+    if node.id.len() > MAX_PLAN_ID_LENGTH {
+        return invalid(format!(
+            "execution plan node ID at index {index} exceeds {MAX_PLAN_ID_LENGTH} bytes"
+        ));
+    }
+    if node.tool_id.trim().is_empty() {
+        return invalid(format!(
+            "execution plan node '{}' has an empty tool ID",
+            node.id
+        ));
+    }
+    if node.tool_id.len() > MAX_PLAN_ID_LENGTH {
+        return invalid(format!(
+            "execution plan node '{}' tool ID exceeds {MAX_PLAN_ID_LENGTH} bytes",
+            node.id
+        ));
+    }
+    let argument_size = serde_json::to_vec(&node.arguments)
+        .map_err(|error| {
+            invalid_error(format!(
+                "node '{}' arguments cannot be serialized: {error}",
+                node.id
             ))
-        }
-        VisitState::Unvisited => {}
+        })?
+        .len();
+    if argument_size > MAX_PLAN_ARGUMENT_BYTES {
+        return invalid(format!(
+            "execution plan node '{}' arguments are {argument_size} bytes, exceeding library hard cap of {MAX_PLAN_ARGUMENT_BYTES} bytes",
+            node.id
+        ));
     }
-    states[index] = VisitState::Visiting;
-    for dependency in &nodes[index].depends_on {
-        visit(
-            node_indexes[dependency.as_str()],
-            nodes,
-            node_indexes,
-            states,
-        )?;
+    let depth = json_depth(&node.arguments);
+    if depth > MAX_PLAN_JSON_DEPTH {
+        return invalid(format!(
+            "execution plan node '{}' arguments depth {depth} exceeds library hard cap of {MAX_PLAN_JSON_DEPTH}",
+            node.id
+        ));
     }
-    states[index] = VisitState::Visited;
     Ok(())
 }
 
-fn transitive_dependencies<'a>(
-    node: &'a PlanNode,
-    nodes: &'a [PlanNode],
+fn validate_bindings(
+    node: &PlanNode,
     node_indexes: &BTreeMap<&str, usize>,
-) -> BTreeSet<&'a str> {
-    let mut dependencies = BTreeSet::new();
-    let mut pending: Vec<&str> = node.depends_on.iter().map(String::as_str).collect();
-    while let Some(dependency) = pending.pop() {
-        if dependencies.insert(dependency) {
-            pending.extend(
-                nodes[node_indexes[dependency]]
-                    .depends_on
-                    .iter()
-                    .map(String::as_str),
-            );
+) -> Result<(), HarnessError> {
+    let mut targets = BTreeSet::new();
+    for binding in &node.result_bindings {
+        validate_pointer_length("binding target pointer", &node.id, &binding.target_pointer)?;
+        if binding.target_pointer.is_empty() || !valid_json_pointer(&binding.target_pointer) {
+            return invalid(format!(
+                "execution plan node '{}' has invalid binding target pointer '{}'",
+                node.id, binding.target_pointer
+            ));
+        }
+        if !targets.insert(binding.target_pointer.as_str()) {
+            return invalid(format!(
+                "execution plan node '{}' has overlapping binding target pointers '{}' and '{}'",
+                node.id, binding.target_pointer, binding.target_pointer
+            ));
+        }
+
+        validate_reference_length("binding source node ID", &node.id, &binding.source.node_id)?;
+        validate_pointer_length(
+            "source output pointer",
+            &node.id,
+            &binding.source.output_pointer,
+        )?;
+        if !valid_json_pointer(&binding.source.output_pointer) {
+            return invalid(format!(
+                "execution plan node '{}' has invalid source output pointer '{}'",
+                node.id, binding.source.output_pointer
+            ));
+        }
+        if !node_indexes.contains_key(binding.source.node_id.as_str()) {
+            return invalid(format!(
+                "execution plan node '{}' binds from missing node '{}'",
+                node.id, binding.source.node_id
+            ));
         }
     }
-    dependencies
+    for target in &targets {
+        for (index, byte) in target.bytes().enumerate().skip(1) {
+            if byte == b'/' {
+                let ancestor = &target[..index];
+                if targets.contains(ancestor) {
+                    return invalid(format!(
+                        "execution plan node '{}' has overlapping binding target pointers '{}' and '{}'",
+                        node.id, ancestor, target
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
-fn valid_pointer(pointer: &str) -> bool {
-    pointer.is_empty() || pointer.starts_with('/')
+fn topological_order(
+    nodes: &[PlanNode],
+    dependents: &[Vec<usize>],
+    indegrees: &mut [usize],
+) -> Result<Vec<usize>, HarnessError> {
+    let mut ready: VecDeque<usize> = indegrees
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect();
+    let mut order = Vec::with_capacity(nodes.len());
+    while let Some(index) = ready.pop_front() {
+        order.push(index);
+        for &dependent in &dependents[index] {
+            indegrees[dependent] -= 1;
+            if indegrees[dependent] == 0 {
+                ready.push_back(dependent);
+            }
+        }
+    }
+    if order.len() != nodes.len() {
+        let index = indegrees.iter().position(|degree| *degree > 0).unwrap_or(0);
+        return invalid(format!(
+            "execution plan contains a dependency cycle involving node '{}'",
+            nodes[index].id
+        ));
+    }
+    Ok(order)
+}
+
+fn compute_ancestors(
+    nodes: &[PlanNode],
+    node_indexes: &BTreeMap<&str, usize>,
+    topological_order: &[usize],
+) -> Vec<Vec<bool>> {
+    let mut ancestors = vec![vec![false; nodes.len()]; nodes.len()];
+    for &index in topological_order {
+        for dependency in &nodes[index].depends_on {
+            let dependency_index = node_indexes[dependency.as_str()];
+            ancestors[index][dependency_index] = true;
+            for candidate in 0..nodes.len() {
+                ancestors[index][candidate] |= ancestors[dependency_index][candidate];
+            }
+        }
+    }
+    ancestors
+}
+
+fn json_depth(value: &Value) -> usize {
+    let mut maximum = 0usize;
+    let mut pending = vec![(value, 1usize)];
+    while let Some((value, depth)) = pending.pop() {
+        maximum = maximum.max(depth);
+        match value {
+            Value::Array(values) => {
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            Value::Object(values) => {
+                pending.extend(values.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    maximum
+}
+
+fn valid_json_pointer(pointer: &str) -> bool {
+    if pointer.is_empty() {
+        return true;
+    }
+    if !pointer.starts_with('/') {
+        return false;
+    }
+    let bytes = pointer.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'~' {
+            if index + 1 >= bytes.len() || !matches!(bytes[index + 1], b'0' | b'1') {
+                return false;
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+fn validate_reference_length(label: &str, node_id: &str, value: &str) -> Result<(), HarnessError> {
+    if value.len() > MAX_PLAN_ID_LENGTH {
+        return invalid(format!(
+            "execution plan node '{node_id}' {label} exceeds {MAX_PLAN_ID_LENGTH} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pointer_length(label: &str, node_id: &str, value: &str) -> Result<(), HarnessError> {
+    if value.len() > MAX_PLAN_POINTER_LENGTH {
+        return invalid(format!(
+            "execution plan node '{node_id}' {label} exceeds {MAX_PLAN_POINTER_LENGTH} bytes"
+        ));
+    }
+    Ok(())
 }
 
 fn invalid<T>(message: String) -> Result<T, HarnessError> {
-    Err(HarnessError::InvalidRequest(message))
+    Err(invalid_error(message))
+}
+
+fn invalid_error(message: impl Into<String>) -> HarnessError {
+    HarnessError::InvalidRequest(message.into())
 }

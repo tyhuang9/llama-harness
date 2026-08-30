@@ -31,7 +31,12 @@ pub use message::{Message, MessageRole};
 pub use model::{
     ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, ProviderHealth, Usage,
 };
-pub use plan::{ExecutionPlan, PlanConcurrency, PlanNode, ResultBinding, ResultRef};
+pub use plan::{
+    ExecutionPlan, PlanConcurrency, PlanNode, ResultBinding, ResultRef,
+    MAX_EXECUTION_PLAN_BINDINGS, MAX_EXECUTION_PLAN_BYTES, MAX_EXECUTION_PLAN_EDGES,
+    MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES, MAX_PLAN_ID_LENGTH, MAX_PLAN_JSON_DEPTH,
+    MAX_PLAN_POINTER_LENGTH,
+};
 pub use policy::{
     AllowAllPolicy, ApprovalHandler, ApprovalRecord, DenyApproval, PolicyDecision, PolicyEngine,
     SafeDefaultPolicy,

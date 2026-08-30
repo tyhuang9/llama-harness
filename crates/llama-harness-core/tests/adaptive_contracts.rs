@@ -1,6 +1,8 @@
+use llama_harness_core::plan::{
+    MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES, MAX_PLAN_JSON_DEPTH,
+};
 use llama_harness_core::{
-    ExecutionPlan, HarnessError, PlanConcurrency, PlanNode, ResultBinding, ResultRef, RunOverrides,
-    RunStrategy,
+    ExecutionPlan, HarnessError, PlanConcurrency, PlanNode, ResultBinding, ResultRef, RunStrategy,
 };
 use serde_json::json;
 
@@ -16,20 +18,12 @@ fn error(plan: ExecutionPlan) -> String {
 }
 
 #[test]
-fn strategy_serde_and_override_default_are_stable() {
-    let overrides: RunOverrides = serde_json::from_value(json!({})).unwrap();
-    assert_eq!(overrides.strategy, None);
-    assert_eq!(overrides.resolved_strategy(), RunStrategy::Adaptive);
+fn strategy_serde_and_default_are_stable() {
+    assert_eq!(RunStrategy::default(), RunStrategy::Adaptive);
     assert_eq!(
         serde_json::to_value(RunStrategy::DeclarativePlan).unwrap(),
         json!("declarative_plan")
     );
-
-    let overrides: RunOverrides = serde_json::from_value(json!({
-        "strategy": "programmatic"
-    }))
-    .unwrap();
-    assert_eq!(overrides.resolved_strategy(), RunStrategy::Programmatic);
 }
 
 #[test]
@@ -56,10 +50,32 @@ fn valid_dag_accepts_transitive_result_bindings() {
             .with_dependency("orders")
             .with_result_binding(ResultBinding::new(
                 "/customer/id",
-                ResultRef::new("account", "/id"),
+                ResultRef::new("account", ""),
             )),
     ]);
     assert_eq!(plan.validate(3), Ok(()));
+}
+
+#[test]
+fn plan_serde_rejects_unknown_fields_at_every_level() {
+    for value in [
+        json!({"nodes": [], "unknown": true}),
+        json!({"nodes": [{"id": "a", "tool_id": "tool.a", "unknown": true}]}),
+        json!({"nodes": [
+            {"id": "a", "tool_id": "tool.a"},
+            {"id": "b", "tool_id": "tool.b", "depends_on": ["a"], "result_bindings": [{
+                "target_pointer": "/x", "source": {"node_id": "a"}, "unknown": true
+            }]}
+        ]}),
+        json!({"nodes": [
+            {"id": "a", "tool_id": "tool.a"},
+            {"id": "b", "tool_id": "tool.b", "depends_on": ["a"], "result_bindings": [{
+                "target_pointer": "/x", "source": {"node_id": "a", "unknown": true}
+            }]}
+        ]}),
+    ] {
+        assert!(serde_json::from_value::<ExecutionPlan>(value).is_err());
+    }
 }
 
 #[test]
@@ -137,6 +153,90 @@ fn validation_rejects_bad_pointers_and_node_limit() {
             "execution plan has 1 nodes, exceeding maximum of 0".into()
         ))
     );
+}
+
+#[test]
+fn validation_rejects_malformed_pointer_escapes_and_overlapping_targets() {
+    for pointer in ["/value~2", "/value~"] {
+        assert_eq!(
+            error(ExecutionPlan::new(vec![
+                node("source"),
+                node("target")
+                    .with_dependency("source")
+                    .with_result_binding(
+                        ResultBinding::new(pointer, ResultRef::new("source", ""),)
+                    ),
+            ])),
+            format!("execution plan node 'target' has invalid binding target pointer '{pointer}'")
+        );
+    }
+    assert_eq!(
+        error(ExecutionPlan::new(vec![
+            node("source"),
+            node("target")
+                .with_dependency("source")
+                .with_result_binding(ResultBinding::new(
+                    "/value",
+                    ResultRef::new("source", "/bad~2"),
+                )),
+        ])),
+        "execution plan node 'target' has invalid source output pointer '/bad~2'"
+    );
+
+    for targets in [["/value", "/value"], ["/value", "/value/nested"]] {
+        let target = node("target")
+            .with_dependency("source")
+            .with_result_binding(ResultBinding::new(targets[0], ResultRef::new("source", "")))
+            .with_result_binding(ResultBinding::new(targets[1], ResultRef::new("source", "")));
+        assert!(error(ExecutionPlan::new(vec![node("source"), target]))
+            .contains("overlapping binding target pointers"));
+    }
+}
+
+#[test]
+fn iterative_validation_accepts_a_chain_at_the_node_hard_cap() {
+    let mut nodes = Vec::with_capacity(MAX_EXECUTION_PLAN_NODES);
+    for index in 0..MAX_EXECUTION_PLAN_NODES {
+        let current = format!("node-{index}");
+        let mut current_node = node(&current);
+        if index > 0 {
+            current_node = current_node.with_dependency(format!("node-{}", index - 1));
+        }
+        nodes.push(current_node);
+    }
+    assert_eq!(
+        ExecutionPlan::new(nodes).validate(MAX_EXECUTION_PLAN_NODES),
+        Ok(())
+    );
+    assert_eq!(
+        ExecutionPlan::default().validate(MAX_EXECUTION_PLAN_NODES + 1),
+        Err(HarnessError::InvalidRequest(format!(
+            "requested maximum node count {} exceeds library hard cap of {MAX_EXECUTION_PLAN_NODES}",
+            MAX_EXECUTION_PLAN_NODES + 1
+        )))
+    );
+}
+
+#[test]
+fn validation_enforces_argument_size_and_depth_hard_caps() {
+    let oversized = "x".repeat(MAX_PLAN_ARGUMENT_BYTES + 1);
+    assert!(error(ExecutionPlan::new(vec![PlanNode::new(
+        "large",
+        "tool.large",
+        json!(oversized),
+    )]))
+    .contains("arguments are"));
+
+    let mut deeply_nested = json!(null);
+    for _ in 0..MAX_PLAN_JSON_DEPTH {
+        deeply_nested = json!([deeply_nested]);
+    }
+    assert!(error(ExecutionPlan::new(vec![PlanNode::new(
+        "deep",
+        "tool.deep",
+        deeply_nested,
+    )]))
+    .contains("arguments depth"));
 }
 
 #[test]

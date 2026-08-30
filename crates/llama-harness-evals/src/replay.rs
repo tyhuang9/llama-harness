@@ -102,7 +102,11 @@ pub fn export_regression_case(
         prompt_override: source.prompt_override,
         model: source.model,
         source_trace_id: result.trace_id.clone(),
-        case: case.clone(),
+        case: {
+            let mut case = case.clone();
+            case.strategy = Some(result.strategy);
+            case
+        },
     };
     regression.validate()?;
     Ok(regression)

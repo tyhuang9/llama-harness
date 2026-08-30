@@ -333,7 +333,6 @@ impl TaskAgentRuntime {
                 metadata: JsonMap::new(),
                 overrides: RunOverrides {
                     model,
-                    strategy: None,
                     generation: GenerationOptions::default(),
                 },
                 evaluation: JsonMap::new(),
