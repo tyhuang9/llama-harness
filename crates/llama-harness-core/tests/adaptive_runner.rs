@@ -617,6 +617,88 @@ async fn recovery_reuses_committed_mutation_instead_of_executing_it_twice() {
 }
 
 #[tokio::test]
+async fn late_effect_reuse_is_charged_before_a_later_mutation() {
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [
+            {"id": "first-write", "tool_id": "write", "arguments": {"input": "same"}},
+            {"id": "lookup", "tool_id": "lookup", "arguments": {}},
+            {
+                "id": "reused-write",
+                "tool_id": "write",
+                "arguments": {"input": "placeholder"},
+                "depends_on": ["lookup"],
+                "result_bindings": [{
+                    "target_pointer": "/input",
+                    "source": {"node_id": "lookup", "output_pointer": "/value"}
+                }]
+            },
+            {
+                "id": "later-write",
+                "tool_id": "write",
+                "arguments": {"input": "distinct"},
+                "depends_on": ["reused-write"]
+            }
+        ]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(envelope.to_string())])
+            .with_capabilities(planning_capabilities(1)),
+    );
+    let lookup_result = ToolResult::success(json!({"value": "same"}));
+    let write_result = ToolResult::success(json!({"written": true}));
+    let lookup = Arc::new(FixedTool::new("lookup", true, lookup_result.clone()));
+    let write = Arc::new(FixedTool::new("write", false, write_result.clone()));
+    let serialized_result_bytes =
+        |result: &ToolResult| u64::try_from(serde_json::to_vec(result).unwrap().len()).unwrap();
+    let exact_entry_bytes = |call_id: &str, tool_id: &str, arguments: &str, result: &ToolResult| {
+        (call_id.len() as u64) * 2
+            + tool_id.len() as u64
+            + arguments.len() as u64
+            + serialized_result_bytes(result)
+    };
+    let max_result_bytes =
+        serialized_result_bytes(&lookup_result).max(serialized_result_bytes(&write_result));
+    let lookup_entry = exact_entry_bytes("plan-1-node-2", "lookup", "{}", &lookup_result);
+    let write_entry = exact_entry_bytes(
+        "plan-1-node-1",
+        "write",
+        r#"{"input":"same"}"#,
+        &write_result,
+    );
+    let later_worst_case = ("plan-1-node-4".len() as u64) * 2
+        + "write".len() as u64
+        + r#"{"input":"distinct"}"#.len() as u64
+        + max_result_bytes;
+
+    let mut run_request = request(&["lookup", "write"]);
+    run_request.agent.limits.max_tool_result_bytes = max_result_bytes;
+    run_request.agent.limits.max_transcript_bytes =
+        run_request.input.len() as u64 + lookup_entry + write_entry + later_worst_case;
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([
+            lookup.clone() as Arc<dyn Tool>,
+            write.clone() as Arc<dyn Tool>,
+        ]))
+        .policy(Arc::new(AllowAllPolicy))
+        .event_sink(events.clone())
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::LimitReached);
+    assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(write.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.requests().len(), 1);
+    assert!(events
+        .events()
+        .iter()
+        .any(|record| matches!(record.event, RunEvent::ToolEffectReused { .. })));
+}
+
+#[tokio::test]
 async fn provider_parallel_limit_bounds_each_deterministic_wave() {
     let nodes = (0..6)
         .map(|index| {

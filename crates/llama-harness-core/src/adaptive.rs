@@ -454,6 +454,35 @@ impl<'a> StrategyRun<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn record_reused_plan_node(
+        &mut self,
+        retained_bytes: &mut u64,
+        budget: u64,
+        completed: &mut BTreeMap<String, Arc<ToolResult>>,
+        transcript: &mut Vec<(ToolCall, Arc<ToolResult>)>,
+        done: &mut HashSet<String>,
+        node_id: String,
+        event_id: String,
+        tool_id: String,
+        wave: u32,
+        call: ToolCall,
+        result: Arc<ToolResult>,
+    ) -> Result<(), HarnessError> {
+        reserve_plan_entry(retained_bytes, budget, &call, &result)?;
+        self.events.emit(RunEvent::PlanNodeCompleted {
+            node_id: event_id,
+            tool_id,
+            wave,
+            ok: result.ok,
+            duration_ms: 0,
+        });
+        completed.insert(node_id.clone(), Arc::clone(&result));
+        transcript.push((call, result));
+        done.insert(node_id);
+        Ok(())
+    }
+
     async fn complete(
         &mut self,
         messages: Vec<Message>,
@@ -915,9 +944,19 @@ impl<'a> StrategyRun<'a> {
             let mut executable = Vec::new();
             for &index in &wave {
                 if let Some((call, reused)) = prepared[index].reused.take() {
-                    if let Err(error) =
-                        reserve_plan_entry(&mut retained_bytes, plan_result_budget, &call, &reused)
-                    {
+                    if let Err(error) = self.record_reused_plan_node(
+                        &mut retained_bytes,
+                        plan_result_budget,
+                        &mut completed,
+                        &mut transcript,
+                        &mut done,
+                        prepared[index].node.id.clone(),
+                        prepared[index].event_id.clone(),
+                        prepared[index].node.tool_id.clone(),
+                        wave_number,
+                        call,
+                        reused,
+                    ) {
                         self.terminate(error);
                         return PlanExecution {
                             completed,
@@ -926,16 +965,6 @@ impl<'a> StrategyRun<'a> {
                             effects_started,
                         };
                     }
-                    self.events.emit(RunEvent::PlanNodeCompleted {
-                        node_id: prepared[index].event_id.clone(),
-                        tool_id: prepared[index].node.tool_id.clone(),
-                        wave: wave_number,
-                        ok: reused.ok,
-                        duration_ms: 0,
-                    });
-                    completed.insert(prepared[index].node.id.clone(), reused.clone());
-                    transcript.push((call, reused));
-                    done.insert(prepared[index].node.id.clone());
                     continue;
                 }
 
@@ -983,16 +1012,28 @@ impl<'a> StrategyRun<'a> {
                     .await
                 {
                     Ok(FinalizeOutcome::Reused(reused)) => {
-                        self.events.emit(RunEvent::PlanNodeCompleted {
-                            node_id: event_id,
+                        let exact_call = call.call.clone();
+                        if let Err(error) = self.record_reused_plan_node(
+                            &mut retained_bytes,
+                            plan_result_budget,
+                            &mut completed,
+                            &mut transcript,
+                            &mut done,
+                            node_id,
+                            event_id,
                             tool_id,
-                            wave: wave_number,
-                            ok: reused.ok,
-                            duration_ms: 0,
-                        });
-                        completed.insert(node_id.clone(), reused.clone());
-                        transcript.push((call.call.clone(), reused));
-                        done.insert(node_id);
+                            wave_number,
+                            exact_call,
+                            reused,
+                        ) {
+                            self.terminate(error);
+                            return PlanExecution {
+                                completed,
+                                transcript,
+                                failure: Some(PlanFailureKind::Terminal),
+                                effects_started,
+                            };
+                        }
                     }
                     Ok(FinalizeOutcome::Ready) => executable.push(index),
                     Ok(FinalizeOutcome::Stop) => {
