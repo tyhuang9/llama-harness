@@ -152,7 +152,9 @@ pub enum RunEvent {
         repair_model_calls: u32,
         /// Provider calls used for the single optional execution recovery.
         recovery_model_calls: u32,
-        /// Provider calls used by direct reactive execution and final synthesis.
+        /// Provider calls used to synthesize a final answer from completed plan results.
+        final_synthesis_model_calls: u32,
+        /// Provider calls used by direct reactive execution.
         reactive_model_calls: u32,
         /// Number of tool proposals admitted to the broker attempt budget.
         tool_calls: u32,

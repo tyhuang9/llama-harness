@@ -57,6 +57,7 @@ struct StrategyRun<'a> {
     planning_model_calls: u32,
     repair_model_calls: u32,
     recovery_model_calls: u32,
+    final_synthesis_model_calls: u32,
     reactive_model_calls: u32,
     output_repairs: u32,
     broker_state: BrokerState,
@@ -91,6 +92,7 @@ enum ModelCallPhase {
     Planning,
     Repair,
     Recovery,
+    FinalSynthesis,
     Reactive,
 }
 
@@ -263,7 +265,7 @@ impl AgentRunner {
                             requested,
                             StrategyFallbackReason::PlannerFailure,
                         );
-                        run.run_reactive().await;
+                        run.run_reactive(ModelCallPhase::Reactive).await;
                     } else {
                         run.terminate(error);
                     }
@@ -336,7 +338,7 @@ impl AgentRunner {
                         .errors
                         .retain(|record| record.code != "invalid_plan");
                     let _ = error;
-                    run.run_reactive().await;
+                    run.run_reactive(ModelCallPhase::Reactive).await;
                     return Ok(run.finish());
                 }
                 Err(error) => {
@@ -369,7 +371,7 @@ impl AgentRunner {
                     reason: StrategySelectionReason::PlannerSelectedDirect,
                 });
                 run.selected = RunStrategy::Direct;
-                run.run_reactive().await;
+                run.run_reactive(ModelCallPhase::Reactive).await;
             }
             PlannerEnvelope::DeclarativePlan { mut plan } => {
                 if requested == RunStrategy::Adaptive {
@@ -390,7 +392,7 @@ impl AgentRunner {
                     && run.has_model_call_capacity()
                 {
                     run.select_direct_fallback(requested, StrategyFallbackReason::InvalidPlan);
-                    run.run_reactive().await;
+                    run.run_reactive(ModelCallPhase::Reactive).await;
                     return Ok(run.finish());
                 }
 
@@ -468,11 +470,6 @@ impl AgentRunner {
                             Ok(Some(response)) => {
                                 match run.parse_envelope(response, RunStrategy::DeclarativePlan) {
                                     Ok(PlannerEnvelope::DeclarativePlan { plan: repaired }) => {
-                                        run.events.emit(RunEvent::PlanLifecycle {
-                                            phase: PlanPhase::Recovery,
-                                            attempt: 1,
-                                            outcome: PlanLifecycleOutcome::Succeeded,
-                                        });
                                         run.events.emit(RunEvent::StrategyFallback {
                                             from: RunStrategy::DeclarativePlan,
                                             to: RunStrategy::DeclarativePlan,
@@ -480,6 +477,11 @@ impl AgentRunner {
                                         });
                                         plan = repaired;
                                         execution = run.execute_plan(&plan).await;
+                                        run.events.emit(RunEvent::PlanLifecycle {
+                                            phase: PlanPhase::Recovery,
+                                            attempt: 1,
+                                            outcome: recovery_execution_outcome(&execution, &run),
+                                        });
                                     }
                                     Ok(PlannerEnvelope::Direct) => unreachable!(
                                         "forced declarative envelope rejects direct recovery"
@@ -534,7 +536,7 @@ impl AgentRunner {
                         run.terminate(error);
                         return Ok(run.finish());
                     }
-                    run.run_reactive().await;
+                    run.run_reactive(ModelCallPhase::FinalSynthesis).await;
                 }
             }
         }
@@ -584,6 +586,7 @@ impl<'a> StrategyRun<'a> {
             planning_model_calls: 0,
             repair_model_calls: 0,
             recovery_model_calls: 0,
+            final_synthesis_model_calls: 0,
             reactive_model_calls: 0,
             output_repairs: 0,
             broker_state: BrokerState::default(),
@@ -671,6 +674,7 @@ impl<'a> StrategyRun<'a> {
                 ModelCallPhase::Planning => self.planning_model_calls += 1,
                 ModelCallPhase::Repair => self.repair_model_calls += 1,
                 ModelCallPhase::Recovery => self.recovery_model_calls += 1,
+                ModelCallPhase::FinalSynthesis => self.final_synthesis_model_calls += 1,
                 ModelCallPhase::Reactive => self.reactive_model_calls += 1,
             }
             self.events.emit(RunEvent::ModelRequested {
@@ -1651,13 +1655,14 @@ impl<'a> StrategyRun<'a> {
         Ok(())
     }
 
-    async fn run_reactive(&mut self) {
+    async fn run_reactive(&mut self, initial_phase: ModelCallPhase) {
         let broker = ToolBroker::new(
             &self.runner.tools,
             &self.runner.policy,
             &self.runner.approvals,
             &self.runner.concurrency,
         );
+        let mut phase = initial_phase;
         loop {
             if self.terminal {
                 return;
@@ -1668,7 +1673,7 @@ impl<'a> StrategyRun<'a> {
                     self.runner
                         .tools
                         .allowed_definitions(&self.request.agent.tool_allowlist),
-                    ModelCallPhase::Reactive,
+                    phase,
                     false,
                 )
                 .await
@@ -1680,6 +1685,7 @@ impl<'a> StrategyRun<'a> {
                     return;
                 }
             };
+            phase = ModelCallPhase::Reactive;
 
             if let Some(output) = response.final_output {
                 if output.trim().is_empty() {
@@ -1836,6 +1842,7 @@ impl<'a> StrategyRun<'a> {
             self.planning_model_calls
                 + self.repair_model_calls
                 + self.recovery_model_calls
+                + self.final_synthesis_model_calls
                 + self.reactive_model_calls
         );
         self.broker_state.finalize_usage();
@@ -1845,6 +1852,7 @@ impl<'a> StrategyRun<'a> {
             planning_model_calls: self.planning_model_calls,
             repair_model_calls: self.repair_model_calls,
             recovery_model_calls: self.recovery_model_calls,
+            final_synthesis_model_calls: self.final_synthesis_model_calls,
             reactive_model_calls: self.reactive_model_calls,
             tool_calls: self.broker_state.tool_calls,
             tool_issued: self.broker_state.tool_issued,
@@ -1927,6 +1935,18 @@ fn lifecycle_outcome_for_status(status: &RunStatus) -> PlanLifecycleOutcome {
         RunStatus::Cancelled => PlanLifecycleOutcome::Cancelled,
         RunStatus::LimitReached => PlanLifecycleOutcome::LimitReached,
         RunStatus::Failed => PlanLifecycleOutcome::Failed,
+    }
+}
+
+fn recovery_execution_outcome(
+    execution: &PlanExecution,
+    run: &StrategyRun<'_>,
+) -> PlanLifecycleOutcome {
+    match execution.failure {
+        None => PlanLifecycleOutcome::Succeeded,
+        Some(PlanFailureKind::Preflight) => PlanLifecycleOutcome::Rejected,
+        Some(PlanFailureKind::Recoverable) => PlanLifecycleOutcome::Failed,
+        Some(PlanFailureKind::Terminal) => lifecycle_outcome_for_status(&run.result.status),
     }
 }
 

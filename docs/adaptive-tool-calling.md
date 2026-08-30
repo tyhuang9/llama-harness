@@ -114,7 +114,8 @@ invariants:
 
 ```text
 model_calls = planning_model_calls + repair_model_calls
-            + recovery_model_calls + reactive_model_calls
+            + recovery_model_calls + final_synthesis_model_calls
+            + reactive_model_calls
 
 tool_calls = tool_issued + tool_reused + tool_rejected
            + tool_pre_dispatch_aborted
@@ -128,6 +129,14 @@ boundary was entered, including a keyed-permit wait. Calls stopped before that
 boundary are rejected or pre-dispatch-aborted. This makes rejection,
 cancellation, reuse, and partial-plan accounting comparable across Direct and
 declarative strategies.
+
+`final_synthesis_model_calls` counts the first provider call made after a
+successful plan (including a successful recovery plan) to turn recorded tool
+results into the final answer. If that response requests more tools, later
+calls are reactive. Direct selection and pre-effect fallback never charge final
+synthesis. A recovery lifecycle is marked `succeeded` only after the recovered
+plan executes successfully; parsing a replacement plan is not execution
+success.
 
 Recommended evaluation metrics derived from these counters include planner
 repair and recovery rates, rejected/attempted rate, reused/attempted rate,

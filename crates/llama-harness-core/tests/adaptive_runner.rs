@@ -65,6 +65,7 @@ fn assert_strategy_usage_reconciles(events: &InMemoryEventSink) {
                 planning_model_calls,
                 repair_model_calls,
                 recovery_model_calls,
+                final_synthesis_model_calls,
                 reactive_model_calls,
                 tool_calls,
                 tool_issued,
@@ -80,6 +81,7 @@ fn assert_strategy_usage_reconciles(events: &InMemoryEventSink) {
                 *planning_model_calls,
                 *repair_model_calls,
                 *recovery_model_calls,
+                *final_synthesis_model_calls,
                 *reactive_model_calls,
                 *tool_calls,
                 *tool_issued,
@@ -93,9 +95,9 @@ fn assert_strategy_usage_reconciles(events: &InMemoryEventSink) {
             _ => None,
         })
         .expect("strategy usage event");
-    assert_eq!(usage.0, usage.1 + usage.2 + usage.3 + usage.4);
-    assert_eq!(usage.5, usage.6 + usage.7 + usage.8 + usage.9);
-    assert_eq!(usage.6, usage.10 + usage.11 + usage.12);
+    assert_eq!(usage.0, usage.1 + usage.2 + usage.3 + usage.4 + usage.5);
+    assert_eq!(usage.6, usage.7 + usage.8 + usage.9 + usage.10);
+    assert_eq!(usage.7, usage.11 + usage.12 + usage.13);
 }
 
 struct FixedTool {
@@ -218,21 +220,23 @@ impl ApprovalHandler for CapturingApproval {
     }
 }
 
-struct ErrorTool {
+struct DelayedOutcomeTool {
     definition: ToolDefinition,
-    error: HarnessError,
+    delay: Duration,
+    outcome: Result<ToolResult, HarnessError>,
     calls: AtomicU32,
 }
 
 #[async_trait]
-impl Tool for ErrorTool {
+impl Tool for DelayedOutcomeTool {
     fn definition(&self) -> &ToolDefinition {
         &self.definition
     }
 
     async fn execute(&self, _: Value, _: CancellationToken) -> Result<ToolResult, HarnessError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(self.error.clone())
+        tokio::time::sleep(self.delay).await;
+        self.outcome.clone()
     }
 }
 
@@ -331,6 +335,18 @@ async fn adaptive_planner_can_choose_no_tool_direct_response() {
     assert_eq!(provider.requests().len(), 2);
     assert!(events.events().iter().any(|record| matches!(
         record.event,
+        RunEvent::StrategyUsage {
+            model_calls: 2,
+            planning_model_calls: 1,
+            repair_model_calls: 0,
+            recovery_model_calls: 0,
+            final_synthesis_model_calls: 0,
+            reactive_model_calls: 1,
+            ..
+        }
+    )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
         RunEvent::StrategySelected {
             selected: RunStrategy::Direct,
             ..
@@ -412,7 +428,8 @@ async fn successful_plan_emits_phase_attempt_outcome_timing_and_reconciled_usage
             planning_model_calls: 1,
             repair_model_calls: 0,
             recovery_model_calls: 0,
-            reactive_model_calls: 1,
+            final_synthesis_model_calls: 1,
+            reactive_model_calls: 0,
             tool_calls: 1,
             tool_issued: 1,
             tool_reused: 0,
@@ -454,6 +471,7 @@ async fn adaptive_downgrades_to_direct_when_provider_cannot_plan() {
             planning_model_calls: 0,
             repair_model_calls: 0,
             recovery_model_calls: 0,
+            final_synthesis_model_calls: 0,
             reactive_model_calls: 1,
             tool_calls: 0,
             ..
@@ -757,6 +775,7 @@ async fn malformed_plan_gets_one_repair_then_falls_back_before_effects() {
             planning_model_calls: 1,
             repair_model_calls: 1,
             recovery_model_calls: 0,
+            final_synthesis_model_calls: 0,
             reactive_model_calls: 1,
             tool_calls: 0,
             ..
@@ -801,6 +820,7 @@ async fn two_call_budget_skips_repair_and_preserves_direct_fallback() {
             planning_model_calls: 1,
             repair_model_calls: 0,
             recovery_model_calls: 0,
+            final_synthesis_model_calls: 0,
             reactive_model_calls: 1,
             ..
         }
@@ -851,6 +871,7 @@ async fn planner_retry_cannot_consume_the_reserved_final_call() {
             planning_model_calls: 1,
             repair_model_calls: 0,
             recovery_model_calls: 0,
+            final_synthesis_model_calls: 0,
             reactive_model_calls: 1,
             ..
         }
@@ -962,7 +983,8 @@ async fn recovery_reuses_committed_mutation_instead_of_executing_it_twice() {
             planning_model_calls: 1,
             repair_model_calls: 0,
             recovery_model_calls: 1,
-            reactive_model_calls: 1,
+            final_synthesis_model_calls: 1,
+            reactive_model_calls: 0,
             tool_calls: 3,
             tool_issued: 2,
             tool_reused: 1,
@@ -971,6 +993,84 @@ async fn recovery_reuses_committed_mutation_instead_of_executing_it_twice() {
             tool_completed: 1,
             tool_failed: 1,
             tool_cancelled: 0,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&events);
+}
+
+#[tokio::test]
+async fn recovery_lifecycle_succeeds_only_after_recovered_execution_succeeds() {
+    let initial = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [
+            {"id": "write", "tool_id": "write", "arguments": {}},
+            {"id": "fail", "tool_id": "fail", "arguments": {}, "depends_on": ["write"]}
+        ]}
+    });
+    let recovery = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [
+            {"id": "fail-again", "tool_id": "fail", "arguments": {}}
+        ]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(initial.to_string()),
+            final_response(recovery.to_string()),
+        ])
+        .with_capabilities(planning_capabilities(2)),
+    );
+    let write = Arc::new(FixedTool::new(
+        "write",
+        false,
+        ToolResult::success(json!({"written": true})),
+    ));
+    let fail = Arc::new(FixedTool::new(
+        "fail",
+        true,
+        ToolResult::failure("expected failure"),
+    ));
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider)
+        .tools(registry([
+            write as Arc<dyn Tool>,
+            fail.clone() as Arc<dyn Tool>,
+        ]))
+        .policy(Arc::new(AllowAllPolicy))
+        .event_sink(events.clone())
+        .build()
+        .run(request(&["write", "fail"]))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(fail.calls.load(Ordering::SeqCst), 2);
+    let recovery_outcomes = events
+        .events()
+        .into_iter()
+        .filter_map(|record| match record.event {
+            RunEvent::PlanLifecycle {
+                phase: PlanPhase::Recovery,
+                outcome,
+                ..
+            } => Some(outcome),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recovery_outcomes,
+        vec![PlanLifecycleOutcome::Started, PlanLifecycleOutcome::Failed]
+    );
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            model_calls: 2,
+            planning_model_calls: 1,
+            repair_model_calls: 0,
+            recovery_model_calls: 1,
+            final_synthesis_model_calls: 0,
+            reactive_model_calls: 0,
             ..
         }
     )));
@@ -1267,11 +1367,12 @@ async fn failed_mutation_is_uncertain_and_never_enters_recovery() {
         MockModelProvider::scripted([final_response(envelope.to_string())])
             .with_capabilities(planning_capabilities(1)),
     );
-    let write = Arc::new(FixedTool::new(
-        "write",
-        false,
-        ToolResult::failure("outcome unknown"),
-    ));
+    let write = Arc::new(DelayedOutcomeTool {
+        definition: definition("write", false, false),
+        delay: Duration::from_millis(10),
+        outcome: Ok(ToolResult::failure("outcome unknown")),
+        calls: AtomicU32::new(0),
+    });
     let events = Arc::new(InMemoryEventSink::default());
     let result = AgentRunner::builder(provider.clone())
         .tools(registry([write.clone() as Arc<dyn Tool>]))
@@ -1298,8 +1399,9 @@ async fn failed_mutation_is_uncertain_and_never_enters_recovery() {
             outcome: PlanNodeOutcome::Failed,
             ok: false,
             attempt: 1,
+            duration_ms,
             ..
-        }
+        } if duration_ms >= 5
     )));
     assert!(events.events().iter().any(|record| matches!(
         record.event,
@@ -1360,9 +1462,10 @@ async fn post_dispatch_cancellation_is_terminal_and_never_replayed() {
         MockModelProvider::scripted([final_response(envelope.to_string())])
             .with_capabilities(planning_capabilities(1)),
     );
-    let write = Arc::new(ErrorTool {
+    let write = Arc::new(DelayedOutcomeTool {
         definition: definition("write", false, false),
-        error: HarnessError::Cancelled,
+        delay: Duration::from_millis(10),
+        outcome: Err(HarnessError::Cancelled),
         calls: AtomicU32::new(0),
     });
     let events = Arc::new(InMemoryEventSink::default());
@@ -1383,8 +1486,9 @@ async fn post_dispatch_cancellation_is_terminal_and_never_replayed() {
         RunEvent::PlanNodeCompleted {
             outcome: PlanNodeOutcome::Cancelled,
             ok: false,
+            duration_ms,
             ..
-        }
+        } if duration_ms >= 5
     )));
     assert!(events.events().iter().any(|record| matches!(
         record.event,
@@ -1410,9 +1514,10 @@ async fn post_dispatch_timeout_has_a_stable_node_outcome() {
         MockModelProvider::scripted([final_response(envelope.to_string())])
             .with_capabilities(planning_capabilities(1)),
     );
-    let read = Arc::new(ErrorTool {
+    let read = Arc::new(DelayedOutcomeTool {
         definition: definition("read", true, true),
-        error: HarnessError::TimedOut("test timeout".into()),
+        delay: Duration::from_millis(10),
+        outcome: Err(HarnessError::TimedOut("test timeout".into())),
         calls: AtomicU32::new(0),
     });
     let events = Arc::new(InMemoryEventSink::default());
@@ -1430,8 +1535,9 @@ async fn post_dispatch_timeout_has_a_stable_node_outcome() {
         RunEvent::PlanNodeCompleted {
             outcome: PlanNodeOutcome::TimedOut,
             ok: false,
+            duration_ms,
             ..
-        }
+        } if duration_ms >= 5
     )));
     assert_strategy_usage_reconciles(&events);
 }
@@ -1742,6 +1848,7 @@ async fn forced_direct_emits_selection_and_usage_metadata() {
             planning_model_calls: 0,
             repair_model_calls: 0,
             recovery_model_calls: 0,
+            final_synthesis_model_calls: 0,
             reactive_model_calls: 1,
             tool_calls: 0,
             tool_issued: 0,

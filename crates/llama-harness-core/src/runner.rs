@@ -370,6 +370,7 @@ impl AgentRunner {
                 planning_model_calls: 0,
                 repair_model_calls: 0,
                 recovery_model_calls: 0,
+                final_synthesis_model_calls: 0,
                 reactive_model_calls: model_calls,
                 tool_calls: broker_state.tool_calls,
                 tool_issued: broker_state.tool_issued,
