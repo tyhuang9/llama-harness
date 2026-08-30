@@ -18,6 +18,7 @@ pub enum MockStep {
 /// Deterministic model provider backed by a scripted queue.
 pub struct MockModelProvider {
     id: String,
+    capabilities: ModelCapabilities,
     steps: Mutex<VecDeque<MockStep>>,
     requests: Mutex<Vec<ModelRequest>>,
 }
@@ -27,6 +28,12 @@ impl MockModelProvider {
     pub fn scripted(steps: impl IntoIterator<Item = MockStep>) -> Self {
         Self {
             id: "mock".into(),
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_streaming: false,
+                supports_structured_output: true,
+                ..ModelCapabilities::default()
+            },
             steps: Mutex::new(steps.into_iter().collect()),
             requests: Mutex::new(vec![]),
         }
@@ -39,6 +46,12 @@ impl MockModelProvider {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Replaces the capabilities advertised by this scripted provider.
+    pub fn with_capabilities(mut self, capabilities: ModelCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
 }
 
 #[async_trait]
@@ -48,12 +61,7 @@ impl ModelProvider for MockModelProvider {
     }
 
     fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities {
-            supports_tools: true,
-            supports_streaming: false,
-            supports_structured_output: true,
-            ..ModelCapabilities::default()
-        }
+        self.capabilities.clone()
     }
 
     async fn health(&self) -> Result<ProviderHealth, HarnessError> {

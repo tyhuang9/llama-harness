@@ -22,11 +22,11 @@ use uuid::Uuid;
 
 /// Executes agent runs against a model provider and registered tools.
 pub struct AgentRunner {
-    provider: Arc<dyn ModelProvider>,
-    tools: ToolRegistry,
-    policy: Arc<dyn PolicyEngine>,
-    approvals: Arc<dyn ApprovalHandler>,
-    events: Arc<dyn EventSink>,
+    pub(crate) provider: Arc<dyn ModelProvider>,
+    pub(crate) tools: ToolRegistry,
+    pub(crate) policy: Arc<dyn PolicyEngine>,
+    pub(crate) approvals: Arc<dyn ApprovalHandler>,
+    pub(crate) events: Arc<dyn EventSink>,
 }
 
 /// Configures an [`AgentRunner`] and its policy, approval, tool, and event integrations.
@@ -50,9 +50,11 @@ impl AgentRunner {
         }
     }
 
-    /// Executes one run. Invalid requests return `Err`; failures after a run starts are captured
-    /// in a terminal `RunResult` and always emit a matching terminal event.
-    pub async fn run(&self, request: RunRequest) -> Result<RunResult, HarnessError> {
+    pub(crate) async fn run_direct(
+        &self,
+        request: RunRequest,
+        strategy_events: Option<DirectStrategyEvents>,
+    ) -> Result<RunResult, HarnessError> {
         let output_validator = validate_request(&request)?;
         let started = StdInstant::now();
         let deadline = absolute_deadline(request.agent.limits.max_run_duration_ms)?;
@@ -88,6 +90,18 @@ impl AgentRunner {
         let mut events =
             EventEmitter::new(run_id.clone(), trace_id.clone(), Arc::clone(&self.events));
         events.emit(RunEvent::Started { run_id, trace_id });
+        if let Some(strategy_events) = strategy_events {
+            events.emit(RunEvent::StrategyFallback {
+                from: crate::RunStrategy::Adaptive,
+                to: crate::RunStrategy::Direct,
+                reason: crate::StrategyFallbackReason::UnsupportedCapability,
+            });
+            events.emit(RunEvent::StrategySelected {
+                requested: crate::RunStrategy::Adaptive,
+                selected: crate::RunStrategy::Direct,
+                reason: strategy_events.reason,
+            });
+        }
 
         let mut messages = initial_messages(&request);
         let mut model_calls = 0;
@@ -319,6 +333,14 @@ impl AgentRunner {
         }
 
         result.duration_ms = started.elapsed().as_millis() as u64;
+        if strategy_events.is_some() {
+            events.emit(RunEvent::StrategyUsage {
+                strategy: crate::RunStrategy::Direct,
+                model_calls,
+                tool_calls: broker_state.tool_calls,
+                duration_ms: result.duration_ms,
+            });
+        }
         events.emit(RunEvent::Completed {
             status: result.status.clone(),
         });
@@ -367,6 +389,11 @@ impl AgentRunner {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct DirectStrategyEvents {
+    pub(crate) reason: crate::StrategySelectionReason,
+}
+
 impl AgentRunnerBuilder {
     /// Replaces the tool registry used by the runner.
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
@@ -404,7 +431,7 @@ impl AgentRunnerBuilder {
     }
 }
 
-fn validate_request(request: &RunRequest) -> Result<Option<Validator>, HarnessError> {
+pub(crate) fn validate_request(request: &RunRequest) -> Result<Option<Validator>, HarnessError> {
     if request.agent.id.trim().is_empty()
         || request.agent.name.trim().is_empty()
         || request.agent.version.trim().is_empty()
@@ -486,7 +513,7 @@ fn validate_request(request: &RunRequest) -> Result<Option<Validator>, HarnessEr
         .transpose()
 }
 
-fn validate_model_response(
+pub(crate) fn validate_model_response(
     response: &ModelResponse,
     limits: &AgentLimits,
 ) -> Result<(), HarnessError> {
@@ -499,7 +526,7 @@ fn validate_model_response(
     Ok(())
 }
 
-fn validate_output(
+pub(crate) fn validate_output(
     validator: Option<&Validator>,
     output: &str,
     max_json_depth: u32,
@@ -515,7 +542,7 @@ fn validate_output(
         .map_err(|error| HarnessError::InvalidOutput(error.to_string()))
 }
 
-fn initial_messages(request: &RunRequest) -> Vec<Message> {
+pub(crate) fn initial_messages(request: &RunRequest) -> Vec<Message> {
     let mut messages = vec![];
     if !request.agent.system_instructions.trim().is_empty() {
         messages.push(Message::system(request.agent.system_instructions.clone()));
@@ -525,7 +552,10 @@ fn initial_messages(request: &RunRequest) -> Vec<Message> {
     messages
 }
 
-fn ensure_transcript(messages: &[Message], limits: &AgentLimits) -> Result<(), HarnessError> {
+pub(crate) fn ensure_transcript(
+    messages: &[Message],
+    limits: &AgentLimits,
+) -> Result<(), HarnessError> {
     let bytes = messages.iter().map(Message::transcript_bytes).sum::<u64>();
     if bytes > limits.max_transcript_bytes {
         return Err(HarnessError::ResourceLimit(format!(
@@ -536,7 +566,7 @@ fn ensure_transcript(messages: &[Message], limits: &AgentLimits) -> Result<(), H
     Ok(())
 }
 
-fn push_tool_message(
+pub(crate) fn push_tool_message(
     messages: &mut Vec<Message>,
     call: &ToolCall,
     result: &ToolResult,
@@ -549,7 +579,7 @@ fn push_tool_message(
     ensure_transcript(messages, limits)
 }
 
-fn apply_terminal_error(result: &mut RunResult, error: HarnessError) {
+pub(crate) fn apply_terminal_error(result: &mut RunResult, error: HarnessError) {
     result.status = match error {
         HarnessError::Cancelled => RunStatus::Cancelled,
         HarnessError::ResourceLimit(_) => RunStatus::LimitReached,
@@ -559,7 +589,7 @@ fn apply_terminal_error(result: &mut RunResult, error: HarnessError) {
     result.errors.push(error.run_error());
 }
 
-fn absolute_deadline(duration_ms: Option<u64>) -> Result<Option<Instant>, HarnessError> {
+pub(crate) fn absolute_deadline(duration_ms: Option<u64>) -> Result<Option<Instant>, HarnessError> {
     duration_ms
         .map(|duration_ms| {
             Instant::now()
@@ -569,7 +599,7 @@ fn absolute_deadline(duration_ms: Option<u64>) -> Result<Option<Instant>, Harnes
         .transpose()
 }
 
-fn provider_deadline(
+pub(crate) fn provider_deadline(
     run_deadline: Option<Instant>,
     provider_duration_ms: Option<u64>,
 ) -> Result<Option<Instant>, HarnessError> {
@@ -641,7 +671,7 @@ where
     result
 }
 
-fn merge_generation(
+pub(crate) fn merge_generation(
     base: &GenerationOptions,
     override_options: &GenerationOptions,
 ) -> GenerationOptions {

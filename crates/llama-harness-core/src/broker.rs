@@ -20,10 +20,6 @@ pub(crate) struct BrokerState {
 }
 
 impl BrokerState {
-    pub(crate) fn committed_effects(&self) -> &HashMap<String, ToolResult> {
-        &self.committed_effects
-    }
-
     pub(crate) fn enable_effect_reuse(&mut self) {
         self.reuse_committed_effects = true;
     }
@@ -36,6 +32,8 @@ pub(crate) struct PreparedCall {
     pub(crate) tool: Arc<dyn Tool>,
     pub(crate) context: ToolCallContext,
     pub(crate) signature: String,
+    caller: ToolCaller,
+    approved: bool,
 }
 
 /// Result of preparing one invocation at the shared broker boundary.
@@ -229,6 +227,7 @@ impl<'a> ToolBroker<'a> {
             )));
         }
 
+        let mut approved = false;
         if approval_barrier || matches!(decision, PolicyDecision::RequireApproval { .. }) {
             events.emit(RunEvent::ApprovalRequested {
                 call_id: call.id.clone(),
@@ -258,6 +257,7 @@ impl<'a> ToolBroker<'a> {
                     "approval denied",
                 )));
             }
+            approved = true;
         }
 
         Ok(PrepareOutcome::Ready(PreparedCall {
@@ -266,7 +266,128 @@ impl<'a> ToolBroker<'a> {
             tool,
             context,
             signature,
+            caller,
+            approved,
         }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn revalidate_bound_arguments(
+        &self,
+        prepared: &mut PreparedCall,
+        arguments: Value,
+        request: &RunRequest,
+        result: &mut RunResult,
+        events: &mut EventEmitter,
+        state: &BrokerState,
+        deadline: Option<Instant>,
+    ) -> Result<Option<ToolResult>, HarnessError> {
+        check_stopped(
+            &request.cancellation,
+            deadline,
+            "run deadline reached before bound argument validation",
+        )?;
+        let arguments_json = serde_json::to_string(&arguments).map_err(|error| {
+            HarnessError::InvalidArguments(format!(
+                "bound arguments for tool {} could not be serialized: {error}",
+                prepared.call.tool_id
+            ))
+        })?;
+        if arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
+            return Err(HarnessError::ResourceLimit(format!(
+                "bound tool arguments exceed {} bytes",
+                request.agent.limits.max_tool_arguments_bytes
+            )));
+        }
+        ensure_json_depth(
+            "bound tool arguments",
+            &arguments,
+            request.agent.limits.max_json_depth,
+        )?;
+        if !prepared.tool.definition().allows_caller(prepared.caller)
+            || !request
+                .agent
+                .tool_allowlist
+                .iter()
+                .any(|id| id == &prepared.call.tool_id)
+        {
+            return Err(HarnessError::InvalidTool(
+                "bound plan call is no longer allowed".into(),
+            ));
+        }
+        self.tools.validate(&prepared.call.tool_id, &arguments)?;
+
+        let signature = canonical_signature(&prepared.call.tool_id, &arguments);
+        if state.reuse_committed_effects && !prepared.tool.definition().read_only {
+            if let Some(recorded) = state.committed_effects.get(&signature) {
+                events.emit(RunEvent::ToolEffectReused {
+                    call_id: prepared.call.id.clone(),
+                    tool_id: prepared.call.tool_id.clone(),
+                });
+                return Ok(Some(recorded.clone()));
+            }
+        }
+
+        let decision = await_guarded(
+            self.policy.decide_with_context(
+                &prepared.context,
+                prepared.tool.definition(),
+                &arguments,
+                request,
+            ),
+            &request.cancellation,
+            deadline,
+            "bound argument policy decision exceeded run deadline",
+            None,
+        )
+        .await?;
+        events.emit(RunEvent::PolicyDecided {
+            call_id: prepared.call.id.clone(),
+            decision: decision.clone(),
+        });
+        result.policy_decisions.push(decision.clone());
+        match decision {
+            PolicyDecision::Deny { reason } => {
+                return Err(HarnessError::Policy(format!(
+                    "bound plan call denied: {reason}"
+                )));
+            }
+            PolicyDecision::RequireApproval { .. } if !prepared.approved => {
+                events.emit(RunEvent::ApprovalRequested {
+                    call_id: prepared.call.id.clone(),
+                    tool_id: prepared.call.tool_id.clone(),
+                });
+                let mut approval = await_guarded(
+                    self.approvals.approve_with_context(
+                        &prepared.context,
+                        prepared.tool.definition(),
+                        &arguments,
+                        request,
+                    ),
+                    &request.cancellation,
+                    deadline,
+                    "bound argument approval exceeded run deadline",
+                    None,
+                )
+                .await?;
+                approval.call_id = prepared.call.id.clone();
+                approval.tool_id = prepared.call.tool_id.clone();
+                let granted = approval.granted;
+                result.approvals.push(approval);
+                if !granted {
+                    return Err(HarnessError::Approval(
+                        "bound plan call approval denied".into(),
+                    ));
+                }
+                prepared.approved = true;
+            }
+            PolicyDecision::RequireApproval { .. } | PolicyDecision::Allow { .. } => {}
+        }
+
+        prepared.arguments = arguments;
+        prepared.call.arguments_json = arguments_json;
+        prepared.signature = signature;
+        Ok(None)
     }
 
     pub(crate) async fn execute(
