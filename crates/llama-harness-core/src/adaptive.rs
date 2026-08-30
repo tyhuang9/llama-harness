@@ -119,6 +119,9 @@ impl AgentRunner {
 
     fn planning_downgrade_reason(&self, request: &RunRequest) -> Option<&'static str> {
         let capabilities = self.provider.capabilities();
+        if request.agent.limits.max_model_calls < 2 {
+            return Some("run model-call budget cannot support planning and finalization");
+        }
         if !capabilities.supports_tools || !capabilities.supports_structured_plans {
             return Some("provider does not support structured plans");
         }
@@ -140,10 +143,11 @@ impl AgentRunner {
         {
             return Some("tool catalog exceeds provider tool-count capacity");
         }
-        let schema_bytes = tools
-            .iter()
-            .map(|tool| serde_json::to_vec(tool).map_or(u64::MAX, |bytes| bytes.len() as u64))
-            .sum::<u64>();
+        let schema_bytes = tools.iter().fold(0u64, |total, tool| {
+            total.saturating_add(
+                serde_json::to_vec(tool).map_or(u64::MAX, |bytes| bytes.len() as u64),
+            )
+        });
         if capabilities
             .limits
             .max_tool_schema_bytes
@@ -236,11 +240,13 @@ impl AgentRunner {
                 run.run_reactive().await;
             }
             PlannerEnvelope::DeclarativePlan { mut plan } => {
-                run.events.emit(RunEvent::StrategySelected {
-                    requested,
-                    selected: RunStrategy::DeclarativePlan,
-                    reason: StrategySelectionReason::PlannerSelectedPlan,
-                });
+                if requested == RunStrategy::Adaptive {
+                    run.events.emit(RunEvent::StrategySelected {
+                        requested,
+                        selected: RunStrategy::DeclarativePlan,
+                        reason: StrategySelectionReason::PlannerSelectedPlan,
+                    });
+                }
                 run.selected = RunStrategy::DeclarativePlan;
                 run.broker_state.enable_effect_reuse();
                 let mut execution = run.execute_plan(&plan).await;
@@ -581,14 +587,16 @@ impl<'a> StrategyRun<'a> {
             }
         };
 
-        let max_parallel = self
-            .runner
-            .provider
-            .capabilities()
-            .limits
-            .max_parallel_tool_calls
-            .map_or(MAX_SCHEDULER_PARALLELISM, |limit| limit as usize)
-            .clamp(1, MAX_SCHEDULER_PARALLELISM);
+        let capabilities = self.runner.provider.capabilities();
+        let max_parallel = if capabilities.supports_parallel_tool_calls {
+            capabilities
+                .limits
+                .max_parallel_tool_calls
+                .map_or(MAX_SCHEDULER_PARALLELISM, |limit| limit as usize)
+                .clamp(1, MAX_SCHEDULER_PARALLELISM)
+        } else {
+            1
+        };
         let mut completed = HashMap::new();
         let mut transcript = Vec::new();
         let mut done = HashSet::new();
@@ -905,8 +913,11 @@ impl<'a> StrategyRun<'a> {
                 ));
                 return;
             }
+            let recorded_calls = self
+                .runner
+                .tool_calls_for_transcript(self.request, &response.tool_calls);
             self.messages
-                .push(Message::assistant_tool_calls(response.tool_calls.clone()));
+                .push(Message::assistant_tool_calls(recorded_calls));
             if let Err(error) = ensure_transcript(&self.messages, &self.request.agent.limits) {
                 apply_terminal_error(&mut self.result, error);
                 return;

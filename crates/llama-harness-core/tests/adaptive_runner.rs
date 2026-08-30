@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use llama_harness_core::{
-    mock::{final_response, MockModelProvider},
+    mock::{final_response, tool_response, MockModelProvider},
     AgentDefinition, AgentRunner, AllowAllPolicy, ApprovalHandler, ApprovalRecord, HarnessError,
     InMemoryEventSink, ModelCapabilities, PlanConcurrency, PolicyDecision, PolicyEngine,
-    ProviderCapabilityLimits, RunEvent, RunRequest, RunStatus, RunStrategy, Tool, ToolCaller,
-    ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    ProviderCapabilityLimits, RunEvent, RunRequest, RunStatus, RunStrategy, Tool, ToolCall,
+    ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
 };
 use serde_json::{json, Value};
 use std::sync::{
@@ -204,6 +204,68 @@ async fn adaptive_downgrades_to_direct_when_provider_cannot_plan() {
             ..
         }
     )));
+}
+
+#[tokio::test]
+async fn adaptive_downgrades_when_model_budget_cannot_finalize_a_plan() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response("direct")])
+            .with_capabilities(planning_capabilities(2)),
+    );
+    let tool = Arc::new(FixedTool::new("read", true, ToolResult::success(json!({}))));
+    let mut run_request = request(&["read"]);
+    run_request.agent.limits.max_model_calls = 1;
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([tool as Arc<dyn Tool>]))
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn adaptive_direct_recovery_redacts_invalid_arguments_before_feedback() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(r#"{"strategy":"direct"}"#),
+            tool_response(ToolCall::new(
+                "invalid",
+                "read",
+                r#"{"secret":"must-not-return","required":4}"#,
+            )),
+            final_response("done"),
+        ])
+        .with_capabilities(planning_capabilities(2)),
+    );
+    let mut tool = FixedTool::new("read", true, ToolResult::success(json!({})));
+    tool.definition.arguments_schema = json!({
+        "type": "object",
+        "required": ["required"],
+        "properties": {"required": {"type": "string"}},
+        "additionalProperties": false
+    });
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([Arc::new(tool) as Arc<dyn Tool>]))
+        .build()
+        .run(request(&["read"]))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let serialized = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(!serialized.contains("must-not-return"));
+    let recorded = requests[2]
+        .messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter())
+        .find(|call| call.id == "invalid")
+        .unwrap();
+    assert_eq!(recorded.arguments_json, "{}");
 }
 
 #[tokio::test]

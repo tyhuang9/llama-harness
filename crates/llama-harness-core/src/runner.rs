@@ -347,7 +347,11 @@ impl AgentRunner {
         Ok(result)
     }
 
-    fn tool_calls_for_transcript(&self, request: &RunRequest, calls: &[ToolCall]) -> Vec<ToolCall> {
+    pub(crate) fn tool_calls_for_transcript(
+        &self,
+        request: &RunRequest,
+        calls: &[ToolCall],
+    ) -> Vec<ToolCall> {
         calls
             .iter()
             .map(|call| {
