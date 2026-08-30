@@ -420,9 +420,18 @@ fn compute_ancestors(
     for &index in topological_order {
         for dependency in &nodes[index].depends_on {
             let dependency_index = node_indexes[dependency.as_str()];
-            ancestors[index][dependency_index] = true;
-            for candidate in 0..nodes.len() {
-                ancestors[index][candidate] |= ancestors[dependency_index][candidate];
+            let (node_ancestors, dependency_ancestors) = if index < dependency_index {
+                let (before_dependency, from_dependency) = ancestors.split_at_mut(dependency_index);
+                (&mut before_dependency[index], &from_dependency[0])
+            } else {
+                let (before_node, from_node) = ancestors.split_at_mut(index);
+                (&mut from_node[0], &before_node[dependency_index])
+            };
+            node_ancestors[dependency_index] = true;
+            for (node_ancestor, dependency_ancestor) in
+                node_ancestors.iter_mut().zip(dependency_ancestors)
+            {
+                *node_ancestor |= *dependency_ancestor;
             }
         }
     }
