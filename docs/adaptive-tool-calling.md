@@ -82,9 +82,63 @@ Planner responses currently use a strict core-validated JSON envelope. Native
 provider structured-response constraints can be added as a capability-specific
 optimization later; core validation remains authoritative.
 
-Strategy, plan-node, fallback, timing, and usage events contain metadata only.
-Plan call and node event identifiers are runner-generated attempt/ordinal IDs;
-model-provided node identifiers are never projected into those telemetry
-fields. Provider raw deltas are not persisted by this execution path, and
-runtimes may continue filtering unknown additive core events when projecting
-older protocol versions.
+Planning, repair, provider retry, and execution recovery are optional phases.
+They run only when at least one model call remains reserved for direct fallback
+or final synthesis. In particular, a two-call budget can spend one call on the
+initial planner and one on final synthesis; it cannot spend the second call on
+repair or a provider retry. Forced declarative execution skips optional repair
+under the same boundary and returns an explicit failed result for invalid
+planner output instead of executing a plan that cannot be finalized.
+
+## Telemetry contract
+
+Strategy, plan-node, fallback, timing, lifecycle, and usage events contain
+metadata only. Plan call and node event identifiers are runner-generated
+attempt/ordinal IDs; model-provided node identifiers are never projected into
+those telemetry fields. `PlanLifecycle` identifies the `planning`, `repair`,
+`validation`, `preflight`, or `recovery` phase, its explicit attempt, and a
+stable value-free outcome. `PlanNodeStarted` and `PlanNodeCompleted` carry the
+execution-plan attempt directly, so consumers do not parse opaque node IDs.
+
+`PlanNodeCompleted` reports a stable outcome: `succeeded`, `failed`,
+`cancelled`, `timed_out`, `rejected`, `limit_reached`, or `reused`. Its duration
+is measured for that node's own broker/preflight operation. Parallel-wave
+completion events may still be emitted in deterministic node order after all
+wave futures settle; the duration is per invocation rather than wave join time.
+No error message, argument, result, model-provided node ID, or model output is
+placed in these fields.
+
+`StrategyUsage` keeps total provider and admitted tool-call counts and also
+exposes phase and disposition counters. The following equalities are runtime
+invariants:
+
+```text
+model_calls = planning_model_calls + repair_model_calls
+            + recovery_model_calls + reactive_model_calls
+
+tool_calls = tool_issued + tool_reused + tool_rejected
+           + tool_pre_dispatch_aborted
+
+tool_issued = tool_completed + tool_failed + tool_cancelled
+```
+
+`tool_calls` means proposals admitted under the broker's total-attempt limit;
+it does not mean validated or executed calls. `tool_issued` means the execution
+boundary was entered, including a keyed-permit wait. Calls stopped before that
+boundary are rejected or pre-dispatch-aborted. This makes rejection,
+cancellation, reuse, and partial-plan accounting comparable across Direct and
+declarative strategies.
+
+Recommended evaluation metrics derived from these counters include planner
+repair and recovery rates, rejected/attempted rate, reused/attempted rate,
+issued success rate, issued cancellation rate, and per-outcome node latency.
+Dashboards and SQLite indexes remain host concerns rather than core scheduler
+behavior.
+
+Provider raw deltas are not persisted by this execution path. The local SQLite
+store records `PlanLifecycle` as `plan.lifecycle`; existing event kinds remain
+unchanged. Protocol runtimes intentionally filter additive core-only strategy
+and plan events when projecting the current wire protocol. Because the core
+event emitter allocates sequence numbers before that projection, wire consumers
+may observe sequence gaps; gaps are filtering artifacts, not lost or reordered
+wire events. Protocol and SDK contracts remain unchanged.
