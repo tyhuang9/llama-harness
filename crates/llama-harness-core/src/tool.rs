@@ -485,10 +485,9 @@ impl ToolRegistry {
             .tools
             .get(tool_id)
             .ok_or_else(|| HarnessError::InvalidTool(format!("unknown tool: {tool_id}")))?;
-        entry
-            .validator
-            .validate(arguments)
-            .map_err(|error| HarnessError::InvalidArguments(error.to_string()))
+        entry.validator.validate(arguments).map_err(|_| {
+            HarnessError::InvalidArguments(format!("tool {tool_id} arguments failed validation"))
+        })
     }
 
     pub(crate) fn validate_output(

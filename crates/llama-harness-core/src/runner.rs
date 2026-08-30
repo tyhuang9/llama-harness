@@ -236,7 +236,9 @@ impl AgentRunner {
                 break;
             }
 
-            messages.push(Message::assistant_tool_calls(response.tool_calls.clone()));
+            messages.push(Message::assistant_tool_calls(
+                self.tool_calls_for_transcript(&request, &response.tool_calls),
+            ));
             if let Err(error) = ensure_transcript(&messages, &request.agent.limits) {
                 apply_terminal_error(&mut result, error);
                 break;
@@ -567,6 +569,47 @@ impl AgentRunner {
             code: "tool_rejected".into(),
             message: reason,
         });
+    }
+
+    fn tool_calls_for_transcript(&self, request: &RunRequest, calls: &[ToolCall]) -> Vec<ToolCall> {
+        calls
+            .iter()
+            .map(|call| {
+                let mut transcript_call = call.clone();
+                if !self.tool_arguments_are_valid(request, call) {
+                    transcript_call.arguments_json = "{}".into();
+                }
+                transcript_call
+            })
+            .collect()
+    }
+
+    fn tool_arguments_are_valid(&self, request: &RunRequest, call: &ToolCall) -> bool {
+        if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
+            return false;
+        }
+        let Ok(arguments) = serde_json::from_str(&call.arguments_json) else {
+            return false;
+        };
+        if ensure_json_depth(
+            "tool arguments",
+            &arguments,
+            request.agent.limits.max_json_depth,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let Some(tool) = self.tools.get(&call.tool_id) else {
+            return false;
+        };
+        request
+            .agent
+            .tool_allowlist
+            .iter()
+            .any(|id| id == &call.tool_id)
+            && tool.definition().allows_caller(ToolCaller::Direct)
+            && self.tools.validate(&call.tool_id, &arguments).is_ok()
     }
 
     #[allow(clippy::too_many_arguments)]

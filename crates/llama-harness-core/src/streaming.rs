@@ -195,15 +195,14 @@ fn checked_provider_cap(
     value: u64,
     local_hard_limit: usize,
 ) -> Result<usize, HarnessError> {
-    let value = usize::try_from(value).map_err(|_| {
-        HarnessError::InvalidRequest(format!("provider {label} does not fit this platform"))
-    })?;
-    if value == 0 || value > local_hard_limit {
+    if value == 0 {
         return Err(HarnessError::InvalidRequest(format!(
-            "provider {label} must be between 1 and {local_hard_limit}"
+            "provider {label} must be greater than zero"
         )));
     }
-    Ok(value)
+    usize::try_from(value.min(local_hard_limit as u64)).map_err(|_| {
+        HarnessError::InvalidRequest(format!("provider {label} does not fit this platform"))
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -481,10 +480,11 @@ impl ToolCallAssembler {
             &arguments,
             self.limits.max_json_depth,
         )?;
-        allowed
-            .validator
-            .validate(&arguments)
-            .map_err(|error| HarnessError::InvalidArguments(error.to_string()))?;
+        allowed.validator.validate(&arguments).map_err(|_| {
+            HarnessError::InvalidArguments(format!(
+                "streamed tool {tool_id} arguments failed validation"
+            ))
+        })?;
         Ok(Some(ToolCall::new(
             call_id,
             tool_id,

@@ -250,6 +250,40 @@ fn assembler_rejects_conflicts_invalid_finals_and_post_final_fragments() {
 }
 
 #[test]
+fn streamed_argument_validation_errors_redact_instance_values() {
+    const SECRET: &str = "sentinel-streamed-argument-secret";
+    let assembler = ToolCallAssembler::new(
+        [ToolDefinition::new(
+            "lookup",
+            "Lookup",
+            "Lookup",
+            json!({
+                "type":"object",
+                "required":["query"],
+                "properties":{"query":{"type":"string","enum":["allowed"]}},
+                "additionalProperties":false
+            }),
+        )],
+        ToolCallAssemblyLimits::default(),
+    )
+    .unwrap();
+    let mut controller = ModelStreamController::new(assembler);
+
+    let error = controller
+        .push(Ok(ModelStreamEvent::ToolCallDelta(
+            ToolCallDelta::new(0, format!(r#"{{"query":"{SECRET}"}}"#), true)
+                .with_call_id("call")
+                .with_tool_id("lookup"),
+        )))
+        .unwrap_err();
+
+    assert!(matches!(error, HarnessError::InvalidArguments(_)));
+    assert!(error.to_string().contains("arguments failed validation"));
+    assert!(!error.to_string().contains(SECRET));
+    assert!(controller.is_terminal());
+}
+
+#[test]
 fn assembler_enforces_call_field_and_total_limits() {
     let limits = ToolCallAssemblyLimits {
         max_calls: 1,
@@ -296,24 +330,18 @@ fn assembler_bounds_catalogs_and_provider_advertised_caps() {
         ToolCallAssemblyLimits::for_provider(&ProviderCapabilityLimits::new().with_max_tools(0)),
         Err(HarnessError::InvalidRequest(_))
     ));
-    assert!(matches!(
-        ToolCallAssemblyLimits::for_provider(
-            &ProviderCapabilityLimits::new().with_max_tools(1_025)
-        ),
-        Err(HarnessError::InvalidRequest(_))
-    ));
-    assert!(matches!(
-        ToolCallAssemblyLimits::for_provider(
-            &ProviderCapabilityLimits::new().with_max_tool_schema_bytes(256 * 1024 + 1)
-        ),
-        Err(HarnessError::InvalidRequest(_))
-    ));
-    assert!(matches!(
-        ToolCallAssemblyLimits::for_provider(
-            &ProviderCapabilityLimits::new().with_max_streamed_tool_calls(17)
-        ),
-        Err(HarnessError::InvalidRequest(_))
-    ));
+    let clipped = ToolCallAssemblyLimits::for_provider(
+        &ProviderCapabilityLimits::new()
+            .with_max_tools(u32::MAX)
+            .with_max_tool_schema_bytes(u64::MAX)
+            .with_max_streamed_tool_calls(u32::MAX)
+            .with_max_streamed_argument_bytes(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(clipped.max_allowed_tools, 1_024);
+    assert_eq!(clipped.max_aggregate_schema_bytes, 256 * 1_024);
+    assert_eq!(clipped.max_calls, 16);
+    assert_eq!(clipped.max_argument_bytes, 64 * 1_024);
     let effective = ToolCallAssemblyLimits::for_provider(
         &ProviderCapabilityLimits::new()
             .with_max_tools(30)

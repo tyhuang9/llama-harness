@@ -1204,6 +1204,66 @@ async fn malformed_unknown_disallowed_and_schema_invalid_calls_feed_back_without
 }
 
 #[tokio::test]
+async fn invalid_argument_values_are_redacted_from_errors_events_and_transcript() {
+    const SECRET: &str = "sentinel-atomic-argument-secret";
+    let read = Arc::new(TestTool::read(
+        "read",
+        json!({
+            "type":"object",
+            "required":["key"],
+            "properties":{"key":{"type":"string","enum":["allowed"]}},
+            "additionalProperties":false
+        }),
+    ));
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call(
+            "invalid-secret",
+            "read",
+            &format!(r#"{{"key":"{SECRET}"}}"#),
+        )),
+        final_response("recovered"),
+    ]));
+    let events = Arc::new(InMemoryEventSink::default());
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry(read.clone()))
+        .event_sink(events.clone())
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(read.calls.load(Ordering::SeqCst), 0);
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.code == "tool_rejected"
+            && error.message.contains("arguments failed validation")));
+    assert!(result
+        .errors
+        .iter()
+        .all(|error| !error.message.contains(SECRET)));
+
+    let records = events.events();
+    assert!(records.iter().any(|record| matches!(
+        &record.event,
+        RunEvent::ToolRejected { reason, .. }
+            if reason.contains("arguments failed validation") && !reason.contains(SECRET)
+    )));
+    assert!(!serde_json::to_string(&records).unwrap().contains(SECRET));
+
+    let transcript = &provider.requests()[1].messages;
+    assert!(!serde_json::to_string(transcript).unwrap().contains(SECRET));
+    let assistant_call = transcript
+        .iter()
+        .find(|message| message.role == MessageRole::Assistant)
+        .and_then(|message| message.tool_calls.first())
+        .unwrap();
+    assert_eq!(assistant_call.arguments_json, "{}");
+}
+
+#[tokio::test]
 async fn direct_runner_hides_and_rejects_tools_without_direct_permission() {
     let mut hidden = TestTool::read("read", json!({"type":"object"}));
     hidden.definition.allowed_callers = [ToolCaller::Programmatic].into();
