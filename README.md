@@ -89,6 +89,7 @@ loop and enforces the boundaries you configure.
 
 - [Start embedding the runner](docs/embedding.md)
 - [Define tools, policy, and approvals](docs/tools-and-policies.md)
+- [Understand adaptive tool calling and recovery](docs/adaptive-tool-calling.md)
 - [Add local observability](docs/observability.md)
 - [Build deterministic evaluations](docs/evaluations.md)
 - [Integrate with Tauri](docs/tauri.md)
