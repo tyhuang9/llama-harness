@@ -297,9 +297,9 @@ fn adaptive_readiness_is_input_order_independent_and_efficiency_is_nonblocking()
         forward.comparisons[0].adaptive.duration_ms
             > forward.comparisons[0].best_forced.duration_ms
     );
-    assert_eq!(forward.comparisons[0].adaptive.recovery_success, false);
+    assert!(!forward.comparisons[0].adaptive.recovery_success);
     assert_eq!(forward.comparisons[0].adaptive.tool_selection_accuracy, 0.9);
-    assert_eq!(forward.comparisons[0].best_forced.recovery_success, true);
+    assert!(forward.comparisons[0].best_forced.recovery_success);
     assert_eq!(forward.comparisons[0].adaptive.total_tokens, 1_200);
     assert_eq!(forward.comparisons[0].adaptive.model_calls, 2);
     assert_eq!(forward.comparisons[0].adaptive.tool_calls, 1);
