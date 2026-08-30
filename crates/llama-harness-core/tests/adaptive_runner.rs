@@ -1481,6 +1481,137 @@ async fn same_concurrency_key_is_exclusive_across_runs() {
 }
 
 #[tokio::test]
+async fn direct_and_declarative_runs_share_concurrency_keys() {
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "planned", "tool_id": "held", "arguments": {}}]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(envelope.to_string()),
+            tool_response(ToolCall::new("direct", "held", "{}")),
+            final_response("done"),
+            final_response("done"),
+        ])
+        .with_capabilities(planning_capabilities(1)),
+    );
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let maximum = Arc::new(AtomicU32::new(0));
+    let tool = Arc::new(HeldTool {
+        definition: definition("held", true, true).with_concurrency_key("shared"),
+        entered: entered.clone(),
+        release: release.clone(),
+        active: Arc::new(AtomicU32::new(0)),
+        maximum: maximum.clone(),
+    });
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry([tool as Arc<dyn Tool>]))
+            .build(),
+    );
+
+    let planned_runner = runner.clone();
+    let planned = tokio::spawn(async move {
+        planned_runner
+            .run_with_strategy(request(&["held"]), RunStrategy::DeclarativePlan)
+            .await
+    });
+    entered.acquire().await.unwrap().forget();
+    let direct_runner = runner.clone();
+    let direct = tokio::spawn(async move {
+        direct_runner
+            .run_with_strategy(request(&["held"]), RunStrategy::Direct)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while provider.requests().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), entered.acquire())
+            .await
+            .is_err()
+    );
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    release.add_permits(1);
+
+    assert_eq!(planned.await.unwrap().unwrap().status, RunStatus::Completed);
+    assert_eq!(direct.await.unwrap().unwrap().status, RunStatus::Completed);
+    assert_eq!(maximum.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancellation_while_waiting_for_a_concurrency_key_never_invokes_the_tool() {
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(ToolCall::new("first", "held", "{}")),
+        tool_response(ToolCall::new("queued", "held", "{}")),
+        final_response("done"),
+    ]));
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let maximum = Arc::new(AtomicU32::new(0));
+    let tool = Arc::new(HeldTool {
+        definition: definition("held", true, true).with_concurrency_key("shared"),
+        entered: entered.clone(),
+        release: release.clone(),
+        active: Arc::new(AtomicU32::new(0)),
+        maximum: maximum.clone(),
+    });
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry([tool as Arc<dyn Tool>]))
+            .build(),
+    );
+
+    let first_runner = runner.clone();
+    let first = tokio::spawn(async move {
+        first_runner
+            .run_with_strategy(request(&["held"]), RunStrategy::Direct)
+            .await
+    });
+    entered.acquire().await.unwrap().forget();
+    let queued_runner = runner.clone();
+    let queued_request = request(&["held"]);
+    let queued_cancellation = queued_request.cancellation.clone();
+    let queued = tokio::spawn(async move {
+        queued_runner
+            .run_with_strategy(queued_request, RunStrategy::Direct)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while provider.requests().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    queued_cancellation.cancel();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .status,
+        RunStatus::Cancelled
+    );
+    assert_eq!(entered.available_permits(), 0);
+    release.add_permits(1);
+    assert_eq!(first.await.unwrap().unwrap().status, RunStatus::Completed);
+    assert_eq!(maximum.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn different_concurrency_keys_can_overlap_across_runs() {
     let provider = Arc::new(MockModelProvider::scripted([
         tool_response(ToolCall::new("one", "one", "{}")),
