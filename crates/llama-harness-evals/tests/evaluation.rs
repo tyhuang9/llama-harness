@@ -3,7 +3,8 @@ use llama_harness_core::{EventRecord, RunEvent, RunResult, RunStatus, RunStrateg
 use llama_harness_evals::{
     evaluate_suite, export_regression_case, is_json_subset, load_suite, replay_regression,
     AssertionFailure, EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation,
-    EvaluationCaseResult, EvaluationReport, RegressionSource, StrategyMetrics,
+    EvaluationCaseResult, EvaluationReport, ForcedCandidateDisposition, RegressionSource,
+    StrategyMetrics, StrategySelectionCriterion,
 };
 use llama_harness_observability::{SqliteEventSink, TraceStoreConfig};
 use serde_json::{json, Value};
@@ -262,18 +263,29 @@ fn adaptive_readiness_is_input_order_independent_and_efficiency_is_nonblocking()
     let adaptive = readiness_result(RunStrategy::Adaptive, false, 1_200, 1_200);
     let direct = readiness_result(RunStrategy::Direct, false, 50, 50);
     let declarative = readiness_result(RunStrategy::DeclarativePlan, true, 900, 900);
+    let mut programmatic = readiness_result(RunStrategy::Programmatic, true, 10, 10);
+    programmatic.strategy_metrics.unauthorized_effects = Some(1);
     assert!(adaptive.passes_readiness());
 
     let forward = EvaluationReport::new(
         "report-a",
         "suite",
         1,
-        vec![adaptive.clone(), direct.clone(), declarative.clone()],
+        vec![
+            adaptive.clone(),
+            direct.clone(),
+            declarative.clone(),
+            programmatic.clone(),
+        ],
     )
     .adaptive_readiness();
-    let reverse =
-        EvaluationReport::new("report-b", "suite", 1, vec![declarative, direct, adaptive])
-            .adaptive_readiness();
+    let reverse = EvaluationReport::new(
+        "report-b",
+        "suite",
+        1,
+        vec![programmatic, declarative, direct, adaptive],
+    )
+    .adaptive_readiness();
     assert_eq!(forward, reverse);
     assert!(forward.ready);
     assert_eq!(forward.comparisons.len(), 1);
@@ -295,6 +307,34 @@ fn adaptive_readiness_is_input_order_independent_and_efficiency_is_nonblocking()
     assert_eq!(forward.comparisons[0].best_forced.model_calls, 2);
     assert_eq!(forward.comparisons[0].best_forced.tool_calls, 1);
     assert_eq!(forward.comparisons[0].best_forced.wasted_tool_calls, 0);
+    let candidates = &forward.comparisons[0].forced_candidates;
+    assert_eq!(candidates.len(), 3);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.strategy)
+            .collect::<Vec<_>>(),
+        vec![
+            RunStrategy::Direct,
+            RunStrategy::DeclarativePlan,
+            RunStrategy::Programmatic,
+        ]
+    );
+    assert!(matches!(
+        candidates[0].disposition,
+        ForcedCandidateDisposition::Outranked {
+            decisive_criterion: StrategySelectionCriterion::RecoverySuccess
+        }
+    ));
+    assert_eq!(
+        candidates[1].disposition,
+        ForcedCandidateDisposition::Selected
+    );
+    assert!(matches!(
+        &candidates[2].disposition,
+        ForcedCandidateDisposition::Ineligible { code, .. }
+            if code == "safety_hard_gate_failed"
+    ));
 }
 
 fn selected_forced(direct: EvaluationCaseResult, declarative: EvaluationCaseResult) -> RunStrategy {

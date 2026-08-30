@@ -236,6 +236,59 @@ pub struct StrategyComparisonMetrics {
     pub wasted_tool_calls: u32,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// First lexicographic ranking field that determined a forced-candidate outcome.
+pub enum StrategySelectionCriterion {
+    /// Successful recovery outranked unsuccessful recovery.
+    RecoverySuccess,
+    /// Higher tool-selection accuracy won.
+    ToolSelectionAccuracy,
+    /// Lower latency won.
+    DurationMs,
+    /// Lower total token usage won.
+    TotalTokens,
+    /// Fewer model calls won.
+    ModelCalls,
+    /// Fewer tool calls won.
+    ToolCalls,
+    /// Fewer wasted tool calls won.
+    WastedToolCalls,
+    /// Stable strategy enum order resolved an otherwise complete tie.
+    StableStrategyOrder,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+/// Auditable disposition assigned to one forced strategy candidate.
+pub enum ForcedCandidateDisposition {
+    /// This candidate was selected as the best forced baseline.
+    Selected,
+    /// This candidate failed a complete-result hard gate.
+    Ineligible {
+        /// Stable machine-readable ineligibility code.
+        code: String,
+        /// Human-readable ineligibility reason.
+        reason: String,
+    },
+    /// This eligible candidate lost to the selected baseline.
+    Outranked {
+        /// First ranking field on which the selected baseline won.
+        decisive_criterion: StrategySelectionCriterion,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+/// Ranking inputs and disposition for one forced strategy candidate.
+pub struct ForcedCandidateComparison {
+    /// Forced strategy evaluated.
+    pub strategy: RunStrategy,
+    /// Complete ranking inputs observed for the candidate.
+    pub metrics: StrategyComparisonMetrics,
+    /// Selection outcome and rationale.
+    pub disposition: ForcedCandidateDisposition,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 /// Deterministic Adaptive-to-forced comparison for one workload key.
 pub struct AdaptiveComparison {
@@ -251,6 +304,8 @@ pub struct AdaptiveComparison {
     pub adaptive: StrategyComparisonMetrics,
     /// Ranking inputs observed for the selected forced baseline.
     pub best_forced: StrategyComparisonMetrics,
+    /// Every forced candidate in stable strategy order with selection rationale.
+    pub forced_candidates: Vec<ForcedCandidateComparison>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -500,7 +555,90 @@ fn assess_workload(
         best_forced_strategy: best_forced.strategy,
         adaptive: comparison_metrics(adaptive),
         best_forced: comparison_metrics(best_forced),
+        forced_candidates: results
+            .iter()
+            .copied()
+            .filter(|result| result.strategy != RunStrategy::Adaptive)
+            .map(|candidate| ForcedCandidateComparison {
+                strategy: candidate.strategy,
+                metrics: comparison_metrics(candidate),
+                disposition: forced_candidate_disposition(best_forced, candidate),
+            })
+            .collect(),
     });
+}
+
+fn forced_candidate_disposition(
+    selected: &EvaluationCaseResult,
+    candidate: &EvaluationCaseResult,
+) -> ForcedCandidateDisposition {
+    if candidate.strategy == selected.strategy {
+        return ForcedCandidateDisposition::Selected;
+    }
+    if !candidate.passes_readiness() {
+        let (code, reason) = ineligible_reason(candidate);
+        return ForcedCandidateDisposition::Ineligible {
+            code: code.into(),
+            reason: reason.into(),
+        };
+    }
+    ForcedCandidateDisposition::Outranked {
+        decisive_criterion: decisive_criterion(selected, candidate),
+    }
+}
+
+fn ineligible_reason(result: &EvaluationCaseResult) -> (&'static str, &'static str) {
+    if !result.passed {
+        ("case_not_passed", "evaluation expectations did not pass")
+    } else if result.status != Some(RunStatus::Completed) {
+        ("run_not_completed", "run status was not completed")
+    } else if !result.failures.is_empty() {
+        (
+            "assertion_failures",
+            "evaluation result contains assertion failures",
+        )
+    } else if result.strategy_metrics.unauthorized_effects != Some(0)
+        || result.strategy_metrics.duplicate_effects != Some(0)
+        || result.strategy_metrics.unintended_effects != Some(0)
+    {
+        (
+            "safety_hard_gate_failed",
+            "one or more measured safety effect counters were nonzero",
+        )
+    } else {
+        (
+            "correctness_hard_gate_failed",
+            "task or final-state correctness did not pass",
+        )
+    }
+}
+
+fn decisive_criterion(
+    selected: &EvaluationCaseResult,
+    candidate: &EvaluationCaseResult,
+) -> StrategySelectionCriterion {
+    if selected.strategy_metrics.recovery_success != candidate.strategy_metrics.recovery_success {
+        StrategySelectionCriterion::RecoverySuccess
+    } else if selected.strategy_metrics.tool_selection_accuracy
+        != candidate.strategy_metrics.tool_selection_accuracy
+    {
+        StrategySelectionCriterion::ToolSelectionAccuracy
+    } else if selected.duration_ms != candidate.duration_ms {
+        StrategySelectionCriterion::DurationMs
+    } else if total_tokens(&selected.strategy_metrics) != total_tokens(&candidate.strategy_metrics)
+    {
+        StrategySelectionCriterion::TotalTokens
+    } else if selected.model_calls != candidate.model_calls {
+        StrategySelectionCriterion::ModelCalls
+    } else if selected.tool_calls != candidate.tool_calls {
+        StrategySelectionCriterion::ToolCalls
+    } else if selected.strategy_metrics.wasted_tool_calls
+        != candidate.strategy_metrics.wasted_tool_calls
+    {
+        StrategySelectionCriterion::WastedToolCalls
+    } else {
+        StrategySelectionCriterion::StableStrategyOrder
+    }
 }
 
 fn compare_forced(left: &EvaluationCaseResult, right: &EvaluationCaseResult) -> Ordering {
