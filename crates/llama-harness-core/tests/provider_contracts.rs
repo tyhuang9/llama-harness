@@ -330,10 +330,30 @@ fn assembler_bounds_catalogs_and_provider_advertised_caps() {
         ToolCallAssemblyLimits::for_provider(&ProviderCapabilityLimits::new().with_max_tools(0)),
         Err(HarnessError::InvalidRequest(_))
     ));
+    assert!(matches!(
+        ToolCallAssemblyLimits::for_provider(
+            &ProviderCapabilityLimits::new().with_max_parallel_tool_calls(0)
+        ),
+        Err(HarnessError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        ToolCallAssemblyLimits::for_provider(
+            &ProviderCapabilityLimits::new().with_max_streamed_tool_calls(0)
+        ),
+        Err(HarnessError::InvalidRequest(_))
+    ));
+    let local = ToolCallAssemblyLimits::default();
+    assert_eq!(
+        ToolCallAssemblyLimits::for_provider(&ProviderCapabilityLimits::new())
+            .unwrap()
+            .max_calls,
+        local.max_calls
+    );
     let clipped = ToolCallAssemblyLimits::for_provider(
         &ProviderCapabilityLimits::new()
             .with_max_tools(u32::MAX)
             .with_max_tool_schema_bytes(u64::MAX)
+            .with_max_parallel_tool_calls(u32::MAX)
             .with_max_streamed_tool_calls(u32::MAX)
             .with_max_streamed_argument_bytes(u64::MAX),
     )
@@ -354,6 +374,36 @@ fn assembler_bounds_catalogs_and_provider_advertised_caps() {
     assert_eq!(effective.max_aggregate_schema_bytes, 4_096);
     assert_eq!(effective.max_calls, 2);
     assert_eq!(effective.max_argument_bytes, 1_024);
+    let combined = ToolCallAssemblyLimits::for_provider(
+        &ProviderCapabilityLimits::new()
+            .with_max_streamed_tool_calls(7)
+            .with_max_parallel_tool_calls(3),
+    )
+    .unwrap();
+    assert_eq!(combined.max_calls, 3);
+
+    let parallel_one = ToolCallAssemblyLimits::for_provider(
+        &ProviderCapabilityLimits::new().with_max_parallel_tool_calls(1),
+    )
+    .unwrap();
+    assert_eq!(parallel_one.max_calls, 1);
+    let mut one_call = assembler(parallel_one);
+    assert!(one_call
+        .push(
+            ToolCallDelta::new(0, r#"{"query":"first"}"#, true)
+                .with_call_id("first")
+                .with_tool_id("lookup")
+        )
+        .unwrap()
+        .is_some());
+    assert!(matches!(
+        one_call.push(
+            ToolCallDelta::new(1, r#"{"query":"second"}"#, true)
+                .with_call_id("second")
+                .with_tool_id("lookup")
+        ),
+        Err(HarnessError::ResourceLimit(_))
+    ));
     let caller_raised = ToolCallAssemblyLimits {
         max_allowed_tools: 1_025,
         ..ToolCallAssemblyLimits::default()

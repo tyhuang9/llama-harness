@@ -172,11 +172,18 @@ impl ToolCallAssemblyLimits {
             )?;
         }
         if let Some(value) = capabilities.max_streamed_tool_calls {
-            limits.max_calls = checked_provider_cap(
+            limits.max_calls = limits.max_calls.min(checked_provider_cap(
                 "maximum streamed tool calls",
                 value as u64,
                 MAX_ASSEMBLY_CALLS,
-            )?;
+            )?);
+        }
+        if let Some(value) = capabilities.max_parallel_tool_calls {
+            limits.max_calls = limits.max_calls.min(checked_provider_cap(
+                "maximum parallel tool calls",
+                value as u64,
+                MAX_ASSEMBLY_CALLS,
+            )?);
         }
         if let Some(value) = capabilities.max_streamed_argument_bytes {
             limits.max_argument_bytes = checked_provider_cap(
