@@ -1,5 +1,6 @@
 use llama_harness_core::plan::{
-    MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES, MAX_PLAN_JSON_DEPTH,
+    MAX_EXECUTION_PLAN_BYTES, MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES,
+    MAX_PLAN_JSON_DEPTH,
 };
 use llama_harness_core::{
     ExecutionPlan, HarnessError, PlanConcurrency, PlanNode, ResultBinding, ResultRef, RunStrategy,
@@ -237,6 +238,24 @@ fn validation_enforces_argument_size_and_depth_hard_caps() {
         deeply_nested,
     )]))
     .contains("arguments depth"));
+}
+
+#[test]
+fn validation_enforces_aggregate_plan_byte_cap_incrementally() {
+    let individually_valid = "x".repeat(MAX_PLAN_ARGUMENT_BYTES - 2);
+    let nodes = (0..5)
+        .map(|index| {
+            PlanNode::new(
+                format!("node-{index}"),
+                format!("tool.{index}"),
+                json!(individually_valid),
+            )
+        })
+        .collect();
+    let message = error(ExecutionPlan::new(nodes));
+    assert!(message.contains(&format!(
+        "serialized size exceeds library hard cap of {MAX_EXECUTION_PLAN_BYTES} bytes"
+    )));
 }
 
 #[test]

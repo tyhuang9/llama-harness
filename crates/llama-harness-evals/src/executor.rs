@@ -43,6 +43,7 @@ pub struct EvalExecutionRequest {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 /// Observable output returned by an evaluation executor.
 pub struct EvalObservation {
     /// Canonical result produced by the agent runner.
@@ -59,6 +60,54 @@ pub struct EvalObservation {
     pub agent_version: Option<String>,
     /// Prompt version observed by the executor.
     pub prompt_version: Option<String>,
+}
+
+impl EvalObservation {
+    /// Creates an observation with unknown strategy metrics and optional state unset.
+    ///
+    /// This constructor is the stable first-contract entry point; builders allow
+    /// future observation fields without requiring downstream struct literals.
+    pub fn new(run: RunResult, model_calls: u32) -> Self {
+        Self {
+            run,
+            model_calls,
+            strategy_metrics: StrategyMetrics::default(),
+            final_state: None,
+            unresolved_items: None,
+            agent_version: None,
+            prompt_version: None,
+        }
+    }
+
+    /// Sets executor-owned strategy metrics.
+    pub fn with_strategy_metrics(mut self, metrics: StrategyMetrics) -> Self {
+        self.strategy_metrics = metrics;
+        self
+    }
+
+    /// Sets an optional application-owned final-state snapshot.
+    pub fn with_final_state(mut self, final_state: Option<Value>) -> Self {
+        self.final_state = final_state;
+        self
+    }
+
+    /// Sets an optional application-owned unresolved-items snapshot.
+    pub fn with_unresolved_items(mut self, unresolved_items: Option<Value>) -> Self {
+        self.unresolved_items = unresolved_items;
+        self
+    }
+
+    /// Sets the observed agent implementation version.
+    pub fn with_agent_version(mut self, agent_version: Option<String>) -> Self {
+        self.agent_version = agent_version;
+        self
+    }
+
+    /// Sets the observed prompt version.
+    pub fn with_prompt_version(mut self, prompt_version: Option<String>) -> Self {
+        self.prompt_version = prompt_version;
+        self
+    }
 }
 
 /// Executes every suite case for the selected models and repetitions.

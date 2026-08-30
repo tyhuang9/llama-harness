@@ -17,7 +17,8 @@ pub use executor::{evaluate_suite, EvalExecutionRequest, EvalExecutor, EvalObser
 pub use replay::{export_regression_case, replay_regression, RegressionCase, RegressionSource};
 pub use result::{
     AdaptiveComparison, AdaptiveReadiness, AdaptiveReadinessFailure, AssertionFailure,
-    EvaluationCaseResult, EvaluationReport, StrategyMetrics, StrategyMetricsValidationError,
+    EvaluationCaseResult, EvaluationReport, StrategyComparisonMetrics, StrategyMetrics,
+    StrategyMetricsValidationError,
 };
 pub use suite::{
     load_suite, load_suite_path, EvalCase, EvalDefaults, EvalExpected, EvalFixture, EvalSuite,

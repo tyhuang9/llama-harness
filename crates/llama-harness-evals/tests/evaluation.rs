@@ -77,17 +77,13 @@ impl EvalExecutor for RecordingExecutor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(request.clone());
-        Ok(EvalObservation {
-            run: run_result(&request.model),
-            model_calls: 2,
-            strategy_metrics: StrategyMetrics::default(),
-            final_state: Some(json!({
+        Ok(EvalObservation::new(run_result(&request.model), 2)
+            .with_final_state(Some(json!({
                 "tasks": [{"id": "task-123", "status": "completed", "extra": true}]
-            })),
-            unresolved_items: Some(json!([])),
-            agent_version: request.agent_version,
-            prompt_version: request.prompt_version,
-        })
+            })))
+            .with_unresolved_items(Some(json!([])))
+            .with_agent_version(request.agent_version)
+            .with_prompt_version(request.prompt_version))
     }
 }
 
@@ -286,8 +282,79 @@ fn adaptive_readiness_is_input_order_independent_and_efficiency_is_nonblocking()
         RunStrategy::DeclarativePlan
     );
     assert!(
-        forward.comparisons[0].adaptive_duration_ms
-            > forward.comparisons[0].best_forced_duration_ms
+        forward.comparisons[0].adaptive.duration_ms
+            > forward.comparisons[0].best_forced.duration_ms
+    );
+    assert_eq!(forward.comparisons[0].adaptive.recovery_success, false);
+    assert_eq!(forward.comparisons[0].adaptive.tool_selection_accuracy, 0.9);
+    assert_eq!(forward.comparisons[0].best_forced.recovery_success, true);
+    assert_eq!(forward.comparisons[0].adaptive.total_tokens, 1_200);
+    assert_eq!(forward.comparisons[0].adaptive.model_calls, 2);
+    assert_eq!(forward.comparisons[0].adaptive.tool_calls, 1);
+    assert_eq!(forward.comparisons[0].adaptive.wasted_tool_calls, 0);
+    assert_eq!(forward.comparisons[0].best_forced.model_calls, 2);
+    assert_eq!(forward.comparisons[0].best_forced.tool_calls, 1);
+    assert_eq!(forward.comparisons[0].best_forced.wasted_tool_calls, 0);
+}
+
+fn selected_forced(direct: EvaluationCaseResult, declarative: EvaluationCaseResult) -> RunStrategy {
+    EvaluationReport::new(
+        "ranking",
+        "suite",
+        1,
+        vec![
+            readiness_result(RunStrategy::Adaptive, true, 100, 100),
+            direct,
+            declarative,
+        ],
+    )
+    .adaptive_readiness()
+    .comparisons[0]
+        .best_forced_strategy
+}
+
+#[test]
+fn forced_ranking_applies_every_tie_break_in_contract_order() {
+    let mut direct = readiness_result(RunStrategy::Direct, true, 1_000, 1_000);
+    let declarative = readiness_result(RunStrategy::DeclarativePlan, true, 1, 1);
+    direct.strategy_metrics.tool_selection_accuracy = Some(0.95);
+    assert_eq!(
+        selected_forced(direct, declarative),
+        RunStrategy::Direct,
+        "higher accuracy must beat lower latency and cost"
+    );
+
+    let direct = readiness_result(RunStrategy::Direct, true, 10, 100);
+    let declarative = readiness_result(RunStrategy::DeclarativePlan, true, 20, 1);
+    assert_eq!(selected_forced(direct, declarative), RunStrategy::Direct);
+
+    let direct = readiness_result(RunStrategy::Direct, true, 10, 10);
+    let declarative = readiness_result(RunStrategy::DeclarativePlan, true, 10, 20);
+    assert_eq!(selected_forced(direct, declarative), RunStrategy::Direct);
+
+    let mut direct = readiness_result(RunStrategy::Direct, true, 10, 10);
+    let mut declarative = readiness_result(RunStrategy::DeclarativePlan, true, 10, 10);
+    direct.model_calls = Some(1);
+    declarative.model_calls = Some(2);
+    assert_eq!(selected_forced(direct, declarative), RunStrategy::Direct);
+
+    let mut direct = readiness_result(RunStrategy::Direct, true, 10, 10);
+    let mut declarative = readiness_result(RunStrategy::DeclarativePlan, true, 10, 10);
+    direct.tool_calls = Some(1);
+    declarative.tool_calls = Some(2);
+    assert_eq!(selected_forced(direct, declarative), RunStrategy::Direct);
+
+    let direct = readiness_result(RunStrategy::Direct, true, 10, 10);
+    let mut declarative = readiness_result(RunStrategy::DeclarativePlan, true, 10, 10);
+    declarative.strategy_metrics.wasted_tool_calls = Some(1);
+    assert_eq!(selected_forced(direct, declarative), RunStrategy::Direct);
+
+    let direct = readiness_result(RunStrategy::Direct, true, 10, 10);
+    let declarative = readiness_result(RunStrategy::DeclarativePlan, true, 10, 10);
+    assert_eq!(
+        selected_forced(direct, declarative),
+        RunStrategy::Direct,
+        "stable enum rank must resolve a complete tie"
     );
 }
 

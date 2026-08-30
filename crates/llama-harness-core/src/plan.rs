@@ -20,6 +20,8 @@ pub const MAX_PLAN_ID_LENGTH: usize = 256;
 /// Maximum byte length for dependency references and JSON pointers.
 pub const MAX_PLAN_POINTER_LENGTH: usize = 1_024;
 
+const PLAN_JSON_ENVELOPE_BYTES: usize = b"{\"nodes\":[]}".len();
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 /// A declarative, dependency-ordered set of tool invocations.
@@ -58,6 +60,7 @@ impl ExecutionPlan {
         let mut node_indexes = BTreeMap::new();
         let mut total_edges = 0usize;
         let mut total_bindings = 0usize;
+        let mut serialized_plan_bytes = PLAN_JSON_ENVELOPE_BYTES;
         for (index, node) in self.nodes.iter().enumerate() {
             validate_node_header(index, node)?;
             if node_indexes.insert(node.id.as_str(), index).is_some() {
@@ -72,6 +75,24 @@ impl ExecutionPlan {
             total_bindings = total_bindings
                 .checked_add(node.result_bindings.len())
                 .ok_or_else(|| invalid_error("execution plan binding count overflow"))?;
+            let serialized_node_bytes = serde_json::to_vec(node)
+                .map_err(|error| {
+                    invalid_error(format!(
+                        "execution plan node '{}' cannot be serialized: {error}",
+                        node.id
+                    ))
+                })?
+                .len();
+            serialized_plan_bytes = serialized_plan_bytes
+                .checked_add(usize::from(index > 0))
+                .and_then(|bytes| bytes.checked_add(serialized_node_bytes))
+                .ok_or_else(|| invalid_error("execution plan serialized size overflow"))?;
+            if serialized_plan_bytes > MAX_EXECUTION_PLAN_BYTES {
+                return invalid(format!(
+                    "execution plan serialized size exceeds library hard cap of {MAX_EXECUTION_PLAN_BYTES} bytes at node '{}'",
+                    node.id
+                ));
+            }
         }
         if total_edges > MAX_EXECUTION_PLAN_EDGES {
             return invalid(format!(
@@ -81,17 +102,6 @@ impl ExecutionPlan {
         if total_bindings > MAX_EXECUTION_PLAN_BINDINGS {
             return invalid(format!(
                 "execution plan has {total_bindings} result bindings, exceeding library hard cap of {MAX_EXECUTION_PLAN_BINDINGS}"
-            ));
-        }
-
-        let serialized_size = serde_json::to_vec(self)
-            .map_err(|error| {
-                invalid_error(format!("execution plan cannot be serialized: {error}"))
-            })?
-            .len();
-        if serialized_size > MAX_EXECUTION_PLAN_BYTES {
-            return invalid(format!(
-                "execution plan serialized size {serialized_size} bytes exceeds library hard cap of {MAX_EXECUTION_PLAN_BYTES} bytes"
             ));
         }
 

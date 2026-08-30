@@ -218,6 +218,25 @@ impl EvaluationCaseResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+/// Ranking inputs reported for one strategy in an Adaptive comparison.
+pub struct StrategyComparisonMetrics {
+    /// Whether recovery succeeded.
+    pub recovery_success: bool,
+    /// Tool-selection accuracy.
+    pub tool_selection_accuracy: f64,
+    /// Run latency in milliseconds.
+    pub duration_ms: u64,
+    /// Total input and output tokens.
+    pub total_tokens: u64,
+    /// Number of model calls.
+    pub model_calls: u32,
+    /// Number of tool calls.
+    pub tool_calls: u32,
+    /// Number of wasted tool calls.
+    pub wasted_tool_calls: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 /// Deterministic Adaptive-to-forced comparison for one workload key.
 pub struct AdaptiveComparison {
     /// Evaluation case identifier.
@@ -228,18 +247,10 @@ pub struct AdaptiveComparison {
     pub repetition: u32,
     /// Deterministically selected forced baseline strategy.
     pub best_forced_strategy: RunStrategy,
-    /// Adaptive latency in milliseconds.
-    pub adaptive_duration_ms: u64,
-    /// Best forced baseline latency in milliseconds.
-    pub best_forced_duration_ms: u64,
-    /// Adaptive total input and output token count.
-    pub adaptive_total_tokens: u64,
-    /// Best forced baseline total input and output token count.
-    pub best_forced_total_tokens: u64,
-    /// Adaptive tool-selection accuracy.
-    pub adaptive_tool_selection_accuracy: f64,
-    /// Best forced baseline tool-selection accuracy.
-    pub best_forced_tool_selection_accuracy: f64,
+    /// Ranking inputs observed for Adaptive.
+    pub adaptive: StrategyComparisonMetrics,
+    /// Ranking inputs observed for the selected forced baseline.
+    pub best_forced: StrategyComparisonMetrics,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -487,18 +498,8 @@ fn assess_workload(
         model: key.model.clone(),
         repetition: key.repetition,
         best_forced_strategy: best_forced.strategy,
-        adaptive_duration_ms: adaptive.duration_ms.expect("metrics were validated"),
-        best_forced_duration_ms: best_forced.duration_ms.expect("metrics were validated"),
-        adaptive_total_tokens: total_tokens(&adaptive.strategy_metrics),
-        best_forced_total_tokens: total_tokens(&best_forced.strategy_metrics),
-        adaptive_tool_selection_accuracy: adaptive
-            .strategy_metrics
-            .tool_selection_accuracy
-            .expect("metrics were validated"),
-        best_forced_tool_selection_accuracy: best_forced
-            .strategy_metrics
-            .tool_selection_accuracy
-            .expect("metrics were validated"),
+        adaptive: comparison_metrics(adaptive),
+        best_forced: comparison_metrics(best_forced),
     });
 }
 
@@ -507,6 +508,13 @@ fn compare_forced(left: &EvaluationCaseResult, right: &EvaluationCaseResult) -> 
         .strategy_metrics
         .recovery_success
         .cmp(&left.strategy_metrics.recovery_success)
+        .then_with(|| {
+            right
+                .strategy_metrics
+                .tool_selection_accuracy
+                .partial_cmp(&left.strategy_metrics.tool_selection_accuracy)
+                .unwrap_or(Ordering::Equal)
+        })
         .then_with(|| left.duration_ms.cmp(&right.duration_ms))
         .then_with(|| {
             total_tokens(&left.strategy_metrics).cmp(&total_tokens(&right.strategy_metrics))
@@ -518,14 +526,28 @@ fn compare_forced(left: &EvaluationCaseResult, right: &EvaluationCaseResult) -> 
                 .wasted_tool_calls
                 .cmp(&right.strategy_metrics.wasted_tool_calls)
         })
-        .then_with(|| {
-            right
-                .strategy_metrics
-                .tool_selection_accuracy
-                .partial_cmp(&left.strategy_metrics.tool_selection_accuracy)
-                .unwrap_or(Ordering::Equal)
-        })
         .then_with(|| strategy_rank(left.strategy).cmp(&strategy_rank(right.strategy)))
+}
+
+fn comparison_metrics(result: &EvaluationCaseResult) -> StrategyComparisonMetrics {
+    StrategyComparisonMetrics {
+        recovery_success: result
+            .strategy_metrics
+            .recovery_success
+            .expect("metrics were validated"),
+        tool_selection_accuracy: result
+            .strategy_metrics
+            .tool_selection_accuracy
+            .expect("metrics were validated"),
+        duration_ms: result.duration_ms.expect("metrics were validated"),
+        total_tokens: total_tokens(&result.strategy_metrics),
+        model_calls: result.model_calls.expect("metrics were validated"),
+        tool_calls: result.tool_calls.expect("metrics were validated"),
+        wasted_tool_calls: result
+            .strategy_metrics
+            .wasted_tool_calls
+            .expect("metrics were validated"),
+    }
 }
 
 fn total_tokens(metrics: &StrategyMetrics) -> u64 {

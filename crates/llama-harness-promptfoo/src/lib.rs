@@ -230,15 +230,11 @@ pub fn normalize_observations(
             })?;
         let result = match observation.response {
             Some(response) => {
-                let harness_observation = EvalObservation {
-                    model_calls: response.model_calls,
-                    strategy_metrics: llama_harness_evals::StrategyMetrics::default(),
-                    final_state: Some(response.final_state),
-                    unresolved_items: response.unresolved_items,
-                    agent_version: Some(response.agent_version),
-                    prompt_version: Some(response.prompt_version),
-                    run: response.run,
-                };
+                let harness_observation = EvalObservation::new(response.run, response.model_calls)
+                    .with_final_state(Some(response.final_state))
+                    .with_unresolved_items(response.unresolved_items)
+                    .with_agent_version(Some(response.agent_version))
+                    .with_prompt_version(Some(response.prompt_version));
                 let failures = evaluate_expectations(&case.expected, &harness_observation);
                 let mut result = EvaluationCaseResult::new(
                     suite.id.clone(),
