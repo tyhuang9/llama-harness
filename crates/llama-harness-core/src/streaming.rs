@@ -657,9 +657,11 @@ fn model_stream_failure(kind: ModelStreamFailureKind) -> HarnessError {
 
 fn normalize_upstream_stream_error(error: HarnessError) -> HarnessError {
     match error {
-        error @ (HarnessError::Cancelled
-        | HarnessError::ResourceLimit(_)
-        | HarnessError::ModelStream { .. }) => error,
+        HarnessError::Cancelled => HarnessError::Cancelled,
+        HarnessError::ResourceLimit(_) => {
+            HarnessError::ResourceLimit("upstream model stream resource limit reached".into())
+        }
+        error @ HarnessError::ModelStream { .. } => error,
         _ => model_stream_failure(ModelStreamFailureKind::UpstreamProviderFailure),
     }
 }

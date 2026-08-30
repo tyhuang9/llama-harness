@@ -697,11 +697,26 @@ fn stream_controller_makes_first_error_or_cancellation_terminal() {
     );
 
     let mut limited = controller();
+    let limit_error = limited
+        .push(Err(HarnessError::ResourceLimit(
+            "sentinel-provider-secret".into(),
+        )))
+        .unwrap_err();
     assert!(matches!(
-        limited.push(Err(HarnessError::ResourceLimit("bounded".into()))),
-        Err(HarnessError::ResourceLimit(message)) if message == "bounded"
+        &limit_error,
+        HarnessError::ResourceLimit(message)
+            if message == "upstream model stream resource limit reached"
+                && !message.contains("sentinel-provider-secret")
     ));
     assert!(limited.is_terminal());
+    assert_stream_failure(
+        limited
+            .push(Ok(ModelStreamEvent::TextDelta {
+                content: "sentinel-provider-secret".into(),
+            }))
+            .unwrap_err(),
+        ModelStreamFailureKind::EventAfterFailure,
+    );
 
     let mut eof = controller();
     assert_stream_failure(
