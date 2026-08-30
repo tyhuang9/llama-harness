@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use llama_harness_core::{
-    GenerationOptions, HarnessError, Message, MessageRole, ModelProvider, ModelRequest, ToolCall,
-    ToolDefinition, ToolRisk,
+    GenerationOptions, HarnessError, Message, MessageRole, ModelProvider, ModelRequest,
+    ModelStreamEvent, ToolCall, ToolDefinition, ToolRisk,
 };
 use llama_harness_ollama::{OllamaProvider, OllamaStreamEvent};
 use serde_json::{json, Value};
@@ -326,6 +326,47 @@ async fn streaming_handles_fragmented_ndjson_tool_calls_and_completion() {
         matches!(&events[3], Ok(OllamaStreamEvent::Completed { model, usage }) if model == "qwen3:8b" && usage.input_tokens == 3 && usage.output_tokens == 2)
     );
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn generic_provider_stream_maps_atomic_ollama_tool_calls_to_final_deltas() {
+    let body = concat!(
+        "{\"model\":\"qwen3:8b\",\"message\":{\"content\":\"hello\",\"tool_calls\":[{\"function\":{\"name\":\"list_tasks\",\"arguments\":{}}}]},\"done\":false}\n",
+        "{\"model\":\"qwen3:8b\",\"done\":true,\"prompt_eval_count\":3,\"eval_count\":2}\n"
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n{body}"
+    )
+    .into_bytes();
+    let (base_url, task) = server(vec![response]).await;
+    let provider = provider(&base_url);
+
+    assert!(!provider.capabilities().supports_streaming_tool_arguments);
+    let events = ModelProvider::stream(&provider, request(CancellationToken::new()))
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert!(matches!(
+        &events[0],
+        Ok(ModelStreamEvent::TextDelta { content }) if content == "hello"
+    ));
+    assert!(matches!(
+        &events[1],
+        Ok(ModelStreamEvent::ToolCallDelta(delta))
+            if delta.index == 0
+                && delta.tool_id.as_deref() == Some("list_tasks")
+                && delta.arguments_fragment == "{}"
+                && delta.is_final
+    ));
+    assert!(matches!(
+        &events[2],
+        Ok(ModelStreamEvent::Completed { model, usage })
+            if model == "qwen3:8b" && usage.input_tokens == 3 && usage.output_tokens == 2
+    ));
+    let requests = task.await.unwrap();
+    assert_eq!(requests[0].path, "/api/chat");
 }
 
 #[tokio::test]
