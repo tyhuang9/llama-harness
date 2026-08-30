@@ -585,8 +585,8 @@ impl<'a> StrategyRun<'a> {
                     node.id
                 )));
             }
+            self.runner.tools.validate(&node.tool_id, &node.arguments)?;
             if node.result_bindings.is_empty() {
-                self.runner.tools.validate(&node.tool_id, &node.arguments)?;
                 let signature = crate::broker::canonical_signature(&node.tool_id, &node.arguments);
                 let count = identical.entry(signature).or_default();
                 *count += 1;

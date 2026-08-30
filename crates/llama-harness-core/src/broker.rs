@@ -194,13 +194,11 @@ impl<'a> ToolBroker<'a> {
                 "tool caller is not allowed",
             )));
         }
-        if !defer_signature_checks {
-            if let Err(error) = self.tools.validate(&call.tool_id, &arguments) {
-                self.reject(result, events, &call, error.to_string());
-                return Ok(PrepareOutcome::Rejected(ToolResult::failure(
-                    "tool arguments failed validation",
-                )));
-            }
+        if let Err(error) = self.tools.validate(&call.tool_id, &arguments) {
+            self.reject(result, events, &call, error.to_string());
+            return Ok(PrepareOutcome::Rejected(ToolResult::failure(
+                "tool arguments failed validation",
+            )));
         }
 
         let context = ToolCallContext::new(
