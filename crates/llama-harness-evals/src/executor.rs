@@ -1,9 +1,9 @@
 use crate::{
     evaluate_expectations, EvalCase, EvalError, EvalFixture, EvalSuite, EvaluationCaseResult,
-    EvaluationReport,
+    EvaluationReport, StrategyMetrics,
 };
 use async_trait::async_trait;
-use llama_harness_core::RunResult;
+use llama_harness_core::{RunResult, RunStrategy};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -36,6 +36,8 @@ pub struct EvalExecutionRequest {
     pub fixture: Option<EvalFixture>,
     /// Model selected for this execution.
     pub model: String,
+    /// Strategy selected for this execution.
+    pub strategy: RunStrategy,
     /// One-based repetition number within the evaluation.
     pub repetition: u32,
 }
@@ -47,6 +49,8 @@ pub struct EvalObservation {
     pub run: RunResult,
     /// Number of model calls made during the run.
     pub model_calls: u32,
+    /// Executor-owned strategy metrics; leave optional fields unset when unknown.
+    pub strategy_metrics: StrategyMetrics,
     /// Optional application-owned final state snapshot.
     pub final_state: Option<Value>,
     /// Optional application-owned unresolved-items snapshot.
@@ -96,28 +100,35 @@ pub async fn evaluate_suite(
             } else {
                 model
             };
-            for repetition in 1..=repeats {
-                let request = EvalExecutionRequest {
-                    suite_id: suite.id.clone(),
-                    agent_id: suite.agent.clone(),
-                    agent_version: case
-                        .agent_version
-                        .clone()
-                        .or_else(|| suite.agent_version.clone()),
-                    prompt_version: case
-                        .prompt_version
-                        .clone()
-                        .or_else(|| suite.prompt_version.clone()),
-                    prompt_override: case
-                        .prompt_override
-                        .clone()
-                        .or_else(|| suite.prompt_override.clone()),
-                    case: case.clone(),
-                    fixture: case.fixture.clone(),
-                    model: model.clone(),
-                    repetition,
-                };
-                results.push(execute_case(executor, request).await);
+            let strategies = case
+                .strategy
+                .map(|strategy| vec![strategy])
+                .unwrap_or_else(|| suite.strategies.clone());
+            for strategy in strategies {
+                for repetition in 1..=repeats {
+                    let request = EvalExecutionRequest {
+                        suite_id: suite.id.clone(),
+                        agent_id: suite.agent.clone(),
+                        agent_version: case
+                            .agent_version
+                            .clone()
+                            .or_else(|| suite.agent_version.clone()),
+                        prompt_version: case
+                            .prompt_version
+                            .clone()
+                            .or_else(|| suite.prompt_version.clone()),
+                        prompt_override: case
+                            .prompt_override
+                            .clone()
+                            .or_else(|| suite.prompt_override.clone()),
+                        case: case.clone(),
+                        fixture: case.fixture.clone(),
+                        model: model.clone(),
+                        strategy,
+                        repetition,
+                    };
+                    results.push(execute_case(executor, request).await);
+                }
             }
         }
     }
@@ -138,6 +149,7 @@ pub(crate) async fn execute_case(
     let suite_id = request.suite_id.clone();
     let case_id = request.case.id.clone();
     let model = request.model.clone();
+    let strategy = request.strategy;
     let repetition = request.repetition;
     match executor.execute(request.clone()).await {
         Ok(observation) => {
@@ -146,6 +158,7 @@ pub(crate) async fn execute_case(
                 suite_id,
                 case_id,
                 model,
+                strategy,
                 repetition,
                 passed: failures.is_empty(),
                 failures,
@@ -155,6 +168,7 @@ pub(crate) async fn execute_case(
                 duration_ms: Some(observation.run.duration_ms),
                 model_calls: Some(observation.model_calls),
                 tool_calls: Some(observation.run.tool_calls.len() as u32),
+                strategy_metrics: observation.strategy_metrics,
                 agent_version: observation.agent_version,
                 prompt_version: observation.prompt_version,
                 final_state: observation.final_state,
@@ -165,6 +179,7 @@ pub(crate) async fn execute_case(
             suite_id,
             case_id,
             model,
+            strategy,
             repetition,
             passed: false,
             failures: vec![crate::AssertionFailure {
@@ -177,6 +192,7 @@ pub(crate) async fn execute_case(
             duration_ms: None,
             model_calls: None,
             tool_calls: None,
+            strategy_metrics: StrategyMetrics::default(),
             agent_version: None,
             prompt_version: None,
             final_state: None,

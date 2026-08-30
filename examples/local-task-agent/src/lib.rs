@@ -5,7 +5,7 @@
 
 use llama_harness::{
     async_trait,
-    evals::{EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation},
+    evals::{EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation, StrategyMetrics},
     load_agent_manifest,
     mock::{final_response, tool_response, MockModelProvider},
     AgentDefinition, AgentRunner, ApprovalHandler, ApprovalRecord, CancellationToken, EventSink,
@@ -333,6 +333,7 @@ impl TaskAgentRuntime {
                 metadata: JsonMap::new(),
                 overrides: RunOverrides {
                     model,
+                    strategy: None,
                     generation: GenerationOptions::default(),
                 },
                 evaluation: JsonMap::new(),
@@ -449,6 +450,7 @@ impl EvalExecutor for TaskAgentEvalExecutor {
             .map_err(|error| EvalError::Executor(error.to_string()))?;
         Ok(EvalObservation {
             model_calls: provider.requests().len() as u32,
+            strategy_metrics: StrategyMetrics::default(),
             final_state: Some(
                 json!({"tasks": store.snapshot().map_err(|error| EvalError::Executor(error.to_string()))?}),
             ),

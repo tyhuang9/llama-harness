@@ -1,5 +1,5 @@
 use crate::EvalError;
-use llama_harness_core::{JsonMap, Message, RunStatus};
+use llama_harness_core::{JsonMap, Message, RunStatus, RunStrategy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeSet, fs, path::Path};
@@ -34,6 +34,9 @@ pub struct EvalSuite {
     pub description: Option<String>,
     /// Models evaluated by default.
     pub models: Vec<String>,
+    #[serde(default = "default_strategies")]
+    /// Execution strategies evaluated when a case does not select one.
+    pub strategies: Vec<RunStrategy>,
     #[serde(default)]
     /// Defaults inherited by cases.
     pub defaults: EvalDefaults,
@@ -89,6 +92,9 @@ pub struct EvalCase {
     #[serde(default)]
     /// Optional per-case model override.
     pub model: Option<String>,
+    #[serde(default)]
+    /// Optional per-case strategy override.
+    pub strategy: Option<RunStrategy>,
     #[serde(default)]
     /// Optional per-case agent version.
     pub agent_version: Option<String>,
@@ -219,6 +225,20 @@ impl EvalSuite {
         for model in &self.models {
             validate_nonempty("model", model)?;
         }
+        if self.strategies.is_empty() {
+            return Err(EvalError::InvalidSuite(
+                "at least one strategy is required".into(),
+            ));
+        }
+        let mut strategies = BTreeSet::new();
+        for strategy in &self.strategies {
+            let name = strategy_name(*strategy);
+            if !strategies.insert(name) {
+                return Err(EvalError::InvalidSuite(format!(
+                    "duplicate suite strategy: {name}"
+                )));
+            }
+        }
         if self.defaults.repeat == 0 {
             return Err(EvalError::InvalidSuite(
                 "default repeat must be greater than zero".into(),
@@ -304,6 +324,19 @@ fn default_suite_version() -> u32 {
 
 fn default_repeat() -> u32 {
     1
+}
+
+fn default_strategies() -> Vec<RunStrategy> {
+    vec![RunStrategy::Adaptive]
+}
+
+fn strategy_name(strategy: RunStrategy) -> &'static str {
+    match strategy {
+        RunStrategy::Adaptive => "adaptive",
+        RunStrategy::Direct => "direct",
+        RunStrategy::DeclarativePlan => "declarative_plan",
+        RunStrategy::Programmatic => "programmatic",
+    }
 }
 
 fn validate_identifier(label: &str, value: &str) -> Result<(), EvalError> {

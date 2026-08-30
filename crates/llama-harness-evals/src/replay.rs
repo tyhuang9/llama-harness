@@ -2,6 +2,7 @@ use crate::{
     executor::execute_case, EvalCase, EvalError, EvalExecutionRequest, EvalExecutor,
     EvaluationCaseResult,
 };
+use llama_harness_core::RunStrategy;
 use serde::{Deserialize, Serialize};
 
 /// A replayable, explicit regression input. It deliberately contains no payload read
@@ -124,6 +125,7 @@ pub async fn replay_regression(
             case: regression.case.clone(),
             fixture: regression.case.fixture.clone(),
             model: regression.model.clone(),
+            strategy: regression.case.strategy.unwrap_or(RunStrategy::Adaptive),
             repetition: 1,
         },
     )

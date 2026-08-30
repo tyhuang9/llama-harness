@@ -1,8 +1,9 @@
 use async_trait::async_trait;
-use llama_harness_core::{EventRecord, RunEvent, RunResult, RunStatus, ToolCall};
+use llama_harness_core::{EventRecord, RunEvent, RunResult, RunStatus, RunStrategy, ToolCall};
 use llama_harness_evals::{
     evaluate_suite, export_regression_case, is_json_subset, load_suite, replay_regression,
     EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation, RegressionSource,
+    StrategyMetrics,
 };
 use llama_harness_observability::{SqliteEventSink, TraceStoreConfig};
 use serde_json::{json, Value};
@@ -79,6 +80,7 @@ impl EvalExecutor for RecordingExecutor {
         Ok(EvalObservation {
             run: run_result(&request.model),
             model_calls: 2,
+            strategy_metrics: StrategyMetrics::default(),
             final_state: Some(json!({
                 "tasks": [{"id": "task-123", "status": "completed", "extra": true}]
             })),
@@ -112,6 +114,7 @@ fn yaml_and_json_suites_validate_strictly_and_round_trip() {
     let suite = load_suite(SUITE, Some("yaml")).unwrap();
     assert_eq!(suite.id, "task-agent-core");
     assert_eq!(suite.defaults.repeat, 2);
+    assert_eq!(suite.strategies, vec![RunStrategy::Adaptive]);
     let json = serde_json::to_string(&suite).unwrap();
     assert_eq!(load_suite(&json, Some("json")).unwrap(), suite);
     assert!(matches!(
@@ -128,6 +131,74 @@ fn yaml_and_json_suites_validate_strictly_and_round_trip() {
         ),
         Err(EvalError::InvalidSuite(message)) if message.contains("at least one case")
     ));
+}
+
+#[tokio::test]
+async fn strategy_matrix_preserves_order_and_case_override_takes_precedence() {
+    let mut suite = load_suite(SUITE, Some("yaml")).unwrap();
+    suite.defaults.repeat = 1;
+    suite.strategies = vec![
+        RunStrategy::Programmatic,
+        RunStrategy::Direct,
+        RunStrategy::DeclarativePlan,
+    ];
+    let executor = RecordingExecutor::default();
+    let report = evaluate_suite(&suite, &executor, &[], None).await.unwrap();
+    assert_eq!(
+        report
+            .results
+            .iter()
+            .map(|result| result.strategy)
+            .collect::<Vec<_>>(),
+        suite.strategies
+    );
+
+    suite.cases[0].strategy = Some(RunStrategy::Direct);
+    let executor = RecordingExecutor::default();
+    let report = evaluate_suite(&suite, &executor, &[], None).await.unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].strategy, RunStrategy::Direct);
+}
+
+#[test]
+fn suite_rejects_empty_and_duplicate_strategy_matrices() {
+    let mut suite = load_suite(SUITE, Some("yaml")).unwrap();
+    suite.strategies.clear();
+    assert!(matches!(
+        suite.validate(),
+        Err(EvalError::InvalidSuite(message)) if message == "at least one strategy is required"
+    ));
+
+    suite.strategies = vec![RunStrategy::Direct, RunStrategy::Direct];
+    assert!(matches!(
+        suite.validate(),
+        Err(EvalError::InvalidSuite(message)) if message == "duplicate suite strategy: direct"
+    ));
+}
+
+#[test]
+fn strategy_metrics_round_trip_without_inventing_unknown_values() {
+    let metrics = StrategyMetrics::default();
+    assert_eq!(metrics.task_correct, None);
+    assert_eq!(metrics.final_state_correct, None);
+    assert_eq!(metrics.recovery_success, None);
+    assert_eq!(metrics.tool_selection_accuracy, None);
+    assert_eq!(metrics.input_tokens, None);
+    assert_eq!(metrics.output_tokens, None);
+    assert_eq!(metrics.wasted_tool_calls, None);
+    assert!(!metrics.passes_readiness());
+
+    let value = serde_json::to_value(&metrics).unwrap();
+    assert_eq!(
+        serde_json::from_value::<StrategyMetrics>(value).unwrap(),
+        metrics
+    );
+    let ready = StrategyMetrics {
+        task_correct: Some(true),
+        final_state_correct: Some(true),
+        ..StrategyMetrics::default()
+    };
+    assert!(ready.passes_readiness());
 }
 
 #[tokio::test]

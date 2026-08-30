@@ -1015,6 +1015,7 @@ fn to_core_generation(generation: WireGenerationOptions) -> GenerationOptions {
 fn to_core_overrides(overrides: WireRunOverrides) -> RunOverrides {
     RunOverrides {
         model: overrides.model,
+        strategy: None,
         generation: to_core_generation(overrides.generation),
     }
 }

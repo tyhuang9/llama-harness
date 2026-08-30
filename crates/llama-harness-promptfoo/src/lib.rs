@@ -232,6 +232,7 @@ pub fn normalize_observations(
             Some(response) => {
                 let harness_observation = EvalObservation {
                     model_calls: response.model_calls,
+                    strategy_metrics: llama_harness_evals::StrategyMetrics::default(),
                     final_state: Some(response.final_state),
                     unresolved_items: response.unresolved_items,
                     agent_version: Some(response.agent_version),
@@ -253,6 +254,7 @@ pub fn normalize_observations(
                 result.duration_ms = Some(harness_observation.run.duration_ms);
                 result.model_calls = Some(harness_observation.model_calls);
                 result.tool_calls = Some(harness_observation.run.tool_calls.len() as u32);
+                result.strategy_metrics = harness_observation.strategy_metrics;
                 result.agent_version = harness_observation.agent_version;
                 result.prompt_version = harness_observation.prompt_version;
                 result.final_state = harness_observation.final_state;

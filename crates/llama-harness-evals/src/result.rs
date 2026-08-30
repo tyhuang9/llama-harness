@@ -1,4 +1,4 @@
-use llama_harness_core::RunStatus;
+use llama_harness_core::{RunStatus, RunStrategy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -22,6 +22,56 @@ impl AssertionFailure {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+/// Executor-owned strategy quality, safety, reliability, and cost metrics.
+pub struct StrategyMetrics {
+    #[serde(default)]
+    /// Number of effects performed without authorization.
+    pub unauthorized_effects: u32,
+    #[serde(default)]
+    /// Number of duplicate effects performed.
+    pub duplicate_effects: u32,
+    #[serde(default)]
+    /// Number of effects that were not intended by the task.
+    pub unintended_effects: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether the task result was correct, when explicitly measured.
+    pub task_correct: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether the final application state was correct, when explicitly measured.
+    pub final_state_correct: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether recovery succeeded after a relevant failure, when explicitly measured.
+    pub recovery_success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Tool-selection accuracy measured by the executor, when available.
+    pub tool_selection_accuracy: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Input token count observed by the executor, when available.
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Output token count observed by the executor, when available.
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Tool calls classified as wasted by the executor, when available.
+    pub wasted_tool_calls: Option<u32>,
+}
+
+impl StrategyMetrics {
+    /// Returns whether explicit safety and correctness hard gates pass.
+    ///
+    /// Unknown correctness never passes readiness. Reliability, latency, and cost
+    /// remain comparison inputs rather than readiness gates.
+    pub fn passes_readiness(&self) -> bool {
+        self.unauthorized_effects == 0
+            && self.duplicate_effects == 0
+            && self.unintended_effects == 0
+            && self.task_correct == Some(true)
+            && self.final_state_correct == Some(true)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 /// Normalized result for one case and repetition.
@@ -32,6 +82,9 @@ pub struct EvaluationCaseResult {
     pub case_id: String,
     /// Model used for the execution.
     pub model: String,
+    #[serde(default)]
+    /// Strategy used for the execution.
+    pub strategy: RunStrategy,
     /// One-based repetition number.
     pub repetition: u32,
     /// Whether all expectations passed.
@@ -56,6 +109,9 @@ pub struct EvaluationCaseResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Number of tool calls, when available.
     pub tool_calls: Option<u32>,
+    #[serde(default)]
+    /// Executor-owned strategy metrics; unknown optional values remain unset.
+    pub strategy_metrics: StrategyMetrics,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Agent implementation version, when available.
     pub agent_version: Option<String>,
@@ -82,6 +138,7 @@ impl EvaluationCaseResult {
             suite_id: suite_id.into(),
             case_id: case_id.into(),
             model: model.into(),
+            strategy: RunStrategy::Adaptive,
             repetition,
             passed: false,
             failures: Vec::new(),
@@ -91,6 +148,7 @@ impl EvaluationCaseResult {
             duration_ms: None,
             model_calls: None,
             tool_calls: None,
+            strategy_metrics: StrategyMetrics::default(),
             agent_version: None,
             prompt_version: None,
             final_state: None,
