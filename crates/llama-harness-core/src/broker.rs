@@ -46,7 +46,15 @@ impl ToolConcurrencyLimiter {
 /// Per-run counters and effect records shared by every tool-calling strategy.
 #[derive(Default)]
 pub(crate) struct BrokerState {
+    /// Tool proposals admitted under the total-call limit.
     pub(crate) tool_calls: u32,
+    pub(crate) tool_issued: u32,
+    pub(crate) tool_reused: u32,
+    pub(crate) tool_rejected: u32,
+    pub(crate) tool_pre_dispatch_aborted: u32,
+    pub(crate) tool_completed: u32,
+    pub(crate) tool_failed: u32,
+    pub(crate) tool_cancelled: u32,
     identical_calls: HashMap<String, u32>,
     effects: HashMap<String, EffectRecord>,
     reuse_committed_effects: bool,
@@ -61,6 +69,43 @@ impl BrokerState {
         self.effects
             .values()
             .all(|record| matches!(record, EffectRecord::Completed(_)))
+    }
+
+    pub(crate) fn record_pre_dispatch_error(&mut self, error: &HarnessError) {
+        if matches!(error, HarnessError::Cancelled | HarnessError::TimedOut(_)) {
+            self.tool_pre_dispatch_aborted += 1;
+        } else {
+            self.tool_rejected += 1;
+        }
+    }
+
+    pub(crate) fn classified_tool_calls(&self) -> u32 {
+        self.tool_issued + self.tool_reused + self.tool_rejected + self.tool_pre_dispatch_aborted
+    }
+
+    pub(crate) fn record_execution_error(&mut self, error: &HarnessError) {
+        if matches!(error, HarnessError::Cancelled | HarnessError::TimedOut(_)) {
+            self.tool_cancelled += 1;
+        } else {
+            self.tool_failed += 1;
+        }
+    }
+
+    pub(crate) fn finalize_usage(&mut self) {
+        let classified = self.classified_tool_calls();
+        debug_assert!(classified <= self.tool_calls);
+        self.tool_pre_dispatch_aborted += self.tool_calls.saturating_sub(classified);
+        debug_assert_eq!(
+            self.tool_calls,
+            self.tool_issued
+                + self.tool_reused
+                + self.tool_rejected
+                + self.tool_pre_dispatch_aborted
+        );
+        debug_assert_eq!(
+            self.tool_issued,
+            self.tool_completed + self.tool_failed + self.tool_cancelled
+        );
     }
 }
 
@@ -166,6 +211,7 @@ impl<'a> ToolBroker<'a> {
             self.reject(
                 result,
                 events,
+                state,
                 &call,
                 format!(
                     "tool arguments exceed {} bytes",
@@ -180,7 +226,13 @@ impl<'a> ToolBroker<'a> {
         let arguments: Value = match serde_json::from_str(&call.arguments_json) {
             Ok(value) => value,
             Err(error) => {
-                self.reject(result, events, &call, format!("malformed JSON: {error}"));
+                self.reject(
+                    result,
+                    events,
+                    state,
+                    &call,
+                    format!("malformed JSON: {error}"),
+                );
                 return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                     "malformed tool arguments",
                 )));
@@ -191,14 +243,14 @@ impl<'a> ToolBroker<'a> {
             &arguments,
             request.agent.limits.max_json_depth,
         ) {
-            self.reject(result, events, &call, error.to_string());
+            self.reject(result, events, state, &call, error.to_string());
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                 "tool arguments exceed JSON depth limit",
             )));
         }
 
         let Some(tool) = self.tools.get(&call.tool_id) else {
-            self.reject(result, events, &call, "unknown tool".into());
+            self.reject(result, events, state, &call, "unknown tool".into());
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                 "unknown tool",
             )));
@@ -212,6 +264,7 @@ impl<'a> ToolBroker<'a> {
             self.reject(
                 result,
                 events,
+                state,
                 &call,
                 "tool is not allowed for agent".into(),
             );
@@ -223,6 +276,7 @@ impl<'a> ToolBroker<'a> {
             self.reject(
                 result,
                 events,
+                state,
                 &call,
                 format!("tool does not allow {} calls", caller_name(caller)),
             );
@@ -231,7 +285,7 @@ impl<'a> ToolBroker<'a> {
             )));
         }
         if let Err(error) = self.tools.validate(&call.tool_id, &arguments) {
-            self.reject(result, events, &call, error.to_string());
+            self.reject(result, events, state, &call, error.to_string());
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                 "tool arguments failed validation",
             )));
@@ -260,6 +314,7 @@ impl<'a> ToolBroker<'a> {
                     request,
                     result,
                     events,
+                    state,
                     &call,
                     &context,
                     tool.as_ref(),
@@ -360,6 +415,7 @@ impl<'a> ToolBroker<'a> {
                     request,
                     result,
                     events,
+                    state,
                     &prepared.call,
                     &prepared.context,
                     prepared.tool.as_ref(),
@@ -400,6 +456,7 @@ impl<'a> ToolBroker<'a> {
         }
         result.status = RunStatus::LimitReached;
         result.repeated_tool_call_limit_reached = true;
+        state.tool_rejected += 1;
         result.errors.push(RunError::new(
             "repeated_tool_call_limit",
             "repeated identical tool call limit reached",
@@ -409,7 +466,7 @@ impl<'a> ToolBroker<'a> {
 
     fn reusable_effect(
         &self,
-        state: &BrokerState,
+        state: &mut BrokerState,
         events: &mut EventEmitter,
         call: &ToolCall,
         read_only: bool,
@@ -420,6 +477,7 @@ impl<'a> ToolBroker<'a> {
         }
         match state.effects.get(signature) {
             Some(EffectRecord::Completed(recorded)) => {
+                state.tool_reused += 1;
                 events.emit(RunEvent::ToolEffectReused {
                     call_id: call.id.clone(),
                     tool_id: call.tool_id.clone(),
@@ -439,6 +497,7 @@ impl<'a> ToolBroker<'a> {
         request: &RunRequest,
         result: &mut RunResult,
         events: &mut EventEmitter,
+        state: &mut BrokerState,
         call: &ToolCall,
         context: &ToolCallContext,
         tool: &dyn Tool,
@@ -462,7 +521,13 @@ impl<'a> ToolBroker<'a> {
         result.policy_decisions.push(decision.clone());
 
         if let PolicyDecision::Deny { reason } = decision {
-            self.reject(result, events, call, format!("policy denied: {reason}"));
+            self.reject(
+                result,
+                events,
+                state,
+                call,
+                format!("policy denied: {reason}"),
+            );
             return Ok(Some(ToolResult::failure("policy denied")));
         }
 
@@ -486,7 +551,13 @@ impl<'a> ToolBroker<'a> {
             let reason = approval.reason.clone();
             result.approvals.push(approval);
             if !granted {
-                self.reject(result, events, call, format!("approval denied: {reason}"));
+                self.reject(
+                    result,
+                    events,
+                    state,
+                    call,
+                    format!("approval denied: {reason}"),
+                );
                 return Ok(Some(ToolResult::failure("approval denied")));
             }
         }
@@ -572,6 +643,7 @@ impl<'a> ToolBroker<'a> {
     }
 
     pub(crate) fn mark_dispatched(&self, state: &mut BrokerState, prepared: &PreparedCall) {
+        state.tool_issued += 1;
         if prepared.tool.definition().read_only {
             return;
         }
@@ -599,6 +671,11 @@ impl<'a> ToolBroker<'a> {
         prepared: &PreparedCall,
         execution: &BrokerExecution,
     ) {
+        if execution.result.ok && execution.validation_error.is_none() {
+            state.tool_completed += 1;
+        } else {
+            state.tool_failed += 1;
+        }
         if prepared.tool.definition().read_only {
             return;
         }
@@ -616,9 +693,11 @@ impl<'a> ToolBroker<'a> {
         &self,
         result: &mut RunResult,
         events: &mut EventEmitter,
+        state: &mut BrokerState,
         call: &ToolCall,
         reason: String,
     ) {
+        state.tool_rejected += 1;
         events.emit(RunEvent::ToolRejected {
             call_id: call.id.clone(),
             tool_id: call.tool_id.clone(),

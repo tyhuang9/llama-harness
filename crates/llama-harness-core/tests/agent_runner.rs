@@ -362,7 +362,18 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
             std::mem::discriminant(&RunEvent::StrategyUsage {
                 strategy: RunStrategy::Direct,
                 model_calls: 0,
+                planning_model_calls: 0,
+                repair_model_calls: 0,
+                recovery_model_calls: 0,
+                reactive_model_calls: 0,
                 tool_calls: 0,
+                tool_issued: 0,
+                tool_reused: 0,
+                tool_rejected: 0,
+                tool_pre_dispatch_aborted: 0,
+                tool_completed: 0,
+                tool_failed: 0,
+                tool_cancelled: 0,
                 duration_ms: 0,
             }),
             std::mem::discriminant(&RunEvent::Completed {

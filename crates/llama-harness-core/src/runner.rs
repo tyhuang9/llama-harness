@@ -268,6 +268,8 @@ impl AgentRunner {
             }
 
             for call in response.tool_calls {
+                let attempts_before = broker_state.tool_calls;
+                let classified_before = broker_state.classified_tool_calls();
                 let outcome = match broker
                     .prepare(
                         &request,
@@ -284,6 +286,11 @@ impl AgentRunner {
                 {
                     Ok(outcome) => outcome,
                     Err(error) => {
+                        if broker_state.tool_calls > attempts_before
+                            && broker_state.classified_tool_calls() == classified_before
+                        {
+                            broker_state.record_pre_dispatch_error(&error);
+                        }
                         apply_terminal_error(&mut result, error);
                         break 'run;
                     }
@@ -294,6 +301,7 @@ impl AgentRunner {
                         let execution = match broker.execute(&prepared, &request, deadline).await {
                             Ok(execution) => execution,
                             Err(error) => {
+                                broker_state.record_execution_error(&error);
                                 broker.mark_uncertain(&mut broker_state, &prepared);
                                 events.emit(RunEvent::ToolCompleted {
                                     call_id: call.id.clone(),
@@ -355,10 +363,22 @@ impl AgentRunner {
 
         result.duration_ms = started.elapsed().as_millis() as u64;
         if strategy_events.is_some() {
+            broker_state.finalize_usage();
             events.emit(RunEvent::StrategyUsage {
                 strategy: crate::RunStrategy::Direct,
                 model_calls,
+                planning_model_calls: 0,
+                repair_model_calls: 0,
+                recovery_model_calls: 0,
+                reactive_model_calls: model_calls,
                 tool_calls: broker_state.tool_calls,
+                tool_issued: broker_state.tool_issued,
+                tool_reused: broker_state.tool_reused,
+                tool_rejected: broker_state.tool_rejected,
+                tool_pre_dispatch_aborted: broker_state.tool_pre_dispatch_aborted,
+                tool_completed: broker_state.tool_completed,
+                tool_failed: broker_state.tool_failed,
+                tool_cancelled: broker_state.tool_cancelled,
                 duration_ms: result.duration_ms,
             });
         }

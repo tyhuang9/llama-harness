@@ -89,8 +89,19 @@ pub enum RunEvent {
         /// Stable reason for the fallback.
         reason: StrategyFallbackReason,
     },
+    /// A metadata-only declarative planning phase changed lifecycle state.
+    PlanLifecycle {
+        /// Stable phase whose lifecycle changed.
+        phase: PlanPhase,
+        /// One-based attempt within the phase.
+        attempt: u32,
+        /// Stable value-free lifecycle outcome.
+        outcome: PlanLifecycleOutcome,
+    },
     /// A complete declarative plan passed structural and execution preflight.
     PlanValidated {
+        /// One-based execution-plan attempt.
+        attempt: u32,
         /// Number of validated plan nodes.
         node_count: u32,
     },
@@ -100,6 +111,8 @@ pub enum RunEvent {
         node_id: String,
         /// Registered tool identifier.
         tool_id: String,
+        /// One-based execution-plan attempt.
+        attempt: u32,
         /// One-based deterministic execution wave.
         wave: u32,
     },
@@ -109,10 +122,14 @@ pub enum RunEvent {
         node_id: String,
         /// Registered tool identifier.
         tool_id: String,
+        /// One-based execution-plan attempt.
+        attempt: u32,
         /// One-based deterministic execution wave.
         wave: u32,
         /// Whether the node returned a successful validated result.
         ok: bool,
+        /// Stable metadata-only node outcome.
+        outcome: PlanNodeOutcome,
         /// Elapsed node execution time in milliseconds.
         duration_ms: u64,
     },
@@ -129,8 +146,30 @@ pub enum RunEvent {
         strategy: RunStrategy,
         /// Number of provider calls issued.
         model_calls: u32,
-        /// Number of concrete tool calls accepted by the broker.
+        /// Provider calls used for initial plan selection and validation.
+        planning_model_calls: u32,
+        /// Provider calls used for the single optional invalid-plan repair.
+        repair_model_calls: u32,
+        /// Provider calls used for the single optional execution recovery.
+        recovery_model_calls: u32,
+        /// Provider calls used by direct reactive execution and final synthesis.
+        reactive_model_calls: u32,
+        /// Number of tool proposals admitted to the broker attempt budget.
         tool_calls: u32,
+        /// Admitted proposals that crossed into the execution boundary.
+        tool_issued: u32,
+        /// Admitted proposals satisfied from an exact completed-effect record.
+        tool_reused: u32,
+        /// Admitted proposals rejected by validation, policy, approval, or limits.
+        tool_rejected: u32,
+        /// Admitted proposals aborted by an error before execution was issued.
+        tool_pre_dispatch_aborted: u32,
+        /// Issued calls that returned a successful validated result.
+        tool_completed: u32,
+        /// Issued calls that failed execution or result validation.
+        tool_failed: u32,
+        /// Issued calls cancelled or timed out before a result was available.
+        tool_cancelled: u32,
         /// Elapsed run duration in milliseconds.
         duration_ms: u64,
     },
@@ -201,6 +240,71 @@ pub enum StrategyFallbackReason {
     InvalidPlan,
     /// Execution failed after some node results were safely recorded.
     ExecutionRecovery,
+    /// Planner execution failed before any tool effect began.
+    PlannerFailure,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Stable declarative planning and recovery phase.
+pub enum PlanPhase {
+    /// Initial strategy-envelope generation and validation.
+    Planning,
+    /// Bounded repair of an invalid strategy envelope.
+    Repair,
+    /// Structural and schema validation of a generated strategy envelope.
+    Validation,
+    /// Structural, broker, policy, and approval preflight.
+    Preflight,
+    /// Bounded recovery after safely recorded execution.
+    Recovery,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Stable value-free outcome for a declarative planning phase.
+pub enum PlanLifecycleOutcome {
+    /// The phase began.
+    Started,
+    /// The phase completed successfully.
+    Succeeded,
+    /// Generated structured content was invalid.
+    Invalid,
+    /// Validation, policy, approval, or another safety gate rejected the phase.
+    Rejected,
+    /// The phase failed for another reason.
+    Failed,
+    /// The phase was cancelled.
+    Cancelled,
+    /// The phase exceeded its deadline.
+    TimedOut,
+    /// The phase exhausted a configured resource or call limit.
+    LimitReached,
+    /// The optional phase was skipped to preserve final-synthesis capacity.
+    Skipped,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Stable value-free outcome for one declarative plan node.
+pub enum PlanNodeOutcome {
+    /// The tool returned a successful validated result.
+    Succeeded,
+    /// The tool or scheduler failed the node.
+    Failed,
+    /// The node was cancelled.
+    Cancelled,
+    /// The node exceeded its deadline.
+    TimedOut,
+    /// Validation, policy, approval, or another safety gate rejected the node.
+    Rejected,
+    /// The node exhausted a configured resource or call limit.
+    LimitReached,
+    /// An exact previously completed effect supplied the node result.
+    Reused,
 }
 
 /// Receives ordered events from an agent runner.

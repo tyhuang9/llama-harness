@@ -29,8 +29,8 @@ pub use agent_manifest::{
 };
 pub use error::{HarnessError, ModelStreamFailureKind, RunError};
 pub use event::{
-    EventRecord, EventSink, InMemoryEventSink, RunEvent, StrategyFallbackReason,
-    StrategySelectionReason,
+    EventRecord, EventSink, InMemoryEventSink, PlanLifecycleOutcome, PlanNodeOutcome, PlanPhase,
+    RunEvent, StrategyFallbackReason, StrategySelectionReason,
 };
 pub use limits::{AgentLimits, GenerationOptions};
 pub use message::{Message, MessageRole};

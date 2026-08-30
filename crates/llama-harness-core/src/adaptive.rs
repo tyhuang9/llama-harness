@@ -9,9 +9,9 @@ use crate::{
         validate_output, validate_request, DirectStrategyEvents,
     },
     AgentRunner, ExecutionPlan, HarnessError, Message, ModelRequest, ModelResponse,
-    PlanConcurrency, PlanNode, RunError, RunEvent, RunRequest, RunResult, RunStatus, RunStrategy,
-    StrategyFallbackReason, StrategySelectionReason, ToolCall, ToolCaller, ToolDefinition,
-    ToolResult,
+    PlanConcurrency, PlanLifecycleOutcome, PlanNode, PlanNodeOutcome, PlanPhase, RunError,
+    RunEvent, RunRequest, RunResult, RunStatus, RunStrategy, StrategyFallbackReason,
+    StrategySelectionReason, ToolCall, ToolCaller, ToolDefinition, ToolResult,
 };
 use futures_util::future::join_all;
 use jsonschema::Validator;
@@ -54,6 +54,10 @@ struct StrategyRun<'a> {
     deadline: Option<Instant>,
     started: StdInstant,
     model_calls: u32,
+    planning_model_calls: u32,
+    repair_model_calls: u32,
+    recovery_model_calls: u32,
+    reactive_model_calls: u32,
     output_repairs: u32,
     broker_state: BrokerState,
     selected: RunStrategy,
@@ -80,6 +84,14 @@ enum PlanFailureKind {
     Preflight,
     Recoverable,
     Terminal,
+}
+
+#[derive(Clone, Copy)]
+enum ModelCallPhase {
+    Planning,
+    Repair,
+    Recovery,
+    Reactive,
 }
 
 impl AgentRunner {
@@ -209,24 +221,90 @@ impl AgentRunner {
         planner_messages.insert(0, Message::system(PLANNER_PROMPT));
         let mut invalid_repair_used = false;
         let envelope = loop {
+            let (plan_phase, model_phase) = if invalid_repair_used {
+                (PlanPhase::Repair, ModelCallPhase::Repair)
+            } else {
+                (PlanPhase::Planning, ModelCallPhase::Planning)
+            };
+            run.events.emit(RunEvent::PlanLifecycle {
+                phase: plan_phase,
+                attempt: 1,
+                outcome: PlanLifecycleOutcome::Started,
+            });
             let response = match run
-                .complete(planner_messages.clone(), plan_tools.clone())
+                .complete(
+                    planner_messages.clone(),
+                    plan_tools.clone(),
+                    model_phase,
+                    true,
+                )
                 .await
             {
                 Ok(Some(response)) => response,
-                Ok(None) => return Ok(run.finish()),
+                Ok(None) => {
+                    run.events.emit(RunEvent::PlanLifecycle {
+                        phase: plan_phase,
+                        attempt: 1,
+                        outcome: lifecycle_outcome_for_status(&run.result.status),
+                    });
+                    return Ok(run.finish());
+                }
                 Err(error) => {
-                    run.terminate(error);
+                    run.events.emit(RunEvent::PlanLifecycle {
+                        phase: plan_phase,
+                        attempt: 1,
+                        outcome: lifecycle_outcome_for_error(&error),
+                    });
+                    if requested == RunStrategy::Adaptive
+                        && !is_terminal_failure(&error)
+                        && run.has_model_call_capacity()
+                    {
+                        run.select_direct_fallback(
+                            requested,
+                            StrategyFallbackReason::PlannerFailure,
+                        );
+                        run.run_reactive().await;
+                    } else {
+                        run.terminate(error);
+                    }
                     return Ok(run.finish());
                 }
             };
+            run.events.emit(RunEvent::PlanLifecycle {
+                phase: plan_phase,
+                attempt: 1,
+                outcome: PlanLifecycleOutcome::Succeeded,
+            });
+            let validation_attempt = if invalid_repair_used { 2 } else { 1 };
+            run.events.emit(RunEvent::PlanLifecycle {
+                phase: PlanPhase::Validation,
+                attempt: validation_attempt,
+                outcome: PlanLifecycleOutcome::Started,
+            });
             match run.parse_envelope(response, requested) {
-                Ok(envelope) => break envelope,
+                Ok(envelope) => {
+                    run.events.emit(RunEvent::PlanLifecycle {
+                        phase: PlanPhase::Validation,
+                        attempt: validation_attempt,
+                        outcome: PlanLifecycleOutcome::Succeeded,
+                    });
+                    break envelope;
+                }
                 Err(error) if is_terminal_failure(&error) => {
+                    run.events.emit(RunEvent::PlanLifecycle {
+                        phase: PlanPhase::Validation,
+                        attempt: validation_attempt,
+                        outcome: lifecycle_outcome_for_error(&error),
+                    });
                     run.terminate(error);
                     return Ok(run.finish());
                 }
-                Err(error) if !invalid_repair_used => {
+                Err(error) if !invalid_repair_used && run.can_spend_optional_model_call() => {
+                    run.events.emit(RunEvent::PlanLifecycle {
+                        phase: PlanPhase::Validation,
+                        attempt: validation_attempt,
+                        outcome: validation_outcome_for_error(&error),
+                    });
                     invalid_repair_used = true;
                     planner_messages.push(Message::system(REPAIR_PROMPT));
                     run.result
@@ -235,17 +313,25 @@ impl AgentRunner {
                     let _ = error;
                 }
                 Err(error) if requested == RunStrategy::Adaptive => {
-                    run.events.emit(RunEvent::StrategyFallback {
-                        from: RunStrategy::DeclarativePlan,
-                        to: RunStrategy::Direct,
-                        reason: StrategyFallbackReason::InvalidPlan,
+                    run.events.emit(RunEvent::PlanLifecycle {
+                        phase: PlanPhase::Validation,
+                        attempt: validation_attempt,
+                        outcome: validation_outcome_for_error(&error),
                     });
-                    run.events.emit(RunEvent::StrategySelected {
-                        requested,
-                        selected: RunStrategy::Direct,
-                        reason: StrategySelectionReason::PlannerSelectedDirect,
-                    });
-                    run.selected = RunStrategy::Direct;
+                    if !invalid_repair_used {
+                        run.events.emit(RunEvent::PlanLifecycle {
+                            phase: PlanPhase::Repair,
+                            attempt: 1,
+                            outcome: PlanLifecycleOutcome::Skipped,
+                        });
+                    }
+                    if !run.has_model_call_capacity() {
+                        run.terminate(HarnessError::ResourceLimit(
+                            "no model call remains for direct fallback".into(),
+                        ));
+                        return Ok(run.finish());
+                    }
+                    run.select_direct_fallback(requested, StrategyFallbackReason::InvalidPlan);
                     run.result
                         .errors
                         .retain(|record| record.code != "invalid_plan");
@@ -254,9 +340,21 @@ impl AgentRunner {
                     return Ok(run.finish());
                 }
                 Err(error) => {
+                    run.events.emit(RunEvent::PlanLifecycle {
+                        phase: PlanPhase::Validation,
+                        attempt: validation_attempt,
+                        outcome: validation_outcome_for_error(&error),
+                    });
+                    if !invalid_repair_used {
+                        run.events.emit(RunEvent::PlanLifecycle {
+                            phase: PlanPhase::Repair,
+                            attempt: 1,
+                            outcome: PlanLifecycleOutcome::Skipped,
+                        });
+                    }
                     run.result.errors.push(RunError::new(
                         "invalid_plan",
-                        format!("declarative plan remained invalid after repair: {error}"),
+                        format!("declarative plan was invalid: {error}"),
                     ));
                     return Ok(run.finish());
                 }
@@ -289,18 +387,9 @@ impl AgentRunner {
                     && requested == RunStrategy::Adaptive
                     && !execution.effects_started
                     && !run.terminal
+                    && run.has_model_call_capacity()
                 {
-                    run.events.emit(RunEvent::StrategyFallback {
-                        from: RunStrategy::DeclarativePlan,
-                        to: RunStrategy::Direct,
-                        reason: StrategyFallbackReason::InvalidPlan,
-                    });
-                    run.events.emit(RunEvent::StrategySelected {
-                        requested,
-                        selected: RunStrategy::Direct,
-                        reason: StrategySelectionReason::PlannerSelectedDirect,
-                    });
-                    run.selected = RunStrategy::Direct;
+                    run.select_direct_fallback(requested, StrategyFallbackReason::InvalidPlan);
                     run.run_reactive().await;
                     return Ok(run.finish());
                 }
@@ -310,58 +399,126 @@ impl AgentRunner {
                     && run.broker_state.recovery_is_safe()
                     && !run.terminal
                 {
-                    if let Err(error) = run.append_plan_transcript(&execution.transcript) {
-                        run.terminate(error);
-                        return Ok(run.finish());
-                    }
-                    let recovery = RecoveryState {
-                        completed: execution
-                            .completed
-                            .iter()
-                            .map(|(node_id, result)| (node_id.as_str(), &result.output))
-                            .collect(),
-                    };
-                    let recovery = match serde_json::to_string(&recovery) {
-                        Ok(recovery) => recovery,
-                        Err(error) => {
-                            run.terminate(HarnessError::InvalidRequest(format!(
-                                "completed results could not be serialized: {error}"
-                            )));
+                    if !run.can_spend_optional_model_call() {
+                        run.events.emit(RunEvent::PlanLifecycle {
+                            phase: PlanPhase::Recovery,
+                            attempt: 1,
+                            outcome: PlanLifecycleOutcome::Skipped,
+                        });
+                    } else {
+                        run.events.emit(RunEvent::PlanLifecycle {
+                            phase: PlanPhase::Recovery,
+                            attempt: 1,
+                            outcome: PlanLifecycleOutcome::Started,
+                        });
+                        if let Err(error) = run.append_plan_transcript(&execution.transcript) {
+                            run.events.emit(RunEvent::PlanLifecycle {
+                                phase: PlanPhase::Recovery,
+                                attempt: 1,
+                                outcome: lifecycle_outcome_for_error(&error),
+                            });
+                            run.terminate(error);
                             return Ok(run.finish());
                         }
-                    };
-                    let mut recovery_messages = run.messages.clone();
-                    recovery_messages.push(Message::system(RECOVERY_PROMPT));
-                    recovery_messages.push(Message::user(recovery));
-                    if let Err(error) = ensure_transcript(&recovery_messages, &request.agent.limits)
-                    {
-                        run.terminate(error);
-                        return Ok(run.finish());
-                    }
-                    match run.complete(recovery_messages, plan_tools.clone()).await {
-                        Ok(Some(response)) => {
-                            match run.parse_envelope(response, RunStrategy::DeclarativePlan) {
-                                Ok(PlannerEnvelope::DeclarativePlan { plan: repaired }) => {
-                                    run.events.emit(RunEvent::StrategyFallback {
-                                        from: RunStrategy::DeclarativePlan,
-                                        to: RunStrategy::DeclarativePlan,
-                                        reason: StrategyFallbackReason::ExecutionRecovery,
-                                    });
-                                    plan = repaired;
-                                    execution = run.execute_plan(&plan).await;
+                        let recovery = RecoveryState {
+                            completed: execution
+                                .completed
+                                .iter()
+                                .map(|(node_id, result)| (node_id.as_str(), &result.output))
+                                .collect(),
+                        };
+                        let recovery = match serde_json::to_string(&recovery) {
+                            Ok(recovery) => recovery,
+                            Err(error) => {
+                                let error = HarnessError::InvalidRequest(format!(
+                                    "completed results could not be serialized: {error}"
+                                ));
+                                run.events.emit(RunEvent::PlanLifecycle {
+                                    phase: PlanPhase::Recovery,
+                                    attempt: 1,
+                                    outcome: lifecycle_outcome_for_error(&error),
+                                });
+                                run.terminate(error);
+                                return Ok(run.finish());
+                            }
+                        };
+                        let mut recovery_messages = run.messages.clone();
+                        recovery_messages.push(Message::system(RECOVERY_PROMPT));
+                        recovery_messages.push(Message::user(recovery));
+                        if let Err(error) =
+                            ensure_transcript(&recovery_messages, &request.agent.limits)
+                        {
+                            run.events.emit(RunEvent::PlanLifecycle {
+                                phase: PlanPhase::Recovery,
+                                attempt: 1,
+                                outcome: lifecycle_outcome_for_error(&error),
+                            });
+                            run.terminate(error);
+                            return Ok(run.finish());
+                        }
+                        match run
+                            .complete(
+                                recovery_messages,
+                                plan_tools.clone(),
+                                ModelCallPhase::Recovery,
+                                true,
+                            )
+                            .await
+                        {
+                            Ok(Some(response)) => {
+                                match run.parse_envelope(response, RunStrategy::DeclarativePlan) {
+                                    Ok(PlannerEnvelope::DeclarativePlan { plan: repaired }) => {
+                                        run.events.emit(RunEvent::PlanLifecycle {
+                                            phase: PlanPhase::Recovery,
+                                            attempt: 1,
+                                            outcome: PlanLifecycleOutcome::Succeeded,
+                                        });
+                                        run.events.emit(RunEvent::StrategyFallback {
+                                            from: RunStrategy::DeclarativePlan,
+                                            to: RunStrategy::DeclarativePlan,
+                                            reason: StrategyFallbackReason::ExecutionRecovery,
+                                        });
+                                        plan = repaired;
+                                        execution = run.execute_plan(&plan).await;
+                                    }
+                                    Ok(PlannerEnvelope::Direct) => unreachable!(
+                                        "forced declarative envelope rejects direct recovery"
+                                    ),
+                                    Err(error) if is_terminal_failure(&error) => {
+                                        run.events.emit(RunEvent::PlanLifecycle {
+                                            phase: PlanPhase::Recovery,
+                                            attempt: 1,
+                                            outcome: lifecycle_outcome_for_error(&error),
+                                        });
+                                        run.terminate(error);
+                                    }
+                                    Err(error) => {
+                                        run.events.emit(RunEvent::PlanLifecycle {
+                                            phase: PlanPhase::Recovery,
+                                            attempt: 1,
+                                            outcome: PlanLifecycleOutcome::Invalid,
+                                        });
+                                        run.result.errors.push(RunError::new(
+                                            "plan_recovery_failed",
+                                            format!("recovery plan was invalid: {error}"),
+                                        ));
+                                    }
                                 }
-                                Ok(PlannerEnvelope::Direct) => unreachable!(
-                                    "forced declarative envelope rejects direct recovery"
-                                ),
-                                Err(error) if is_terminal_failure(&error) => run.terminate(error),
-                                Err(error) => run.result.errors.push(RunError::new(
-                                    "plan_recovery_failed",
-                                    format!("recovery plan was invalid: {error}"),
-                                )),
+                            }
+                            Ok(None) => run.events.emit(RunEvent::PlanLifecycle {
+                                phase: PlanPhase::Recovery,
+                                attempt: 1,
+                                outcome: lifecycle_outcome_for_status(&run.result.status),
+                            }),
+                            Err(error) => {
+                                run.events.emit(RunEvent::PlanLifecycle {
+                                    phase: PlanPhase::Recovery,
+                                    attempt: 1,
+                                    outcome: lifecycle_outcome_for_error(&error),
+                                });
+                                run.terminate(error);
                             }
                         }
-                        Ok(None) => {}
-                        Err(error) => run.terminate(error),
                     }
                 }
 
@@ -424,6 +581,10 @@ impl<'a> StrategyRun<'a> {
             deadline,
             started,
             model_calls: 0,
+            planning_model_calls: 0,
+            repair_model_calls: 0,
+            recovery_model_calls: 0,
+            reactive_model_calls: 0,
             output_repairs: 0,
             broker_state: BrokerState::default(),
             selected: requested,
@@ -468,14 +629,17 @@ impl<'a> StrategyRun<'a> {
         wave: u32,
         call: ToolCall,
         result: Arc<ToolResult>,
+        duration_ms: u64,
     ) -> Result<(), HarnessError> {
         reserve_plan_entry(retained_bytes, budget, &call, &result)?;
         self.events.emit(RunEvent::PlanNodeCompleted {
             node_id: event_id,
             tool_id,
+            attempt: self.plan_attempt,
             wave,
             ok: result.ok,
-            duration_ms: 0,
+            outcome: PlanNodeOutcome::Reused,
+            duration_ms,
         });
         completed.insert(node_id.clone(), Arc::clone(&result));
         transcript.push((call, result));
@@ -487,6 +651,8 @@ impl<'a> StrategyRun<'a> {
         &mut self,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
+        phase: ModelCallPhase,
+        reserve_final_synthesis: bool,
     ) -> Result<Option<ModelResponse>, HarnessError> {
         let mut provider_retries = 0;
         loop {
@@ -501,6 +667,12 @@ impl<'a> StrategyRun<'a> {
                 return Ok(None);
             }
             self.model_calls += 1;
+            match phase {
+                ModelCallPhase::Planning => self.planning_model_calls += 1,
+                ModelCallPhase::Repair => self.repair_model_calls += 1,
+                ModelCallPhase::Recovery => self.recovery_model_calls += 1,
+                ModelCallPhase::Reactive => self.reactive_model_calls += 1,
+            }
             self.events.emit(RunEvent::ModelRequested {
                 call_number: self.model_calls,
                 model: self.model.clone(),
@@ -540,6 +712,11 @@ impl<'a> StrategyRun<'a> {
                 Err(HarnessError::RetryableProvider(reason))
                     if provider_retries < self.request.agent.limits.max_provider_retries =>
                 {
+                    if reserve_final_synthesis && !self.can_spend_optional_model_call() {
+                        return Err(HarnessError::RetryableProvider(
+                            "provider retry skipped to preserve final synthesis capacity".into(),
+                        ));
+                    }
                     provider_retries += 1;
                     self.events.emit(RunEvent::ModelRetrying {
                         next_call_number: self.model_calls.saturating_add(1),
@@ -549,6 +726,33 @@ impl<'a> StrategyRun<'a> {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    fn can_spend_optional_model_call(&self) -> bool {
+        self.request
+            .agent
+            .limits
+            .max_model_calls
+            .saturating_sub(self.model_calls)
+            > 1
+    }
+
+    fn has_model_call_capacity(&self) -> bool {
+        self.model_calls < self.request.agent.limits.max_model_calls
+    }
+
+    fn select_direct_fallback(&mut self, requested: RunStrategy, reason: StrategyFallbackReason) {
+        self.events.emit(RunEvent::StrategyFallback {
+            from: RunStrategy::DeclarativePlan,
+            to: RunStrategy::Direct,
+            reason,
+        });
+        self.events.emit(RunEvent::StrategySelected {
+            requested,
+            selected: RunStrategy::Direct,
+            reason: StrategySelectionReason::PlannerSelectedDirect,
+        });
+        self.selected = RunStrategy::Direct;
     }
 
     fn parse_envelope(
@@ -690,6 +894,7 @@ impl<'a> StrategyRun<'a> {
     async fn preflight_plan(
         &mut self,
         plan: &ExecutionPlan,
+        plan_attempt: u32,
     ) -> Result<Option<Vec<PreparedNode>>, HarnessError> {
         self.static_plan_preflight(plan)?;
         let broker = ToolBroker::new(
@@ -698,10 +903,6 @@ impl<'a> StrategyRun<'a> {
             &self.runner.approvals,
             &self.runner.concurrency,
         );
-        self.plan_attempt = self.plan_attempt.checked_add(1).ok_or_else(|| {
-            HarnessError::ResourceLimit("declarative plan attempt counter overflow".into())
-        })?;
-        let plan_attempt = self.plan_attempt;
         let mut prepared_nodes = Vec::with_capacity(plan.nodes.len());
         for (node_index, node) in plan.nodes.iter().enumerate() {
             let arguments_json = serde_json::to_string(&node.arguments).map_err(|error| {
@@ -712,7 +913,10 @@ impl<'a> StrategyRun<'a> {
             })?;
             let event_id = format!("plan-{plan_attempt}-node-{}", node_index + 1);
             let call = ToolCall::new(event_id.clone(), node.tool_id.clone(), arguments_json);
-            match broker
+            let started = StdInstant::now();
+            let attempts_before = self.broker_state.tool_calls;
+            let classified_before = self.broker_state.classified_tool_calls();
+            let outcome = broker
                 .prepare(
                     self.request,
                     &mut self.result,
@@ -724,30 +928,68 @@ impl<'a> StrategyRun<'a> {
                     !node.result_bindings.is_empty(),
                     self.deadline,
                 )
-                .await?
-            {
-                PrepareOutcome::Ready(prepared) => prepared_nodes.push(PreparedNode {
+                .await;
+            match outcome {
+                Ok(PrepareOutcome::Ready(prepared)) => prepared_nodes.push(PreparedNode {
                     node: node.clone(),
                     prepared: Some(*prepared),
                     reused: None,
                     event_id,
                 }),
-                PrepareOutcome::Reused(result) => prepared_nodes.push(PreparedNode {
+                Ok(PrepareOutcome::Reused(result)) => prepared_nodes.push(PreparedNode {
                     node: node.clone(),
                     prepared: None,
                     reused: Some((call, result)),
                     event_id,
                 }),
-                PrepareOutcome::Rejected(_) => {
+                Ok(PrepareOutcome::Rejected(_)) => {
+                    self.events.emit(RunEvent::PlanNodeCompleted {
+                        node_id: event_id,
+                        tool_id: node.tool_id.clone(),
+                        attempt: plan_attempt,
+                        wave: 0,
+                        ok: false,
+                        outcome: PlanNodeOutcome::Rejected,
+                        duration_ms: elapsed_millis(started),
+                    });
                     return Err(HarnessError::InvalidRequest(format!(
                         "plan node '{}' failed execution preflight",
                         node.id
                     )));
                 }
-                PrepareOutcome::Stop => return Ok(None),
+                Ok(PrepareOutcome::Stop) => {
+                    self.events.emit(RunEvent::PlanNodeCompleted {
+                        node_id: event_id,
+                        tool_id: node.tool_id.clone(),
+                        attempt: plan_attempt,
+                        wave: 0,
+                        ok: false,
+                        outcome: node_outcome_for_status(&self.result.status),
+                        duration_ms: elapsed_millis(started),
+                    });
+                    return Ok(None);
+                }
+                Err(error) => {
+                    if self.broker_state.tool_calls > attempts_before
+                        && self.broker_state.classified_tool_calls() == classified_before
+                    {
+                        self.broker_state.record_pre_dispatch_error(&error);
+                    }
+                    self.events.emit(RunEvent::PlanNodeCompleted {
+                        node_id: event_id,
+                        tool_id: node.tool_id.clone(),
+                        attempt: plan_attempt,
+                        wave: 0,
+                        ok: false,
+                        outcome: node_outcome_for_error(&error),
+                        duration_ms: elapsed_millis(started),
+                    });
+                    return Err(error);
+                }
             }
         }
         self.events.emit(RunEvent::PlanValidated {
+            attempt: plan_attempt,
             node_count: plan.nodes.len() as u32,
         });
         Ok(Some(prepared_nodes))
@@ -775,12 +1017,29 @@ impl<'a> StrategyRun<'a> {
             if call.tool.definition().read_only && !node.node.approval_barrier {
                 continue;
             }
-            let arguments = bind_arguments(
+            let started = StdInstant::now();
+            let arguments = match bind_arguments(
                 &node.node,
                 completed,
                 self.request.agent.limits.max_tool_arguments_bytes,
-            )?;
+            ) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    self.broker_state.record_pre_dispatch_error(&error);
+                    self.events.emit(RunEvent::PlanNodeCompleted {
+                        node_id: node.event_id.clone(),
+                        tool_id: node.node.tool_id.clone(),
+                        attempt: self.plan_attempt,
+                        wave: 0,
+                        ok: false,
+                        outcome: node_outcome_for_error(&error),
+                        duration_ms: elapsed_millis(started),
+                    });
+                    return Err(error);
+                }
+            };
             let call = node.prepared.as_mut().expect("checked above");
+            let classified_before = self.broker_state.classified_tool_calls();
             let outcome = broker
                 .revalidate_bound_arguments(
                     call,
@@ -791,24 +1050,82 @@ impl<'a> StrategyRun<'a> {
                     &mut self.broker_state,
                     self.deadline,
                 )
-                .await?;
+                .await;
             match outcome {
-                FinalizeOutcome::Ready => {}
-                FinalizeOutcome::Reused(result) => {
+                Ok(FinalizeOutcome::Ready) => {}
+                Ok(FinalizeOutcome::Reused(result)) => {
                     let exact_call = call.call.clone();
                     node.prepared = None;
                     node.reused = Some((exact_call, result));
                 }
-                FinalizeOutcome::Stop => return Ok(false),
+                Ok(FinalizeOutcome::Stop) => {
+                    self.events.emit(RunEvent::PlanNodeCompleted {
+                        node_id: node.event_id.clone(),
+                        tool_id: node.node.tool_id.clone(),
+                        attempt: self.plan_attempt,
+                        wave: 0,
+                        ok: false,
+                        outcome: node_outcome_for_status(&self.result.status),
+                        duration_ms: elapsed_millis(started),
+                    });
+                    return Ok(false);
+                }
+                Err(error) => {
+                    if self.broker_state.classified_tool_calls() == classified_before {
+                        self.broker_state.record_pre_dispatch_error(&error);
+                    }
+                    self.events.emit(RunEvent::PlanNodeCompleted {
+                        node_id: node.event_id.clone(),
+                        tool_id: node.node.tool_id.clone(),
+                        attempt: self.plan_attempt,
+                        wave: 0,
+                        ok: false,
+                        outcome: node_outcome_for_error(&error),
+                        duration_ms: elapsed_millis(started),
+                    });
+                    return Err(error);
+                }
             }
         }
         Ok(true)
     }
 
     async fn execute_plan(&mut self, plan: &ExecutionPlan) -> PlanExecution {
-        let mut prepared = match self.preflight_plan(plan).await {
-            Ok(Some(prepared)) => prepared,
+        self.plan_attempt = match self.plan_attempt.checked_add(1) {
+            Some(attempt) => attempt,
+            None => {
+                self.terminate(HarnessError::ResourceLimit(
+                    "declarative plan attempt counter overflow".into(),
+                ));
+                return PlanExecution {
+                    completed: BTreeMap::new(),
+                    transcript: Vec::new(),
+                    failure: Some(PlanFailureKind::Terminal),
+                    effects_started: false,
+                };
+            }
+        };
+        let plan_attempt = self.plan_attempt;
+        self.events.emit(RunEvent::PlanLifecycle {
+            phase: PlanPhase::Preflight,
+            attempt: plan_attempt,
+            outcome: PlanLifecycleOutcome::Started,
+        });
+        let mut prepared = match self.preflight_plan(plan, plan_attempt).await {
+            Ok(Some(prepared)) => {
+                self.events.emit(RunEvent::PlanLifecycle {
+                    phase: PlanPhase::Preflight,
+                    attempt: plan_attempt,
+                    outcome: PlanLifecycleOutcome::Succeeded,
+                });
+                prepared
+            }
             Ok(None) => {
+                self.events.emit(RunEvent::PlanLifecycle {
+                    phase: PlanPhase::Preflight,
+                    attempt: plan_attempt,
+                    outcome: lifecycle_outcome_for_status(&self.result.status),
+                });
                 self.terminal = true;
                 return PlanExecution {
                     completed: BTreeMap::new(),
@@ -818,6 +1135,11 @@ impl<'a> StrategyRun<'a> {
                 };
             }
             Err(error) => {
+                self.events.emit(RunEvent::PlanLifecycle {
+                    phase: PlanPhase::Preflight,
+                    attempt: plan_attempt,
+                    outcome: lifecycle_outcome_for_error(&error),
+                });
                 let failure = self.record_plan_error(error, PlanFailureKind::Preflight);
                 return PlanExecution {
                     completed: BTreeMap::new(),
@@ -943,6 +1265,7 @@ impl<'a> StrategyRun<'a> {
             );
             let mut executable = Vec::new();
             for &index in &wave {
+                let node_started = StdInstant::now();
                 if let Some((call, reused)) = prepared[index].reused.take() {
                     if let Err(error) = self.record_reused_plan_node(
                         &mut retained_bytes,
@@ -956,7 +1279,17 @@ impl<'a> StrategyRun<'a> {
                         wave_number,
                         call,
                         reused,
+                        elapsed_millis(node_started),
                     ) {
+                        self.events.emit(RunEvent::PlanNodeCompleted {
+                            node_id: prepared[index].event_id.clone(),
+                            tool_id: prepared[index].node.tool_id.clone(),
+                            attempt: plan_attempt,
+                            wave: wave_number,
+                            ok: false,
+                            outcome: node_outcome_for_error(&error),
+                            duration_ms: elapsed_millis(node_started),
+                        });
                         self.terminate(error);
                         return PlanExecution {
                             completed,
@@ -975,6 +1308,16 @@ impl<'a> StrategyRun<'a> {
                 ) {
                     Ok(arguments) => arguments,
                     Err(error) => {
+                        self.broker_state.record_pre_dispatch_error(&error);
+                        self.events.emit(RunEvent::PlanNodeCompleted {
+                            node_id: prepared[index].event_id.clone(),
+                            tool_id: prepared[index].node.tool_id.clone(),
+                            attempt: plan_attempt,
+                            wave: wave_number,
+                            ok: false,
+                            outcome: node_outcome_for_error(&error),
+                            duration_ms: elapsed_millis(node_started),
+                        });
                         let failure = self.record_plan_error(error, PlanFailureKind::Recoverable);
                         return PlanExecution {
                             completed,
@@ -988,6 +1331,18 @@ impl<'a> StrategyRun<'a> {
                 let tool_id = prepared[index].node.tool_id.clone();
                 let event_id = prepared[index].event_id.clone();
                 let Some(call) = prepared[index].prepared.as_mut() else {
+                    let error =
+                        HarnessError::Tool("prepared plan node is missing its invocation".into());
+                    self.broker_state.record_pre_dispatch_error(&error);
+                    self.events.emit(RunEvent::PlanNodeCompleted {
+                        node_id: event_id,
+                        tool_id,
+                        attempt: plan_attempt,
+                        wave: wave_number,
+                        ok: false,
+                        outcome: PlanNodeOutcome::Failed,
+                        duration_ms: elapsed_millis(node_started),
+                    });
                     self.result.errors.push(RunError::new(
                         "plan_execution_failed",
                         "prepared plan node is missing its invocation",
@@ -999,6 +1354,7 @@ impl<'a> StrategyRun<'a> {
                         effects_started,
                     };
                 };
+                let classified_before = self.broker_state.classified_tool_calls();
                 match broker
                     .revalidate_bound_arguments(
                         call,
@@ -1025,7 +1381,17 @@ impl<'a> StrategyRun<'a> {
                             wave_number,
                             exact_call,
                             reused,
+                            elapsed_millis(node_started),
                         ) {
+                            self.events.emit(RunEvent::PlanNodeCompleted {
+                                node_id: prepared[index].event_id.clone(),
+                                tool_id: prepared[index].node.tool_id.clone(),
+                                attempt: plan_attempt,
+                                wave: wave_number,
+                                ok: false,
+                                outcome: node_outcome_for_error(&error),
+                                duration_ms: elapsed_millis(node_started),
+                            });
                             self.terminate(error);
                             return PlanExecution {
                                 completed,
@@ -1037,6 +1403,15 @@ impl<'a> StrategyRun<'a> {
                     }
                     Ok(FinalizeOutcome::Ready) => executable.push(index),
                     Ok(FinalizeOutcome::Stop) => {
+                        self.events.emit(RunEvent::PlanNodeCompleted {
+                            node_id: prepared[index].event_id.clone(),
+                            tool_id: prepared[index].node.tool_id.clone(),
+                            attempt: plan_attempt,
+                            wave: wave_number,
+                            ok: false,
+                            outcome: node_outcome_for_status(&self.result.status),
+                            duration_ms: elapsed_millis(node_started),
+                        });
                         self.terminal = true;
                         return PlanExecution {
                             completed,
@@ -1046,6 +1421,18 @@ impl<'a> StrategyRun<'a> {
                         };
                     }
                     Err(error) => {
+                        if self.broker_state.classified_tool_calls() == classified_before {
+                            self.broker_state.record_pre_dispatch_error(&error);
+                        }
+                        self.events.emit(RunEvent::PlanNodeCompleted {
+                            node_id: prepared[index].event_id.clone(),
+                            tool_id: prepared[index].node.tool_id.clone(),
+                            attempt: plan_attempt,
+                            wave: wave_number,
+                            ok: false,
+                            outcome: node_outcome_for_error(&error),
+                            duration_ms: elapsed_millis(node_started),
+                        });
                         let failure = self.record_plan_error(error, PlanFailureKind::Recoverable);
                         return PlanExecution {
                             completed,
@@ -1057,6 +1444,7 @@ impl<'a> StrategyRun<'a> {
                 }
             }
 
+            let budget_check_started = StdInstant::now();
             let mut permitted = 0usize;
             let mut worst_case_bytes = retained_bytes;
             for &index in &executable {
@@ -1075,6 +1463,16 @@ impl<'a> StrategyRun<'a> {
                 permitted += 1;
             }
             if permitted == 0 && !executable.is_empty() {
+                let index = executable[0];
+                self.events.emit(RunEvent::PlanNodeCompleted {
+                    node_id: prepared[index].event_id.clone(),
+                    tool_id: prepared[index].node.tool_id.clone(),
+                    attempt: plan_attempt,
+                    wave: wave_number,
+                    ok: false,
+                    outcome: PlanNodeOutcome::LimitReached,
+                    duration_ms: elapsed_millis(budget_check_started),
+                });
                 self.terminate(HarnessError::ResourceLimit(
                     "aggregate plan result budget is exhausted before the next wave".into(),
                 ));
@@ -1093,20 +1491,25 @@ impl<'a> StrategyRun<'a> {
                 self.events.emit(RunEvent::PlanNodeStarted {
                     node_id: prepared[index].event_id.clone(),
                     tool_id: call.call.tool_id.clone(),
+                    attempt: plan_attempt,
                     wave: wave_number,
                 });
             }
+            let request = self.request;
+            let deadline = self.deadline;
             let executions = join_all(executable.iter().map(|&index| {
-                broker.execute(
-                    prepared[index].prepared.as_ref().expect("checked above"),
-                    self.request,
-                    self.deadline,
-                )
+                let prepared_call = prepared[index].prepared.as_ref().expect("checked above");
+                let broker = &broker;
+                async move {
+                    let started = StdInstant::now();
+                    let outcome = broker.execute(prepared_call, request, deadline).await;
+                    (outcome, elapsed_millis(started))
+                }
             }))
             .await;
 
             let mut wave_failure = None;
-            for (&index, execution) in executable.iter().zip(executions) {
+            for (&index, (execution, elapsed_ms)) in executable.iter().zip(executions) {
                 let call = prepared[index].prepared.as_ref().expect("checked above");
                 match execution {
                     Ok(execution) => {
@@ -1115,18 +1518,29 @@ impl<'a> StrategyRun<'a> {
                             tool_id: call.call.tool_id.clone(),
                             ok: execution.result.ok,
                         });
-                        self.events.emit(RunEvent::PlanNodeCompleted {
-                            node_id: prepared[index].event_id.clone(),
-                            tool_id: call.call.tool_id.clone(),
-                            wave: wave_number,
-                            ok: execution.result.ok,
-                            duration_ms: execution.duration_ms,
-                        });
                         broker.record_execution(&mut self.broker_state, call, &execution);
                         if let Some(error) = execution.validation_error {
+                            self.events.emit(RunEvent::PlanNodeCompleted {
+                                node_id: prepared[index].event_id.clone(),
+                                tool_id: call.call.tool_id.clone(),
+                                attempt: plan_attempt,
+                                wave: wave_number,
+                                ok: false,
+                                outcome: PlanNodeOutcome::Rejected,
+                                duration_ms: execution.duration_ms,
+                            });
                             self.result.errors.push(error);
                             wave_failure.get_or_insert(PlanFailureKind::Recoverable);
                         } else if !execution.result.ok {
+                            self.events.emit(RunEvent::PlanNodeCompleted {
+                                node_id: prepared[index].event_id.clone(),
+                                tool_id: call.call.tool_id.clone(),
+                                attempt: plan_attempt,
+                                wave: wave_number,
+                                ok: false,
+                                outcome: PlanNodeOutcome::Failed,
+                                duration_ms: execution.duration_ms,
+                            });
                             self.result.errors.push(RunError::new(
                                 "tool_error",
                                 execution
@@ -1144,6 +1558,15 @@ impl<'a> StrategyRun<'a> {
                                 &execution.result,
                             ) {
                                 Ok(()) => {
+                                    self.events.emit(RunEvent::PlanNodeCompleted {
+                                        node_id: prepared[index].event_id.clone(),
+                                        tool_id: call.call.tool_id.clone(),
+                                        attempt: plan_attempt,
+                                        wave: wave_number,
+                                        ok: true,
+                                        outcome: PlanNodeOutcome::Succeeded,
+                                        duration_ms: execution.duration_ms,
+                                    });
                                     completed.insert(
                                         prepared[index].node.id.clone(),
                                         Arc::clone(&execution.result),
@@ -1152,6 +1575,15 @@ impl<'a> StrategyRun<'a> {
                                     done.insert(prepared[index].node.id.clone());
                                 }
                                 Err(error) => {
+                                    self.events.emit(RunEvent::PlanNodeCompleted {
+                                        node_id: prepared[index].event_id.clone(),
+                                        tool_id: call.call.tool_id.clone(),
+                                        attempt: plan_attempt,
+                                        wave: wave_number,
+                                        ok: false,
+                                        outcome: node_outcome_for_error(&error),
+                                        duration_ms: execution.duration_ms,
+                                    });
                                     self.terminate(error);
                                     wave_failure = Some(PlanFailureKind::Terminal);
                                 }
@@ -1159,6 +1591,7 @@ impl<'a> StrategyRun<'a> {
                         }
                     }
                     Err(error) => {
+                        self.broker_state.record_execution_error(&error);
                         broker.mark_uncertain(&mut self.broker_state, call);
                         self.events.emit(RunEvent::ToolCompleted {
                             call_id: call.call.id.clone(),
@@ -1168,9 +1601,11 @@ impl<'a> StrategyRun<'a> {
                         self.events.emit(RunEvent::PlanNodeCompleted {
                             node_id: prepared[index].event_id.clone(),
                             tool_id: call.call.tool_id.clone(),
+                            attempt: plan_attempt,
                             wave: wave_number,
                             ok: false,
-                            duration_ms: 0,
+                            outcome: node_outcome_for_error(&error),
+                            duration_ms: elapsed_ms,
                         });
                         let failure = self.record_plan_error(error, PlanFailureKind::Recoverable);
                         if failure == PlanFailureKind::Terminal {
@@ -1233,6 +1668,8 @@ impl<'a> StrategyRun<'a> {
                     self.runner
                         .tools
                         .allowed_definitions(&self.request.agent.tool_allowlist),
+                    ModelCallPhase::Reactive,
+                    false,
                 )
                 .await
             {
@@ -1307,6 +1744,8 @@ impl<'a> StrategyRun<'a> {
             }
 
             for call in response.tool_calls {
+                let attempts_before = self.broker_state.tool_calls;
+                let classified_before = self.broker_state.classified_tool_calls();
                 let outcome = match broker
                     .prepare(
                         self.request,
@@ -1323,6 +1762,11 @@ impl<'a> StrategyRun<'a> {
                 {
                     Ok(outcome) => outcome,
                     Err(error) => {
+                        if self.broker_state.tool_calls > attempts_before
+                            && self.broker_state.classified_tool_calls() == classified_before
+                        {
+                            self.broker_state.record_pre_dispatch_error(&error);
+                        }
                         self.terminate(error);
                         return;
                     }
@@ -1334,6 +1778,7 @@ impl<'a> StrategyRun<'a> {
                             match broker.execute(&prepared, self.request, self.deadline).await {
                                 Ok(execution) => execution,
                                 Err(error) => {
+                                    self.broker_state.record_execution_error(&error);
                                     broker.mark_uncertain(&mut self.broker_state, &prepared);
                                     self.events.emit(RunEvent::ToolCompleted {
                                         call_id: call.id.clone(),
@@ -1386,10 +1831,29 @@ impl<'a> StrategyRun<'a> {
 
     fn finish(mut self) -> RunResult {
         self.result.duration_ms = self.started.elapsed().as_millis() as u64;
+        debug_assert_eq!(
+            self.model_calls,
+            self.planning_model_calls
+                + self.repair_model_calls
+                + self.recovery_model_calls
+                + self.reactive_model_calls
+        );
+        self.broker_state.finalize_usage();
         self.events.emit(RunEvent::StrategyUsage {
             strategy: self.selected,
             model_calls: self.model_calls,
+            planning_model_calls: self.planning_model_calls,
+            repair_model_calls: self.repair_model_calls,
+            recovery_model_calls: self.recovery_model_calls,
+            reactive_model_calls: self.reactive_model_calls,
             tool_calls: self.broker_state.tool_calls,
+            tool_issued: self.broker_state.tool_issued,
+            tool_reused: self.broker_state.tool_reused,
+            tool_rejected: self.broker_state.tool_rejected,
+            tool_pre_dispatch_aborted: self.broker_state.tool_pre_dispatch_aborted,
+            tool_completed: self.broker_state.tool_completed,
+            tool_failed: self.broker_state.tool_failed,
+            tool_cancelled: self.broker_state.tool_cancelled,
             duration_ms: self.result.duration_ms,
         });
         self.events.emit(RunEvent::Completed {
@@ -1433,6 +1897,65 @@ fn is_terminal_failure(error: &HarnessError) -> bool {
         error,
         HarnessError::Cancelled | HarnessError::TimedOut(_) | HarnessError::ResourceLimit(_)
     )
+}
+
+fn lifecycle_outcome_for_error(error: &HarnessError) -> PlanLifecycleOutcome {
+    match error {
+        HarnessError::Cancelled => PlanLifecycleOutcome::Cancelled,
+        HarnessError::TimedOut(_) => PlanLifecycleOutcome::TimedOut,
+        HarnessError::ResourceLimit(_) => PlanLifecycleOutcome::LimitReached,
+        HarnessError::InvalidRequest(_)
+        | HarnessError::InvalidTool(_)
+        | HarnessError::InvalidArguments(_)
+        | HarnessError::Policy(_)
+        | HarnessError::Approval(_)
+        | HarnessError::InvalidOutput(_) => PlanLifecycleOutcome::Rejected,
+        _ => PlanLifecycleOutcome::Failed,
+    }
+}
+
+fn validation_outcome_for_error(error: &HarnessError) -> PlanLifecycleOutcome {
+    match error {
+        HarnessError::InvalidOutput(_) => PlanLifecycleOutcome::Invalid,
+        _ => lifecycle_outcome_for_error(error),
+    }
+}
+
+fn lifecycle_outcome_for_status(status: &RunStatus) -> PlanLifecycleOutcome {
+    match status {
+        RunStatus::Completed => PlanLifecycleOutcome::Succeeded,
+        RunStatus::Cancelled => PlanLifecycleOutcome::Cancelled,
+        RunStatus::LimitReached => PlanLifecycleOutcome::LimitReached,
+        RunStatus::Failed => PlanLifecycleOutcome::Failed,
+    }
+}
+
+fn node_outcome_for_error(error: &HarnessError) -> PlanNodeOutcome {
+    match error {
+        HarnessError::Cancelled => PlanNodeOutcome::Cancelled,
+        HarnessError::TimedOut(_) => PlanNodeOutcome::TimedOut,
+        HarnessError::ResourceLimit(_) => PlanNodeOutcome::LimitReached,
+        HarnessError::InvalidRequest(_)
+        | HarnessError::InvalidTool(_)
+        | HarnessError::InvalidArguments(_)
+        | HarnessError::Policy(_)
+        | HarnessError::Approval(_)
+        | HarnessError::InvalidOutput(_) => PlanNodeOutcome::Rejected,
+        _ => PlanNodeOutcome::Failed,
+    }
+}
+
+fn node_outcome_for_status(status: &RunStatus) -> PlanNodeOutcome {
+    match status {
+        RunStatus::Completed => PlanNodeOutcome::Succeeded,
+        RunStatus::Cancelled => PlanNodeOutcome::Cancelled,
+        RunStatus::LimitReached => PlanNodeOutcome::LimitReached,
+        RunStatus::Failed => PlanNodeOutcome::Failed,
+    }
+}
+
+fn elapsed_millis(started: StdInstant) -> u64 {
+    started.elapsed().as_millis() as u64
 }
 
 fn maximum_plan_entry_bytes(call: &ToolCall, max_tool_result_bytes: u64) -> u64 {

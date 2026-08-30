@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use llama_harness_core::{
-    mock::{final_response, tool_response, MockModelProvider},
+    mock::{error_response, final_response, tool_response, MockModelProvider},
     AgentDefinition, AgentRunner, AllowAllPolicy, ApprovalHandler, ApprovalRecord, HarnessError,
-    InMemoryEventSink, ModelCapabilities, PlanConcurrency, PolicyDecision, PolicyEngine,
-    ProviderCapabilityLimits, RunEvent, RunRequest, RunStatus, RunStrategy, Tool, ToolCall,
-    ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    InMemoryEventSink, ModelCapabilities, PlanConcurrency, PlanLifecycleOutcome, PlanNodeOutcome,
+    PlanPhase, PolicyDecision, PolicyEngine, ProviderCapabilityLimits, RunEvent, RunRequest,
+    RunStatus, RunStrategy, Tool, ToolCall, ToolCaller, ToolDefinition, ToolRegistry, ToolResult,
+    ToolRisk,
 };
 use serde_json::{json, Value};
 use std::sync::{
@@ -54,6 +55,49 @@ fn registry(tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> ToolRegistry {
     registry
 }
 
+fn assert_strategy_usage_reconciles(events: &InMemoryEventSink) {
+    let records = events.events();
+    let usage = records
+        .iter()
+        .find_map(|record| match &record.event {
+            RunEvent::StrategyUsage {
+                model_calls,
+                planning_model_calls,
+                repair_model_calls,
+                recovery_model_calls,
+                reactive_model_calls,
+                tool_calls,
+                tool_issued,
+                tool_reused,
+                tool_rejected,
+                tool_pre_dispatch_aborted,
+                tool_completed,
+                tool_failed,
+                tool_cancelled,
+                ..
+            } => Some((
+                *model_calls,
+                *planning_model_calls,
+                *repair_model_calls,
+                *recovery_model_calls,
+                *reactive_model_calls,
+                *tool_calls,
+                *tool_issued,
+                *tool_reused,
+                *tool_rejected,
+                *tool_pre_dispatch_aborted,
+                *tool_completed,
+                *tool_failed,
+                *tool_cancelled,
+            )),
+            _ => None,
+        })
+        .expect("strategy usage event");
+    assert_eq!(usage.0, usage.1 + usage.2 + usage.3 + usage.4);
+    assert_eq!(usage.5, usage.6 + usage.7 + usage.8 + usage.9);
+    assert_eq!(usage.6, usage.10 + usage.11 + usage.12);
+}
+
 struct FixedTool {
     definition: ToolDefinition,
     output: ToolResult,
@@ -97,6 +141,23 @@ struct BarrierTool {
     barrier: Arc<Barrier>,
     active: Arc<AtomicU32>,
     maximum: Arc<AtomicU32>,
+}
+
+struct DelayedTool {
+    definition: ToolDefinition,
+    delay: Duration,
+}
+
+#[async_trait]
+impl Tool for DelayedTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(&self, _: Value, _: CancellationToken) -> Result<ToolResult, HarnessError> {
+        tokio::time::sleep(self.delay).await;
+        Ok(ToolResult::success(json!({"ok": true})))
+    }
 }
 
 #[async_trait]
@@ -278,6 +339,95 @@ async fn adaptive_planner_can_choose_no_tool_direct_response() {
 }
 
 #[tokio::test]
+async fn successful_plan_emits_phase_attempt_outcome_timing_and_reconciled_usage() {
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "read", "tool_id": "read", "arguments": {}}]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(envelope.to_string()), final_response("done")])
+            .with_capabilities(planning_capabilities(1)),
+    );
+    let tool = Arc::new(DelayedTool {
+        definition: definition("read", true, true),
+        delay: Duration::from_millis(10),
+    });
+    let events = Arc::new(InMemoryEventSink::default());
+    let mut run_request = request(&["read"]);
+    run_request.agent.limits.max_model_calls = 2;
+    let result = AgentRunner::builder(provider)
+        .tools(registry([tool as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let records = events.events();
+    assert!(records.iter().any(|record| matches!(
+        record.event,
+        RunEvent::PlanValidated {
+            attempt: 1,
+            node_count: 1
+        }
+    )));
+    assert!(records.iter().any(|record| matches!(
+        record.event,
+        RunEvent::PlanNodeCompleted {
+            attempt: 1,
+            wave: 1,
+            ok: true,
+            outcome: PlanNodeOutcome::Succeeded,
+            duration_ms,
+            ..
+        } if duration_ms >= 5
+    )));
+    let lifecycle = records
+        .iter()
+        .filter_map(|record| match record.event {
+            RunEvent::PlanLifecycle {
+                phase,
+                attempt,
+                outcome,
+            } => Some((phase, attempt, outcome)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle,
+        vec![
+            (PlanPhase::Planning, 1, PlanLifecycleOutcome::Started),
+            (PlanPhase::Planning, 1, PlanLifecycleOutcome::Succeeded),
+            (PlanPhase::Validation, 1, PlanLifecycleOutcome::Started),
+            (PlanPhase::Validation, 1, PlanLifecycleOutcome::Succeeded),
+            (PlanPhase::Preflight, 1, PlanLifecycleOutcome::Started),
+            (PlanPhase::Preflight, 1, PlanLifecycleOutcome::Succeeded),
+        ]
+    );
+    assert!(records.iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            model_calls: 2,
+            planning_model_calls: 1,
+            repair_model_calls: 0,
+            recovery_model_calls: 0,
+            reactive_model_calls: 1,
+            tool_calls: 1,
+            tool_issued: 1,
+            tool_reused: 0,
+            tool_rejected: 0,
+            tool_pre_dispatch_aborted: 0,
+            tool_completed: 1,
+            tool_failed: 0,
+            tool_cancelled: 0,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&events);
+}
+
+#[tokio::test]
 async fn adaptive_downgrades_to_direct_when_provider_cannot_plan() {
     let provider = Arc::new(MockModelProvider::scripted([final_response("direct")]));
     let events = Arc::new(InMemoryEventSink::default());
@@ -297,6 +447,19 @@ async fn adaptive_downgrades_to_direct_when_provider_cannot_plan() {
             ..
         }
     )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            model_calls: 1,
+            planning_model_calls: 0,
+            repair_model_calls: 0,
+            recovery_model_calls: 0,
+            reactive_model_calls: 1,
+            tool_calls: 0,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&events);
 }
 
 #[tokio::test]
@@ -587,6 +750,147 @@ async fn malformed_plan_gets_one_repair_then_falls_back_before_effects() {
             ..
         }
     )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            model_calls: 3,
+            planning_model_calls: 1,
+            repair_model_calls: 1,
+            recovery_model_calls: 0,
+            reactive_model_calls: 1,
+            tool_calls: 0,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&events);
+}
+
+#[tokio::test]
+async fn two_call_budget_skips_repair_and_preserves_direct_fallback() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response("not-json"), final_response("fallback")])
+            .with_capabilities(planning_capabilities(1)),
+    );
+    let events = Arc::new(InMemoryEventSink::default());
+    let unused = Arc::new(FixedTool::new("read", true, ToolResult::success(json!({}))));
+    let mut run_request = request(&["read"]);
+    run_request.agent.limits.max_model_calls = 2;
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([unused as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.final_output.as_deref(), Some("fallback"));
+    assert_eq!(provider.requests().len(), 2);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::PlanLifecycle {
+            phase: PlanPhase::Repair,
+            attempt: 1,
+            outcome: PlanLifecycleOutcome::Skipped,
+        }
+    )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            model_calls: 2,
+            planning_model_calls: 1,
+            repair_model_calls: 0,
+            recovery_model_calls: 0,
+            reactive_model_calls: 1,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&events);
+}
+
+#[tokio::test]
+async fn planner_retry_cannot_consume_the_reserved_final_call() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            error_response(HarnessError::RetryableProvider("busy".into())),
+            final_response("fallback"),
+        ])
+        .with_capabilities(planning_capabilities(1)),
+    );
+    let events = Arc::new(InMemoryEventSink::default());
+    let unused = Arc::new(FixedTool::new("read", true, ToolResult::success(json!({}))));
+    let mut run_request = request(&["read"]);
+    run_request.agent.limits.max_model_calls = 2;
+    run_request.agent.limits.max_provider_retries = 1;
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([unused as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.final_output.as_deref(), Some("fallback"));
+    assert_eq!(provider.requests().len(), 2);
+    assert!(!events
+        .events()
+        .iter()
+        .any(|record| matches!(record.event, RunEvent::ModelRetrying { .. })));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyFallback {
+            reason: llama_harness_core::StrategyFallbackReason::PlannerFailure,
+            ..
+        }
+    )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            model_calls: 2,
+            planning_model_calls: 1,
+            repair_model_calls: 0,
+            recovery_model_calls: 0,
+            reactive_model_calls: 1,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&events);
+}
+
+#[tokio::test]
+async fn forced_plan_with_two_calls_skips_repair_and_fails_clearly() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response("not-json")])
+            .with_capabilities(planning_capabilities(1)),
+    );
+    let events = Arc::new(InMemoryEventSink::default());
+    let unused = Arc::new(FixedTool::new("read", true, ToolResult::success(json!({}))));
+    let mut run_request = request(&["read"]);
+    run_request.agent.limits.max_model_calls = 2;
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([unused as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .build()
+        .run_with_strategy(run_request, RunStrategy::DeclarativePlan)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.code == "invalid_plan"));
+    assert_eq!(provider.requests().len(), 1);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::PlanLifecycle {
+            phase: PlanPhase::Repair,
+            outcome: PlanLifecycleOutcome::Skipped,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&events);
 }
 
 #[tokio::test]
@@ -643,6 +947,34 @@ async fn recovery_reuses_committed_mutation_instead_of_executing_it_twice() {
         .events()
         .iter()
         .any(|record| matches!(record.event, RunEvent::ToolEffectReused { .. })));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::PlanLifecycle {
+            phase: PlanPhase::Recovery,
+            attempt: 1,
+            outcome: PlanLifecycleOutcome::Succeeded,
+        }
+    )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            model_calls: 3,
+            planning_model_calls: 1,
+            repair_model_calls: 0,
+            recovery_model_calls: 1,
+            reactive_model_calls: 1,
+            tool_calls: 3,
+            tool_issued: 2,
+            tool_reused: 1,
+            tool_rejected: 0,
+            tool_pre_dispatch_aborted: 0,
+            tool_completed: 1,
+            tool_failed: 1,
+            tool_cancelled: 0,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&events);
 }
 
 #[tokio::test]
@@ -817,6 +1149,115 @@ async fn policy_required_approval_is_honored_during_whole_plan_preflight() {
 }
 
 #[tokio::test]
+async fn validation_policy_and_approval_rejections_have_stable_metadata() {
+    let invalid_envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "read", "tool_id": "read", "arguments": {"value": "bad"}}]}
+    });
+    let invalid_provider = Arc::new(
+        MockModelProvider::scripted([final_response(invalid_envelope.to_string())])
+            .with_capabilities(planning_capabilities(1)),
+    );
+    let mut validated_tool = FixedTool::new("read", true, ToolResult::success(json!({})));
+    validated_tool.definition.arguments_schema = json!({
+        "type": "object",
+        "required": ["value"],
+        "properties": {"value": {"type": "integer"}}
+    });
+    let validation_events = Arc::new(InMemoryEventSink::default());
+    let validation = AgentRunner::builder(invalid_provider)
+        .tools(registry([Arc::new(validated_tool) as Arc<dyn Tool>]))
+        .event_sink(validation_events.clone())
+        .build()
+        .run_with_strategy(request(&["read"]), RunStrategy::DeclarativePlan)
+        .await
+        .unwrap();
+    assert_eq!(validation.status, RunStatus::Failed);
+    assert!(validation_events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::PlanLifecycle {
+            phase: PlanPhase::Validation,
+            attempt: 1,
+            outcome: PlanLifecycleOutcome::Rejected,
+        }
+    )));
+    assert_strategy_usage_reconciles(&validation_events);
+
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "read", "tool_id": "read", "arguments": {}}]}
+    });
+    let policy_events = Arc::new(InMemoryEventSink::default());
+    let policy = AgentRunner::builder(Arc::new(
+        MockModelProvider::scripted([final_response(envelope.to_string())])
+            .with_capabilities(planning_capabilities(1)),
+    ))
+    .tools(registry([
+        Arc::new(FixedTool::new("read", true, ToolResult::success(json!({})))) as Arc<dyn Tool>,
+    ]))
+    .policy(Arc::new(DenyToolPolicy("read")))
+    .event_sink(policy_events.clone())
+    .build()
+    .run_with_strategy(request(&["read"]), RunStrategy::DeclarativePlan)
+    .await
+    .unwrap();
+    assert_eq!(policy.status, RunStatus::Failed);
+    assert!(policy_events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::PlanNodeCompleted {
+            outcome: PlanNodeOutcome::Rejected,
+            attempt: 1,
+            wave: 0,
+            ..
+        }
+    )));
+    assert!(policy_events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            tool_calls: 1,
+            tool_issued: 0,
+            tool_rejected: 1,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&policy_events);
+
+    let approval_envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{
+            "id": "read",
+            "tool_id": "read",
+            "arguments": {},
+            "approval_barrier": true
+        }]}
+    });
+    let approval_events = Arc::new(InMemoryEventSink::default());
+    let approval = AgentRunner::builder(Arc::new(
+        MockModelProvider::scripted([final_response(approval_envelope.to_string())])
+            .with_capabilities(planning_capabilities(1)),
+    ))
+    .tools(registry([
+        Arc::new(FixedTool::new("read", true, ToolResult::success(json!({})))) as Arc<dyn Tool>,
+    ]))
+    .event_sink(approval_events.clone())
+    .build()
+    .run_with_strategy(request(&["read"]), RunStrategy::DeclarativePlan)
+    .await
+    .unwrap();
+    assert_eq!(approval.status, RunStatus::Failed);
+    assert!(approval_events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::PlanNodeCompleted {
+            outcome: PlanNodeOutcome::Rejected,
+            attempt: 1,
+            wave: 0,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&approval_events);
+}
+
+#[tokio::test]
 async fn failed_mutation_is_uncertain_and_never_enters_recovery() {
     let envelope = json!({
         "strategy": "declarative_plan",
@@ -851,6 +1292,27 @@ async fn failed_mutation_is_uncertain_and_never_enters_recovery() {
             ..
         }
     )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::PlanNodeCompleted {
+            outcome: PlanNodeOutcome::Failed,
+            ok: false,
+            attempt: 1,
+            ..
+        }
+    )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            tool_calls: 1,
+            tool_issued: 1,
+            tool_completed: 0,
+            tool_failed: 1,
+            tool_cancelled: 0,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&events);
 }
 
 #[tokio::test]
@@ -903,9 +1365,11 @@ async fn post_dispatch_cancellation_is_terminal_and_never_replayed() {
         error: HarnessError::Cancelled,
         calls: AtomicU32::new(0),
     });
+    let events = Arc::new(InMemoryEventSink::default());
     let result = AgentRunner::builder(provider.clone())
         .tools(registry([write.clone() as Arc<dyn Tool>]))
         .policy(Arc::new(AllowAllPolicy))
+        .event_sink(events.clone())
         .build()
         .run(request(&["write"]))
         .await
@@ -914,6 +1378,62 @@ async fn post_dispatch_cancellation_is_terminal_and_never_replayed() {
     assert_eq!(result.status, RunStatus::Cancelled);
     assert_eq!(write.calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.requests().len(), 1);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::PlanNodeCompleted {
+            outcome: PlanNodeOutcome::Cancelled,
+            ok: false,
+            ..
+        }
+    )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            tool_calls: 1,
+            tool_issued: 1,
+            tool_completed: 0,
+            tool_failed: 0,
+            tool_cancelled: 1,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&events);
+}
+
+#[tokio::test]
+async fn post_dispatch_timeout_has_a_stable_node_outcome() {
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "read", "tool_id": "read", "arguments": {}}]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(envelope.to_string())])
+            .with_capabilities(planning_capabilities(1)),
+    );
+    let read = Arc::new(ErrorTool {
+        definition: definition("read", true, true),
+        error: HarnessError::TimedOut("test timeout".into()),
+        calls: AtomicU32::new(0),
+    });
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider)
+        .tools(registry([read as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .build()
+        .run(request(&["read"]))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::PlanNodeCompleted {
+            outcome: PlanNodeOutcome::TimedOut,
+            ok: false,
+            ..
+        }
+    )));
+    assert_strategy_usage_reconciles(&events);
 }
 
 #[tokio::test]
@@ -1218,9 +1738,23 @@ async fn forced_direct_emits_selection_and_usage_metadata() {
         record.event,
         RunEvent::StrategyUsage {
             strategy: RunStrategy::Direct,
+            model_calls: 1,
+            planning_model_calls: 0,
+            repair_model_calls: 0,
+            recovery_model_calls: 0,
+            reactive_model_calls: 1,
+            tool_calls: 0,
+            tool_issued: 0,
+            tool_reused: 0,
+            tool_rejected: 0,
+            tool_pre_dispatch_aborted: 0,
+            tool_completed: 0,
+            tool_failed: 0,
+            tool_cancelled: 0,
             ..
         }
     )));
+    assert_strategy_usage_reconciles(&events);
 }
 
 #[tokio::test]

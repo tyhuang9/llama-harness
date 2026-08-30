@@ -693,6 +693,7 @@ fn event_kind(event: &RunEvent) -> &'static str {
         RunEvent::ModelResponded { .. } => "model.responded",
         RunEvent::StrategySelected { .. } => "strategy.selected",
         RunEvent::StrategyFallback { .. } => "strategy.fallback",
+        RunEvent::PlanLifecycle { .. } => "plan.lifecycle",
         RunEvent::PlanValidated { .. } => "plan.validated",
         RunEvent::PlanNodeStarted { .. } => "plan.node.started",
         RunEvent::PlanNodeCompleted { .. } => "plan.node.completed",
