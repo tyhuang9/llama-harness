@@ -11,7 +11,8 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
 };
-use tokio::sync::Barrier;
+use std::time::Duration;
+use tokio::sync::{Barrier, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 fn planning_capabilities(parallel: u32) -> ModelCapabilities {
@@ -187,6 +188,57 @@ impl PolicyEngine for RequireApproval {
         Ok(PolicyDecision::RequireApproval {
             reason: "test policy".into(),
         })
+    }
+}
+
+struct DenyToolPolicy(&'static str);
+
+#[async_trait]
+impl PolicyEngine for DenyToolPolicy {
+    async fn decide(
+        &self,
+        tool: &ToolDefinition,
+        _: &Value,
+        _: &RunRequest,
+    ) -> Result<PolicyDecision, HarnessError> {
+        if tool.id == self.0 {
+            Ok(PolicyDecision::Deny {
+                reason: "security test denial".into(),
+            })
+        } else {
+            Ok(PolicyDecision::Allow {
+                reason: "security test allow".into(),
+            })
+        }
+    }
+}
+
+struct HeldTool {
+    definition: ToolDefinition,
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+    active: Arc<AtomicU32>,
+    maximum: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl Tool for HeldTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(&self, _: Value, _: CancellationToken) -> Result<ToolResult, HarnessError> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.maximum.fetch_max(active, Ordering::SeqCst);
+        self.entered.add_permits(1);
+        let permit = self
+            .release
+            .acquire()
+            .await
+            .map_err(|_| HarnessError::Tool("test release semaphore closed".into()))?;
+        permit.forget();
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolResult::success(json!({"ok": true})))
     }
 }
 
@@ -467,7 +519,9 @@ async fn approval_and_mutation_nodes_are_serialized_from_safe_reads() {
         .events()
         .iter()
         .find_map(|record| match &record.event {
-            RunEvent::PlanNodeStarted { node_id, wave, .. } if node_id == "write" => Some(*wave),
+            RunEvent::PlanNodeStarted { node_id, wave, .. } if node_id == "plan-1-node-2" => {
+                Some(*wave)
+            }
             _ => None,
         });
     assert_eq!(write_wave, Some(2));
@@ -1056,4 +1110,376 @@ async fn forced_direct_emits_selection_and_usage_metadata() {
             ..
         }
     )));
+}
+
+#[tokio::test]
+async fn binding_copy_budget_rejects_amplification_before_invocation() {
+    let bindings = (0..32)
+        .map(|index| {
+            json!({
+                "target_pointer": format!("/values/{index}"),
+                "source": {"node_id": "lookup", "output_pointer": "/large"}
+            })
+        })
+        .collect::<Vec<_>>();
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [
+            {"id": "lookup", "tool_id": "lookup", "arguments": {}},
+            {
+                "id": "amplify",
+                "tool_id": "consume",
+                "arguments": {"values": vec![Value::Null; 32]},
+                "depends_on": ["lookup"],
+                "result_bindings": bindings
+            }
+        ]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(envelope.to_string())])
+            .with_capabilities(planning_capabilities(1)),
+    );
+    let lookup = Arc::new(FixedTool::new(
+        "lookup",
+        true,
+        ToolResult::success(json!({"large": "x".repeat(4096)})),
+    ));
+    let consume = Arc::new(FixedTool::new(
+        "consume",
+        true,
+        ToolResult::success(json!({"ok": true})),
+    ));
+    let mut run_request = request(&["lookup", "consume"]);
+    run_request.agent.limits.max_tool_arguments_bytes = 8 * 1024;
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([
+            lookup.clone() as Arc<dyn Tool>,
+            consume.clone() as Arc<dyn Tool>,
+        ]))
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::LimitReached);
+    assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(consume.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn cumulative_plan_result_budget_stops_before_later_wave() {
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [
+            {"id": "one", "tool_id": "read", "arguments": {"index": 1}},
+            {"id": "two", "tool_id": "read", "arguments": {"index": 2}, "depends_on": ["one"]},
+            {"id": "three", "tool_id": "read", "arguments": {"index": 3}, "depends_on": ["two"]}
+        ]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(envelope.to_string())])
+            .with_capabilities(planning_capabilities(1)),
+    );
+    let read = Arc::new(FixedTool::new(
+        "read",
+        true,
+        ToolResult::success(json!({"payload": "x".repeat(700)})),
+    ));
+    let mut run_request = request(&["read"]);
+    run_request.agent.limits.max_tool_result_bytes = 1024;
+    run_request.agent.limits.max_transcript_bytes = run_request.input.len() as u64 + 2300;
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([read.clone() as Arc<dyn Tool>]))
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::LimitReached);
+    assert_eq!(read.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn mutation_gate_denial_prevents_every_mutation_dispatch() {
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [
+            {"id": "early-secret", "tool_id": "early", "arguments": {}},
+            {"id": "lookup-secret", "tool_id": "lookup", "arguments": {}},
+            {
+                "id": "late-secret",
+                "tool_id": "late",
+                "arguments": {"input": "placeholder"},
+                "depends_on": ["lookup-secret"],
+                "result_bindings": [{
+                    "target_pointer": "/input",
+                    "source": {"node_id": "lookup-secret", "output_pointer": "/value"}
+                }]
+            }
+        ]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(envelope.to_string()),
+            final_response("invalid recovery"),
+        ])
+        .with_capabilities(planning_capabilities(1)),
+    );
+    let early = Arc::new(FixedTool::new(
+        "early",
+        false,
+        ToolResult::success(json!({"ok": true})),
+    ));
+    let lookup = Arc::new(FixedTool::new(
+        "lookup",
+        true,
+        ToolResult::success(json!({"value": "resolved"})),
+    ));
+    let late = Arc::new(FixedTool::new(
+        "late",
+        false,
+        ToolResult::success(json!({"ok": true})),
+    ));
+    let result = AgentRunner::builder(provider)
+        .tools(registry([
+            early.clone() as Arc<dyn Tool>,
+            lookup.clone() as Arc<dyn Tool>,
+            late.clone() as Arc<dyn Tool>,
+        ]))
+        .policy(Arc::new(DenyToolPolicy("late")))
+        .build()
+        .run_with_strategy(
+            request(&["early", "lookup", "late"]),
+            RunStrategy::DeclarativePlan,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(early.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(late.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn bound_mutation_after_mutation_is_repaired_or_fails_before_effects() {
+    let invalid = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [
+            {"id": "first-secret", "tool_id": "first", "arguments": {}},
+            {
+                "id": "second-secret",
+                "tool_id": "second",
+                "arguments": {"input": "placeholder"},
+                "depends_on": ["first-secret"],
+                "result_bindings": [{
+                    "target_pointer": "/input",
+                    "source": {"node_id": "first-secret", "output_pointer": "/value"}
+                }]
+            }
+        ]}
+    });
+    let first = Arc::new(FixedTool::new(
+        "first",
+        false,
+        ToolResult::success(json!({"value": "mutated"})),
+    ));
+    let second = Arc::new(FixedTool::new(
+        "second",
+        false,
+        ToolResult::success(json!({"ok": true})),
+    ));
+
+    let adaptive_provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(invalid.to_string()),
+            final_response(invalid.to_string()),
+            final_response("direct fallback"),
+        ])
+        .with_capabilities(planning_capabilities(1)),
+    );
+    let adaptive = AgentRunner::builder(adaptive_provider.clone())
+        .tools(registry([
+            first.clone() as Arc<dyn Tool>,
+            second.clone() as Arc<dyn Tool>,
+        ]))
+        .policy(Arc::new(AllowAllPolicy))
+        .build()
+        .run(request(&["first", "second"]))
+        .await
+        .unwrap();
+    assert_eq!(adaptive.status, RunStatus::Completed);
+    assert_eq!(adaptive.final_output.as_deref(), Some("direct fallback"));
+    assert_eq!(first.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(second.calls.load(Ordering::SeqCst), 0);
+
+    let forced_provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(invalid.to_string()),
+            final_response(invalid.to_string()),
+        ])
+        .with_capabilities(planning_capabilities(1)),
+    );
+    let forced = AgentRunner::builder(forced_provider)
+        .tools(registry([
+            first.clone() as Arc<dyn Tool>,
+            second.clone() as Arc<dyn Tool>,
+        ]))
+        .policy(Arc::new(AllowAllPolicy))
+        .build()
+        .run_with_strategy(request(&["first", "second"]), RunStrategy::DeclarativePlan)
+        .await
+        .unwrap();
+    assert_eq!(forced.status, RunStatus::Failed);
+    assert_eq!(first.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(second.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn same_concurrency_key_is_exclusive_across_runs() {
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(ToolCall::new("one", "held", "{}")),
+        tool_response(ToolCall::new("two", "held", "{}")),
+        final_response("done"),
+        final_response("done"),
+    ]));
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let active = Arc::new(AtomicU32::new(0));
+    let maximum = Arc::new(AtomicU32::new(0));
+    let tool = Arc::new(HeldTool {
+        definition: definition("held", true, true).with_concurrency_key("shared"),
+        entered: entered.clone(),
+        release: release.clone(),
+        active,
+        maximum: maximum.clone(),
+    });
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry([tool as Arc<dyn Tool>]))
+            .build(),
+    );
+    let first_runner = runner.clone();
+    let first = tokio::spawn(async move {
+        first_runner
+            .run_with_strategy(request(&["held"]), RunStrategy::Direct)
+            .await
+    });
+    entered.acquire().await.unwrap().forget();
+    let second_runner = runner.clone();
+    let second = tokio::spawn(async move {
+        second_runner
+            .run_with_strategy(request(&["held"]), RunStrategy::Direct)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while provider.requests().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), entered.acquire())
+            .await
+            .is_err()
+    );
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    release.add_permits(1);
+    assert_eq!(first.await.unwrap().unwrap().status, RunStatus::Completed);
+    assert_eq!(second.await.unwrap().unwrap().status, RunStatus::Completed);
+    assert_eq!(maximum.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn different_concurrency_keys_can_overlap_across_runs() {
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(ToolCall::new("one", "one", "{}")),
+        tool_response(ToolCall::new("two", "two", "{}")),
+        final_response("done"),
+        final_response("done"),
+    ]));
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let active = Arc::new(AtomicU32::new(0));
+    let maximum = Arc::new(AtomicU32::new(0));
+    let one = Arc::new(HeldTool {
+        definition: definition("one", true, true).with_concurrency_key("one-key"),
+        entered: entered.clone(),
+        release: release.clone(),
+        active: active.clone(),
+        maximum: maximum.clone(),
+    });
+    let two = Arc::new(HeldTool {
+        definition: definition("two", true, true).with_concurrency_key("two-key"),
+        entered: entered.clone(),
+        release: release.clone(),
+        active,
+        maximum: maximum.clone(),
+    });
+    let runner = Arc::new(
+        AgentRunner::builder(provider)
+            .tools(registry([one as Arc<dyn Tool>, two as Arc<dyn Tool>]))
+            .build(),
+    );
+    let first_runner = runner.clone();
+    let first = tokio::spawn(async move {
+        first_runner
+            .run_with_strategy(request(&["one", "two"]), RunStrategy::Direct)
+            .await
+    });
+    entered.acquire().await.unwrap().forget();
+    let second_runner = runner.clone();
+    let second = tokio::spawn(async move {
+        second_runner
+            .run_with_strategy(request(&["one", "two"]), RunStrategy::Direct)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    release.add_permits(2);
+    assert_eq!(first.await.unwrap().unwrap().status, RunStatus::Completed);
+    assert_eq!(second.await.unwrap().unwrap().status, RunStatus::Completed);
+}
+
+#[tokio::test]
+async fn plan_event_identifiers_do_not_persist_model_node_ids() {
+    let secret_node_id = "secret-customer-token-123";
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": secret_node_id, "tool_id": "read", "arguments": {}}]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(envelope.to_string()), final_response("done")])
+            .with_capabilities(planning_capabilities(1)),
+    );
+    let read = Arc::new(FixedTool::new("read", true, ToolResult::success(json!({}))));
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider)
+        .tools(registry([read as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .build()
+        .run(request(&["read"]))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(!serde_json::to_string(&events.events())
+        .unwrap()
+        .contains(secret_node_id));
+    assert!(result
+        .tool_calls
+        .iter()
+        .all(|call| !call.id.contains(secret_node_id)));
 }
