@@ -253,12 +253,15 @@ impl ToolCallAssembler {
     ) -> Result<Self, HarnessError> {
         limits.validate()?;
         let schema_limits = AgentLimits::default();
-        let definitions = allowed_tools.into_iter().collect::<Vec<_>>();
-        if definitions.len() > limits.max_allowed_tools {
-            return Err(HarnessError::ResourceLimit(format!(
-                "streamed tool catalog exceeds {} tools",
-                limits.max_allowed_tools
-            )));
+        let mut definitions = Vec::with_capacity(limits.max_allowed_tools.min(64));
+        for definition in allowed_tools {
+            if definitions.len() >= limits.max_allowed_tools {
+                return Err(HarnessError::ResourceLimit(format!(
+                    "streamed tool catalog exceeds {} tools",
+                    limits.max_allowed_tools
+                )));
+            }
+            definitions.push(definition);
         }
         let mut seen_ids = HashSet::with_capacity(definitions.len());
         let mut aggregate_schema_bytes = 0_usize;
