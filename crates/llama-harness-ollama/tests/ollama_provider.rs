@@ -138,6 +138,7 @@ async fn health_and_model_inventory_use_direct_ollama_endpoints() {
         ["qwen3:8b", "gemma3:4b"]
     );
     assert!(models[0].capabilities.supports_tools);
+    assert!(models[0].capabilities.supports_parallel_tool_calls);
     let requests = task.await.unwrap();
     assert_eq!(
         requests
@@ -341,6 +342,7 @@ async fn generic_provider_stream_maps_atomic_ollama_tool_calls_to_final_deltas()
     let (base_url, task) = server(vec![response]).await;
     let provider = provider(&base_url);
 
+    assert!(provider.capabilities().supports_parallel_tool_calls);
     assert!(!provider.capabilities().supports_streaming_tool_arguments);
     let events = ModelProvider::stream(&provider, request(CancellationToken::new()))
         .await

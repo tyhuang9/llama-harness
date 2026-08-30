@@ -257,7 +257,7 @@ impl ModelProvider for OllamaProvider {
     }
 
     fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities::new(true, true, false)
+        ModelCapabilities::new(true, true, false).with_parallel_tool_calls(true)
     }
 
     async fn health(&self) -> Result<ProviderHealth, HarnessError> {
