@@ -540,6 +540,8 @@ async fn recovery_reuses_committed_mutation_instead_of_executing_it_twice() {
         ToolResult::failure("expected failure"),
     ));
     let events = Arc::new(InMemoryEventSink::default());
+    let mut run_request = request(&["write", "fail"]);
+    run_request.agent.limits.max_identical_tool_calls = 1;
     let result = AgentRunner::builder(provider)
         .tools(registry([
             write.clone() as Arc<dyn Tool>,
@@ -548,7 +550,7 @@ async fn recovery_reuses_committed_mutation_instead_of_executing_it_twice() {
         .policy(Arc::new(AllowAllPolicy))
         .event_sink(events.clone())
         .build()
-        .run(request(&["write", "fail"]))
+        .run(run_request)
         .await
         .unwrap();
 
@@ -684,6 +686,41 @@ async fn failed_mutation_is_uncertain_and_never_enters_recovery() {
             ..
         }
     )));
+}
+
+#[tokio::test]
+async fn invalid_mutation_output_is_uncertain_and_never_enters_recovery() {
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "write", "tool_id": "write", "arguments": {}}]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(envelope.to_string())])
+            .with_capabilities(planning_capabilities(1)),
+    );
+    let mut write_tool = FixedTool::new(
+        "write",
+        false,
+        ToolResult::success(json!({"accepted": "not-a-boolean"})),
+    );
+    write_tool.definition = write_tool.definition.with_output_schema(json!({
+        "type": "object",
+        "required": ["accepted"],
+        "properties": {"accepted": {"type": "boolean"}}
+    }));
+    let write = Arc::new(write_tool);
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([write.clone() as Arc<dyn Tool>]))
+        .policy(Arc::new(AllowAllPolicy))
+        .build()
+        .run(request(&["write"]))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(write.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.requests().len(), 1);
+    assert!(result.errors.iter().any(|error| error.code == "tool_error"));
 }
 
 #[tokio::test]
