@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use llama_harness_core::{
     HarnessError, ModelCapabilities, ModelEventStream, ModelInfo, ModelProvider, ModelRequest,
-    ModelResponse, ModelStreamEvent, ProviderHealth, ToolCallDelta,
+    ModelResponse, ModelStreamController, ModelStreamEvent, ProviderHealth, ToolCallAssembler,
+    ToolCallAssemblyLimits, ToolCallDelta,
 };
 use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 use serde::Deserialize;
@@ -327,21 +328,16 @@ impl ModelProvider for OllamaProvider {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelEventStream, HarnessError> {
+        let assembly_limits = ToolCallAssemblyLimits::for_provider(&self.capabilities().limits)?;
+        let assembler = ToolCallAssembler::new(request.tools.clone(), assembly_limits)?;
+        let mut controller = ModelStreamController::new(assembler);
         let mut events = OllamaProvider::stream_chat(self, request).await?;
         Ok(Box::pin(async_stream::stream! {
             let mut call_index = 0_usize;
             while let Some(event) = events.next().await {
-                let event = match event {
-                    Ok(event) => event,
-                    Err(error) => {
-                        yield Err(error);
-                        return;
-                    }
-                };
-                match event {
-                    crate::OllamaStreamEvent::TextDelta { content } => {
-                        yield Ok(ModelStreamEvent::TextDelta { content });
-                    }
+                let mapped = event.map(|event| match event {
+                    crate::OllamaStreamEvent::TextDelta { content } =>
+                        ModelStreamEvent::TextDelta { content },
                     crate::OllamaStreamEvent::ToolCall { call } => {
                         let delta = ToolCallDelta::new(
                             call_index,
@@ -351,12 +347,21 @@ impl ModelProvider for OllamaProvider {
                         .with_call_id(format!("{}-{call_index}", call.id))
                         .with_tool_id(call.tool_id);
                         call_index = call_index.saturating_add(1);
-                        yield Ok(ModelStreamEvent::ToolCallDelta(delta));
+                        ModelStreamEvent::ToolCallDelta(delta)
                     }
-                    crate::OllamaStreamEvent::Completed { model, usage } => {
-                        yield Ok(ModelStreamEvent::Completed { model, usage });
+                    crate::OllamaStreamEvent::Completed { model, usage } =>
+                        ModelStreamEvent::Completed { model, usage },
+                });
+                match controller.push(mapped) {
+                    Ok(validated) => yield Ok(validated.event),
+                    Err(error) => {
+                        yield Err(error);
+                        return;
                     }
                 }
+            }
+            if let Err(error) = controller.finish_eof() {
+                yield Err(error);
             }
         }))
     }

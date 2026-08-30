@@ -45,8 +45,8 @@ pub use policy::{
 };
 pub use runner::{AgentRunner, AgentRunnerBuilder};
 pub use streaming::{
-    ModelEventStream, ModelStreamEvent, PartialToolCall, ToolCallAssembler, ToolCallAssemblyLimits,
-    ToolCallDelta,
+    ModelEventStream, ModelStreamController, ModelStreamEvent, PartialToolCall, ToolCallAssembler,
+    ToolCallAssemblyLimits, ToolCallDelta, ValidatedModelStreamEvent,
 };
 pub use tool::{
     CancellationSafety, ExecutionLocation, IssueSafety, NetworkEgress, SpeculationPolicy, Tool,

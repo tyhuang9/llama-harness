@@ -1,7 +1,16 @@
 use crate::{
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len},
-    AgentLimits, HarnessError, ToolCall, ToolDefinition, Usage,
+    AgentLimits, HarnessError, ProviderCapabilityLimits, ToolCall, ToolDefinition, Usage,
 };
+
+const MAX_ASSEMBLY_CALLS: usize = 16;
+const MAX_ASSEMBLY_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_ASSEMBLY_CALL_BYTES: usize = MAX_ASSEMBLY_ARGUMENT_BYTES + 2 * 1024;
+const MAX_ASSEMBLY_BUFFERED_BYTES: usize = 256 * 1024;
+const MAX_ASSEMBLY_FIELD_BYTES: usize = 1024;
+const MAX_ASSEMBLY_JSON_DEPTH: u32 = 64;
+const MAX_ASSEMBLY_ALLOWED_TOOLS: usize = 1024;
+const MAX_ASSEMBLY_SCHEMA_BYTES: usize = 256 * 1024;
 use futures_core::Stream;
 use jsonschema::Validator;
 use serde::{Deserialize, Serialize};
@@ -85,12 +94,18 @@ pub struct ToolCallAssemblyLimits {
     pub max_calls: usize,
     /// Maximum bytes retained for one call, including identifiers and arguments.
     pub max_call_bytes: usize,
+    /// Maximum JSON argument bytes retained for one call.
+    pub max_argument_bytes: usize,
     /// Maximum bytes retained across all incomplete calls.
     pub max_total_buffered_bytes: usize,
     /// Maximum bytes accepted for either call identifier field.
     pub max_field_bytes: usize,
     /// Maximum JSON nesting depth accepted for completed arguments.
     pub max_json_depth: u32,
+    /// Maximum tool definitions accepted by one assembler.
+    pub max_allowed_tools: usize,
+    /// Maximum aggregate serialized argument-schema bytes accepted by one assembler.
+    pub max_aggregate_schema_bytes: usize,
 }
 
 impl Default for ToolCallAssemblyLimits {
@@ -98,10 +113,13 @@ impl Default for ToolCallAssemblyLimits {
         let limits = AgentLimits::default();
         Self {
             max_calls: limits.max_tool_calls as usize,
-            max_call_bytes: limits.max_tool_arguments_bytes as usize + 2 * 1024,
+            max_call_bytes: MAX_ASSEMBLY_CALL_BYTES,
+            max_argument_bytes: limits.max_tool_arguments_bytes as usize,
             max_total_buffered_bytes: limits.max_request_payload_bytes as usize,
             max_field_bytes: 1024,
             max_json_depth: limits.max_json_depth,
+            max_allowed_tools: MAX_ASSEMBLY_ALLOWED_TOOLS,
+            max_aggregate_schema_bytes: limits.max_request_payload_bytes as usize,
         }
     }
 }
@@ -111,16 +129,81 @@ impl ToolCallAssemblyLimits {
     pub fn validate(&self) -> Result<(), HarnessError> {
         if self.max_calls == 0
             || self.max_call_bytes == 0
+            || self.max_argument_bytes == 0
             || self.max_total_buffered_bytes == 0
             || self.max_field_bytes == 0
             || self.max_json_depth == 0
+            || self.max_allowed_tools == 0
+            || self.max_aggregate_schema_bytes == 0
         {
             return Err(HarnessError::InvalidRequest(
                 "tool-call assembly limits must be greater than zero".into(),
             ));
         }
+        if self.max_calls > MAX_ASSEMBLY_CALLS
+            || self.max_call_bytes > MAX_ASSEMBLY_CALL_BYTES
+            || self.max_argument_bytes > MAX_ASSEMBLY_ARGUMENT_BYTES
+            || self.max_total_buffered_bytes > MAX_ASSEMBLY_BUFFERED_BYTES
+            || self.max_field_bytes > MAX_ASSEMBLY_FIELD_BYTES
+            || self.max_json_depth > MAX_ASSEMBLY_JSON_DEPTH
+            || self.max_allowed_tools > MAX_ASSEMBLY_ALLOWED_TOOLS
+            || self.max_aggregate_schema_bytes > MAX_ASSEMBLY_SCHEMA_BYTES
+            || self.max_argument_bytes > self.max_call_bytes
+        {
+            return Err(HarnessError::InvalidRequest(
+                "tool-call assembly limits exceed immutable local hard limits".into(),
+            ));
+        }
         Ok(())
     }
+
+    /// Derives effective local limits from conservative defaults and provider caps.
+    pub fn for_provider(capabilities: &ProviderCapabilityLimits) -> Result<Self, HarnessError> {
+        let mut limits = Self::default();
+        if let Some(value) = capabilities.max_tools {
+            limits.max_allowed_tools =
+                checked_provider_cap("maximum tools", value as u64, MAX_ASSEMBLY_ALLOWED_TOOLS)?;
+        }
+        if let Some(value) = capabilities.max_tool_schema_bytes {
+            limits.max_aggregate_schema_bytes = checked_provider_cap(
+                "maximum tool schema bytes",
+                value,
+                MAX_ASSEMBLY_SCHEMA_BYTES,
+            )?;
+        }
+        if let Some(value) = capabilities.max_streamed_tool_calls {
+            limits.max_calls = checked_provider_cap(
+                "maximum streamed tool calls",
+                value as u64,
+                MAX_ASSEMBLY_CALLS,
+            )?;
+        }
+        if let Some(value) = capabilities.max_streamed_argument_bytes {
+            limits.max_argument_bytes = checked_provider_cap(
+                "maximum streamed argument bytes",
+                value,
+                MAX_ASSEMBLY_ARGUMENT_BYTES,
+            )?;
+        }
+        limits.validate()?;
+        Ok(limits)
+    }
+}
+
+fn checked_provider_cap(
+    label: &str,
+    value: u64,
+    local_hard_limit: usize,
+) -> Result<usize, HarnessError> {
+    let value = usize::try_from(value).map_err(|_| {
+        HarnessError::InvalidRequest(format!("provider {label} does not fit this platform"))
+    })?;
+    if value == 0 || value > local_hard_limit {
+        return Err(HarnessError::InvalidRequest(format!(
+            "provider {label} must be between 1 and {local_hard_limit}"
+        )));
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,24 +253,44 @@ impl ToolCallAssembler {
     ) -> Result<Self, HarnessError> {
         limits.validate()?;
         let schema_limits = AgentLimits::default();
-        let mut compiled = HashMap::new();
-        for definition in allowed_tools {
-            let id = definition.id;
-            if id.trim().is_empty() || id.len() > limits.max_field_bytes {
+        let definitions = allowed_tools.into_iter().collect::<Vec<_>>();
+        if definitions.len() > limits.max_allowed_tools {
+            return Err(HarnessError::ResourceLimit(format!(
+                "streamed tool catalog exceeds {} tools",
+                limits.max_allowed_tools
+            )));
+        }
+        let mut seen_ids = HashSet::with_capacity(definitions.len());
+        let mut aggregate_schema_bytes = 0_usize;
+        for definition in &definitions {
+            if definition.id.trim().is_empty() || definition.id.len() > limits.max_field_bytes {
                 return Err(HarnessError::InvalidTool(
                     "allowed streamed tool id is empty or too large".into(),
                 ));
             }
-            if compiled.contains_key(&id) {
+            if !seen_ids.insert(definition.id.as_str()) {
                 return Err(HarnessError::InvalidTool(format!(
-                    "duplicate allowed streamed tool: {id}"
+                    "duplicate allowed streamed tool: {}",
+                    definition.id
                 )));
             }
-            if serialized_len(&definition.arguments_schema)?
-                > schema_limits.max_request_payload_bytes
-            {
+            let schema_bytes = usize::try_from(serialized_len(&definition.arguments_schema)?)
+                .map_err(|_| {
+                    HarnessError::ResourceLimit(
+                        "streamed tool schema size does not fit this platform".into(),
+                    )
+                })?;
+            aggregate_schema_bytes = checked_schema_total(aggregate_schema_bytes, schema_bytes)?;
+            if schema_bytes > schema_limits.max_request_payload_bytes as usize {
                 return Err(HarnessError::InvalidTool(format!(
-                    "schema for {id} exceeds trusted schema limit"
+                    "schema for {} exceeds trusted schema limit",
+                    definition.id
+                )));
+            }
+            if aggregate_schema_bytes > limits.max_aggregate_schema_bytes {
+                return Err(HarnessError::ResourceLimit(format!(
+                    "streamed tool schemas exceed {} aggregate bytes",
+                    limits.max_aggregate_schema_bytes
                 )));
             }
             ensure_json_depth(
@@ -196,6 +299,11 @@ impl ToolCallAssembler {
                 schema_limits.max_json_depth,
             )
             .map_err(|error| HarnessError::InvalidTool(error.to_string()))?;
+        }
+
+        let mut compiled = HashMap::with_capacity(definitions.len());
+        for definition in definitions {
+            let id = definition.id;
             let validator = compile_trusted_schema(&definition.arguments_schema, |error| {
                 HarnessError::InvalidTool(format!("invalid schema for {id}: {error}"))
             })?;
@@ -215,6 +323,23 @@ impl ToolCallAssembler {
             call_ids: HashSet::new(),
             total_buffered_bytes: 0,
         })
+    }
+
+    /// Returns the number of incomplete tool calls currently buffered.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Validates that no incomplete calls remain at stream completion or EOF.
+    pub fn finish(&self) -> Result<(), HarnessError> {
+        if self.pending.is_empty() {
+            Ok(())
+        } else {
+            Err(HarnessError::Provider(format!(
+                "model stream ended with {} incomplete tool call(s)",
+                self.pending.len()
+            )))
+        }
     }
 
     /// Returns ephemeral partial JSON for an incomplete call index.
@@ -281,6 +406,18 @@ impl ToolCallAssembler {
                 delta.tool_id.as_deref(),
             );
         let current_call_bytes = current.map_or(0, |pending| pending.buffered_bytes);
+        let current_argument_bytes = current.map_or(0, |pending| pending.arguments_json.len());
+        let next_argument_bytes = current_argument_bytes
+            .checked_add(delta.arguments_fragment.len())
+            .ok_or_else(|| {
+                HarnessError::ResourceLimit("streamed tool argument size overflow".into())
+            })?;
+        if next_argument_bytes > self.limits.max_argument_bytes {
+            return Err(HarnessError::ResourceLimit(format!(
+                "streamed tool arguments {} exceed {} bytes",
+                delta.index, self.limits.max_argument_bytes
+            )));
+        }
         let next_call_bytes = current_call_bytes.checked_add(added_bytes).ok_or_else(|| {
             HarnessError::ResourceLimit("streamed tool call size overflow".into())
         })?;
@@ -353,6 +490,120 @@ impl ToolCallAssembler {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+/// One stream event after fused terminal-state and tool-call validation.
+pub struct ValidatedModelStreamEvent {
+    /// The original ephemeral provider-neutral stream event.
+    pub event: ModelStreamEvent,
+    /// A complete validated tool call produced by a final delta, when present.
+    pub completed_tool_call: Option<ToolCall>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelStreamState {
+    Active,
+    Completed,
+    Failed,
+}
+
+/// Fused controller that makes the first completion, error, or cancellation terminal.
+pub struct ModelStreamController {
+    assembler: ToolCallAssembler,
+    state: ModelStreamState,
+}
+
+impl ModelStreamController {
+    /// Creates an active controller around a bounded tool-call assembler.
+    pub fn new(assembler: ToolCallAssembler) -> Self {
+        Self {
+            assembler,
+            state: ModelStreamState::Active,
+        }
+    }
+
+    /// Validates one stream item and permanently fuses the controller on terminal state.
+    pub fn push(
+        &mut self,
+        event: Result<ModelStreamEvent, HarnessError>,
+    ) -> Result<ValidatedModelStreamEvent, HarnessError> {
+        match self.state {
+            ModelStreamState::Completed => {
+                return Err(HarnessError::Provider(
+                    "model stream received an event after completion".into(),
+                ));
+            }
+            ModelStreamState::Failed => {
+                return Err(HarnessError::Provider(
+                    "model stream received an event after terminal failure".into(),
+                ));
+            }
+            ModelStreamState::Active => {}
+        }
+
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                self.state = ModelStreamState::Failed;
+                return Err(error);
+            }
+        };
+        let completed_tool_call = match &event {
+            ModelStreamEvent::ToolCallDelta(delta) => match self.assembler.push(delta.clone()) {
+                Ok(call) => call,
+                Err(error) => {
+                    self.state = ModelStreamState::Failed;
+                    return Err(error);
+                }
+            },
+            ModelStreamEvent::Completed { .. } => {
+                if let Err(error) = self.assembler.finish() {
+                    self.state = ModelStreamState::Failed;
+                    return Err(error);
+                }
+                self.state = ModelStreamState::Completed;
+                None
+            }
+            ModelStreamEvent::TextDelta { .. } => None,
+        };
+        Ok(ValidatedModelStreamEvent {
+            event,
+            completed_tool_call,
+        })
+    }
+
+    /// Finalizes the controller when the underlying transport reaches EOF.
+    pub fn finish_eof(&mut self) -> Result<(), HarnessError> {
+        match self.state {
+            ModelStreamState::Completed => Ok(()),
+            ModelStreamState::Failed => Err(HarnessError::Provider(
+                "model stream reached EOF after terminal failure".into(),
+            )),
+            ModelStreamState::Active => {
+                if let Err(error) = self.assembler.finish() {
+                    self.state = ModelStreamState::Failed;
+                    return Err(error);
+                }
+                self.state = ModelStreamState::Failed;
+                Err(HarnessError::Provider(
+                    "model stream reached EOF before completion".into(),
+                ))
+            }
+        }
+    }
+
+    /// Returns whether completion or failure has fused the stream.
+    pub fn is_terminal(&self) -> bool {
+        self.state != ModelStreamState::Active
+    }
+}
+
+fn checked_schema_total(current: usize, next: usize) -> Result<usize, HarnessError> {
+    current
+        .checked_add(next)
+        .ok_or_else(|| HarnessError::ResourceLimit("streamed tool schema size overflow".into()))
+}
+
 fn validate_field(label: &str, value: Option<&str>, max_bytes: usize) -> Result<(), HarnessError> {
     if value.is_some_and(|value| value.is_empty() || value.len() > max_bytes) {
         return Err(HarnessError::Provider(format!(
@@ -385,4 +636,18 @@ fn new_field_bytes(current: Option<&str>, incoming: Option<&str>) -> usize {
 
 fn required_field(label: &str, value: Option<String>) -> Result<String, HarnessError> {
     value.ok_or_else(|| HarnessError::Provider(format!("final streamed {label} is missing")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_schema_total;
+    use crate::HarnessError;
+
+    #[test]
+    fn aggregate_schema_accounting_rejects_integer_overflow() {
+        assert!(matches!(
+            checked_schema_total(usize::MAX, 1),
+            Err(HarnessError::ResourceLimit(message)) if message.contains("overflow")
+        ));
+    }
 }

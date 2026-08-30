@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use llama_harness_core::{
     mock::MockModelProvider, CancellationSafety, ExecutionLocation, HarnessError, IssueSafety,
-    ModelCapabilities, ModelProvider, ModelRequest, NetworkEgress, ProviderCapabilityLimits,
-    SpeculationPolicy, Tool, ToolCallAssembler, ToolCallAssemblyLimits, ToolCallDelta, ToolCaller,
-    ToolDefinition, ToolRegistry, ToolResult,
+    ModelCapabilities, ModelProvider, ModelRequest, ModelStreamController, ModelStreamEvent,
+    NetworkEgress, ProviderCapabilityLimits, SpeculationPolicy, Tool, ToolCallAssembler,
+    ToolCallAssemblyLimits, ToolCallDelta, ToolCaller, ToolDefinition, ToolRegistry, ToolResult,
+    Usage,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -253,9 +254,11 @@ fn assembler_enforces_call_field_and_total_limits() {
     let limits = ToolCallAssemblyLimits {
         max_calls: 1,
         max_call_bytes: 64,
+        max_argument_bytes: 48,
         max_total_buffered_bytes: 32,
         max_field_bytes: 8,
         max_json_depth: 4,
+        ..ToolCallAssemblyLimits::default()
     };
     let mut fields = assembler(limits.clone());
     assert!(matches!(
@@ -284,6 +287,164 @@ fn assembler_enforces_call_field_and_total_limits() {
                 .with_tool_id("lookup")
         ),
         Err(HarnessError::ResourceLimit(_))
+    ));
+}
+
+#[test]
+fn assembler_bounds_catalogs_and_provider_advertised_caps() {
+    assert!(matches!(
+        ToolCallAssemblyLimits::for_provider(&ProviderCapabilityLimits::new().with_max_tools(0)),
+        Err(HarnessError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        ToolCallAssemblyLimits::for_provider(
+            &ProviderCapabilityLimits::new().with_max_tools(1_025)
+        ),
+        Err(HarnessError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        ToolCallAssemblyLimits::for_provider(
+            &ProviderCapabilityLimits::new().with_max_tool_schema_bytes(256 * 1024 + 1)
+        ),
+        Err(HarnessError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        ToolCallAssemblyLimits::for_provider(
+            &ProviderCapabilityLimits::new().with_max_streamed_tool_calls(17)
+        ),
+        Err(HarnessError::InvalidRequest(_))
+    ));
+    let effective = ToolCallAssemblyLimits::for_provider(
+        &ProviderCapabilityLimits::new()
+            .with_max_tools(30)
+            .with_max_tool_schema_bytes(4_096)
+            .with_max_streamed_tool_calls(2)
+            .with_max_streamed_argument_bytes(1_024),
+    )
+    .unwrap();
+    assert_eq!(effective.max_allowed_tools, 30);
+    assert_eq!(effective.max_aggregate_schema_bytes, 4_096);
+    assert_eq!(effective.max_calls, 2);
+    assert_eq!(effective.max_argument_bytes, 1_024);
+    let caller_raised = ToolCallAssemblyLimits {
+        max_allowed_tools: 1_025,
+        ..ToolCallAssemblyLimits::default()
+    };
+    assert!(matches!(
+        caller_raised.validate(),
+        Err(HarnessError::InvalidRequest(_))
+    ));
+
+    let thousand = (0..1_000)
+        .map(|index| {
+            ToolDefinition::new(
+                format!("tool-{index}"),
+                format!("Tool {index}"),
+                "test",
+                json!(true),
+            )
+        })
+        .collect::<Vec<_>>();
+    ToolCallAssembler::new(thousand, ToolCallAssemblyLimits::default()).unwrap();
+
+    let two_tools = ToolCallAssemblyLimits {
+        max_allowed_tools: 2,
+        ..ToolCallAssemblyLimits::default()
+    };
+    let three = (0..3)
+        .map(|index| {
+            ToolDefinition::new(format!("bounded-{index}"), "Bounded", "test", json!(true))
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        ToolCallAssembler::new(three, two_tools),
+        Err(HarnessError::ResourceLimit(_))
+    ));
+
+    let seven_schema_bytes = ToolCallAssemblyLimits {
+        max_aggregate_schema_bytes: 7,
+        ..ToolCallAssemblyLimits::default()
+    };
+    let schemas = [
+        ToolDefinition::new("one", "One", "test", json!(true)),
+        ToolDefinition::new("two", "Two", "test", json!(true)),
+    ];
+    assert!(matches!(
+        ToolCallAssembler::new(schemas, seven_schema_bytes),
+        Err(HarnessError::ResourceLimit(_))
+    ));
+}
+
+fn controller() -> ModelStreamController {
+    ModelStreamController::new(assembler(ToolCallAssemblyLimits::default()))
+}
+
+fn completed() -> ModelStreamEvent {
+    ModelStreamEvent::Completed {
+        model: "test".into(),
+        usage: Usage::default(),
+    }
+}
+
+#[test]
+fn stream_controller_fuses_completion_and_rejects_post_terminal_events() {
+    let mut controller = controller();
+    let update = controller
+        .push(Ok(ModelStreamEvent::ToolCallDelta(
+            ToolCallDelta::new(0, "{\"query\":\"ok\"}", true)
+                .with_call_id("call")
+                .with_tool_id("lookup"),
+        )))
+        .unwrap();
+    assert!(update.completed_tool_call.is_some());
+    controller.push(Ok(completed())).unwrap();
+    assert!(controller.is_terminal());
+    assert!(controller.finish_eof().is_ok());
+    assert!(matches!(
+        controller.push(Ok(completed())),
+        Err(HarnessError::Provider(message)) if message.contains("after completion")
+    ));
+}
+
+#[test]
+fn stream_controller_rejects_pending_completion_and_eof() {
+    for complete_with_event in [true, false] {
+        let mut controller = controller();
+        controller
+            .push(Ok(ModelStreamEvent::ToolCallDelta(
+                ToolCallDelta::new(0, "{", false)
+                    .with_call_id("call")
+                    .with_tool_id("lookup"),
+            )))
+            .unwrap();
+        let error = if complete_with_event {
+            controller.push(Ok(completed())).unwrap_err()
+        } else {
+            controller.finish_eof().unwrap_err()
+        };
+        assert!(matches!(error, HarnessError::Provider(message) if message.contains("incomplete")));
+        assert!(controller.is_terminal());
+    }
+}
+
+#[test]
+fn stream_controller_makes_first_error_or_cancellation_terminal() {
+    let mut cancelled = controller();
+    assert!(matches!(
+        cancelled.push(Err(HarnessError::Cancelled)),
+        Err(HarnessError::Cancelled)
+    ));
+    assert!(matches!(
+        cancelled.push(Ok(ModelStreamEvent::TextDelta {
+            content: "late".into()
+        })),
+        Err(HarnessError::Provider(message)) if message.contains("terminal failure")
+    ));
+
+    let mut eof = controller();
+    assert!(matches!(
+        eof.finish_eof(),
+        Err(HarnessError::Provider(message)) if message.contains("before completion")
     ));
 }
 

@@ -344,7 +344,9 @@ async fn generic_provider_stream_maps_atomic_ollama_tool_calls_to_final_deltas()
 
     assert!(provider.capabilities().supports_parallel_tool_calls);
     assert!(!provider.capabilities().supports_streaming_tool_arguments);
-    let events = ModelProvider::stream(&provider, request(CancellationToken::new()))
+    let mut stream_request = request(CancellationToken::new());
+    stream_request.tools = vec![tool()];
+    let events = ModelProvider::stream(&provider, stream_request)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -508,6 +510,35 @@ async fn cancellation_timeout_and_loopback_controls_fail_safely() {
         result = &mut pending => panic!("request unexpectedly completed: {result:?}"),
     }
     assert!(matches!(pending.await, Err(HarnessError::Cancelled)));
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_stream_cancellation_is_terminal_while_body_is_pending() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        let _ = socket
+            .write_all(b"{\"model\":\"qwen3:8b\",\"done\":true}\n")
+            .await;
+    });
+    let cancellation = CancellationToken::new();
+    let stream = ModelProvider::stream(&provider(&base_url), request(cancellation.clone()))
+        .await
+        .unwrap();
+    cancellation.cancel();
+    let events = stream.collect::<Vec<_>>().await;
+
+    assert!(matches!(events.as_slice(), [Err(HarnessError::Cancelled)]));
     task.abort();
 }
 
