@@ -397,7 +397,7 @@ async fn independent_safe_nodes_execute_in_one_parallel_wave() {
         maximum: maximum.clone(),
     });
     let events = Arc::new(InMemoryEventSink::default());
-    let result = AgentRunner::builder(provider)
+    let result = AgentRunner::builder(provider.clone())
         .tools(registry([tool as Arc<dyn Tool>]))
         .event_sink(events.clone())
         .build()
@@ -407,6 +407,35 @@ async fn independent_safe_nodes_execute_in_one_parallel_wave() {
 
     assert_eq!(result.status, RunStatus::Completed);
     assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let final_messages = &requests[1].messages;
+    let planned_calls = final_messages
+        .iter()
+        .find(|message| message.tool_calls.len() == 2)
+        .expect("the final request must retain the complete planned call batch");
+    let planned_call_ids = planned_calls
+        .tool_calls
+        .iter()
+        .map(|call| call.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(planned_call_ids, vec!["plan-1-node-1", "plan-1-node-2"]);
+    let correlated_results = final_messages
+        .iter()
+        .filter_map(|message| {
+            message.tool_call_id.as_deref().map(|call_id| {
+                (
+                    call_id,
+                    serde_json::from_str::<ToolResult>(&message.content),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(correlated_results.len(), 2);
+    assert!(correlated_results
+        .iter()
+        .all(|(call_id, result)| planned_call_ids.contains(call_id)
+            && result.as_ref().is_ok_and(|result| result.ok)));
     let waves = events
         .events()
         .iter()
