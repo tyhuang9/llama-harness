@@ -4,8 +4,8 @@ use llama_harness_core::{
     AgentDefinition, AgentLimits, AgentRunner, ApprovalHandler, ApprovalRecord, EventRecord,
     GenerationOptions, HarnessError, InMemoryEventSink, JsonMap, Message, MessageRole,
     ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, PolicyDecision,
-    PolicyEngine, ProviderHealth, RunEvent, RunOverrides, RunRequest, RunStatus, Tool, ToolCall,
-    ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    PolicyEngine, ProviderHealth, RunEvent, RunOverrides, RunRequest, RunStatus, RunStrategy, Tool,
+    ToolCall, ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
 };
 use serde_json::{json, Value};
 use std::{
@@ -285,7 +285,10 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
         .event_sink(events.clone())
         .build();
 
-    let result = runner.run(run_request).await.unwrap();
+    let result = runner
+        .run_with_strategy(run_request, RunStrategy::Direct)
+        .await
+        .unwrap();
     assert_eq!(result.status, RunStatus::Completed);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
     assert_eq!(result.tool_calls[0].arguments_json, r#"{"key":"one"}"#);
