@@ -39,10 +39,11 @@ pub use async_trait::async_trait;
 pub use llama_harness_core::{
     load_agent_manifest, load_agent_manifest_path, AgentDefinition, AgentLimits, AgentManifest,
     AgentManifestError, AgentRunner, AgentRunnerBuilder, AllowAllPolicy, ApprovalHandler,
-    ApprovalRecord, DenyApproval, EventRecord, EventSink, GenerationOptions, HarnessError,
-    InMemoryEventSink, JsonMap, Message, MessageRole, ModelCapabilities, ModelInfo, ModelProvider,
-    ModelRequest, ModelResponse, PolicyDecision, PolicyEngine, ProviderHealth, RunError, RunEvent,
-    RunOverrides, RunRequest, RunResult, RunStatus, SafeDefaultPolicy, Tool, ToolCall,
+    ApprovalRecord, DenyApproval, EventRecord, EventSink, ExecutionPlan, GenerationOptions,
+    HarnessError, InMemoryEventSink, JsonMap, Message, MessageRole, ModelCapabilities, ModelInfo,
+    ModelProvider, ModelRequest, ModelResponse, PlanConcurrency, PlanNode, PolicyDecision,
+    PolicyEngine, ProviderHealth, ResultBinding, ResultRef, RunError, RunEvent, RunOverrides,
+    RunRequest, RunResult, RunStatus, RunStrategy, SafeDefaultPolicy, Tool, ToolCall,
     ToolCallContext, ToolDefinition, ToolRegistry, ToolResult, ToolRisk, Usage,
     AGENT_MANIFEST_VERSION,
 };

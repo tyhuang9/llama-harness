@@ -12,6 +12,21 @@ use tokio_util::sync::CancellationToken;
 /// A JSON object map used for application-defined metadata and context.
 pub type JsonMap = serde_json::Map<String, Value>;
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+/// Strategy requested for an agent run.
+pub enum RunStrategy {
+    /// Allows the runtime to select the most appropriate supported strategy.
+    #[default]
+    Adaptive,
+    /// Executes the existing direct model-and-tool loop.
+    Direct,
+    /// Executes a declarative plan.
+    DeclarativePlan,
+    /// Executes a programmatic orchestration strategy.
+    Programmatic,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 /// Describes an agent and its runtime defaults.
 pub struct AgentDefinition {
@@ -72,9 +87,19 @@ pub struct RunOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional model identifier for this run.
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional execution strategy for this run.
+    pub strategy: Option<RunStrategy>,
     #[serde(default)]
     /// Generation settings for this run.
     pub generation: GenerationOptions,
+}
+
+impl RunOverrides {
+    /// Returns the requested strategy, defaulting to adaptive selection.
+    pub fn resolved_strategy(&self) -> RunStrategy {
+        self.strategy.unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
