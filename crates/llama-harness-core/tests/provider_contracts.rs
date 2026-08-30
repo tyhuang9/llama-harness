@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use llama_harness_core::{
     mock::MockModelProvider, CancellationSafety, ExecutionLocation, HarnessError, IssueSafety,
     ModelCapabilities, ModelProvider, ModelRequest, ModelStreamController, ModelStreamEvent,
-    NetworkEgress, ProviderCapabilityLimits, SpeculationPolicy, Tool, ToolCallAssembler,
-    ToolCallAssemblyLimits, ToolCallDelta, ToolCaller, ToolDefinition, ToolRegistry, ToolResult,
-    Usage,
+    ModelStreamFailureKind, NetworkEgress, ProviderCapabilityLimits, SpeculationPolicy, Tool,
+    ToolCallAssembler, ToolCallAssemblyLimits, ToolCallDelta, ToolCaller, ToolDefinition,
+    ToolRegistry, ToolResult, Usage,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -177,6 +177,22 @@ fn assembler(limits: ToolCallAssemblyLimits) -> ToolCallAssembler {
     .unwrap()
 }
 
+fn assert_stream_failure(error: HarnessError, kind: ModelStreamFailureKind) {
+    assert_eq!(error, HarnessError::ModelStream { kind });
+    assert_eq!(error.to_string(), kind.message());
+    assert!(kind.code().starts_with("model_stream."));
+    for sentinel in [
+        "sentinel-call-id",
+        "sentinel-tool-id",
+        "sentinel-arguments",
+        "sentinel-streamed-argument-secret",
+        "sentinel-provider-message",
+    ] {
+        assert!(!error.to_string().contains(sentinel));
+        assert!(!kind.code().contains(sentinel));
+    }
+}
+
 #[test]
 fn assembler_interleaves_calls_and_only_yields_validated_finals() {
     let mut assembler = assembler(ToolCallAssemblyLimits::default());
@@ -211,42 +227,149 @@ fn assembler_interleaves_calls_and_only_yields_validated_finals() {
 }
 
 #[test]
-fn assembler_rejects_conflicts_invalid_finals_and_post_final_fragments() {
-    let mut conflict = assembler(ToolCallAssemblyLimits::default());
-    conflict
+fn assembler_rejects_identifier_failures_with_exact_value_free_kinds() {
+    let mut invalid_call_id = assembler(ToolCallAssemblyLimits::default());
+    assert_stream_failure(
+        invalid_call_id
+            .push(
+                ToolCallDelta::new(0, "{}", true)
+                    .with_call_id("")
+                    .with_tool_id("lookup"),
+            )
+            .unwrap_err(),
+        ModelStreamFailureKind::InvalidCallId,
+    );
+
+    let mut invalid_tool_id = assembler(ToolCallAssemblyLimits::default());
+    assert_stream_failure(
+        invalid_tool_id
+            .push(
+                ToolCallDelta::new(0, "{}", true)
+                    .with_call_id("sentinel-call-id")
+                    .with_tool_id(""),
+            )
+            .unwrap_err(),
+        ModelStreamFailureKind::InvalidToolId,
+    );
+
+    let mut conflicting_call_id = assembler(ToolCallAssemblyLimits::default());
+    conflicting_call_id
+        .push(
+            ToolCallDelta::new(0, "{", false)
+                .with_call_id("sentinel-call-id")
+                .with_tool_id("lookup"),
+        )
+        .unwrap();
+    assert_stream_failure(
+        conflicting_call_id
+            .push(ToolCallDelta::new(0, "}", true).with_call_id("changed"))
+            .unwrap_err(),
+        ModelStreamFailureKind::ConflictingCallId,
+    );
+
+    let mut conflicting_tool_id = assembler(ToolCallAssemblyLimits::default());
+    conflicting_tool_id
         .push(
             ToolCallDelta::new(0, "{", false)
                 .with_call_id("call")
                 .with_tool_id("lookup"),
         )
         .unwrap();
-    assert!(matches!(
-        conflict.push(ToolCallDelta::new(0, "}", true).with_tool_id("other")),
-        Err(HarnessError::Provider(message)) if message.contains("conflicting")
-    ));
+    assert_stream_failure(
+        conflicting_tool_id
+            .push(ToolCallDelta::new(0, "}", true).with_tool_id("sentinel-tool-id"))
+            .unwrap_err(),
+        ModelStreamFailureKind::ConflictingToolId,
+    );
+
+    let mut missing_call_id = assembler(ToolCallAssemblyLimits::default());
+    assert_stream_failure(
+        missing_call_id
+            .push(ToolCallDelta::new(0, "{}", true).with_tool_id("lookup"))
+            .unwrap_err(),
+        ModelStreamFailureKind::MissingCallId,
+    );
+
+    let mut missing_tool_id = assembler(ToolCallAssemblyLimits::default());
+    assert_stream_failure(
+        missing_tool_id
+            .push(ToolCallDelta::new(0, "{}", true).with_call_id("sentinel-call-id"))
+            .unwrap_err(),
+        ModelStreamFailureKind::MissingToolId,
+    );
+
+    let mut duplicate_call_id = assembler(ToolCallAssemblyLimits::default());
+    duplicate_call_id
+        .push(
+            ToolCallDelta::new(0, r#"{"query":"first"}"#, true)
+                .with_call_id("sentinel-call-id")
+                .with_tool_id("lookup"),
+        )
+        .unwrap();
+    assert_stream_failure(
+        duplicate_call_id
+            .push(
+                ToolCallDelta::new(1, r#"{"query":"second"}"#, true)
+                    .with_call_id("sentinel-call-id")
+                    .with_tool_id("lookup"),
+            )
+            .unwrap_err(),
+        ModelStreamFailureKind::DuplicateCallId,
+    );
+}
+
+#[test]
+fn assembler_rejects_invalid_finals_with_exact_value_free_kinds() {
+    let mut unknown = assembler(ToolCallAssemblyLimits::default());
+    assert_stream_failure(
+        unknown
+            .push(
+                ToolCallDelta::new(0, "{}", true)
+                    .with_call_id("sentinel-call-id")
+                    .with_tool_id("sentinel-tool-id"),
+            )
+            .unwrap_err(),
+        ModelStreamFailureKind::UnknownTool,
+    );
 
     let mut malformed = assembler(ToolCallAssemblyLimits::default());
-    assert!(matches!(
-        malformed.push(
-            ToolCallDelta::new(0, "{", true)
-                .with_call_id("call")
-                .with_tool_id("lookup")
-        ),
-        Err(HarnessError::InvalidArguments(_))
-    ));
+    assert_stream_failure(
+        malformed
+            .push(
+                ToolCallDelta::new(0, "{sentinel-arguments", true)
+                    .with_call_id("sentinel-call-id")
+                    .with_tool_id("lookup"),
+            )
+            .unwrap_err(),
+        ModelStreamFailureKind::MalformedArgumentsJson,
+    );
+
+    let mut mismatch = assembler(ToolCallAssemblyLimits::default());
+    assert_stream_failure(
+        mismatch
+            .push(
+                ToolCallDelta::new(0, r#"{"query":1}"#, true)
+                    .with_call_id("sentinel-call-id")
+                    .with_tool_id("lookup"),
+            )
+            .unwrap_err(),
+        ModelStreamFailureKind::ArgumentsSchemaMismatch,
+    );
 
     let mut finalized = assembler(ToolCallAssemblyLimits::default());
     finalized
         .push(
-            ToolCallDelta::new(0, "{\"query\":\"ok\"}", true)
-                .with_call_id("call")
+            ToolCallDelta::new(0, r#"{"query":"ok"}"#, true)
+                .with_call_id("sentinel-call-id")
                 .with_tool_id("lookup"),
         )
         .unwrap();
-    assert!(matches!(
-        finalized.push(ToolCallDelta::new(0, "", false)),
-        Err(HarnessError::Provider(message)) if message.contains("after completion")
-    ));
+    assert_stream_failure(
+        finalized
+            .push(ToolCallDelta::new(0, "sentinel-arguments", false))
+            .unwrap_err(),
+        ModelStreamFailureKind::FragmentAfterCallCompletion,
+    );
 }
 
 #[test]
@@ -277,9 +400,7 @@ fn streamed_argument_validation_errors_redact_instance_values() {
         )))
         .unwrap_err();
 
-    assert!(matches!(error, HarnessError::InvalidArguments(_)));
-    assert!(error.to_string().contains("arguments failed validation"));
-    assert!(!error.to_string().contains(SECRET));
+    assert_stream_failure(error, ModelStreamFailureKind::ArgumentsSchemaMismatch);
     assert!(controller.is_terminal());
 }
 
@@ -295,10 +416,12 @@ fn assembler_enforces_call_field_and_total_limits() {
         ..ToolCallAssemblyLimits::default()
     };
     let mut fields = assembler(limits.clone());
-    assert!(matches!(
-        fields.push(ToolCallDelta::new(0, "{}", true).with_call_id("too-long-id")),
-        Err(HarnessError::Provider(_))
-    ));
+    assert_stream_failure(
+        fields
+            .push(ToolCallDelta::new(0, "{}", true).with_call_id("too-long-id"))
+            .unwrap_err(),
+        ModelStreamFailureKind::InvalidCallId,
+    );
 
     let mut calls = assembler(limits.clone());
     calls
@@ -478,75 +601,113 @@ fn stream_controller_fuses_completion_and_rejects_post_terminal_events() {
     controller.push(Ok(completed())).unwrap();
     assert!(controller.is_terminal());
     assert!(controller.finish_eof().is_ok());
-    assert!(matches!(
-        controller.push(Ok(completed())),
-        Err(HarnessError::Provider(message)) if message.contains("after completion")
-    ));
+    assert_stream_failure(
+        controller.push(Ok(completed())).unwrap_err(),
+        ModelStreamFailureKind::EventAfterCompletion,
+    );
+    assert_stream_failure(
+        controller
+            .push(Ok(ModelStreamEvent::TextDelta {
+                content: "sentinel-provider-message".into(),
+            }))
+            .unwrap_err(),
+        ModelStreamFailureKind::EventAfterCompletion,
+    );
 }
 
 #[test]
 fn stream_controller_rejects_pending_completion_and_eof() {
-    for complete_with_event in [true, false] {
-        let mut controller = controller();
-        controller
-            .push(Ok(ModelStreamEvent::ToolCallDelta(
-                ToolCallDelta::new(0, "{", false)
-                    .with_call_id("call")
-                    .with_tool_id("lookup"),
-            )))
-            .unwrap();
-        let error = if complete_with_event {
-            controller.push(Ok(completed())).unwrap_err()
-        } else {
-            controller.finish_eof().unwrap_err()
-        };
-        assert!(matches!(error, HarnessError::Provider(message) if message.contains("incomplete")));
-        assert!(controller.is_terminal());
-    }
+    let mut completion = controller();
+    completion
+        .push(Ok(ModelStreamEvent::ToolCallDelta(
+            ToolCallDelta::new(0, "{sentinel-arguments", false)
+                .with_call_id("sentinel-call-id")
+                .with_tool_id("lookup"),
+        )))
+        .unwrap();
+    assert_stream_failure(
+        completion.push(Ok(completed())).unwrap_err(),
+        ModelStreamFailureKind::CompletionWithPendingCall,
+    );
+    assert!(completion.is_terminal());
+
+    let mut eof = controller();
+    eof.push(Ok(ModelStreamEvent::ToolCallDelta(
+        ToolCallDelta::new(0, "{sentinel-arguments", false)
+            .with_call_id("sentinel-call-id")
+            .with_tool_id("lookup"),
+    )))
+    .unwrap();
+    assert_stream_failure(
+        eof.finish_eof().unwrap_err(),
+        ModelStreamFailureKind::EofWithPendingCall,
+    );
+    assert!(eof.is_terminal());
+
+    let mut direct = assembler(ToolCallAssemblyLimits::default());
+    direct
+        .push(
+            ToolCallDelta::new(0, "{sentinel-arguments", false)
+                .with_call_id("sentinel-call-id")
+                .with_tool_id("lookup"),
+        )
+        .unwrap();
+    assert_stream_failure(
+        direct.finish().unwrap_err(),
+        ModelStreamFailureKind::IncompletePendingCall,
+    );
 }
 
 #[test]
 fn stream_controller_makes_first_error_or_cancellation_terminal() {
+    let mut upstream = controller();
+    assert_stream_failure(
+        upstream
+            .push(Err(HarnessError::Provider(
+                "sentinel-provider-message".into(),
+            )))
+            .unwrap_err(),
+        ModelStreamFailureKind::UpstreamProviderFailure,
+    );
+    assert_stream_failure(
+        upstream
+            .push(Ok(ModelStreamEvent::TextDelta {
+                content: "sentinel-provider-message".into(),
+            }))
+            .unwrap_err(),
+        ModelStreamFailureKind::EventAfterFailure,
+    );
+    assert_stream_failure(
+        upstream.finish_eof().unwrap_err(),
+        ModelStreamFailureKind::EofAfterFailure,
+    );
+
     let mut cancelled = controller();
     assert!(matches!(
         cancelled.push(Err(HarnessError::Cancelled)),
         Err(HarnessError::Cancelled)
     ));
+    assert_stream_failure(
+        cancelled
+            .push(Ok(ModelStreamEvent::TextDelta {
+                content: "sentinel-provider-message".into(),
+            }))
+            .unwrap_err(),
+        ModelStreamFailureKind::EventAfterFailure,
+    );
+
+    let mut limited = controller();
     assert!(matches!(
-        cancelled.push(Ok(ModelStreamEvent::TextDelta {
-            content: "late".into()
-        })),
-        Err(HarnessError::Provider(message)) if message.contains("terminal failure")
+        limited.push(Err(HarnessError::ResourceLimit("bounded".into()))),
+        Err(HarnessError::ResourceLimit(message)) if message == "bounded"
     ));
+    assert!(limited.is_terminal());
 
     let mut eof = controller();
-    assert!(matches!(
-        eof.finish_eof(),
-        Err(HarnessError::Provider(message)) if message.contains("before completion")
-    ));
-}
-
-#[test]
-fn assembler_rejects_unknown_tools_and_schema_mismatches() {
-    let mut unknown = assembler(ToolCallAssemblyLimits::default());
-    assert!(matches!(
-        unknown.push(
-            ToolCallDelta::new(0, "{}", true)
-                .with_call_id("call")
-                .with_tool_id("missing")
-        ),
-        Err(HarnessError::InvalidTool(_))
-    ));
-
-    let mut invalid = assembler(ToolCallAssemblyLimits::default());
-    assert!(matches!(
-        invalid.push(
-            ToolCallDelta::new(0, "{\"query\":1}", true)
-                .with_call_id("call")
-                .with_tool_id("lookup")
-        ),
-        Err(HarnessError::InvalidArguments(_))
-    ));
+    assert_stream_failure(
+        eof.finish_eof().unwrap_err(),
+        ModelStreamFailureKind::EofBeforeCompletion,
+    );
 }
 
 #[tokio::test]

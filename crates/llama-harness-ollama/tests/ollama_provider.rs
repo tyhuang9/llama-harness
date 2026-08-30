@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use llama_harness_core::{
     GenerationOptions, HarnessError, Message, MessageRole, ModelProvider, ModelRequest,
-    ModelStreamEvent, ToolCall, ToolDefinition, ToolRisk,
+    ModelStreamEvent, ModelStreamFailureKind, ToolCall, ToolDefinition, ToolRisk,
 };
 use llama_harness_ollama::{OllamaProvider, OllamaStreamEvent};
 use serde_json::{json, Value};
@@ -447,7 +447,7 @@ async fn generic_provider_stream_preserves_parallel_atomic_tool_calls_in_order()
 }
 
 #[tokio::test]
-async fn generic_provider_stream_preserves_adapter_errors() {
+async fn generic_provider_stream_redacts_adapter_errors() {
     let (base_url, task) = server(vec![
         b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot-json\n".to_vec(),
     ])
@@ -460,7 +460,9 @@ async fn generic_provider_stream_preserves_adapter_errors() {
 
     assert!(matches!(
         events.as_slice(),
-        [Err(HarnessError::Provider(message))] if message.contains("decode")
+        [Err(HarnessError::ModelStream {
+            kind: ModelStreamFailureKind::UpstreamProviderFailure
+        })]
     ));
     task.await.unwrap();
 }

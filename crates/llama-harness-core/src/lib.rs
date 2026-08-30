@@ -25,7 +25,7 @@ pub use agent_manifest::{
     load_agent_manifest, load_agent_manifest_path, AgentManifest, AgentManifestError,
     AGENT_MANIFEST_VERSION,
 };
-pub use error::{HarnessError, RunError};
+pub use error::{HarnessError, ModelStreamFailureKind, RunError};
 pub use event::{EventRecord, EventSink, InMemoryEventSink, RunEvent};
 pub use limits::{AgentLimits, GenerationOptions};
 pub use message::{Message, MessageRole};

@@ -1,6 +1,7 @@
 use crate::{
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len},
-    AgentLimits, HarnessError, ProviderCapabilityLimits, ToolCall, ToolDefinition, Usage,
+    AgentLimits, HarnessError, ModelStreamFailureKind, ProviderCapabilityLimits, ToolCall,
+    ToolDefinition, Usage,
 };
 
 const MAX_ASSEMBLY_CALLS: usize = 16;
@@ -344,10 +345,9 @@ impl ToolCallAssembler {
         if self.pending.is_empty() {
             Ok(())
         } else {
-            Err(HarnessError::Provider(format!(
-                "model stream ended with {} incomplete tool call(s)",
-                self.pending.len()
-            )))
+            Err(model_stream_failure(
+                ModelStreamFailureKind::IncompletePendingCall,
+            ))
         }
     }
 
@@ -369,10 +369,9 @@ impl ToolCallAssembler {
     /// Adds a fragment and yields a validated call only when its final fragment arrives.
     pub fn push(&mut self, delta: ToolCallDelta) -> Result<Option<ToolCall>, HarnessError> {
         if self.finalized_indices.contains(&delta.index) {
-            return Err(HarnessError::Provider(format!(
-                "tool call {} received a fragment after completion",
-                delta.index
-            )));
+            return Err(model_stream_failure(
+                ModelStreamFailureKind::FragmentAfterCallCompletion,
+            ));
         }
         if !self.seen_indices.contains(&delta.index) {
             if self.seen_indices.len() >= self.limits.max_calls {
@@ -385,25 +384,25 @@ impl ToolCallAssembler {
         }
 
         validate_field(
-            "call id",
             delta.call_id.as_deref(),
             self.limits.max_field_bytes,
+            ModelStreamFailureKind::InvalidCallId,
         )?;
         validate_field(
-            "tool id",
             delta.tool_id.as_deref(),
             self.limits.max_field_bytes,
+            ModelStreamFailureKind::InvalidToolId,
         )?;
         let current = self.pending.get(&delta.index);
         check_immutable_field(
-            "call id",
             current.and_then(|pending| pending.call_id.as_deref()),
             delta.call_id.as_deref(),
+            ModelStreamFailureKind::ConflictingCallId,
         )?;
         check_immutable_field(
-            "tool id",
             current.and_then(|pending| pending.tool_id.as_deref()),
             delta.tool_id.as_deref(),
+            ModelStreamFailureKind::ConflictingToolId,
         )?;
         let added_bytes = delta.arguments_fragment.len()
             + new_field_bytes(
@@ -422,19 +421,17 @@ impl ToolCallAssembler {
                 HarnessError::ResourceLimit("streamed tool argument size overflow".into())
             })?;
         if next_argument_bytes > self.limits.max_argument_bytes {
-            return Err(HarnessError::ResourceLimit(format!(
-                "streamed tool arguments {} exceed {} bytes",
-                delta.index, self.limits.max_argument_bytes
-            )));
+            return Err(HarnessError::ResourceLimit(
+                "streamed tool argument byte limit exceeded".into(),
+            ));
         }
         let next_call_bytes = current_call_bytes.checked_add(added_bytes).ok_or_else(|| {
             HarnessError::ResourceLimit("streamed tool call size overflow".into())
         })?;
         if next_call_bytes > self.limits.max_call_bytes {
-            return Err(HarnessError::ResourceLimit(format!(
-                "streamed tool call {} exceeds {} bytes",
-                delta.index, self.limits.max_call_bytes
-            )));
+            return Err(HarnessError::ResourceLimit(
+                "streamed tool call byte limit exceeded".into(),
+            ));
         }
         let next_total = self
             .total_buffered_bytes
@@ -469,29 +466,28 @@ impl ToolCallAssembler {
             .total_buffered_bytes
             .saturating_sub(pending.buffered_bytes);
         self.finalized_indices.insert(delta.index);
-        let call_id = required_field("call id", pending.call_id)?;
-        let tool_id = required_field("tool id", pending.tool_id)?;
+        let call_id = required_field(pending.call_id, ModelStreamFailureKind::MissingCallId)?;
+        let tool_id = required_field(pending.tool_id, ModelStreamFailureKind::MissingToolId)?;
         if !self.call_ids.insert(call_id.clone()) {
-            return Err(HarnessError::Provider(format!(
-                "duplicate streamed tool call id: {call_id}"
-            )));
+            return Err(model_stream_failure(
+                ModelStreamFailureKind::DuplicateCallId,
+            ));
         }
-        let allowed = self.allowed_tools.get(&tool_id).ok_or_else(|| {
-            HarnessError::InvalidTool(format!("unknown streamed tool: {tool_id}"))
-        })?;
-        let arguments: Value = serde_json::from_str(&pending.arguments_json).map_err(|error| {
-            HarnessError::InvalidArguments(format!("streamed tool arguments are not JSON: {error}"))
-        })?;
+        let allowed = self
+            .allowed_tools
+            .get(&tool_id)
+            .ok_or_else(|| model_stream_failure(ModelStreamFailureKind::UnknownTool))?;
+        let arguments: Value = serde_json::from_str(&pending.arguments_json)
+            .map_err(|_| model_stream_failure(ModelStreamFailureKind::MalformedArgumentsJson))?;
         ensure_json_depth(
             "streamed tool arguments",
             &arguments,
             self.limits.max_json_depth,
         )?;
-        allowed.validator.validate(&arguments).map_err(|_| {
-            HarnessError::InvalidArguments(format!(
-                "streamed tool {tool_id} arguments failed validation"
-            ))
-        })?;
+        allowed
+            .validator
+            .validate(&arguments)
+            .map_err(|_| model_stream_failure(ModelStreamFailureKind::ArgumentsSchemaMismatch))?;
         Ok(Some(ToolCall::new(
             call_id,
             tool_id,
@@ -539,13 +535,13 @@ impl ModelStreamController {
     ) -> Result<ValidatedModelStreamEvent, HarnessError> {
         match self.state {
             ModelStreamState::Completed => {
-                return Err(HarnessError::Provider(
-                    "model stream received an event after completion".into(),
+                return Err(model_stream_failure(
+                    ModelStreamFailureKind::EventAfterCompletion,
                 ));
             }
             ModelStreamState::Failed => {
-                return Err(HarnessError::Provider(
-                    "model stream received an event after terminal failure".into(),
+                return Err(model_stream_failure(
+                    ModelStreamFailureKind::EventAfterFailure,
                 ));
             }
             ModelStreamState::Active => {}
@@ -555,7 +551,7 @@ impl ModelStreamController {
             Ok(event) => event,
             Err(error) => {
                 self.state = ModelStreamState::Failed;
-                return Err(error);
+                return Err(normalize_upstream_stream_error(error));
             }
         };
         let completed_tool_call = match &event {
@@ -567,9 +563,11 @@ impl ModelStreamController {
                 }
             },
             ModelStreamEvent::Completed { .. } => {
-                if let Err(error) = self.assembler.finish() {
+                if self.assembler.pending_count() != 0 {
                     self.state = ModelStreamState::Failed;
-                    return Err(error);
+                    return Err(model_stream_failure(
+                        ModelStreamFailureKind::CompletionWithPendingCall,
+                    ));
                 }
                 self.state = ModelStreamState::Completed;
                 None
@@ -586,18 +584,20 @@ impl ModelStreamController {
     pub fn finish_eof(&mut self) -> Result<(), HarnessError> {
         match self.state {
             ModelStreamState::Completed => Ok(()),
-            ModelStreamState::Failed => Err(HarnessError::Provider(
-                "model stream reached EOF after terminal failure".into(),
+            ModelStreamState::Failed => Err(model_stream_failure(
+                ModelStreamFailureKind::EofAfterFailure,
             )),
             ModelStreamState::Active => {
-                if let Err(error) = self.assembler.finish() {
-                    self.state = ModelStreamState::Failed;
-                    return Err(error);
-                }
                 self.state = ModelStreamState::Failed;
-                Err(HarnessError::Provider(
-                    "model stream reached EOF before completion".into(),
-                ))
+                if self.assembler.pending_count() == 0 {
+                    Err(model_stream_failure(
+                        ModelStreamFailureKind::EofBeforeCompletion,
+                    ))
+                } else {
+                    Err(model_stream_failure(
+                        ModelStreamFailureKind::EofWithPendingCall,
+                    ))
+                }
             }
         }
     }
@@ -614,24 +614,24 @@ fn checked_schema_total(current: usize, next: usize) -> Result<usize, HarnessErr
         .ok_or_else(|| HarnessError::ResourceLimit("streamed tool schema size overflow".into()))
 }
 
-fn validate_field(label: &str, value: Option<&str>, max_bytes: usize) -> Result<(), HarnessError> {
+fn validate_field(
+    value: Option<&str>,
+    max_bytes: usize,
+    kind: ModelStreamFailureKind,
+) -> Result<(), HarnessError> {
     if value.is_some_and(|value| value.is_empty() || value.len() > max_bytes) {
-        return Err(HarnessError::Provider(format!(
-            "streamed {label} is empty or exceeds {max_bytes} bytes"
-        )));
+        return Err(model_stream_failure(kind));
     }
     Ok(())
 }
 
 fn check_immutable_field(
-    label: &str,
     current: Option<&str>,
     incoming: Option<&str>,
+    kind: ModelStreamFailureKind,
 ) -> Result<(), HarnessError> {
     if matches!((current, incoming), (Some(current), Some(incoming)) if current != incoming) {
-        return Err(HarnessError::Provider(format!(
-            "conflicting streamed {label}"
-        )));
+        return Err(model_stream_failure(kind));
     }
     Ok(())
 }
@@ -644,8 +644,24 @@ fn new_field_bytes(current: Option<&str>, incoming: Option<&str>) -> usize {
     }
 }
 
-fn required_field(label: &str, value: Option<String>) -> Result<String, HarnessError> {
-    value.ok_or_else(|| HarnessError::Provider(format!("final streamed {label} is missing")))
+fn required_field(
+    value: Option<String>,
+    kind: ModelStreamFailureKind,
+) -> Result<String, HarnessError> {
+    value.ok_or_else(|| model_stream_failure(kind))
+}
+
+fn model_stream_failure(kind: ModelStreamFailureKind) -> HarnessError {
+    HarnessError::ModelStream { kind }
+}
+
+fn normalize_upstream_stream_error(error: HarnessError) -> HarnessError {
+    match error {
+        error @ (HarnessError::Cancelled
+        | HarnessError::ResourceLimit(_)
+        | HarnessError::ModelStream { .. }) => error,
+        _ => model_stream_failure(ModelStreamFailureKind::UpstreamProviderFailure),
+    }
 }
 
 #[cfg(test)]
