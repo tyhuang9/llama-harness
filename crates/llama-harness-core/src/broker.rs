@@ -15,7 +15,7 @@ use crate::event::EventEmitter;
 pub(crate) struct BrokerState {
     pub(crate) tool_calls: u32,
     identical_calls: HashMap<String, u32>,
-    committed_effects: HashMap<String, ToolResult>,
+    effects: HashMap<String, EffectRecord>,
     reuse_committed_effects: bool,
 }
 
@@ -23,6 +23,19 @@ impl BrokerState {
     pub(crate) fn enable_effect_reuse(&mut self) {
         self.reuse_committed_effects = true;
     }
+
+    pub(crate) fn recovery_is_safe(&self) -> bool {
+        self.effects
+            .values()
+            .all(|record| matches!(record, EffectRecord::Completed(_)))
+    }
+}
+
+#[derive(Clone)]
+enum EffectRecord {
+    Dispatched,
+    Uncertain,
+    Completed(ToolResult),
 }
 
 /// A completely validated and authorized invocation ready to execute.
@@ -31,15 +44,24 @@ pub(crate) struct PreparedCall {
     pub(crate) arguments: Value,
     pub(crate) tool: Arc<dyn Tool>,
     pub(crate) context: ToolCallContext,
-    pub(crate) signature: String,
+    signature: Option<String>,
     caller: ToolCaller,
-    approved: bool,
+    authorized_signature: Option<String>,
+    signature_accounted: bool,
+    approval_barrier: bool,
 }
 
 /// Result of preparing one invocation at the shared broker boundary.
 pub(crate) enum PrepareOutcome {
-    Ready(PreparedCall),
+    Ready(Box<PreparedCall>),
     Rejected(ToolResult),
+    Reused(ToolResult),
+    Stop,
+}
+
+/// Result of resolving and authorizing a call whose arguments contain bindings.
+pub(crate) enum FinalizeOutcome {
+    Ready,
     Reused(ToolResult),
     Stop,
 }
@@ -81,6 +103,7 @@ impl<'a> ToolBroker<'a> {
         call: ToolCall,
         caller: ToolCaller,
         approval_barrier: bool,
+        defer_signature_checks: bool,
         deadline: Option<Instant>,
     ) -> Result<PrepareOutcome, HarnessError> {
         check_stopped(
@@ -98,8 +121,10 @@ impl<'a> ToolBroker<'a> {
         }
         state.tool_calls += 1;
 
-        let recorded_call = self.call_for_transcript(request, &call, caller);
-        result.tool_calls.push(recorded_call);
+        if !defer_signature_checks {
+            let recorded_call = self.call_for_transcript(request, &call, caller);
+            result.tool_calls.push(recorded_call);
+        }
 
         if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
             self.reject(
@@ -136,19 +161,6 @@ impl<'a> ToolBroker<'a> {
             )));
         }
 
-        let signature = canonical_signature(&call.tool_id, &arguments);
-        let count = state.identical_calls.entry(signature.clone()).or_default();
-        *count += 1;
-        if *count > request.agent.limits.max_identical_tool_calls {
-            result.status = RunStatus::LimitReached;
-            result.repeated_tool_call_limit_reached = true;
-            result.errors.push(RunError::new(
-                "repeated_tool_call_limit",
-                "repeated identical tool call limit reached",
-            ));
-            return Ok(PrepareOutcome::Stop);
-        }
-
         let Some(tool) = self.tools.get(&call.tool_id) else {
             self.reject(result, events, &call, "unknown tool".into());
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
@@ -182,20 +194,12 @@ impl<'a> ToolBroker<'a> {
                 "tool caller is not allowed",
             )));
         }
-        if let Err(error) = self.tools.validate(&call.tool_id, &arguments) {
-            self.reject(result, events, &call, error.to_string());
-            return Ok(PrepareOutcome::Rejected(ToolResult::failure(
-                "tool arguments failed validation",
-            )));
-        }
-
-        if state.reuse_committed_effects && !tool.definition().read_only {
-            if let Some(recorded) = state.committed_effects.get(&signature) {
-                events.emit(RunEvent::ToolEffectReused {
-                    call_id: call.id.clone(),
-                    tool_id: call.tool_id.clone(),
-                });
-                return Ok(PrepareOutcome::Reused(recorded.clone()));
+        if !defer_signature_checks {
+            if let Err(error) = self.tools.validate(&call.tool_id, &arguments) {
+                self.reject(result, events, &call, error.to_string());
+                return Ok(PrepareOutcome::Rejected(ToolResult::failure(
+                    "tool arguments failed validation",
+                )));
             }
         }
 
@@ -205,70 +209,48 @@ impl<'a> ToolBroker<'a> {
             call.id.clone(),
             call.tool_id.clone(),
         );
-        let decision = await_guarded(
-            self.policy
-                .decide_with_context(&context, tool.definition(), &arguments, request),
-            &request.cancellation,
-            deadline,
-            "policy decision exceeded run deadline",
-            None,
-        )
-        .await?;
-        events.emit(RunEvent::PolicyDecided {
-            call_id: call.id.clone(),
-            decision: decision.clone(),
-        });
-        result.policy_decisions.push(decision.clone());
 
-        if let PolicyDecision::Deny { reason } = decision {
-            self.reject(result, events, &call, format!("policy denied: {reason}"));
-            return Ok(PrepareOutcome::Rejected(ToolResult::failure(
-                "policy denied",
-            )));
-        }
-
-        let mut approved = false;
-        if approval_barrier || matches!(decision, PolicyDecision::RequireApproval { .. }) {
-            events.emit(RunEvent::ApprovalRequested {
-                call_id: call.id.clone(),
-                tool_id: call.tool_id.clone(),
-            });
-            let mut approval = await_guarded(
-                self.approvals.approve_with_context(
-                    &context,
-                    tool.definition(),
-                    &arguments,
-                    request,
-                ),
-                &request.cancellation,
-                deadline,
-                "approval exceeded run deadline",
-                None,
-            )
-            .await?;
-            approval.call_id = call.id.clone();
-            approval.tool_id = call.tool_id.clone();
-            let granted = approval.granted;
-            let reason = approval.reason.clone();
-            result.approvals.push(approval);
-            if !granted {
-                self.reject(result, events, &call, format!("approval denied: {reason}"));
-                return Ok(PrepareOutcome::Rejected(ToolResult::failure(
-                    "approval denied",
-                )));
+        let signature =
+            (!defer_signature_checks).then(|| canonical_signature(&call.tool_id, &arguments));
+        if let Some(signature) = &signature {
+            if let Some(recorded) =
+                self.reusable_effect(state, events, &call, tool.definition().read_only, signature)?
+            {
+                return Ok(PrepareOutcome::Reused(recorded));
             }
-            approved = true;
+            if !self.account_signature(request, result, state, signature) {
+                return Ok(PrepareOutcome::Stop);
+            }
+            if let Some(rejection) = self
+                .authorize(
+                    request,
+                    result,
+                    events,
+                    &call,
+                    &context,
+                    tool.as_ref(),
+                    &arguments,
+                    approval_barrier,
+                    deadline,
+                )
+                .await?
+            {
+                return Ok(PrepareOutcome::Rejected(rejection));
+            }
         }
 
-        Ok(PrepareOutcome::Ready(PreparedCall {
+        let authorized_signature = signature.clone();
+        Ok(PrepareOutcome::Ready(Box::new(PreparedCall {
             call,
             arguments,
             tool,
             context,
             signature,
             caller,
-            approved,
-        }))
+            authorized_signature,
+            signature_accounted: !defer_signature_checks,
+            approval_barrier,
+        })))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -279,9 +261,9 @@ impl<'a> ToolBroker<'a> {
         request: &RunRequest,
         result: &mut RunResult,
         events: &mut EventEmitter,
-        state: &BrokerState,
+        state: &mut BrokerState,
         deadline: Option<Instant>,
-    ) -> Result<Option<ToolResult>, HarnessError> {
+    ) -> Result<FinalizeOutcome, HarnessError> {
         check_stopped(
             &request.cancellation,
             deadline,
@@ -318,75 +300,163 @@ impl<'a> ToolBroker<'a> {
         self.tools.validate(&prepared.call.tool_id, &arguments)?;
 
         let signature = canonical_signature(&prepared.call.tool_id, &arguments);
-        if state.reuse_committed_effects && !prepared.tool.definition().read_only {
-            if let Some(recorded) = state.committed_effects.get(&signature) {
-                events.emit(RunEvent::ToolEffectReused {
-                    call_id: prepared.call.id.clone(),
-                    tool_id: prepared.call.tool_id.clone(),
-                });
-                return Ok(Some(recorded.clone()));
+        if !prepared.signature_accounted {
+            prepared.call.arguments_json = arguments_json.clone();
+            result.tool_calls.push(prepared.call.clone());
+        }
+        if let Some(recorded) = self.reusable_effect(
+            state,
+            events,
+            &prepared.call,
+            prepared.tool.definition().read_only,
+            &signature,
+        )? {
+            return Ok(FinalizeOutcome::Reused(recorded));
+        }
+        if !prepared.signature_accounted {
+            if !self.account_signature(request, result, state, &signature) {
+                return Ok(FinalizeOutcome::Stop);
             }
+            prepared.signature_accounted = true;
         }
 
-        let decision = await_guarded(
-            self.policy.decide_with_context(
-                &prepared.context,
-                prepared.tool.definition(),
-                &arguments,
-                request,
-            ),
-            &request.cancellation,
-            deadline,
-            "bound argument policy decision exceeded run deadline",
-            None,
-        )
-        .await?;
-        events.emit(RunEvent::PolicyDecided {
-            call_id: prepared.call.id.clone(),
-            decision: decision.clone(),
-        });
-        result.policy_decisions.push(decision.clone());
-        match decision {
-            PolicyDecision::Deny { reason } => {
-                return Err(HarnessError::Policy(format!(
-                    "bound plan call denied: {reason}"
-                )));
-            }
-            PolicyDecision::RequireApproval { .. } if !prepared.approved => {
-                events.emit(RunEvent::ApprovalRequested {
-                    call_id: prepared.call.id.clone(),
-                    tool_id: prepared.call.tool_id.clone(),
-                });
-                let mut approval = await_guarded(
-                    self.approvals.approve_with_context(
-                        &prepared.context,
-                        prepared.tool.definition(),
-                        &arguments,
-                        request,
-                    ),
-                    &request.cancellation,
+        if prepared.authorized_signature.as_deref() != Some(signature.as_str()) {
+            if self
+                .authorize(
+                    request,
+                    result,
+                    events,
+                    &prepared.call,
+                    &prepared.context,
+                    prepared.tool.as_ref(),
+                    &arguments,
+                    prepared.approval_barrier,
                     deadline,
-                    "bound argument approval exceeded run deadline",
-                    None,
                 )
-                .await?;
-                approval.call_id = prepared.call.id.clone();
-                approval.tool_id = prepared.call.tool_id.clone();
-                let granted = approval.granted;
-                result.approvals.push(approval);
-                if !granted {
-                    return Err(HarnessError::Approval(
-                        "bound plan call approval denied".into(),
-                    ));
-                }
-                prepared.approved = true;
+                .await?
+                .is_some()
+            {
+                return Err(HarnessError::Policy(
+                    "bound plan call authorization denied".into(),
+                ));
             }
-            PolicyDecision::RequireApproval { .. } | PolicyDecision::Allow { .. } => {}
+            prepared.authorized_signature = Some(signature.clone());
         }
 
         prepared.arguments = arguments;
         prepared.call.arguments_json = arguments_json;
-        prepared.signature = signature;
+        prepared.signature = Some(signature);
+        Ok(FinalizeOutcome::Ready)
+    }
+
+    fn account_signature(
+        &self,
+        request: &RunRequest,
+        result: &mut RunResult,
+        state: &mut BrokerState,
+        signature: &str,
+    ) -> bool {
+        let count = state
+            .identical_calls
+            .entry(signature.to_owned())
+            .or_default();
+        *count += 1;
+        if *count <= request.agent.limits.max_identical_tool_calls {
+            return true;
+        }
+        result.status = RunStatus::LimitReached;
+        result.repeated_tool_call_limit_reached = true;
+        result.errors.push(RunError::new(
+            "repeated_tool_call_limit",
+            "repeated identical tool call limit reached",
+        ));
+        false
+    }
+
+    fn reusable_effect(
+        &self,
+        state: &BrokerState,
+        events: &mut EventEmitter,
+        call: &ToolCall,
+        read_only: bool,
+        signature: &str,
+    ) -> Result<Option<ToolResult>, HarnessError> {
+        if !state.reuse_committed_effects || read_only {
+            return Ok(None);
+        }
+        match state.effects.get(signature) {
+            Some(EffectRecord::Completed(recorded)) => {
+                events.emit(RunEvent::ToolEffectReused {
+                    call_id: call.id.clone(),
+                    tool_id: call.tool_id.clone(),
+                });
+                Ok(Some(recorded.clone()))
+            }
+            Some(EffectRecord::Dispatched | EffectRecord::Uncertain) => Err(HarnessError::Tool(
+                "state-changing tool outcome is uncertain; implicit replay is prohibited".into(),
+            )),
+            None => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn authorize(
+        &self,
+        request: &RunRequest,
+        result: &mut RunResult,
+        events: &mut EventEmitter,
+        call: &ToolCall,
+        context: &ToolCallContext,
+        tool: &dyn Tool,
+        arguments: &Value,
+        approval_barrier: bool,
+        deadline: Option<Instant>,
+    ) -> Result<Option<ToolResult>, HarnessError> {
+        let decision = await_guarded(
+            self.policy
+                .decide_with_context(context, tool.definition(), arguments, request),
+            &request.cancellation,
+            deadline,
+            "policy decision exceeded run deadline",
+            None,
+        )
+        .await?;
+        events.emit(RunEvent::PolicyDecided {
+            call_id: call.id.clone(),
+            decision: decision.clone(),
+        });
+        result.policy_decisions.push(decision.clone());
+
+        if let PolicyDecision::Deny { reason } = decision {
+            self.reject(result, events, call, format!("policy denied: {reason}"));
+            return Ok(Some(ToolResult::failure("policy denied")));
+        }
+
+        if approval_barrier || matches!(decision, PolicyDecision::RequireApproval { .. }) {
+            events.emit(RunEvent::ApprovalRequested {
+                call_id: call.id.clone(),
+                tool_id: call.tool_id.clone(),
+            });
+            let mut approval = await_guarded(
+                self.approvals
+                    .approve_with_context(context, tool.definition(), arguments, request),
+                &request.cancellation,
+                deadline,
+                "approval exceeded run deadline",
+                None,
+            )
+            .await?;
+            approval.call_id = call.id.clone();
+            approval.tool_id = call.tool_id.clone();
+            let granted = approval.granted;
+            let reason = approval.reason.clone();
+            result.approvals.push(approval);
+            if !granted {
+                self.reject(result, events, call, format!("approval denied: {reason}"));
+                return Ok(Some(ToolResult::failure("approval denied")));
+            }
+        }
+
         Ok(None)
     }
 
@@ -448,16 +518,44 @@ impl<'a> ToolBroker<'a> {
         })
     }
 
+    pub(crate) fn mark_dispatched(&self, state: &mut BrokerState, prepared: &PreparedCall) {
+        if prepared.tool.definition().read_only {
+            return;
+        }
+        if let Some(signature) = &prepared.signature {
+            state
+                .effects
+                .insert(signature.clone(), EffectRecord::Dispatched);
+        }
+    }
+
+    pub(crate) fn mark_uncertain(&self, state: &mut BrokerState, prepared: &PreparedCall) {
+        if prepared.tool.definition().read_only {
+            return;
+        }
+        if let Some(signature) = &prepared.signature {
+            state
+                .effects
+                .insert(signature.clone(), EffectRecord::Uncertain);
+        }
+    }
+
     pub(crate) fn record_execution(
         &self,
         state: &mut BrokerState,
         prepared: &PreparedCall,
         execution: &BrokerExecution,
     ) {
-        if execution.result.ok && !prepared.tool.definition().read_only {
-            state
-                .committed_effects
-                .insert(prepared.signature.clone(), execution.result.clone());
+        if prepared.tool.definition().read_only {
+            return;
+        }
+        if let Some(signature) = &prepared.signature {
+            let record = if execution.result.ok && execution.validation_error.is_none() {
+                EffectRecord::Completed(execution.result.clone())
+            } else {
+                EffectRecord::Uncertain
+            };
+            state.effects.insert(signature.clone(), record);
         }
     }
 

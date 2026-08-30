@@ -91,13 +91,15 @@ impl AgentRunner {
             EventEmitter::new(run_id.clone(), trace_id.clone(), Arc::clone(&self.events));
         events.emit(RunEvent::Started { run_id, trace_id });
         if let Some(strategy_events) = strategy_events {
-            events.emit(RunEvent::StrategyFallback {
-                from: crate::RunStrategy::Adaptive,
-                to: crate::RunStrategy::Direct,
-                reason: crate::StrategyFallbackReason::UnsupportedCapability,
-            });
+            if let Some(reason) = strategy_events.fallback {
+                events.emit(RunEvent::StrategyFallback {
+                    from: strategy_events.requested,
+                    to: crate::RunStrategy::Direct,
+                    reason,
+                });
+            }
             events.emit(RunEvent::StrategySelected {
-                requested: crate::RunStrategy::Adaptive,
+                requested: strategy_events.requested,
                 selected: crate::RunStrategy::Direct,
                 reason: strategy_events.reason,
             });
@@ -267,6 +269,7 @@ impl AgentRunner {
                         call.clone(),
                         ToolCaller::Direct,
                         false,
+                        false,
                         deadline,
                     )
                     .await
@@ -279,9 +282,11 @@ impl AgentRunner {
                 };
                 match outcome {
                     PrepareOutcome::Ready(prepared) => {
+                        broker.mark_dispatched(&mut broker_state, &prepared);
                         let execution = match broker.execute(&prepared, &request, deadline).await {
                             Ok(execution) => execution,
                             Err(error) => {
+                                broker.mark_uncertain(&mut broker_state, &prepared);
                                 events.emit(RunEvent::ToolCompleted {
                                     call_id: call.id.clone(),
                                     tool_id: call.tool_id.clone(),
@@ -395,7 +400,9 @@ impl AgentRunner {
 
 #[derive(Clone, Copy)]
 pub(crate) struct DirectStrategyEvents {
+    pub(crate) requested: crate::RunStrategy,
     pub(crate) reason: crate::StrategySelectionReason,
+    pub(crate) fallback: Option<crate::StrategyFallbackReason>,
 }
 
 impl AgentRunnerBuilder {
