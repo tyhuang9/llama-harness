@@ -1304,6 +1304,10 @@ async fn invalid_success_output_fails_closed_without_entering_transcript() {
     assert!(result.errors.iter().any(|error| {
         error.code == "tool_error" && error.message.contains("output failed validation")
     }));
+    assert!(result
+        .errors
+        .iter()
+        .all(|error| !error.message.contains("must-not-leak")));
     let requests = provider.requests();
     let feedback_message = requests[1]
         .messages

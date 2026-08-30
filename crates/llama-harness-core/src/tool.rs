@@ -501,10 +501,8 @@ impl ToolRegistry {
             .get(tool_id)
             .ok_or_else(|| HarnessError::InvalidTool(format!("unknown tool: {tool_id}")))?;
         if let Some(validator) = &entry.output_validator {
-            validator.validate(output).map_err(|error| {
-                HarnessError::InvalidOutput(format!(
-                    "tool {tool_id} output failed validation: {error}"
-                ))
+            validator.validate(output).map_err(|_| {
+                HarnessError::InvalidOutput(format!("tool {tool_id} output failed validation"))
             })?;
         }
         Ok(())
