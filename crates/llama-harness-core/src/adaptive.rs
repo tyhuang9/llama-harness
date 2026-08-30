@@ -1,7 +1,8 @@
 use crate::{
     broker::{BrokerState, FinalizeOutcome, PrepareOutcome, PreparedCall, ToolBroker},
     event::EventEmitter,
-    plan::MAX_EXECUTION_PLAN_NODES,
+    limits::serialized_len,
+    plan::{MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES},
     runner::{
         absolute_deadline, apply_terminal_error, ensure_transcript, initial_messages,
         merge_generation, provider_deadline, push_tool_message, validate_model_response,
@@ -14,8 +15,8 @@ use crate::{
 };
 use futures_util::future::join_all;
 use jsonschema::Validator;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
@@ -25,6 +26,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 const MAX_SCHEDULER_PARALLELISM: usize = 8;
+const MAX_PLAN_RETAINED_BYTES: u64 = 16 * 1024 * 1024;
 const PLANNER_PROMPT: &str = "Select the safest efficient tool strategy. Return only one strict JSON object: {\"strategy\":\"direct\"} when no finite safe plan is justified, or {\"strategy\":\"declarative_plan\",\"plan\":{\"nodes\":[...]}} for a finite dependency DAG. Use only the supplied tools. Every plan node requires id, tool_id, and schema-valid arguments. Optional fields are depends_on, result_bindings, concurrency, approval_barrier, and commit_boundary. Choose direct for mutations, approval-sensitive work, ambiguity, or an uncertain next step.";
 const REPAIR_PROMPT: &str = "The previous strategy envelope was invalid. Repair it once. Return only the strict JSON envelope requested by the planning instructions, with no prose or markdown.";
 const RECOVERY_PROMPT: &str = "Execution stopped after the recorded completed results. Produce one replacement declarative plan using only those results as prior state. Never repeat a completed mutation. Return only {\"strategy\":\"declarative_plan\",\"plan\":{\"nodes\":[...]}}.";
@@ -34,6 +36,11 @@ const RECOVERY_PROMPT: &str = "Execution stopped after the recorded completed re
 enum PlannerEnvelope {
     Direct,
     DeclarativePlan { plan: ExecutionPlan },
+}
+
+#[derive(Serialize)]
+struct RecoveryState<'a> {
+    completed: BTreeMap<&'a str, &'a Value>,
 }
 
 struct StrategyRun<'a> {
@@ -51,17 +58,19 @@ struct StrategyRun<'a> {
     broker_state: BrokerState,
     selected: RunStrategy,
     terminal: bool,
+    plan_attempt: u32,
 }
 
 struct PreparedNode {
     node: PlanNode,
     prepared: Option<PreparedCall>,
-    reused: Option<ToolResult>,
+    reused: Option<(ToolCall, Arc<ToolResult>)>,
+    event_id: String,
 }
 
 struct PlanExecution {
-    completed: BTreeMap<String, ToolResult>,
-    transcript: Vec<(ToolCall, ToolResult)>,
+    completed: BTreeMap<String, Arc<ToolResult>>,
+    transcript: Vec<(ToolCall, Arc<ToolResult>)>,
     failure: Option<PlanFailureKind>,
     effects_started: bool,
 }
@@ -305,16 +314,25 @@ impl AgentRunner {
                         run.terminate(error);
                         return Ok(run.finish());
                     }
-                    let recovery = json!({
-                        "completed": execution
+                    let recovery = RecoveryState {
+                        completed: execution
                             .completed
                             .iter()
-                            .map(|(node_id, result)| (node_id, &result.output))
-                            .collect::<BTreeMap<_, _>>()
-                    });
+                            .map(|(node_id, result)| (node_id.as_str(), &result.output))
+                            .collect(),
+                    };
+                    let recovery = match serde_json::to_string(&recovery) {
+                        Ok(recovery) => recovery,
+                        Err(error) => {
+                            run.terminate(HarnessError::InvalidRequest(format!(
+                                "completed results could not be serialized: {error}"
+                            )));
+                            return Ok(run.finish());
+                        }
+                    };
                     let mut recovery_messages = run.messages.clone();
                     recovery_messages.push(Message::system(RECOVERY_PROMPT));
-                    recovery_messages.push(Message::user(recovery.to_string()));
+                    recovery_messages.push(Message::user(recovery));
                     if let Err(error) = ensure_transcript(&recovery_messages, &request.agent.limits)
                     {
                         run.terminate(error);
@@ -410,6 +428,7 @@ impl<'a> StrategyRun<'a> {
             broker_state: BrokerState::default(),
             selected: requested,
             terminal: false,
+            plan_attempt: 0,
         })
     }
 
@@ -556,6 +575,7 @@ impl<'a> StrategyRun<'a> {
             ));
         }
         plan.validate(max_nodes)?;
+        self.validate_bound_authorization_topology(plan)?;
         if capabilities.limits.max_plan_bytes.is_some_and(|limit| {
             serde_json::to_vec(plan).map_or(true, |bytes| bytes.len() as u64 > limit)
         }) {
@@ -600,6 +620,44 @@ impl<'a> StrategyRun<'a> {
         Ok(())
     }
 
+    fn validate_bound_authorization_topology(
+        &self,
+        plan: &ExecutionPlan,
+    ) -> Result<(), HarnessError> {
+        let indexes = plan
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        for (node_index, node) in plan.nodes.iter().enumerate() {
+            if node.result_bindings.is_empty() {
+                continue;
+            }
+            let mut pending = node.depends_on.clone();
+            let mut visited = HashSet::new();
+            while let Some(dependency_id) = pending.pop() {
+                if !visited.insert(dependency_id.clone()) {
+                    continue;
+                }
+                let dependency_index = indexes[dependency_id.as_str()];
+                let dependency = &plan.nodes[dependency_index];
+                let dependency_tool =
+                    self.runner.tools.get(&dependency.tool_id).ok_or_else(|| {
+                        HarnessError::InvalidTool("plan selects an unknown tool".into())
+                    })?;
+                if !dependency_tool.definition().read_only {
+                    return Err(HarnessError::InvalidRequest(format!(
+                        "bound plan node {} transitively depends on a mutation",
+                        node_index + 1
+                    )));
+                }
+                pending.extend(dependency.depends_on.iter().cloned());
+            }
+        }
+        Ok(())
+    }
+
     async fn preflight_plan(
         &mut self,
         plan: &ExecutionPlan,
@@ -609,27 +667,29 @@ impl<'a> StrategyRun<'a> {
             &self.runner.tools,
             &self.runner.policy,
             &self.runner.approvals,
+            &self.runner.concurrency,
         );
+        self.plan_attempt = self.plan_attempt.checked_add(1).ok_or_else(|| {
+            HarnessError::ResourceLimit("declarative plan attempt counter overflow".into())
+        })?;
+        let plan_attempt = self.plan_attempt;
         let mut prepared_nodes = Vec::with_capacity(plan.nodes.len());
-        for node in &plan.nodes {
+        for (node_index, node) in plan.nodes.iter().enumerate() {
             let arguments_json = serde_json::to_string(&node.arguments).map_err(|error| {
                 HarnessError::InvalidArguments(format!(
                     "plan node '{}' arguments cannot be serialized: {error}",
                     node.id
                 ))
             })?;
-            let call = ToolCall::new(
-                format!("plan:{}", node.id),
-                node.tool_id.clone(),
-                arguments_json,
-            );
+            let event_id = format!("plan-{plan_attempt}-node-{}", node_index + 1);
+            let call = ToolCall::new(event_id.clone(), node.tool_id.clone(), arguments_json);
             match broker
                 .prepare(
                     self.request,
                     &mut self.result,
                     &mut self.events,
                     &mut self.broker_state,
-                    call,
+                    call.clone(),
                     ToolCaller::DeclarativePlan,
                     node.approval_barrier,
                     !node.result_bindings.is_empty(),
@@ -641,11 +701,13 @@ impl<'a> StrategyRun<'a> {
                     node: node.clone(),
                     prepared: Some(*prepared),
                     reused: None,
+                    event_id,
                 }),
                 PrepareOutcome::Reused(result) => prepared_nodes.push(PreparedNode {
                     node: node.clone(),
                     prepared: None,
-                    reused: Some(result),
+                    reused: Some((call, result)),
+                    event_id,
                 }),
                 PrepareOutcome::Rejected(_) => {
                     return Err(HarnessError::InvalidRequest(format!(
@@ -660,6 +722,58 @@ impl<'a> StrategyRun<'a> {
             node_count: plan.nodes.len() as u32,
         });
         Ok(Some(prepared_nodes))
+    }
+
+    async fn authorize_mutation_gate(
+        &mut self,
+        prepared: &mut [PreparedNode],
+        completed: &BTreeMap<String, Arc<ToolResult>>,
+        done: &HashSet<String>,
+    ) -> Result<bool, HarnessError> {
+        let broker = ToolBroker::new(
+            &self.runner.tools,
+            &self.runner.policy,
+            &self.runner.approvals,
+            &self.runner.concurrency,
+        );
+        for node in prepared.iter_mut() {
+            if done.contains(&node.node.id) || node.reused.is_some() {
+                continue;
+            }
+            let Some(call) = node.prepared.as_ref() else {
+                continue;
+            };
+            if call.tool.definition().read_only && !node.node.approval_barrier {
+                continue;
+            }
+            let arguments = bind_arguments(
+                &node.node,
+                completed,
+                self.request.agent.limits.max_tool_arguments_bytes,
+            )?;
+            let call = node.prepared.as_mut().expect("checked above");
+            let outcome = broker
+                .revalidate_bound_arguments(
+                    call,
+                    arguments,
+                    self.request,
+                    &mut self.result,
+                    &mut self.events,
+                    &mut self.broker_state,
+                    self.deadline,
+                )
+                .await?;
+            match outcome {
+                FinalizeOutcome::Ready => {}
+                FinalizeOutcome::Reused(result) => {
+                    let exact_call = call.call.clone();
+                    node.prepared = None;
+                    node.reused = Some((exact_call, result));
+                }
+                FinalizeOutcome::Stop => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     async fn execute_plan(&mut self, plan: &ExecutionPlan) -> PlanExecution {
@@ -695,14 +809,38 @@ impl<'a> StrategyRun<'a> {
         } else {
             1
         };
+        let plan_budget = self
+            .request
+            .agent
+            .limits
+            .max_transcript_bytes
+            .min(MAX_PLAN_RETAINED_BYTES);
+        let existing_transcript_bytes = self
+            .messages
+            .iter()
+            .map(Message::transcript_bytes)
+            .sum::<u64>();
+        let Some(plan_result_budget) = plan_budget.checked_sub(existing_transcript_bytes) else {
+            self.terminate(HarnessError::ResourceLimit(
+                "plan result budget is exhausted before execution".into(),
+            ));
+            return PlanExecution {
+                completed: BTreeMap::new(),
+                transcript: Vec::new(),
+                failure: Some(PlanFailureKind::Terminal),
+                effects_started: false,
+            };
+        };
         let mut completed = BTreeMap::new();
         let mut transcript = Vec::new();
+        let mut retained_bytes = 0u64;
         let mut done = HashSet::new();
         let mut wave_number = 0u32;
         let mut effects_started = false;
+        let mut mutation_gate_open = false;
 
         while done.len() < prepared.len() {
-            let ready = prepared
+            let mut ready = prepared
                 .iter()
                 .enumerate()
                 .filter(|(_, candidate)| {
@@ -727,6 +865,44 @@ impl<'a> StrategyRun<'a> {
                     effects_started,
                 };
             }
+            if !mutation_gate_open {
+                let read_ready = ready
+                    .iter()
+                    .copied()
+                    .filter(|&index| prepared_node_is_read_only(&prepared[index]))
+                    .collect::<Vec<_>>();
+                if read_ready.is_empty() {
+                    match self
+                        .authorize_mutation_gate(&mut prepared, &completed, &done)
+                        .await
+                    {
+                        Ok(true) => {
+                            mutation_gate_open = true;
+                            continue;
+                        }
+                        Ok(false) => {
+                            self.terminal = true;
+                            return PlanExecution {
+                                completed,
+                                transcript,
+                                failure: Some(PlanFailureKind::Terminal),
+                                effects_started,
+                            };
+                        }
+                        Err(error) => {
+                            let failure =
+                                self.record_plan_error(error, PlanFailureKind::Recoverable);
+                            return PlanExecution {
+                                completed,
+                                transcript,
+                                failure: Some(failure),
+                                effects_started,
+                            };
+                        }
+                    }
+                }
+                ready = read_ready;
+            }
             let wave = build_wave(&prepared, &ready, max_parallel);
             wave_number += 1;
 
@@ -734,18 +910,24 @@ impl<'a> StrategyRun<'a> {
                 &self.runner.tools,
                 &self.runner.policy,
                 &self.runner.approvals,
+                &self.runner.concurrency,
             );
             let mut executable = Vec::new();
             for &index in &wave {
-                if let Some(reused) = prepared[index].reused.take() {
-                    let call = ToolCall::new(
-                        format!("plan:{}", prepared[index].node.id),
-                        prepared[index].node.tool_id.clone(),
-                        serde_json::to_string(&prepared[index].node.arguments)
-                            .unwrap_or_else(|_| "{}".into()),
-                    );
+                if let Some((call, reused)) = prepared[index].reused.take() {
+                    if let Err(error) =
+                        reserve_plan_entry(&mut retained_bytes, plan_result_budget, &call, &reused)
+                    {
+                        self.terminate(error);
+                        return PlanExecution {
+                            completed,
+                            transcript,
+                            failure: Some(PlanFailureKind::Terminal),
+                            effects_started,
+                        };
+                    }
                     self.events.emit(RunEvent::PlanNodeCompleted {
-                        node_id: prepared[index].node.id.clone(),
+                        node_id: prepared[index].event_id.clone(),
                         tool_id: prepared[index].node.tool_id.clone(),
                         wave: wave_number,
                         ok: reused.ok,
@@ -757,7 +939,11 @@ impl<'a> StrategyRun<'a> {
                     continue;
                 }
 
-                let arguments = match bind_arguments(&prepared[index].node, &completed) {
+                let arguments = match bind_arguments(
+                    &prepared[index].node,
+                    &completed,
+                    self.request.agent.limits.max_tool_arguments_bytes,
+                ) {
                     Ok(arguments) => arguments,
                     Err(error) => {
                         let failure = self.record_plan_error(error, PlanFailureKind::Recoverable);
@@ -771,6 +957,7 @@ impl<'a> StrategyRun<'a> {
                 };
                 let node_id = prepared[index].node.id.clone();
                 let tool_id = prepared[index].node.tool_id.clone();
+                let event_id = prepared[index].event_id.clone();
                 let Some(call) = prepared[index].prepared.as_mut() else {
                     self.result.errors.push(RunError::new(
                         "plan_execution_failed",
@@ -797,7 +984,7 @@ impl<'a> StrategyRun<'a> {
                 {
                     Ok(FinalizeOutcome::Reused(reused)) => {
                         self.events.emit(RunEvent::PlanNodeCompleted {
-                            node_id: node_id.clone(),
+                            node_id: event_id,
                             tool_id,
                             wave: wave_number,
                             ok: reused.ok,
@@ -829,12 +1016,41 @@ impl<'a> StrategyRun<'a> {
                 }
             }
 
+            let mut permitted = 0usize;
+            let mut worst_case_bytes = retained_bytes;
+            for &index in &executable {
+                let call = prepared[index].prepared.as_ref().expect("checked above");
+                let entry_bytes = maximum_plan_entry_bytes(
+                    &call.call,
+                    self.request.agent.limits.max_tool_result_bytes,
+                );
+                let Some(next) = worst_case_bytes.checked_add(entry_bytes) else {
+                    break;
+                };
+                if next > plan_result_budget {
+                    break;
+                }
+                worst_case_bytes = next;
+                permitted += 1;
+            }
+            if permitted == 0 && !executable.is_empty() {
+                self.terminate(HarnessError::ResourceLimit(
+                    "aggregate plan result budget is exhausted before the next wave".into(),
+                ));
+                return PlanExecution {
+                    completed,
+                    transcript,
+                    failure: Some(PlanFailureKind::Terminal),
+                    effects_started,
+                };
+            }
+            executable.truncate(permitted);
             effects_started |= !executable.is_empty();
             for &index in &executable {
                 let call = prepared[index].prepared.as_ref().expect("checked above");
                 broker.mark_dispatched(&mut self.broker_state, call);
                 self.events.emit(RunEvent::PlanNodeStarted {
-                    node_id: prepared[index].node.id.clone(),
+                    node_id: prepared[index].event_id.clone(),
                     tool_id: call.call.tool_id.clone(),
                     wave: wave_number,
                 });
@@ -859,7 +1075,7 @@ impl<'a> StrategyRun<'a> {
                             ok: execution.result.ok,
                         });
                         self.events.emit(RunEvent::PlanNodeCompleted {
-                            node_id: prepared[index].node.id.clone(),
+                            node_id: prepared[index].event_id.clone(),
                             tool_id: call.call.tool_id.clone(),
                             wave: wave_number,
                             ok: execution.result.ok,
@@ -880,10 +1096,25 @@ impl<'a> StrategyRun<'a> {
                             ));
                             wave_failure.get_or_insert(PlanFailureKind::Recoverable);
                         } else {
-                            completed
-                                .insert(prepared[index].node.id.clone(), execution.result.clone());
-                            transcript.push((call.call.clone(), execution.result));
-                            done.insert(prepared[index].node.id.clone());
+                            match reserve_plan_entry(
+                                &mut retained_bytes,
+                                plan_result_budget,
+                                &call.call,
+                                &execution.result,
+                            ) {
+                                Ok(()) => {
+                                    completed.insert(
+                                        prepared[index].node.id.clone(),
+                                        Arc::clone(&execution.result),
+                                    );
+                                    transcript.push((call.call.clone(), execution.result));
+                                    done.insert(prepared[index].node.id.clone());
+                                }
+                                Err(error) => {
+                                    self.terminate(error);
+                                    wave_failure = Some(PlanFailureKind::Terminal);
+                                }
+                            }
                         }
                     }
                     Err(error) => {
@@ -894,7 +1125,7 @@ impl<'a> StrategyRun<'a> {
                             ok: false,
                         });
                         self.events.emit(RunEvent::PlanNodeCompleted {
-                            node_id: prepared[index].node.id.clone(),
+                            node_id: prepared[index].event_id.clone(),
                             tool_id: call.call.tool_id.clone(),
                             wave: wave_number,
                             ok: false,
@@ -929,7 +1160,7 @@ impl<'a> StrategyRun<'a> {
 
     fn append_plan_transcript(
         &mut self,
-        entries: &[(ToolCall, ToolResult)],
+        entries: &[(ToolCall, Arc<ToolResult>)],
     ) -> Result<(), HarnessError> {
         if entries.is_empty() {
             return Ok(());
@@ -949,6 +1180,7 @@ impl<'a> StrategyRun<'a> {
             &self.runner.tools,
             &self.runner.policy,
             &self.runner.approvals,
+            &self.runner.concurrency,
         );
         loop {
             if self.terminal {
@@ -1091,7 +1323,8 @@ impl<'a> StrategyRun<'a> {
                         }
                         execution.result
                     }
-                    PrepareOutcome::Rejected(result) | PrepareOutcome::Reused(result) => result,
+                    PrepareOutcome::Rejected(result) => Arc::new(result),
+                    PrepareOutcome::Reused(result) => result,
                     PrepareOutcome::Stop => {
                         self.terminal = true;
                         return;
@@ -1148,11 +1381,50 @@ fn build_wave(prepared: &[PreparedNode], ready: &[usize], max_parallel: usize) -
     wave
 }
 
+fn prepared_node_is_read_only(node: &PreparedNode) -> bool {
+    node.prepared
+        .as_ref()
+        .is_some_and(|call| call.tool.definition().read_only)
+}
+
 fn is_terminal_failure(error: &HarnessError) -> bool {
     matches!(
         error,
         HarnessError::Cancelled | HarnessError::TimedOut(_) | HarnessError::ResourceLimit(_)
     )
+}
+
+fn maximum_plan_entry_bytes(call: &ToolCall, max_tool_result_bytes: u64) -> u64 {
+    (call.id.len() as u64)
+        .saturating_mul(2)
+        .saturating_add(call.tool_id.len() as u64)
+        .saturating_add(call.arguments_json.len() as u64)
+        .saturating_add(max_tool_result_bytes)
+}
+
+fn reserve_plan_entry(
+    retained_bytes: &mut u64,
+    budget: u64,
+    call: &ToolCall,
+    result: &ToolResult,
+) -> Result<(), HarnessError> {
+    let result_bytes = serialized_len(result)?;
+    let entry_bytes = (call.id.len() as u64)
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(call.tool_id.len() as u64))
+        .and_then(|bytes| bytes.checked_add(call.arguments_json.len() as u64))
+        .and_then(|bytes| bytes.checked_add(result_bytes))
+        .ok_or_else(|| HarnessError::ResourceLimit("plan result budget overflow".into()))?;
+    let next = retained_bytes
+        .checked_add(entry_bytes)
+        .ok_or_else(|| HarnessError::ResourceLimit("plan result budget overflow".into()))?;
+    if next > budget {
+        return Err(HarnessError::ResourceLimit(format!(
+            "aggregate plan results exceed {budget} bytes"
+        )));
+    }
+    *retained_bytes = next;
+    Ok(())
 }
 
 fn parallel_eligible(node: &PreparedNode) -> bool {
@@ -1171,8 +1443,45 @@ fn parallel_eligible(node: &PreparedNode) -> bool {
 
 fn bind_arguments(
     node: &PlanNode,
-    completed: &BTreeMap<String, ToolResult>,
+    completed: &BTreeMap<String, Arc<ToolResult>>,
+    max_arguments_bytes: u64,
 ) -> Result<Value, HarnessError> {
+    let copy_budget = max_arguments_bytes.min(MAX_PLAN_ARGUMENT_BYTES as u64);
+    let mut projected_bytes = serialized_len(&node.arguments)?;
+    for binding in &node.result_bindings {
+        let source = completed.get(&binding.source.node_id).ok_or_else(|| {
+            HarnessError::InvalidArguments(format!(
+                "plan node '{}' cannot bind missing result '{}'",
+                node.id, binding.source.node_id
+            ))
+        })?;
+        let value = source
+            .output
+            .pointer(&binding.source.output_pointer)
+            .ok_or_else(|| {
+                HarnessError::InvalidArguments(format!(
+                    "plan node '{}' source pointer did not resolve",
+                    node.id
+                ))
+            })?;
+        if node.arguments.pointer(&binding.target_pointer).is_none() {
+            return Err(HarnessError::InvalidArguments(format!(
+                "plan node '{}' target pointer did not resolve",
+                node.id
+            )));
+        }
+        projected_bytes = projected_bytes
+            .checked_add(serialized_len(value)?)
+            .ok_or_else(|| {
+                HarnessError::ResourceLimit("bound argument copy budget overflow".into())
+            })?;
+        if projected_bytes > copy_budget {
+            return Err(HarnessError::ResourceLimit(format!(
+                "bound argument copies exceed {copy_budget} bytes"
+            )));
+        }
+    }
+
     let mut arguments = node.arguments.clone();
     for binding in &node.result_bindings {
         let source = completed.get(&binding.source.node_id).ok_or_else(|| {

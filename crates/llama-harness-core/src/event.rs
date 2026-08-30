@@ -96,7 +96,7 @@ pub enum RunEvent {
     },
     /// A declarative plan node started execution.
     PlanNodeStarted {
-        /// Stable node identifier from the validated plan.
+        /// Runner-generated opaque node identifier; never model-provided text.
         node_id: String,
         /// Registered tool identifier.
         tool_id: String,
@@ -105,7 +105,7 @@ pub enum RunEvent {
     },
     /// A declarative plan node completed execution.
     PlanNodeCompleted {
-        /// Stable node identifier from the validated plan.
+        /// Runner-generated opaque node identifier; never model-provided text.
         node_id: String,
         /// Registered tool identifier.
         tool_id: String,

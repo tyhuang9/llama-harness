@@ -1,6 +1,6 @@
 use crate::{
     agent::{RunRequest, RunResult, RunStatus},
-    broker::{BrokerState, PrepareOutcome, ToolBroker},
+    broker::{BrokerState, PrepareOutcome, ToolBroker, ToolConcurrencyLimiter},
     event::{EventEmitter, EventSink, InMemoryEventSink, RunEvent},
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len, AgentLimits},
     message::Message,
@@ -27,6 +27,7 @@ pub struct AgentRunner {
     pub(crate) policy: Arc<dyn PolicyEngine>,
     pub(crate) approvals: Arc<dyn ApprovalHandler>,
     pub(crate) events: Arc<dyn EventSink>,
+    pub(crate) concurrency: Arc<ToolConcurrencyLimiter>,
 }
 
 /// Configures an [`AgentRunner`] and its policy, approval, tool, and event integrations.
@@ -36,6 +37,7 @@ pub struct AgentRunnerBuilder {
     policy: Arc<dyn PolicyEngine>,
     approvals: Arc<dyn ApprovalHandler>,
     events: Arc<dyn EventSink>,
+    concurrency: Arc<ToolConcurrencyLimiter>,
 }
 
 impl AgentRunner {
@@ -47,6 +49,7 @@ impl AgentRunner {
             policy: Arc::new(SafeDefaultPolicy),
             approvals: Arc::new(DenyApproval),
             events: Arc::new(InMemoryEventSink::default()),
+            concurrency: Arc::new(ToolConcurrencyLimiter::default()),
         }
     }
 
@@ -109,7 +112,12 @@ impl AgentRunner {
         let mut model_calls = 0;
         let mut broker_state = BrokerState::default();
         let mut output_repairs = 0;
-        let broker = ToolBroker::new(&self.tools, &self.policy, &self.approvals);
+        let broker = ToolBroker::new(
+            &self.tools,
+            &self.policy,
+            &self.approvals,
+            &self.concurrency,
+        );
 
         'run: loop {
             if let Err(error) =
@@ -324,7 +332,15 @@ impl AgentRunner {
                             break 'run;
                         }
                     }
-                    PrepareOutcome::Rejected(failure) | PrepareOutcome::Reused(failure) => {
+                    PrepareOutcome::Rejected(failure) => {
+                        if let Err(error) =
+                            push_tool_message(&mut messages, &call, &failure, &request.agent.limits)
+                        {
+                            apply_terminal_error(&mut result, error);
+                            break 'run;
+                        }
+                    }
+                    PrepareOutcome::Reused(failure) => {
                         if let Err(error) =
                             push_tool_message(&mut messages, &call, &failure, &request.agent.limits)
                         {
@@ -438,6 +454,7 @@ impl AgentRunnerBuilder {
             policy: self.policy,
             approvals: self.approvals,
             events: self.events,
+            concurrency: self.concurrency,
         }
     }
 }

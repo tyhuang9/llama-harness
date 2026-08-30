@@ -5,10 +5,43 @@ use crate::{
     RunResult, RunStatus, Tool, ToolCall, ToolCallContext, ToolCaller, ToolRegistry, ToolResult,
 };
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc, time::Instant as StdInstant};
-use tokio::time::Instant;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+    time::Instant as StdInstant,
+};
+use tokio::{
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
 
 use crate::event::EventEmitter;
+
+/// Runner-wide keyed permits shared by direct and planned invocations.
+#[derive(Default)]
+pub(crate) struct ToolConcurrencyLimiter {
+    keyed: Mutex<HashMap<String, Weak<Semaphore>>>,
+}
+
+impl ToolConcurrencyLimiter {
+    async fn acquire(&self, key: &str) -> Result<OwnedSemaphorePermit, HarnessError> {
+        let semaphore = {
+            let mut keyed = self.keyed.lock().await;
+            keyed.retain(|_, semaphore| semaphore.strong_count() > 0);
+            if let Some(semaphore) = keyed.get(key).and_then(Weak::upgrade) {
+                semaphore
+            } else {
+                let semaphore = Arc::new(Semaphore::new(1));
+                keyed.insert(key.to_owned(), Arc::downgrade(&semaphore));
+                semaphore
+            }
+        };
+        semaphore
+            .acquire_owned()
+            .await
+            .map_err(|_| HarnessError::Tool("tool concurrency permit closed".into()))
+    }
+}
 
 /// Per-run counters and effect records shared by every tool-calling strategy.
 #[derive(Default)]
@@ -35,7 +68,7 @@ impl BrokerState {
 enum EffectRecord {
     Dispatched,
     Uncertain,
-    Completed(ToolResult),
+    Completed(Arc<ToolResult>),
 }
 
 /// A completely validated and authorized invocation ready to execute.
@@ -55,20 +88,20 @@ pub(crate) struct PreparedCall {
 pub(crate) enum PrepareOutcome {
     Ready(Box<PreparedCall>),
     Rejected(ToolResult),
-    Reused(ToolResult),
+    Reused(Arc<ToolResult>),
     Stop,
 }
 
 /// Result of resolving and authorizing a call whose arguments contain bindings.
 pub(crate) enum FinalizeOutcome {
     Ready,
-    Reused(ToolResult),
+    Reused(Arc<ToolResult>),
     Stop,
 }
 
 /// Result of executing one prepared invocation.
 pub(crate) struct BrokerExecution {
-    pub(crate) result: ToolResult,
+    pub(crate) result: Arc<ToolResult>,
     pub(crate) validation_error: Option<RunError>,
     pub(crate) duration_ms: u64,
 }
@@ -78,6 +111,7 @@ pub(crate) struct ToolBroker<'a> {
     tools: &'a ToolRegistry,
     policy: &'a Arc<dyn PolicyEngine>,
     approvals: &'a Arc<dyn ApprovalHandler>,
+    concurrency: &'a Arc<ToolConcurrencyLimiter>,
 }
 
 impl<'a> ToolBroker<'a> {
@@ -85,11 +119,13 @@ impl<'a> ToolBroker<'a> {
         tools: &'a ToolRegistry,
         policy: &'a Arc<dyn PolicyEngine>,
         approvals: &'a Arc<dyn ApprovalHandler>,
+        concurrency: &'a Arc<ToolConcurrencyLimiter>,
     ) -> Self {
         Self {
             tools,
             policy,
             approvals,
+            concurrency,
         }
     }
 
@@ -378,7 +414,7 @@ impl<'a> ToolBroker<'a> {
         call: &ToolCall,
         read_only: bool,
         signature: &str,
-    ) -> Result<Option<ToolResult>, HarnessError> {
+    ) -> Result<Option<Arc<ToolResult>>, HarnessError> {
         if !state.reuse_committed_effects || read_only {
             return Ok(None);
         }
@@ -470,6 +506,25 @@ impl<'a> ToolBroker<'a> {
             "run deadline reached before tool invocation",
         )?;
         let started = StdInstant::now();
+        let _concurrency_permit = if let Some(key) = &prepared.tool.definition().concurrency_key {
+            Some(
+                await_guarded(
+                    self.concurrency.acquire(key),
+                    &request.cancellation,
+                    deadline,
+                    "tool concurrency wait exceeded run deadline",
+                    None,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        check_stopped(
+            &request.cancellation,
+            deadline,
+            "run deadline reached while waiting for tool concurrency",
+        )?;
         let tool_cancellation = request.cancellation.child_token();
         let execution = prepared.tool.execute_with_context(
             &prepared.context,
@@ -510,7 +565,7 @@ impl<'a> ToolBroker<'a> {
         };
 
         Ok(BrokerExecution {
-            result: tool_result,
+            result: Arc::new(tool_result),
             validation_error,
             duration_ms: started.elapsed().as_millis() as u64,
         })
@@ -549,7 +604,7 @@ impl<'a> ToolBroker<'a> {
         }
         if let Some(signature) = &prepared.signature {
             let record = if execution.result.ok && execution.validation_error.is_none() {
-                EffectRecord::Completed(execution.result.clone())
+                EffectRecord::Completed(Arc::clone(&execution.result))
             } else {
                 EffectRecord::Uncertain
             };
