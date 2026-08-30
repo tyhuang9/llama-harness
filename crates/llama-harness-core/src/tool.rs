@@ -469,12 +469,20 @@ impl ToolRegistry {
     }
 
     pub(crate) fn allowed_definitions(&self, allowlist: &[String]) -> Vec<ToolDefinition> {
+        self.allowed_definitions_for(allowlist, ToolCaller::Direct)
+    }
+
+    pub(crate) fn allowed_definitions_for(
+        &self,
+        allowlist: &[String],
+        caller: ToolCaller,
+    ) -> Vec<ToolDefinition> {
         allowlist
             .iter()
             .filter_map(|id| {
                 self.tools
                     .get(id)
-                    .filter(|entry| entry.tool.definition().allows_caller(ToolCaller::Direct))
+                    .filter(|entry| entry.tool.definition().allows_caller(caller))
                     .map(|entry| entry.tool.definition().clone())
             })
             .collect()

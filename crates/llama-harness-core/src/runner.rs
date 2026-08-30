@@ -1,17 +1,17 @@
 use crate::{
     agent::{RunRequest, RunResult, RunStatus},
+    broker::{BrokerState, PrepareOutcome, ToolBroker},
     event::{EventEmitter, EventSink, InMemoryEventSink, RunEvent},
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len, AgentLimits},
     message::Message,
     model::{ModelProvider, ModelRequest, ModelResponse},
-    policy::{ApprovalHandler, DenyApproval, PolicyDecision, PolicyEngine, SafeDefaultPolicy},
-    tool::{Tool, ToolCall, ToolCallContext, ToolCaller, ToolRegistry, ToolResult},
+    policy::{ApprovalHandler, DenyApproval, PolicyEngine, SafeDefaultPolicy},
+    tool::{ToolCall, ToolCaller, ToolRegistry, ToolResult},
     GenerationOptions, HarnessError, RunError,
 };
 use jsonschema::Validator;
 use serde_json::Value;
 use std::{
-    collections::HashMap,
     future::Future,
     sync::Arc,
     time::{Duration, Instant as StdInstant},
@@ -91,9 +91,9 @@ impl AgentRunner {
 
         let mut messages = initial_messages(&request);
         let mut model_calls = 0;
-        let mut tool_calls = 0;
+        let mut broker_state = BrokerState::default();
         let mut output_repairs = 0;
-        let mut identical_calls: HashMap<String, u32> = HashMap::new();
+        let broker = ToolBroker::new(&self.tools, &self.policy, &self.approvals);
 
         'run: loop {
             if let Err(error) =
@@ -243,304 +243,77 @@ impl AgentRunner {
                 break;
             }
 
-            for (call, recorded_call) in response.tool_calls.into_iter().zip(recorded_calls) {
-                if let Err(error) =
-                    check_stopped(&request.cancellation, deadline, "run deadline reached")
-                {
-                    apply_terminal_error(&mut result, error);
-                    break 'run;
-                }
-                if tool_calls >= request.agent.limits.max_tool_calls {
-                    result.status = RunStatus::LimitReached;
-                    result.tool_call_limit_reached = true;
-                    result.errors.push(RunError {
-                        code: "tool_call_limit".into(),
-                        message: "tool call limit reached".into(),
-                    });
-                    break 'run;
-                }
-                tool_calls += 1;
-                result.tool_calls.push(recorded_call);
-
-                if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes
-                {
-                    self.reject(
-                        &mut result,
-                        &mut events,
-                        &call,
-                        format!(
-                            "tool arguments exceed {} bytes",
-                            request.agent.limits.max_tool_arguments_bytes
-                        ),
-                    );
-                    if let Err(error) = push_tool_message(
-                        &mut messages,
-                        &call,
-                        &ToolResult::failure("tool arguments exceed byte limit"),
-                        &request.agent.limits,
-                    ) {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                    continue;
-                }
-
-                let arguments: Value = match serde_json::from_str(&call.arguments_json) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        self.reject(
-                            &mut result,
-                            &mut events,
-                            &call,
-                            format!("malformed JSON: {error}"),
-                        );
-                        if let Err(error) = push_tool_message(
-                            &mut messages,
-                            &call,
-                            &ToolResult::failure("malformed tool arguments"),
-                            &request.agent.limits,
-                        ) {
-                            apply_terminal_error(&mut result, error);
-                            break 'run;
-                        }
-                        continue;
-                    }
-                };
-                if let Err(error) = ensure_json_depth(
-                    "tool arguments",
-                    &arguments,
-                    request.agent.limits.max_json_depth,
-                ) {
-                    self.reject(&mut result, &mut events, &call, error.to_string());
-                    if let Err(error) = push_tool_message(
-                        &mut messages,
-                        &call,
-                        &ToolResult::failure("tool arguments exceed JSON depth limit"),
-                        &request.agent.limits,
-                    ) {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                    continue;
-                }
-
-                let signature = format!("{}:{}", call.tool_id, canonical_json(&arguments));
-                let count = identical_calls.entry(signature).or_default();
-                *count += 1;
-                if *count > request.agent.limits.max_identical_tool_calls {
-                    result.status = RunStatus::LimitReached;
-                    result.repeated_tool_call_limit_reached = true;
-                    result.errors.push(RunError {
-                        code: "repeated_tool_call_limit".into(),
-                        message: "repeated identical tool call limit reached".into(),
-                    });
-                    break 'run;
-                }
-
-                let Some(tool) = self.tools.get(&call.tool_id) else {
-                    self.reject(&mut result, &mut events, &call, "unknown tool".into());
-                    if let Err(error) = push_tool_message(
-                        &mut messages,
-                        &call,
-                        &ToolResult::failure("unknown tool"),
-                        &request.agent.limits,
-                    ) {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                    continue;
-                };
-                if !request
-                    .agent
-                    .tool_allowlist
-                    .iter()
-                    .any(|id| id == &call.tool_id)
-                {
-                    self.reject(
-                        &mut result,
-                        &mut events,
-                        &call,
-                        "tool is not allowed for agent".into(),
-                    );
-                    if let Err(error) = push_tool_message(
-                        &mut messages,
-                        &call,
-                        &ToolResult::failure("tool is not allowed"),
-                        &request.agent.limits,
-                    ) {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                    continue;
-                }
-                if !tool.definition().allows_caller(ToolCaller::Direct) {
-                    self.reject(
-                        &mut result,
-                        &mut events,
-                        &call,
-                        "tool does not allow direct calls".into(),
-                    );
-                    if let Err(error) = push_tool_message(
-                        &mut messages,
-                        &call,
-                        &ToolResult::failure("tool does not allow direct calls"),
-                        &request.agent.limits,
-                    ) {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                    continue;
-                }
-                if let Err(error) = self.tools.validate(&call.tool_id, &arguments) {
-                    self.reject(&mut result, &mut events, &call, error.to_string());
-                    if let Err(error) = push_tool_message(
-                        &mut messages,
-                        &call,
-                        &ToolResult::failure("tool arguments failed validation"),
-                        &request.agent.limits,
-                    ) {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                    continue;
-                }
-
-                let context = ToolCallContext {
-                    run_id: result.id.clone(),
-                    trace_id: result.trace_id.clone(),
-                    call_id: call.id.clone(),
-                    tool_id: call.tool_id.clone(),
-                };
-                let decision = match await_guarded(
-                    self.policy.decide_with_context(
-                        &context,
-                        tool.definition(),
-                        &arguments,
+            for call in response.tool_calls {
+                let outcome = match broker
+                    .prepare(
                         &request,
-                    ),
-                    &request.cancellation,
-                    deadline,
-                    "policy decision exceeded run deadline",
-                    None,
-                )
-                .await
+                        &mut result,
+                        &mut events,
+                        &mut broker_state,
+                        call.clone(),
+                        ToolCaller::Direct,
+                        false,
+                        deadline,
+                    )
+                    .await
                 {
-                    Ok(decision) => decision,
+                    Ok(outcome) => outcome,
                     Err(error) => {
                         apply_terminal_error(&mut result, error);
                         break 'run;
                     }
                 };
-                events.emit(RunEvent::PolicyDecided {
-                    call_id: call.id.clone(),
-                    decision: decision.clone(),
-                });
-                result.policy_decisions.push(decision.clone());
-
-                match decision {
-                    PolicyDecision::Deny { reason } => {
-                        self.reject(
-                            &mut result,
-                            &mut events,
-                            &call,
-                            format!("policy denied: {reason}"),
-                        );
-                        if let Err(error) = push_tool_message(
-                            &mut messages,
-                            &call,
-                            &ToolResult::failure("policy denied"),
-                            &request.agent.limits,
-                        ) {
-                            apply_terminal_error(&mut result, error);
-                            break 'run;
-                        }
-                    }
-                    PolicyDecision::RequireApproval { .. } => {
-                        events.emit(RunEvent::ApprovalRequested {
-                            call_id: call.id.clone(),
-                            tool_id: call.tool_id.clone(),
-                        });
-                        let mut approval = match await_guarded(
-                            self.approvals.approve_with_context(
-                                &context,
-                                tool.definition(),
-                                &arguments,
-                                &request,
-                            ),
-                            &request.cancellation,
-                            deadline,
-                            "approval exceeded run deadline",
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(approval) => approval,
+                match outcome {
+                    PrepareOutcome::Ready(prepared) => {
+                        let execution = match broker.execute(&prepared, &request, deadline).await {
+                            Ok(execution) => execution,
                             Err(error) => {
+                                events.emit(RunEvent::ToolCompleted {
+                                    call_id: call.id.clone(),
+                                    tool_id: call.tool_id.clone(),
+                                    ok: false,
+                                });
                                 apply_terminal_error(&mut result, error);
                                 break 'run;
                             }
                         };
-                        approval.call_id = call.id.clone();
-                        approval.tool_id = call.tool_id.clone();
-                        let granted = approval.granted;
-                        result.approvals.push(approval.clone());
-                        if granted {
-                            if let Err(error) = self
-                                .run_tool(
-                                    &mut result,
-                                    &mut events,
-                                    &mut messages,
-                                    &call,
-                                    tool,
-                                    &context,
-                                    arguments,
-                                    &request.cancellation,
-                                    deadline,
-                                    &request.agent.limits,
-                                )
-                                .await
-                            {
-                                apply_terminal_error(&mut result, error);
-                                break 'run;
-                            }
-                        } else {
-                            self.reject(
-                                &mut result,
-                                &mut events,
-                                &call,
-                                format!("approval denied: {}", approval.reason),
-                            );
-                            if let Err(error) = push_tool_message(
-                                &mut messages,
-                                &call,
-                                &ToolResult::failure("approval denied"),
-                                &request.agent.limits,
-                            ) {
-                                apply_terminal_error(&mut result, error);
-                                break 'run;
-                            }
+                        events.emit(RunEvent::ToolCompleted {
+                            call_id: call.id.clone(),
+                            tool_id: call.tool_id.clone(),
+                            ok: execution.result.ok,
+                        });
+                        broker.record_execution(&mut broker_state, &prepared, &execution);
+                        if let Some(error) = execution.validation_error {
+                            result.errors.push(error);
+                        } else if !execution.result.ok {
+                            result.errors.push(RunError::new(
+                                "tool_error",
+                                execution
+                                    .result
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "tool returned a failure result".into()),
+                            ));
+                        }
+                        if let Err(error) = push_tool_message(
+                            &mut messages,
+                            &call,
+                            &execution.result,
+                            &request.agent.limits,
+                        ) {
+                            apply_terminal_error(&mut result, error);
+                            break 'run;
                         }
                     }
-                    PolicyDecision::Allow { .. } => {
-                        if let Err(error) = self
-                            .run_tool(
-                                &mut result,
-                                &mut events,
-                                &mut messages,
-                                &call,
-                                tool,
-                                &context,
-                                arguments,
-                                &request.cancellation,
-                                deadline,
-                                &request.agent.limits,
-                            )
-                            .await
+                    PrepareOutcome::Rejected(failure) | PrepareOutcome::Reused(failure) => {
+                        if let Err(error) =
+                            push_tool_message(&mut messages, &call, &failure, &request.agent.limits)
                         {
                             apply_terminal_error(&mut result, error);
                             break 'run;
                         }
                     }
+                    PrepareOutcome::Stop => break 'run,
                 }
             }
         }
@@ -550,24 +323,6 @@ impl AgentRunner {
             status: result.status.clone(),
         });
         Ok(result)
-    }
-
-    fn reject(
-        &self,
-        result: &mut RunResult,
-        events: &mut EventEmitter,
-        call: &ToolCall,
-        reason: String,
-    ) {
-        events.emit(RunEvent::ToolRejected {
-            call_id: call.id.clone(),
-            tool_id: call.tool_id.clone(),
-            reason: reason.clone(),
-        });
-        result.errors.push(RunError {
-            code: "tool_rejected".into(),
-            message: reason,
-        });
     }
 
     fn tool_calls_for_transcript(&self, request: &RunRequest, calls: &[ToolCall]) -> Vec<ToolCall> {
@@ -609,106 +364,6 @@ impl AgentRunner {
             .any(|id| id == &call.tool_id)
             && tool.definition().allows_caller(ToolCaller::Direct)
             && self.tools.validate(&call.tool_id, &arguments).is_ok()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn run_tool(
-        &self,
-        run: &mut RunResult,
-        events: &mut EventEmitter,
-        messages: &mut Vec<Message>,
-        call: &ToolCall,
-        tool: Arc<dyn Tool>,
-        context: &ToolCallContext,
-        arguments: Value,
-        cancellation: &CancellationToken,
-        deadline: Option<Instant>,
-        limits: &AgentLimits,
-    ) -> Result<(), HarnessError> {
-        // This check closes the cancellation window between policy/approval and invocation.
-        check_stopped(
-            cancellation,
-            deadline,
-            "run deadline reached before tool invocation",
-        )?;
-        let tool_cancellation = cancellation.child_token();
-        let execution = tool.execute_with_context(context, arguments, tool_cancellation.clone());
-        let tool_result = await_guarded(
-            execution,
-            cancellation,
-            deadline,
-            "tool execution exceeded run deadline",
-            Some(&tool_cancellation),
-        )
-        .await;
-
-        let tool_result = match tool_result {
-            Ok(tool_result) => tool_result,
-            Err(error) => {
-                events.emit(RunEvent::ToolCompleted {
-                    call_id: call.id.clone(),
-                    tool_id: call.tool_id.clone(),
-                    ok: false,
-                });
-                return Err(error);
-            }
-        };
-        if serialized_len(&tool_result)? > limits.max_tool_result_bytes {
-            events.emit(RunEvent::ToolCompleted {
-                call_id: call.id.clone(),
-                tool_id: call.tool_id.clone(),
-                ok: false,
-            });
-            return Err(HarnessError::ResourceLimit(format!(
-                "tool result exceeds {} bytes",
-                limits.max_tool_result_bytes
-            )));
-        }
-        if let Err(error) =
-            ensure_json_depth("tool result", &tool_result.output, limits.max_json_depth)
-        {
-            events.emit(RunEvent::ToolCompleted {
-                call_id: call.id.clone(),
-                tool_id: call.tool_id.clone(),
-                ok: false,
-            });
-            return Err(error);
-        }
-        if tool_result.ok {
-            if let Err(error) = self
-                .tools
-                .validate_output(&call.tool_id, &tool_result.output)
-            {
-                events.emit(RunEvent::ToolCompleted {
-                    call_id: call.id.clone(),
-                    tool_id: call.tool_id.clone(),
-                    ok: false,
-                });
-                let failure = ToolResult::failure("tool output failed validation");
-                push_tool_message(messages, call, &failure, limits)?;
-                run.errors.push(RunError {
-                    code: "tool_error".into(),
-                    message: error.to_string(),
-                });
-                return Ok(());
-            }
-        }
-        events.emit(RunEvent::ToolCompleted {
-            call_id: call.id.clone(),
-            tool_id: call.tool_id.clone(),
-            ok: tool_result.ok,
-        });
-        push_tool_message(messages, call, &tool_result, limits)?;
-        if !tool_result.ok {
-            run.errors.push(RunError {
-                code: "tool_error".into(),
-                message: tool_result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "tool returned a failure result".into()),
-            });
-        }
-        Ok(())
     }
 }
 
@@ -934,7 +589,7 @@ fn provider_deadline(
     }
 }
 
-fn check_stopped(
+pub(crate) fn check_stopped(
     cancellation: &CancellationToken,
     deadline: Option<Instant>,
     timeout_message: &str,
@@ -948,7 +603,7 @@ fn check_stopped(
     Ok(())
 }
 
-async fn await_guarded<T, F>(
+pub(crate) async fn await_guarded<T, F>(
     future: F,
     cancellation: &CancellationToken,
     deadline: Option<Instant>,
@@ -997,8 +652,4 @@ fn merge_generation(
             .max_output_tokens
             .or(base.max_output_tokens),
     }
-}
-
-fn canonical_json(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_default()
 }

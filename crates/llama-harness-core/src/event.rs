@@ -1,4 +1,4 @@
-use crate::{PolicyDecision, RunStatus};
+use crate::{PolicyDecision, RunStatus, RunStrategy};
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{Arc, Mutex},
@@ -71,6 +71,69 @@ pub enum RunEvent {
         /// Model call number that returned.
         call_number: u32,
     },
+    /// The runner selected an execution strategy using metadata-only inputs.
+    StrategySelected {
+        /// Strategy requested by the host.
+        requested: RunStrategy,
+        /// Strategy selected for execution.
+        selected: RunStrategy,
+        /// Stable reason for the selection.
+        reason: StrategySelectionReason,
+    },
+    /// The runner fell back from one strategy to another.
+    StrategyFallback {
+        /// Strategy that could not continue.
+        from: RunStrategy,
+        /// Safe fallback strategy.
+        to: RunStrategy,
+        /// Stable reason for the fallback.
+        reason: StrategyFallbackReason,
+    },
+    /// A complete declarative plan passed structural and execution preflight.
+    PlanValidated {
+        /// Number of validated plan nodes.
+        node_count: u32,
+    },
+    /// A declarative plan node started execution.
+    PlanNodeStarted {
+        /// Stable node identifier from the validated plan.
+        node_id: String,
+        /// Registered tool identifier.
+        tool_id: String,
+        /// One-based deterministic execution wave.
+        wave: u32,
+    },
+    /// A declarative plan node completed execution.
+    PlanNodeCompleted {
+        /// Stable node identifier from the validated plan.
+        node_id: String,
+        /// Registered tool identifier.
+        tool_id: String,
+        /// One-based deterministic execution wave.
+        wave: u32,
+        /// Whether the node returned a successful validated result.
+        ok: bool,
+        /// Elapsed node execution time in milliseconds.
+        duration_ms: u64,
+    },
+    /// A previously committed effect was reused instead of being invoked again.
+    ToolEffectReused {
+        /// Identifier of the call receiving the recorded result.
+        call_id: String,
+        /// Registered tool identifier.
+        tool_id: String,
+    },
+    /// Aggregate metadata-only strategy usage for the completed run.
+    StrategyUsage {
+        /// Strategy that performed the run's final execution path.
+        strategy: RunStrategy,
+        /// Number of provider calls issued.
+        model_calls: u32,
+        /// Number of concrete tool calls accepted by the broker.
+        tool_calls: u32,
+        /// Elapsed run duration in milliseconds.
+        duration_ms: u64,
+    },
     /// A tool call was rejected before execution.
     ToolRejected {
         /// Identifier of the rejected call.
@@ -108,6 +171,36 @@ pub enum RunEvent {
         /// Terminal run status.
         status: RunStatus,
     },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Stable, value-free reason for selecting an execution strategy.
+pub enum StrategySelectionReason {
+    /// The host explicitly forced the selected strategy.
+    Forced,
+    /// Provider capabilities permit adaptive declarative planning.
+    AdaptivePlanner,
+    /// The provider-directed planner selected direct reactive execution.
+    PlannerSelectedDirect,
+    /// The provider-directed planner selected a declarative plan.
+    PlannerSelectedPlan,
+    /// Provider capabilities require the direct compatibility path.
+    CapabilityDowngrade,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Stable, value-free reason for a strategy fallback.
+pub enum StrategyFallbackReason {
+    /// The provider does not support structured plan generation.
+    UnsupportedCapability,
+    /// A generated plan remained invalid after one repair attempt.
+    InvalidPlan,
+    /// Execution failed after some node results were safely recorded.
+    ExecutionRecovery,
 }
 
 /// Receives ordered events from an agent runner.

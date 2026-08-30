@@ -4,6 +4,7 @@
 
 mod agent;
 mod agent_manifest;
+mod broker;
 mod error;
 mod event;
 mod limits;
@@ -26,7 +27,10 @@ pub use agent_manifest::{
     AGENT_MANIFEST_VERSION,
 };
 pub use error::{HarnessError, ModelStreamFailureKind, RunError};
-pub use event::{EventRecord, EventSink, InMemoryEventSink, RunEvent};
+pub use event::{
+    EventRecord, EventSink, InMemoryEventSink, RunEvent, StrategyFallbackReason,
+    StrategySelectionReason,
+};
 pub use limits::{AgentLimits, GenerationOptions};
 pub use message::{Message, MessageRole};
 pub use model::{
