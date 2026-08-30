@@ -125,6 +125,46 @@ pub enum SpeculationPolicy {
     Enabled,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Guarantee that merely issuing a tool cannot create externally visible effects.
+pub enum IssueSafety {
+    /// No issue-time safety guarantee has been made.
+    #[default]
+    Unknown,
+    /// Issuing the tool is guaranteed not to create externally visible effects.
+    Guaranteed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Execution location relevant to speculative privacy guarantees.
+pub enum ExecutionLocation {
+    /// The execution location has not been declared.
+    #[default]
+    Unknown,
+    /// Execution is confined to a local, private environment.
+    LocalPrivate,
+    /// Execution may occur in a remote environment.
+    Remote,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Network-egress behavior relevant to speculative privacy guarantees.
+pub enum NetworkEgress {
+    /// Network-egress behavior has not been declared.
+    #[default]
+    Unknown,
+    /// The tool is guaranteed not to perform network egress.
+    Prohibited,
+    /// The tool may perform network egress.
+    Permitted,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 /// Description and safety metadata for a registered tool.
 pub struct ToolDefinition {
@@ -163,6 +203,15 @@ pub struct ToolDefinition {
     #[serde(default)]
     /// Explicit speculative-execution policy.
     pub speculation_policy: SpeculationPolicy,
+    #[serde(default)]
+    /// Independent guarantee that issuing the tool is itself side-effect free.
+    pub issue_safety: IssueSafety,
+    #[serde(default)]
+    /// Execution location used by speculative privacy gates.
+    pub execution_location: ExecutionLocation,
+    #[serde(default)]
+    /// Network-egress behavior used by speculative privacy gates.
+    pub network_egress: NetworkEgress,
 }
 
 fn direct_caller_only() -> BTreeSet<ToolCaller> {
@@ -195,6 +244,9 @@ impl ToolDefinition {
             expected_latency_ms: None,
             allowed_callers: direct_caller_only(),
             speculation_policy: SpeculationPolicy::Disabled,
+            issue_safety: IssueSafety::Unknown,
+            execution_location: ExecutionLocation::Unknown,
+            network_egress: NetworkEgress::Unknown,
         }
     }
 
@@ -259,6 +311,29 @@ impl ToolDefinition {
     pub fn with_speculation_policy(mut self, speculation_policy: SpeculationPolicy) -> Self {
         self.speculation_policy = speculation_policy;
         self
+    }
+
+    /// Declares the tool's issue-time side-effect guarantee.
+    pub fn with_issue_safety(mut self, issue_safety: IssueSafety) -> Self {
+        self.issue_safety = issue_safety;
+        self
+    }
+
+    /// Declares where tool execution occurs.
+    pub fn with_execution_location(mut self, execution_location: ExecutionLocation) -> Self {
+        self.execution_location = execution_location;
+        self
+    }
+
+    /// Declares whether tool execution can perform network egress.
+    pub fn with_network_egress(mut self, network_egress: NetworkEgress) -> Self {
+        self.network_egress = network_egress;
+        self
+    }
+
+    /// Returns whether this tool permits the supplied execution context.
+    pub fn allows_caller(&self, caller: ToolCaller) -> bool {
+        self.allowed_callers.contains(&caller)
     }
 }
 
@@ -328,6 +403,7 @@ pub trait Tool: Send + Sync {
 struct RegisteredTool {
     tool: Arc<dyn Tool>,
     validator: Arc<Validator>,
+    output_validator: Option<Arc<Validator>>,
 }
 
 #[derive(Default)]
@@ -360,7 +436,7 @@ impl ToolRegistry {
         let validator = compile_trusted_schema(schema, |error| {
             HarnessError::InvalidTool(format!("invalid schema for {id}: {error}"))
         })?;
-        if let Some(output_schema) = &tool.definition().output_schema {
+        let output_validator = if let Some(output_schema) = &tool.definition().output_schema {
             if serialized_len(output_schema)? > defaults.max_request_payload_bytes {
                 return Err(HarnessError::InvalidTool(format!(
                     "output schema for {id} exceeds {} bytes",
@@ -369,16 +445,19 @@ impl ToolRegistry {
             }
             ensure_json_depth("tool output schema", output_schema, defaults.max_json_depth)
                 .map_err(|error| HarnessError::InvalidTool(error.to_string()))?;
-            compile_trusted_schema(output_schema, |error| {
+            Some(Arc::new(compile_trusted_schema(output_schema, |error| {
                 HarnessError::InvalidTool(format!("invalid output schema for {id}: {error}"))
-            })?;
-        }
+            })?))
+        } else {
+            None
+        };
         validate_scheduling_metadata(tool.definition(), &id)?;
         self.tools.insert(
             id,
             RegisteredTool {
                 tool,
                 validator: Arc::new(validator),
+                output_validator,
             },
         );
         Ok(())
@@ -395,6 +474,7 @@ impl ToolRegistry {
             .filter_map(|id| {
                 self.tools
                     .get(id)
+                    .filter(|entry| entry.tool.definition().allows_caller(ToolCaller::Direct))
                     .map(|entry| entry.tool.definition().clone())
             })
             .collect()
@@ -409,6 +489,25 @@ impl ToolRegistry {
             .validator
             .validate(arguments)
             .map_err(|error| HarnessError::InvalidArguments(error.to_string()))
+    }
+
+    pub(crate) fn validate_output(
+        &self,
+        tool_id: &str,
+        output: &Value,
+    ) -> Result<(), HarnessError> {
+        let entry = self
+            .tools
+            .get(tool_id)
+            .ok_or_else(|| HarnessError::InvalidTool(format!("unknown tool: {tool_id}")))?;
+        if let Some(validator) = &entry.output_validator {
+            validator.validate(output).map_err(|error| {
+                HarnessError::InvalidOutput(format!(
+                    "tool {tool_id} output failed validation: {error}"
+                ))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -446,7 +545,10 @@ fn validate_scheduling_metadata(definition: &ToolDefinition, id: &str) -> Result
         && (!definition.read_only
             || !definition.idempotent
             || !definition.parallel_safe
-            || definition.cancellation_safety != CancellationSafety::Guaranteed)
+            || definition.cancellation_safety != CancellationSafety::Guaranteed
+            || definition.issue_safety != IssueSafety::Guaranteed
+            || definition.execution_location != ExecutionLocation::LocalPrivate
+            || definition.network_egress != NetworkEgress::Prohibited)
     {
         return Err(HarnessError::InvalidTool(format!(
             "tool {id} is not eligible for speculative execution"

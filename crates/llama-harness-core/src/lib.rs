@@ -49,6 +49,6 @@ pub use streaming::{
     ToolCallDelta,
 };
 pub use tool::{
-    CancellationSafety, SpeculationPolicy, Tool, ToolCall, ToolCallContext, ToolCaller,
-    ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    CancellationSafety, ExecutionLocation, IssueSafety, NetworkEgress, SpeculationPolicy, Tool,
+    ToolCall, ToolCallContext, ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
 };

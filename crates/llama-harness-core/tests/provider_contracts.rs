@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use llama_harness_core::{
-    mock::MockModelProvider, CancellationSafety, HarnessError, ModelCapabilities, ModelProvider,
-    ModelRequest, ProviderCapabilityLimits, SpeculationPolicy, Tool, ToolCallAssembler,
-    ToolCallAssemblyLimits, ToolCallDelta, ToolCaller, ToolDefinition, ToolRegistry, ToolResult,
+    mock::MockModelProvider, CancellationSafety, ExecutionLocation, HarnessError, IssueSafety,
+    ModelCapabilities, ModelProvider, ModelRequest, NetworkEgress, ProviderCapabilityLimits,
+    SpeculationPolicy, Tool, ToolCallAssembler, ToolCallAssemblyLimits, ToolCallDelta, ToolCaller,
+    ToolDefinition, ToolRegistry, ToolResult,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -45,12 +46,18 @@ fn tool_metadata_defaults_are_conservative() {
         "expected_latency_ms",
         "allowed_callers",
         "speculation_policy",
+        "issue_safety",
+        "execution_location",
+        "network_egress",
     ] {
         legacy.remove(key);
     }
     let decoded: ToolDefinition = serde_json::from_value(Value::Object(legacy)).unwrap();
     assert_eq!(decoded.allowed_callers, [ToolCaller::Direct].into());
     assert_eq!(decoded.speculation_policy, SpeculationPolicy::Disabled);
+    assert_eq!(decoded.issue_safety, IssueSafety::Unknown);
+    assert_eq!(decoded.execution_location, ExecutionLocation::Unknown);
+    assert_eq!(decoded.network_egress, NetworkEgress::Unknown);
 }
 
 #[test]
@@ -82,8 +89,48 @@ fn speculative_registration_is_fail_closed() {
         .with_read_only(true)
         .with_idempotent(true)
         .with_parallel_safe(true)
-        .with_cancellation_safety(CancellationSafety::Guaranteed);
+        .with_cancellation_safety(CancellationSafety::Guaranteed)
+        .with_issue_safety(IssueSafety::Guaranteed)
+        .with_execution_location(ExecutionLocation::LocalPrivate)
+        .with_network_egress(NetworkEgress::Prohibited);
     register(safe_definition).unwrap();
+}
+
+#[test]
+fn speculation_requires_issue_time_and_privacy_guarantees() {
+    let base = ToolDefinition::new(
+        "candidate",
+        "Candidate",
+        "Candidate",
+        json!({"type":"object"}),
+    )
+    .with_allowed_callers([ToolCaller::Direct, ToolCaller::Speculative])
+    .with_speculation_policy(SpeculationPolicy::Enabled)
+    .with_read_only(true)
+    .with_idempotent(true)
+    .with_parallel_safe(true)
+    .with_cancellation_safety(CancellationSafety::Guaranteed);
+
+    assert!(
+        matches!(register(base.clone()), Err(HarnessError::InvalidTool(message)) if message.contains("not eligible"))
+    );
+    assert!(matches!(
+        register(
+            base.clone()
+                .with_issue_safety(IssueSafety::Guaranteed)
+                .with_execution_location(ExecutionLocation::Remote)
+                .with_network_egress(NetworkEgress::Prohibited)
+        ),
+        Err(HarnessError::InvalidTool(message)) if message.contains("not eligible")
+    ));
+    assert!(matches!(
+        register(
+            base.with_issue_safety(IssueSafety::Guaranteed)
+                .with_execution_location(ExecutionLocation::LocalPrivate)
+                .with_network_egress(NetworkEgress::Permitted)
+        ),
+        Err(HarnessError::InvalidTool(message)) if message.contains("not eligible")
+    ));
 }
 
 #[test]

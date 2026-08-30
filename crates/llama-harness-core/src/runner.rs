@@ -5,7 +5,7 @@ use crate::{
     message::Message,
     model::{ModelProvider, ModelRequest, ModelResponse},
     policy::{ApprovalHandler, DenyApproval, PolicyDecision, PolicyEngine, SafeDefaultPolicy},
-    tool::{Tool, ToolCall, ToolCallContext, ToolRegistry, ToolResult},
+    tool::{Tool, ToolCall, ToolCallContext, ToolCaller, ToolRegistry, ToolResult},
     GenerationOptions, HarnessError, RunError,
 };
 use jsonschema::Validator;
@@ -372,6 +372,24 @@ impl AgentRunner {
                     }
                     continue;
                 }
+                if !tool.definition().allows_caller(ToolCaller::Direct) {
+                    self.reject(
+                        &mut result,
+                        &mut events,
+                        &call,
+                        "tool does not allow direct calls".into(),
+                    );
+                    if let Err(error) = push_tool_message(
+                        &mut messages,
+                        &call,
+                        &ToolResult::failure("tool does not allow direct calls"),
+                        &request.agent.limits,
+                    ) {
+                        apply_terminal_error(&mut result, error);
+                        break 'run;
+                    }
+                    continue;
+                }
                 if let Err(error) = self.tools.validate(&call.tool_id, &arguments) {
                     self.reject(&mut result, &mut events, &call, error.to_string());
                     if let Err(error) = push_tool_message(
@@ -593,18 +611,51 @@ impl AgentRunner {
                 return Err(error);
             }
         };
-        events.emit(RunEvent::ToolCompleted {
-            call_id: call.id.clone(),
-            tool_id: call.tool_id.clone(),
-            ok: tool_result.ok,
-        });
         if serialized_len(&tool_result)? > limits.max_tool_result_bytes {
+            events.emit(RunEvent::ToolCompleted {
+                call_id: call.id.clone(),
+                tool_id: call.tool_id.clone(),
+                ok: false,
+            });
             return Err(HarnessError::ResourceLimit(format!(
                 "tool result exceeds {} bytes",
                 limits.max_tool_result_bytes
             )));
         }
-        ensure_json_depth("tool result", &tool_result.output, limits.max_json_depth)?;
+        if let Err(error) =
+            ensure_json_depth("tool result", &tool_result.output, limits.max_json_depth)
+        {
+            events.emit(RunEvent::ToolCompleted {
+                call_id: call.id.clone(),
+                tool_id: call.tool_id.clone(),
+                ok: false,
+            });
+            return Err(error);
+        }
+        if tool_result.ok {
+            if let Err(error) = self
+                .tools
+                .validate_output(&call.tool_id, &tool_result.output)
+            {
+                events.emit(RunEvent::ToolCompleted {
+                    call_id: call.id.clone(),
+                    tool_id: call.tool_id.clone(),
+                    ok: false,
+                });
+                let failure = ToolResult::failure("tool output failed validation");
+                push_tool_message(messages, call, &failure, limits)?;
+                run.errors.push(RunError {
+                    code: "tool_error".into(),
+                    message: error.to_string(),
+                });
+                return Ok(());
+            }
+        }
+        events.emit(RunEvent::ToolCompleted {
+            call_id: call.id.clone(),
+            tool_id: call.tool_id.clone(),
+            ok: tool_result.ok,
+        });
         push_tool_message(messages, call, &tool_result, limits)?;
         if !tool_result.ok {
             run.errors.push(RunError {

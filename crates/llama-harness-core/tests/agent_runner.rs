@@ -5,7 +5,7 @@ use llama_harness_core::{
     GenerationOptions, HarnessError, InMemoryEventSink, JsonMap, Message, MessageRole,
     ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, PolicyDecision,
     PolicyEngine, ProviderHealth, RunEvent, RunOverrides, RunRequest, RunStatus, Tool, ToolCall,
-    ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
 };
 use serde_json::{json, Value};
 use std::{
@@ -1201,6 +1201,157 @@ async fn malformed_unknown_disallowed_and_schema_invalid_calls_feed_back_without
         .rev()
         .take(4)
         .all(|message| { message.role == MessageRole::Tool && message.tool_call_id.is_some() }));
+}
+
+#[tokio::test]
+async fn direct_runner_hides_and_rejects_tools_without_direct_permission() {
+    let mut hidden = TestTool::read("read", json!({"type":"object"}));
+    hidden.definition.allowed_callers = [ToolCaller::Programmatic].into();
+    let hidden = Arc::new(hidden);
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("hidden", "read", "{}")),
+        final_response("done"),
+    ]));
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry(hidden.clone()))
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(provider.requests()[0].tools.is_empty());
+    assert_eq!(hidden.calls.load(Ordering::SeqCst), 0);
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.message.contains("does not allow direct calls")));
+    let feedback: ToolResult = serde_json::from_str(
+        &provider.requests()[1]
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    assert!(!feedback.ok);
+}
+
+#[tokio::test]
+async fn tool_output_schema_accepts_valid_success() {
+    let mut tool = TestTool::read("read", json!({"type":"object"}));
+    tool.definition.output_schema = Some(json!({
+        "type":"object",
+        "required":["value"],
+        "properties":{"value":{"type":"string"}},
+        "additionalProperties":false
+    }));
+    let tool = Arc::new(tool);
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("valid", "read", "{}")),
+        final_response("done"),
+    ]));
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry(tool))
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let feedback: ToolResult = serde_json::from_str(
+        &provider.requests()[1]
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    assert!(feedback.ok);
+    assert_eq!(feedback.output, json!({"value":"ok"}));
+}
+
+#[tokio::test]
+async fn invalid_success_output_fails_closed_without_entering_transcript() {
+    let mut tool = TestTool::read("read", json!({"type":"object"}))
+        .returning(ToolResult::success(json!({"secret":"must-not-leak"})));
+    tool.definition.output_schema = Some(json!({
+        "type":"object",
+        "required":["value"],
+        "properties":{"value":{"type":"string"}},
+        "additionalProperties":false
+    }));
+    let tool = Arc::new(tool);
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("invalid", "read", "{}")),
+        final_response("recovered"),
+    ]));
+    let events = Arc::new(InMemoryEventSink::default());
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry(tool))
+        .event_sink(events.clone())
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(result.errors.iter().any(|error| {
+        error.code == "tool_error" && error.message.contains("output failed validation")
+    }));
+    let requests = provider.requests();
+    let feedback_message = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::Tool)
+        .unwrap();
+    assert!(!feedback_message.content.contains("must-not-leak"));
+    let feedback: ToolResult = serde_json::from_str(&feedback_message.content).unwrap();
+    assert!(!feedback.ok);
+    assert!(events.events().iter().any(|record| matches!(
+        &record.event,
+        RunEvent::ToolCompleted { call_id, ok, .. } if call_id == "invalid" && !ok
+    )));
+}
+
+#[tokio::test]
+async fn declared_failure_bypasses_success_output_schema() {
+    let mut tool = TestTool::read("read", json!({"type":"object"}))
+        .returning(ToolResult::failure("declared failure"));
+    tool.definition.output_schema = Some(json!({"type":"string"}));
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("failure", "read", "{}")),
+        final_response("done"),
+    ]));
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry(Arc::new(tool)))
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.message == "declared failure"));
+    let feedback: ToolResult = serde_json::from_str(
+        &provider.requests()[1]
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    assert!(!feedback.ok);
+    assert_eq!(feedback.error.as_deref(), Some("declared failure"));
 }
 
 #[tokio::test]
