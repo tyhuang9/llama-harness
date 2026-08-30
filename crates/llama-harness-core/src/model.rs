@@ -1,4 +1,4 @@
-use crate::{GenerationOptions, HarnessError, JsonMap, Message, ToolDefinition};
+use crate::{GenerationOptions, HarnessError, JsonMap, Message, ModelEventStream, ToolDefinition};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -343,4 +343,11 @@ pub trait ModelProvider: Send + Sync {
     async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError>;
     /// Completes one model request.
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError>;
+    /// Streams one model request when the provider implements streaming.
+    async fn stream(&self, _: ModelRequest) -> Result<ModelEventStream, HarnessError> {
+        Err(HarnessError::UnsupportedCapability(format!(
+            "provider {} does not support streaming",
+            self.id()
+        )))
+    }
 }

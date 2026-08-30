@@ -15,6 +15,7 @@ mod model;
 pub mod plan;
 mod policy;
 mod runner;
+mod streaming;
 mod tool;
 
 pub use agent::{
@@ -43,6 +44,10 @@ pub use policy::{
     SafeDefaultPolicy,
 };
 pub use runner::{AgentRunner, AgentRunnerBuilder};
+pub use streaming::{
+    ModelEventStream, ModelStreamEvent, PartialToolCall, ToolCallAssembler, ToolCallAssemblyLimits,
+    ToolCallDelta,
+};
 pub use tool::{
     CancellationSafety, SpeculationPolicy, Tool, ToolCall, ToolCallContext, ToolCaller,
     ToolDefinition, ToolRegistry, ToolResult, ToolRisk,

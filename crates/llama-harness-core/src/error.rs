@@ -40,6 +40,9 @@ pub enum HarnessError {
     #[error("retryable provider error: {0}")]
     /// The model provider returned an error eligible for retry.
     RetryableProvider(String),
+    #[error("unsupported capability: {0}")]
+    /// The selected provider does not implement a requested optional capability.
+    UnsupportedCapability(String),
     #[error("policy error: {0}")]
     /// Policy evaluation failed.
     Policy(String),
@@ -70,6 +73,7 @@ impl HarnessError {
             Self::InvalidTool(_) => "invalid_tool",
             Self::InvalidArguments(_) => "invalid_arguments",
             Self::Provider(_) | Self::RetryableProvider(_) => "provider_error",
+            Self::UnsupportedCapability(_) => "unsupported_capability",
             Self::Policy(_) => "policy_error",
             Self::Approval(_) => "approval_error",
             Self::Tool(_) => "tool_error",

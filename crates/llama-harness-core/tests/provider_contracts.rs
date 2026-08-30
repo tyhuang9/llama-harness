@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use llama_harness_core::{
-    CancellationSafety, HarnessError, ModelCapabilities, ProviderCapabilityLimits,
-    SpeculationPolicy, Tool, ToolCaller, ToolDefinition, ToolRegistry, ToolResult,
+    mock::MockModelProvider, CancellationSafety, HarnessError, ModelCapabilities, ModelProvider,
+    ModelRequest, ProviderCapabilityLimits, SpeculationPolicy, Tool, ToolCallAssembler,
+    ToolCallAssemblyLimits, ToolCallDelta, ToolCaller, ToolDefinition, ToolRegistry, ToolResult,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -108,4 +109,165 @@ fn new_model_capabilities_remain_false_unless_advertised() {
         .with_limits(limits.clone());
     assert!(advertised.supports_programmatic_calling);
     assert_eq!(advertised.limits, limits);
+}
+
+fn assembler(limits: ToolCallAssemblyLimits) -> ToolCallAssembler {
+    ToolCallAssembler::new(
+        [ToolDefinition::new(
+            "lookup",
+            "Lookup",
+            "Lookup",
+            json!({
+                "type":"object",
+                "required":["query"],
+                "properties":{"query":{"type":"string"}},
+                "additionalProperties":false
+            }),
+        )],
+        limits,
+    )
+    .unwrap()
+}
+
+#[test]
+fn assembler_interleaves_calls_and_only_yields_validated_finals() {
+    let mut assembler = assembler(ToolCallAssemblyLimits::default());
+    assert!(assembler
+        .push(
+            ToolCallDelta::new(0, "{\"query\":", false)
+                .with_call_id("call-0")
+                .with_tool_id("lookup")
+        )
+        .unwrap()
+        .is_none());
+    assert!(assembler
+        .push(
+            ToolCallDelta::new(1, "{\"query\":\"second\"}", true)
+                .with_call_id("call-1")
+                .with_tool_id("lookup")
+        )
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        assembler.partial_call(0).unwrap().arguments_json,
+        "{\"query\":"
+    );
+    let call = assembler
+        .push(ToolCallDelta::new(0, "\"first\"}", true))
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.id, "call-0");
+    assert_eq!(call.tool_id, "lookup");
+    assert_eq!(call.arguments_json, "{\"query\":\"first\"}");
+    assert_eq!(assembler.buffered_bytes(), 0);
+}
+
+#[test]
+fn assembler_rejects_conflicts_invalid_finals_and_post_final_fragments() {
+    let mut conflict = assembler(ToolCallAssemblyLimits::default());
+    conflict
+        .push(
+            ToolCallDelta::new(0, "{", false)
+                .with_call_id("call")
+                .with_tool_id("lookup"),
+        )
+        .unwrap();
+    assert!(matches!(
+        conflict.push(ToolCallDelta::new(0, "}", true).with_tool_id("other")),
+        Err(HarnessError::Provider(message)) if message.contains("conflicting")
+    ));
+
+    let mut malformed = assembler(ToolCallAssemblyLimits::default());
+    assert!(matches!(
+        malformed.push(
+            ToolCallDelta::new(0, "{", true)
+                .with_call_id("call")
+                .with_tool_id("lookup")
+        ),
+        Err(HarnessError::InvalidArguments(_))
+    ));
+
+    let mut finalized = assembler(ToolCallAssemblyLimits::default());
+    finalized
+        .push(
+            ToolCallDelta::new(0, "{\"query\":\"ok\"}", true)
+                .with_call_id("call")
+                .with_tool_id("lookup"),
+        )
+        .unwrap();
+    assert!(matches!(
+        finalized.push(ToolCallDelta::new(0, "", false)),
+        Err(HarnessError::Provider(message)) if message.contains("after completion")
+    ));
+}
+
+#[test]
+fn assembler_enforces_call_field_and_total_limits() {
+    let limits = ToolCallAssemblyLimits {
+        max_calls: 1,
+        max_call_bytes: 64,
+        max_total_buffered_bytes: 32,
+        max_field_bytes: 8,
+        max_json_depth: 4,
+    };
+    let mut fields = assembler(limits.clone());
+    assert!(matches!(
+        fields.push(ToolCallDelta::new(0, "{}", true).with_call_id("too-long-id")),
+        Err(HarnessError::Provider(_))
+    ));
+
+    let mut calls = assembler(limits.clone());
+    calls
+        .push(
+            ToolCallDelta::new(0, "", false)
+                .with_call_id("one")
+                .with_tool_id("lookup"),
+        )
+        .unwrap();
+    assert!(matches!(
+        calls.push(ToolCallDelta::new(1, "", false)),
+        Err(HarnessError::ResourceLimit(_))
+    ));
+
+    let mut total = assembler(limits);
+    assert!(matches!(
+        total.push(
+            ToolCallDelta::new(0, "{\"query\":\"012345678901234567890123456789\"}", false)
+                .with_call_id("call")
+                .with_tool_id("lookup")
+        ),
+        Err(HarnessError::ResourceLimit(_))
+    ));
+}
+
+#[test]
+fn assembler_rejects_unknown_tools_and_schema_mismatches() {
+    let mut unknown = assembler(ToolCallAssemblyLimits::default());
+    assert!(matches!(
+        unknown.push(
+            ToolCallDelta::new(0, "{}", true)
+                .with_call_id("call")
+                .with_tool_id("missing")
+        ),
+        Err(HarnessError::InvalidTool(_))
+    ));
+
+    let mut invalid = assembler(ToolCallAssemblyLimits::default());
+    assert!(matches!(
+        invalid.push(
+            ToolCallDelta::new(0, "{\"query\":1}", true)
+                .with_call_id("call")
+                .with_tool_id("lookup")
+        ),
+        Err(HarnessError::InvalidArguments(_))
+    ));
+}
+
+#[tokio::test]
+async fn model_provider_stream_defaults_to_unsupported_capability() {
+    let provider = MockModelProvider::scripted([]);
+    assert!(matches!(
+        provider.stream(ModelRequest::new("mock")).await,
+        Err(HarnessError::UnsupportedCapability(message)) if message.contains("mock")
+    ));
 }
