@@ -322,6 +322,11 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
                 run_id: String::new(),
                 trace_id: String::new(),
             }),
+            std::mem::discriminant(&RunEvent::StrategySelected {
+                requested: RunStrategy::Direct,
+                selected: RunStrategy::Direct,
+                reason: llama_harness_core::StrategySelectionReason::Forced,
+            }),
             std::mem::discriminant(&RunEvent::ModelRequested {
                 call_number: 0,
                 model: String::new(),
@@ -354,6 +359,12 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
                 model: String::new(),
             }),
             std::mem::discriminant(&RunEvent::ModelResponded { call_number: 0 }),
+            std::mem::discriminant(&RunEvent::StrategyUsage {
+                strategy: RunStrategy::Direct,
+                model_calls: 0,
+                tool_calls: 0,
+                duration_ms: 0,
+            }),
             std::mem::discriminant(&RunEvent::Completed {
                 status: RunStatus::Completed,
             }),
