@@ -2201,7 +2201,7 @@ fn advance_path(
             debug_assert!(key.len() <= MAX_ATOMIC_KEY_BYTES);
             if key == &state.segment {
                 let selected = value.clone();
-                if state.pointer_offset == pointer.len() {
+                if state.pointer_offset == pointer.len() && !pointer.ends_with('/') {
                     Ok(Some(selected))
                 } else {
                     state.current = selected;
@@ -2219,6 +2219,9 @@ fn advance_path(
             mut value,
         } => {
             let bytes = state.segment.as_bytes();
+            if bytes.is_empty() {
+                return Err(execution("JSON pointer array index is invalid"));
+            }
             let end = offset
                 .saturating_add(MAX_ATOMIC_STRING_BYTES)
                 .min(bytes.len());
@@ -2243,7 +2246,7 @@ fn advance_path(
                 .and_then(|items| items.get(value))
                 .cloned()
                 .ok_or_else(|| execution("JSON pointer did not resolve"))?;
-            if state.pointer_offset == pointer.len() {
+            if state.pointer_offset == pointer.len() && !pointer.ends_with('/') {
                 Ok(Some(selected))
             } else {
                 state.current = selected;
@@ -2830,6 +2833,41 @@ mod tests {
         );
         let mut vm = execution(&raw, 4, SandboxLimits::default());
         assert_eq!(complete(&mut vm, 1), json!("found"));
+    }
+
+    #[test]
+    fn path_array_indices_reject_empty_segments_without_reinterpreting_them_as_zero() {
+        for (raw, id) in [
+            (
+                r#"{"version":1,"body":[{"kind":"return","value":{"kind":"path","value":{"kind":"array","items":[{"kind":"string","value":"zero"}]},"pointer":"/"}}]}"#,
+                41,
+            ),
+            (
+                r#"{"version":1,"body":[{"kind":"return","value":{"kind":"path","value":{"kind":"array","items":[{"kind":"array","items":[{"kind":"string","value":"nested"}]}]},"pointer":"/0/"}}]}"#,
+                42,
+            ),
+        ] {
+            let mut vm = execution(raw, id, SandboxLimits::default());
+            let error = loop {
+                match vm.step(1) {
+                    Ok(StepOutcome::Sliced) => {}
+                    Ok(outcome) => {
+                        panic!("expected path error for execution {id}, got {outcome:?}")
+                    }
+                    Err(error) => break error,
+                }
+            };
+            assert_eq!(error.code(), SandboxErrorCode::Execution);
+            assert_eq!(error.message(), "JSON pointer array index is invalid");
+        }
+
+        let zero = r#"{"version":1,"body":[{"kind":"return","value":{"kind":"path","value":{"kind":"array","items":[{"kind":"string","value":"zero"}]},"pointer":"/0"}}]}"#;
+        let mut zero = execution(zero, 43, SandboxLimits::default());
+        assert_eq!(complete(&mut zero, 1), json!("zero"));
+
+        let escaped = r#"{"version":1,"body":[{"kind":"return","value":{"kind":"path","value":{"kind":"object","entries":[{"key":"a/b","value":{"kind":"object","entries":[{"key":"~","value":{"kind":"string","value":"escaped"}}]}}]},"pointer":"/a~1b/~0"}}]}"#;
+        let mut escaped = execution(escaped, 44, SandboxLimits::default());
+        assert_eq!(complete(&mut escaped, 1), json!("escaped"));
     }
 
     #[test]
