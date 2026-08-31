@@ -17,5 +17,11 @@ The runtime does not provide universal shell, filesystem, database, or network
 tools. Applications own their tools and side effects and should make mutation
 tools idempotent where practical.
 
+Large catalogs can mark individual registrations as deferred with
+`ToolRegistry::register_with_discovery`. Selection is deterministic and bounded,
+and every selected invocation still crosses the same core broker validation,
+policy, approval, cancellation, and resource-limit boundary. Existing
+`register` calls remain hot and preserve small-catalog behavior.
+
 The minimum supported Rust version is 1.88. This crate is licensed under the
 MIT License; see `LICENSE`.
