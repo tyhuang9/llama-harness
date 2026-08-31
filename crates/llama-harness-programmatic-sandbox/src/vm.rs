@@ -1123,7 +1123,7 @@ impl Execution {
                 _ => return Err(execution("fan-out state changed")),
             };
             self.locals[item_slot] = None;
-            self.store(slot, RuntimeValue::array(Vec::new())?)?;
+            self.store(slot, collection)?;
             self.pc += 1;
             return Ok(());
         }
@@ -2756,6 +2756,24 @@ mod tests {
         }
     }
 
+    fn repeated_empty_fan_out_program(count: usize) -> String {
+        assert!(count > 0);
+        let mut body = String::new();
+        for index in 0..count {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(
+                r#"{{"kind":"fan_out","name":"results{index}","tool_id":"read","item":"item{index}","collection":{{"kind":"array","items":[]}},"max_calls":1,"arguments":{{"kind":"object","entries":[{{"key":"value","value":{{"kind":"variable","name":"item{index}"}}}}]}}}}"#
+            ));
+        }
+        body.push_str(&format!(
+            r#",{{"kind":"return","value":{{"kind":"variable","name":"results{}"}}}}"#,
+            count - 1
+        ));
+        format!(r#"{{"version":1,"body":[{body}]}}"#)
+    }
+
     fn yield_once(vm: &mut Execution) -> (ToolBatch, ResumeToken) {
         loop {
             match vm.step(1).unwrap() {
@@ -2833,6 +2851,57 @@ mod tests {
         assert_eq!(vm.metrics().yields, 0);
         assert_eq!(vm.metrics().fanout_batches, 0);
         assert_eq!(vm.locals.iter().filter(|value| value.is_some()).count(), 1);
+    }
+
+    #[test]
+    fn repeated_empty_fan_outs_respect_tight_live_and_cumulative_byte_quotas() {
+        const ADMITTED_FAN_OUTS: usize = 3;
+        let admitted_program = repeated_empty_fan_out_program(ADMITTED_FAN_OUTS);
+        let mut baseline = execution(&admitted_program, 31, SandboxLimits::default());
+        assert_eq!(complete(&mut baseline, 1), json!([]));
+        let baseline_metrics = baseline.metrics();
+        assert_eq!(
+            baseline_metrics.retained_bytes, baseline_metrics.cumulative_bytes,
+            "conservative live and cumulative charges stay aligned for this path"
+        );
+
+        let limits = SandboxLimits {
+            max_live_bytes: baseline_metrics.retained_bytes,
+            max_cumulative_bytes: baseline_metrics.cumulative_bytes,
+            ..SandboxLimits::default()
+        };
+        let mut admitted = execution(&admitted_program, 32, limits);
+        assert_eq!(complete(&mut admitted, 1), json!([]));
+        assert_eq!(admitted.metrics().retained_bytes, limits.max_live_bytes);
+        assert_eq!(
+            admitted.metrics().cumulative_bytes,
+            limits.max_cumulative_bytes
+        );
+        assert_eq!(admitted.metrics().yields, 0);
+        assert_eq!(admitted.metrics().fanout_batches, 0);
+
+        let rejected_program = repeated_empty_fan_out_program(ADMITTED_FAN_OUTS + 1);
+        let program = Program::from_json(rejected_program.as_bytes(), &limits)
+            .unwrap()
+            .compile(&limits)
+            .unwrap();
+        let mut rejected = Execution::new(program, ExecutionId(33))
+            .expect("N+1 empty fan-outs must enter execution before exhausting the byte quotas");
+        loop {
+            match rejected.step(1) {
+                Ok(StepOutcome::Sliced) => {}
+                Ok(StepOutcome::Complete(value)) => {
+                    panic!("N+1 empty fan-outs unexpectedly completed with {value}")
+                }
+                Ok(StepOutcome::Yielded { .. }) => {
+                    panic!("N+1 empty fan-outs unexpectedly yielded")
+                }
+                Err(error) => {
+                    assert_eq!(error.code(), SandboxErrorCode::ResourceLimit);
+                    break;
+                }
+            }
+        }
     }
 
     #[test]
