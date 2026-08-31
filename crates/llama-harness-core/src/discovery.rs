@@ -1,6 +1,6 @@
 use crate::{
-    runner::check_stopped, HarnessError, ProviderCapabilityLimits, ToolCaller, ToolDefinition,
-    ToolRegistry,
+    runner::check_stopped, HarnessError, PreparedToolCatalog, ProviderCapabilityLimits, ToolCaller,
+    ToolDefinition, ToolRegistry,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,6 +28,7 @@ const MIN_CONFIDENCE_MARGIN: u64 = 500_000_000;
 pub(crate) const MAX_DISCOVERY_IDENTIFIER_BYTES: usize = 128;
 pub(crate) const DISCOVERY_GUARD_INTERVAL: usize = 64;
 pub(crate) const MAX_SCOPE_CATALOG_CACHE_ENTRIES: usize = 16;
+pub(crate) const MAX_PREPARED_CATALOG_CACHE_ENTRIES: usize = 32;
 
 /// Whether a registered tool is always exposed or selected only when relevant.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,8 +188,7 @@ pub struct CatalogFingerprint {
 pub(crate) struct ToolScope {
     caller: ToolCaller,
     tool_ids: BTreeSet<String>,
-    definitions: Arc<[ToolDefinition]>,
-    serialized_definitions: Arc<[u8]>,
+    prepared: Option<Arc<PreparedToolCatalog>>,
 }
 
 impl ToolScope {
@@ -201,26 +201,31 @@ impl ToolScope {
     }
 
     pub(crate) fn definitions(&self) -> &[ToolDefinition] {
-        debug_assert_eq!(self.serialized_definitions.first(), Some(&b'['));
-        debug_assert_eq!(self.serialized_definitions.last(), Some(&b']'));
-        &self.definitions
+        self.prepared
+            .as_deref()
+            .map_or(&[], PreparedToolCatalog::definitions)
+    }
+
+    pub(crate) fn prepared(&self) -> Option<Arc<PreparedToolCatalog>> {
+        self.prepared.clone()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.definitions.is_empty()
+        self.prepared.is_none()
     }
 
     #[cfg(test)]
     pub(crate) fn serialized_definitions(&self) -> &[u8] {
-        &self.serialized_definitions
+        self.prepared
+            .as_deref()
+            .map_or(&b"[]"[..], PreparedToolCatalog::serialized_definitions)
     }
 
     fn empty(caller: ToolCaller) -> Self {
         Self {
             caller,
             tool_ids: BTreeSet::new(),
-            definitions: Arc::from([]),
-            serialized_definitions: Arc::from(&b"[]"[..]),
+            prepared: None,
         }
     }
 }
@@ -247,6 +252,7 @@ pub(crate) struct AllowedCatalogEntry<'a> {
     pub(crate) definition: &'a ToolDefinition,
     pub(crate) metadata: &'a ToolDiscoveryMetadata,
     pub(crate) serialized_definition: &'a Arc<[u8]>,
+    pub(crate) serialized_provider_tool: &'a Arc<[u8]>,
     pub(crate) version: u64,
 }
 
@@ -294,6 +300,41 @@ impl CatalogCache {
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedCatalogKey(Arc<[(String, u64)]>);
+
+impl PreparedCatalogKey {
+    fn new(entries: &[&AllowedCatalogEntry<'_>]) -> Self {
+        Self(Arc::from(
+            entries
+                .iter()
+                .map(|entry| (entry.definition.id.clone(), entry.version))
+                .collect::<Vec<_>>(),
+        ))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PreparedCatalogCache {
+    entries: VecDeque<(PreparedCatalogKey, Arc<PreparedToolCatalog>)>,
+}
+
+impl PreparedCatalogCache {
+    pub(crate) fn get(&self, key: &PreparedCatalogKey) -> Option<Arc<PreparedToolCatalog>> {
+        self.entries
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, catalog)| Arc::clone(catalog))
+    }
+
+    pub(crate) fn insert(&mut self, key: PreparedCatalogKey, catalog: Arc<PreparedToolCatalog>) {
+        if self.entries.len() == MAX_PREPARED_CATALOG_CACHE_ENTRIES {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, catalog));
     }
 }
 
@@ -439,7 +480,7 @@ impl ToolRegistry {
         if fits(&allowed, limits, guard)? {
             guard()?;
             let selected = collect_all(&allowed, guard)?;
-            return scope_with_stats(caller, selected, base_stats, false, guard);
+            return scope_with_stats(self, caller, selected, base_stats, false, guard);
         }
 
         let mut required = BTreeSet::new();
@@ -514,7 +555,7 @@ impl ToolRegistry {
         }
         guard()?;
         let selected = collect_required(&allowed, &required, guard)?;
-        scope_with_stats(caller, selected, base_stats, true, guard)
+        scope_with_stats(self, caller, selected, base_stats, true, guard)
     }
 }
 
@@ -552,12 +593,45 @@ fn collect_required<'a>(
 }
 
 fn scope_with_stats(
+    registry: &ToolRegistry,
     caller: ToolCaller,
-    entries: Vec<&AllowedCatalogEntry<'_>>,
+    mut entries: Vec<&AllowedCatalogEntry<'_>>,
     mut stats: ToolDiscoveryStats,
     exceeded: bool,
     guard: &mut impl FnMut() -> Result<(), HarnessError>,
 ) -> Result<(ToolScope, ToolDiscoveryStats), HarnessError> {
+    if entries.is_empty() {
+        stats.catalog_exceeded_budget = exceeded;
+        return Ok((ToolScope::empty(caller), stats));
+    }
+    if exceeded {
+        entries.sort_by(|left, right| left.definition.id.cmp(&right.definition.id));
+        guard()?;
+    }
+    let cache_key = PreparedCatalogKey::new(&entries);
+    guard()?;
+    if let Some(prepared) = registry
+        .prepared_catalog_cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&cache_key)
+    {
+        stats.selected_count = prepared.definitions().len() as u32;
+        stats.catalog_exceeded_budget = exceeded;
+        let tool_ids = prepared
+            .definitions()
+            .iter()
+            .map(|definition| definition.id.clone())
+            .collect();
+        return Ok((
+            ToolScope {
+                caller,
+                tool_ids,
+                prepared: Some(prepared),
+            },
+            stats,
+        ));
+    }
     let mut definitions = Vec::with_capacity(entries.len());
     let mut tool_ids = BTreeSet::new();
     for (position, entry) in entries.iter().enumerate() {
@@ -569,18 +643,77 @@ fn scope_with_stats(
     }
     guard()?;
     let serialized_definitions = serialize_definition_array(&entries, guard)?;
+    let provider_tools = serialize_provider_tool_array(&entries, guard)?;
+    let provider_tools = serde_json::value::RawValue::from_string(
+        String::from_utf8(provider_tools.to_vec()).map_err(|error| {
+            HarnessError::InvalidTool(format!("prepared tool JSON is not UTF-8: {error}"))
+        })?,
+    )
+    .map_err(|error| {
+        HarnessError::InvalidTool(format!("prepared tool JSON is invalid: {error}"))
+    })?;
     stats.selected_count = definitions.len() as u32;
+    let prepared = Arc::new(PreparedToolCatalog::new(
+        Arc::from(definitions),
+        serialized_definitions,
+        provider_tools,
+    ));
     stats.catalog_exceeded_budget = exceeded;
     guard()?;
+    let mut cache = registry
+        .prepared_catalog_cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard()?;
+    let prepared = if let Some(existing) = cache.get(&cache_key) {
+        existing
+    } else {
+        cache.insert(cache_key, Arc::clone(&prepared));
+        registry
+            .prepared_catalog_build_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        prepared
+    };
     Ok((
         ToolScope {
             caller,
             tool_ids,
-            definitions: Arc::from(definitions),
-            serialized_definitions,
+            prepared: Some(prepared),
         },
         stats,
     ))
+}
+
+fn serialize_provider_tool_array(
+    entries: &[&AllowedCatalogEntry<'_>],
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
+) -> Result<Arc<[u8]>, HarnessError> {
+    serialize_fragment_array(
+        entries
+            .iter()
+            .map(|entry| entry.serialized_provider_tool.as_ref()),
+        guard,
+    )
+}
+
+fn serialize_fragment_array<'a>(
+    fragments: impl Iterator<Item = &'a [u8]>,
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
+) -> Result<Arc<[u8]>, HarnessError> {
+    let mut serialized = Vec::new();
+    serialized.push(b'[');
+    for (position, fragment) in fragments.enumerate() {
+        if position % DISCOVERY_GUARD_INTERVAL == 0 {
+            guard()?;
+        }
+        if position > 0 {
+            serialized.push(b',');
+        }
+        serialized.extend_from_slice(fragment);
+    }
+    serialized.push(b']');
+    guard()?;
+    Ok(Arc::from(serialized))
 }
 
 fn serialize_definition_array(
@@ -1474,6 +1607,8 @@ mod tests {
             .unwrap();
         assert!(warm_stats.cache_hit);
         assert_eq!(registry.catalog_build_count(), 1);
+        assert_eq!(registry.prepared_catalog_build_count(), 1);
+        assert_eq!(warm.definitions(), cold.definitions());
         assert_eq!(
             warm.serialized_definitions(),
             serde_json::to_vec(warm.definitions()).unwrap()
@@ -1800,6 +1935,39 @@ mod tests {
             &ids,
             exact.with_max_tool_schema_bytes(bytes - 1),
             ProviderCapabilityLimits::new()
+        )
+        .is_err());
+
+        let mut pair_registry = ToolRegistry::default();
+        for id in ["pair.one", "pair.two"] {
+            register(&mut pair_registry, id, "pair", ToolDiscoveryMetadata::hot());
+        }
+        let pair_ids = vec!["pair.two".into(), "pair.one".into()];
+        let pair_entries = pair_registry.allowed_catalog(&pair_ids, ToolCaller::Direct);
+        let pair_bytes = pair_entries
+            .iter()
+            .map(|entry| entry.serialized_definition.len() as u64)
+            .sum::<u64>()
+            + 3;
+        let pair_exact = ToolDiscoveryLimits::new()
+            .with_max_tools(2)
+            .with_max_tool_schema_bytes(pair_bytes);
+        let (pair, _) = scope(
+            &pair_registry,
+            "pair",
+            &pair_ids,
+            pair_exact,
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert_eq!(pair.serialized_definitions().len() as u64, pair_bytes);
+        assert_eq!(pair.definitions()[0].id, "pair.two");
+        assert!(scope(
+            &pair_registry,
+            "pair",
+            &pair_ids,
+            pair_exact.with_max_tool_schema_bytes(pair_bytes - 1),
+            ProviderCapabilityLimits::new(),
         )
         .is_err());
         let (empty, _) = scope(

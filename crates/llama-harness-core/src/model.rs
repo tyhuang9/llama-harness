@@ -1,7 +1,94 @@
 use crate::{GenerationOptions, HarnessError, JsonMap, Message, ModelEventStream, ToolDefinition};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug)]
+/// Immutable tool definitions and their exact provider-consumable JSON.
+pub struct PreparedToolCatalog {
+    definitions: Arc<[ToolDefinition]>,
+    serialized_definitions: Arc<[u8]>,
+    provider_tools: Box<RawValue>,
+}
+
+impl PartialEq for PreparedToolCatalog {
+    fn eq(&self, other: &Self) -> bool {
+        self.definitions == other.definitions
+            && self.serialized_definitions == other.serialized_definitions
+            && self.provider_tools.get() == other.provider_tools.get()
+    }
+}
+
+impl PreparedToolCatalog {
+    /// Prepares an immutable catalog for hosts constructing model requests directly.
+    pub fn from_definitions(definitions: Vec<ToolDefinition>) -> Result<Self, HarnessError> {
+        #[derive(Serialize)]
+        struct ProviderTool<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            function: ProviderFunction<'a>,
+        }
+        #[derive(Serialize)]
+        struct ProviderFunction<'a> {
+            name: &'a str,
+            description: &'a str,
+            parameters: &'a serde_json::Value,
+        }
+        let serialized_definitions = serde_json::to_vec(&definitions)
+            .map(Arc::<[u8]>::from)
+            .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?;
+        let provider_tools = definitions
+            .iter()
+            .map(|definition| ProviderTool {
+                kind: "function",
+                function: ProviderFunction {
+                    name: &definition.id,
+                    description: &definition.description,
+                    parameters: &definition.arguments_schema,
+                },
+            })
+            .collect::<Vec<_>>();
+        let provider_tools = RawValue::from_string(
+            serde_json::to_string(&provider_tools)
+                .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?,
+        )
+        .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?;
+        Ok(Self::new(
+            Arc::from(definitions),
+            serialized_definitions,
+            provider_tools,
+        ))
+    }
+
+    pub(crate) fn new(
+        definitions: Arc<[ToolDefinition]>,
+        serialized_definitions: Arc<[u8]>,
+        provider_tools: Box<RawValue>,
+    ) -> Self {
+        Self {
+            definitions,
+            serialized_definitions,
+            provider_tools,
+        }
+    }
+
+    /// Returns the selected definitions in provider order.
+    pub fn definitions(&self) -> &[ToolDefinition] {
+        &self.definitions
+    }
+
+    /// Returns the exact serialized `ToolDefinition` array used for discovery budgets.
+    pub fn serialized_definitions(&self) -> &[u8] {
+        &self.serialized_definitions
+    }
+
+    /// Returns exact JSON for a standard function-tool array without reserializing schemas.
+    pub fn provider_tools_json(&self) -> &RawValue {
+        &self.provider_tools
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
@@ -13,6 +100,9 @@ pub struct ModelRequest {
     pub messages: Vec<Message>,
     /// Tools available to the model for this request.
     pub tools: Vec<ToolDefinition>,
+    #[serde(skip)]
+    /// Immutable prepared form of `tools`, when supplied by the core runner.
+    pub prepared_tools: Option<Arc<PreparedToolCatalog>>,
     /// Generation settings for this request.
     pub generation: GenerationOptions,
     #[serde(default)]
@@ -30,6 +120,7 @@ impl ModelRequest {
             model: model.into(),
             messages: Vec::new(),
             tools: Vec::new(),
+            prepared_tools: None,
             generation: GenerationOptions::default(),
             metadata: JsonMap::new(),
             cancellation: CancellationToken::new(),

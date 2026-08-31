@@ -199,6 +199,7 @@ impl AgentRunner {
                     model: model.clone(),
                     messages: messages.clone(),
                     tools: tool_scope.definitions().to_vec(),
+                    prepared_tools: tool_scope.prepared(),
                     generation: merge_generation(
                         &request.agent.generation,
                         &request.overrides.generation,

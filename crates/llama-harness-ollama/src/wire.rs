@@ -1,20 +1,29 @@
 use llama_harness_core::{
-    GenerationOptions, HarnessError, Message, MessageRole, ToolCall, ToolDefinition, Usage,
+    GenerationOptions, HarnessError, Message, MessageRole, PreparedToolCatalog, ToolCall,
+    ToolDefinition, Usage,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 
 #[derive(Debug, Serialize)]
-pub(crate) struct ChatRequest {
+pub(crate) struct ChatRequest<'a> {
     pub(crate) model: String,
     pub(crate) messages: Vec<WireMessage>,
     pub(crate) stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) keep_alive: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) tools: Option<Vec<WireToolDefinition>>,
+    pub(crate) tools: Option<WireTools<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) options: Option<WireOptions>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum WireTools<'a> {
+    Prepared(&'a RawValue),
+    Legacy(Vec<WireToolDefinition>),
 }
 
 #[derive(Debug, Serialize)]
@@ -91,14 +100,20 @@ pub(crate) struct TagModel {
     pub(crate) name: String,
 }
 
-pub(crate) fn chat_request(
+pub(crate) fn chat_request<'a>(
     model: String,
     messages: &[Message],
     tools: &[ToolDefinition],
+    prepared_tools: Option<&'a PreparedToolCatalog>,
     generation: &GenerationOptions,
     keep_alive: Option<&str>,
     stream: bool,
-) -> Result<ChatRequest, HarnessError> {
+) -> Result<ChatRequest<'a>, HarnessError> {
+    if prepared_tools.is_some_and(|prepared| prepared.definitions() != tools) {
+        return Err(HarnessError::InvalidRequest(
+            "prepared tool catalog does not match request tools".into(),
+        ));
+    }
     Ok(ChatRequest {
         model,
         messages: messages
@@ -107,7 +122,12 @@ pub(crate) fn chat_request(
             .collect::<Result<Vec<_>, _>>()?,
         stream,
         keep_alive: keep_alive.map(str::to_owned),
-        tools: (!tools.is_empty()).then(|| tools.iter().map(wire_tool).collect()),
+        tools: prepared_tools
+            .map(|prepared| WireTools::Prepared(prepared.provider_tools_json()))
+            .or_else(|| {
+                (!tools.is_empty())
+                    .then(|| WireTools::Legacy(tools.iter().map(wire_tool).collect()))
+            }),
         options: options(generation),
     })
 }
@@ -188,4 +208,45 @@ pub(crate) fn usage(response: &ChatResponse) -> Usage {
         response.prompt_eval_count.unwrap_or_default(),
         response.eval_count.unwrap_or_default(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn prepared_and_legacy_tool_bodies_are_byte_equivalent() {
+        let tools = vec![ToolDefinition::new(
+            "lookup",
+            "Lookup",
+            "Look up one value",
+            serde_json::json!({"type":"object","properties":{"id":{"type":"string"}}}),
+        )];
+        let prepared = Arc::new(PreparedToolCatalog::from_definitions(tools.clone()).unwrap());
+        let legacy = chat_request(
+            "model".into(),
+            &[Message::user("lookup")],
+            &tools,
+            None,
+            &GenerationOptions::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let cached = chat_request(
+            "model".into(),
+            &[Message::user("lookup")],
+            &tools,
+            Some(&prepared),
+            &GenerationOptions::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&legacy).unwrap(),
+            serde_json::to_vec(&cached).unwrap()
+        );
+    }
 }

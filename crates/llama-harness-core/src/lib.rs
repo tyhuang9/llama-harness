@@ -40,7 +40,7 @@ pub use event::{
 pub use limits::{AgentLimits, GenerationOptions};
 pub use message::{Message, MessageRole};
 pub use model::{
-    ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
+    ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, PreparedToolCatalog,
     ProviderCapabilityLimits, ProviderHealth, Usage,
 };
 pub use plan::{

@@ -13,7 +13,7 @@ use crate::{
     AgentRunner, ExecutionPlan, HarnessError, Message, ModelRequest, ModelResponse,
     PlanConcurrency, PlanLifecycleOutcome, PlanNode, PlanNodeOutcome, PlanPhase, RunError,
     RunEvent, RunRequest, RunResult, RunStatus, RunStrategy, StrategyFallbackReason,
-    StrategySelectionReason, ToolCall, ToolCaller, ToolDefinition, ToolResult,
+    StrategySelectionReason, ToolCall, ToolCaller, ToolResult,
 };
 use futures_util::future::join_all;
 use jsonschema::Validator;
@@ -288,7 +288,7 @@ impl AgentRunner {
             });
         }
 
-        let plan_tools = run.plan_scope.definitions().to_vec();
+        let plan_scope = run.plan_scope.clone();
         let mut planner_messages = run.messages.clone();
         planner_messages.insert(0, Message::system(PLANNER_PROMPT));
         let mut invalid_repair_used = false;
@@ -306,7 +306,7 @@ impl AgentRunner {
             let response = match run
                 .complete(
                     planner_messages.clone(),
-                    plan_tools.clone(),
+                    plan_scope.clone(),
                     model_phase,
                     true,
                 )
@@ -531,7 +531,7 @@ impl AgentRunner {
                         match run
                             .complete(
                                 recovery_messages,
-                                plan_tools.clone(),
+                                plan_scope.clone(),
                                 ModelCallPhase::Recovery,
                                 true,
                             )
@@ -741,7 +741,7 @@ impl<'a> StrategyRun<'a> {
     async fn complete(
         &mut self,
         messages: Vec<Message>,
-        tools: Vec<ToolDefinition>,
+        scope: ToolScope,
         phase: ModelCallPhase,
         reserve_final_synthesis: bool,
     ) -> Result<Option<ModelResponse>, HarnessError> {
@@ -777,7 +777,8 @@ impl<'a> StrategyRun<'a> {
             let completion = self.runner.provider.complete(ModelRequest {
                 model: self.model.clone(),
                 messages: messages.clone(),
-                tools: tools.clone(),
+                tools: scope.definitions().to_vec(),
+                prepared_tools: scope.prepared(),
                 generation: merge_generation(
                     &self.request.agent.generation,
                     &self.request.overrides.generation,
@@ -1777,7 +1778,7 @@ impl<'a> StrategyRun<'a> {
             let response = match self
                 .complete(
                     self.messages.clone(),
-                    self.direct_scope.definitions().to_vec(),
+                    self.direct_scope.clone(),
                     phase,
                     false,
                 )
@@ -2209,8 +2210,8 @@ mod discovery_terminal_tests {
     use super::*;
     use crate::{
         mock::{final_response, MockModelProvider},
-        InMemoryEventSink, ModelCapabilities, ProviderCapabilityLimits, Tool, ToolDiscoveryLimits,
-        ToolDiscoveryMetadata, ToolRegistry, ToolRisk,
+        InMemoryEventSink, ModelCapabilities, ProviderCapabilityLimits, Tool, ToolDefinition,
+        ToolDiscoveryLimits, ToolDiscoveryMetadata, ToolRegistry, ToolRisk,
     };
     use async_trait::async_trait;
     use serde_json::json;

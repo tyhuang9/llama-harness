@@ -1,8 +1,8 @@
 use crate::{
     discovery::{
         bounded_index_value, fingerprint_catalog, AllowedCatalogEntry, CatalogCache,
-        CatalogCacheKey, CatalogEntry, CatalogFingerprint, CatalogIndex, ToolDiscoveryMetadata,
-        DISCOVERY_GUARD_INTERVAL,
+        CatalogCacheKey, CatalogEntry, CatalogFingerprint, CatalogIndex, PreparedCatalogCache,
+        ToolDiscoveryMetadata, DISCOVERY_GUARD_INTERVAL,
     },
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len},
     AgentLimits, HarnessError,
@@ -419,6 +419,7 @@ pub(crate) struct RegisteredTool {
     output_validator: Option<Arc<Validator>>,
     pub(crate) discovery: ToolDiscoveryMetadata,
     pub(crate) serialized_definition: Arc<[u8]>,
+    pub(crate) serialized_provider_tool: Arc<[u8]>,
     pub(crate) catalog_version: u64,
 }
 
@@ -428,8 +429,10 @@ pub struct ToolRegistry {
     exact_tool_ids: HashMap<String, String>,
     pub(crate) catalog_generation: u64,
     pub(crate) catalog_cache: RwLock<CatalogCache>,
+    pub(crate) prepared_catalog_cache: RwLock<PreparedCatalogCache>,
     pub(crate) fingerprint_cache: RwLock<Option<CatalogFingerprint>>,
     catalog_build_count: AtomicU64,
+    pub(crate) prepared_catalog_build_count: AtomicU64,
     #[cfg(test)]
     pub(crate) discovery_checkpoint: Option<Arc<dyn Fn(ToolCaller) + Send + Sync>>,
     #[cfg(test)]
@@ -443,6 +446,20 @@ struct ToolSafeMetadata<'a> {
     discovery: &'a ToolDiscoveryMetadata,
 }
 
+#[derive(Serialize)]
+struct ProviderTool<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ProviderToolFunction<'a>,
+}
+
+#[derive(Serialize)]
+struct ProviderToolFunction<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a Value,
+}
+
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self {
@@ -450,8 +467,10 @@ impl Default for ToolRegistry {
             exact_tool_ids: HashMap::new(),
             catalog_generation: 0,
             catalog_cache: RwLock::new(CatalogCache::default()),
+            prepared_catalog_cache: RwLock::new(PreparedCatalogCache::default()),
             fingerprint_cache: RwLock::new(None),
             catalog_build_count: AtomicU64::new(0),
+            prepared_catalog_build_count: AtomicU64::new(0),
             #[cfg(test)]
             discovery_checkpoint: None,
             #[cfg(test)]
@@ -555,6 +574,16 @@ impl ToolRegistry {
             .map_err(|error| {
                 HarnessError::InvalidTool(format!("tool is not serializable: {error}"))
             })?;
+        let serialized_provider_tool = serde_json::to_vec(&ProviderTool {
+            kind: "function",
+            function: ProviderToolFunction {
+                name: &definition.id,
+                description: &definition.description,
+                parameters: &definition.arguments_schema,
+            },
+        })
+        .map(Arc::<[u8]>::from)
+        .map_err(|error| HarnessError::InvalidTool(format!("tool is not serializable: {error}")))?;
         let next_generation = self.catalog_generation.checked_add(1).ok_or_else(|| {
             HarnessError::InvalidTool("tool catalog generation is exhausted".into())
         })?;
@@ -569,6 +598,7 @@ impl ToolRegistry {
                 output_validator,
                 discovery,
                 serialized_definition,
+                serialized_provider_tool,
                 catalog_version: next_generation,
             },
         );
@@ -618,6 +648,7 @@ impl ToolRegistry {
                     definition: &entry.definition,
                     metadata: &entry.discovery,
                     serialized_definition: &entry.serialized_definition,
+                    serialized_provider_tool: &entry.serialized_provider_tool,
                     version: entry.catalog_version,
                 });
             }
@@ -677,6 +708,7 @@ impl ToolRegistry {
             .catalog_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard()?;
         if let Some(existing) = cache.get(&key) {
             return Ok((existing, true));
         }
@@ -721,6 +753,11 @@ impl ToolRegistry {
     #[cfg(test)]
     pub(crate) fn catalog_build_count(&self) -> u64 {
         self.catalog_build_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_catalog_build_count(&self) -> u64 {
+        self.prepared_catalog_build_count.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]

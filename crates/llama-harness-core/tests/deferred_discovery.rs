@@ -240,7 +240,19 @@ async fn direct_e2e_reuses_one_immutable_selected_scope_and_emits_private_counte
     for model_request in &requests {
         assert_eq!(model_request.tools.len(), 1);
         assert_eq!(model_request.tools[0].id, target);
+        assert_eq!(
+            model_request
+                .prepared_tools
+                .as_ref()
+                .unwrap()
+                .serialized_definitions(),
+            serde_json::to_vec(&model_request.tools).unwrap()
+        );
     }
+    assert!(Arc::ptr_eq(
+        requests[0].prepared_tools.as_ref().unwrap(),
+        requests[1].prepared_tools.as_ref().unwrap()
+    ));
     let discovery = events
         .events()
         .into_iter()
@@ -312,6 +324,10 @@ async fn planner_repair_and_final_synthesis_reuse_selected_scopes() {
     assert!(requests
         .iter()
         .all(|request| request.tools.len() == 1 && request.tools[0].id == target));
+    let prepared = requests[0].prepared_tools.as_ref().unwrap();
+    assert!(requests
+        .iter()
+        .all(|request| Arc::ptr_eq(prepared, request.prepared_tools.as_ref().unwrap())));
 }
 
 #[tokio::test]
@@ -593,6 +609,7 @@ async fn hot_overflow_fails_before_model_use_and_zero_provider_capacity_is_no_to
         .unwrap();
     assert_eq!(result.status, RunStatus::Completed);
     assert!(zero_provider.requests()[0].tools.is_empty());
+    assert!(zero_provider.requests()[0].prepared_tools.is_none());
 
     for schema_bytes in [0, 1] {
         let provider = Arc::new(
@@ -607,6 +624,7 @@ async fn hot_overflow_fails_before_model_use_and_zero_provider_capacity_is_no_to
             .await
             .unwrap();
         assert_eq!(result.status, RunStatus::Completed);
+        assert!(provider.requests()[0].prepared_tools.is_none());
         let requests = provider.requests();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].tools.is_empty());
@@ -741,6 +759,10 @@ async fn forced_direct_and_declarative_use_the_same_selected_definition() {
     assert!(declarative_requests
         .iter()
         .all(|request| request.tools == direct_tools));
+    assert!(Arc::ptr_eq(
+        declarative_requests[0].prepared_tools.as_ref().unwrap(),
+        declarative_requests[1].prepared_tools.as_ref().unwrap()
+    ));
     assert_eq!(direct_tools.len(), 1);
     assert_eq!(direct_tools[0].id, target);
     assert_eq!(tools[42].calls.load(Ordering::SeqCst), 1);
