@@ -24,6 +24,10 @@ impl Default for RedactionConfig {
                 "password".into(),
                 "secret".into(),
                 "token".into(),
+                "accesstoken".into(),
+                "authtoken".into(),
+                "sessiontoken".into(),
+                "apitoken".into(),
                 "api_key".into(),
                 "apikey".into(),
                 "program".into(),
@@ -117,4 +121,31 @@ fn key_tokens(key: &str) -> Vec<String> {
         tokens.push(component[start..].to_ascii_lowercase());
     }
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn default_redaction_matches_targeted_lower_concatenated_secret_keys() {
+        let redacted = RedactionConfig::default().redact(&json!({
+            "accesstoken": "access",
+            "AUTHTOKEN": "auth",
+            "sessionToken": "session",
+            "apiTOKEN": "api",
+            "accesstokenized": "visible",
+            "resourceapitoken": "visible",
+            "sessiontokenizer": "visible"
+        }));
+
+        assert_eq!(redacted["accesstoken"], REDACTED_VALUE);
+        assert_eq!(redacted["AUTHTOKEN"], REDACTED_VALUE);
+        assert_eq!(redacted["sessionToken"], REDACTED_VALUE);
+        assert_eq!(redacted["apiTOKEN"], REDACTED_VALUE);
+        assert_eq!(redacted["accesstokenized"], "visible");
+        assert_eq!(redacted["resourceapitoken"], "visible");
+        assert_eq!(redacted["sessiontokenizer"], "visible");
+    }
 }

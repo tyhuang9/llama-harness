@@ -934,6 +934,10 @@ fn camel_case_redaction_persists_across_reopen_queries_and_exports() {
         "CLIENT_SECRET_CANARY",
         "OPENAI_API_KEY_CANARY",
         "X_API_KEY_CANARY",
+        "ACCESS_TOKEN_LOWER_CONCATENATED_CANARY",
+        "AUTH_TOKEN_LOWER_CONCATENATED_CANARY",
+        "SESSION_TOKEN_LOWER_CONCATENATED_CANARY",
+        "API_TOKEN_LOWER_CONCATENATED_CANARY",
         "PROGRAM_SOURCE_CANARY",
         "PROGRAM_AST_CANARY",
         "PROGRAM_BYTECODE_CANARY",
@@ -954,10 +958,16 @@ fn camel_case_redaction_persists_across_reopen_queries_and_exports() {
         "clientSecret": canaries[4],
         "openaiApiKey": canaries[5],
         "x-api-key": canaries[6],
-        "programSource": canaries[7],
-        "programAST": canaries[8],
-        "programBytecode": canaries[9],
-        "vmLocals": canaries[10],
+        "accesstoken": canaries[7],
+        "AUTHTOKEN": canaries[8],
+        "sessiontoken": canaries[9],
+        "apiTOKEN": canaries[10],
+        "programSource": canaries[11],
+        "programAST": canaries[12],
+        "programBytecode": canaries[13],
+        "vmLocals": canaries[14],
+        "accesstokenized": "visible-access-tokenized",
+        "resourceapitoken": "visible-resource-api-token",
         "programmatic_conformance": "strict_json_ast_v1",
         "locale": "en-US",
         "resource_api": "visible-resource-api",
@@ -990,6 +1000,10 @@ fn camel_case_redaction_persists_across_reopen_queries_and_exports() {
         "clientSecret",
         "openaiApiKey",
         "x-api-key",
+        "accesstoken",
+        "AUTHTOKEN",
+        "sessiontoken",
+        "apiTOKEN",
         "programSource",
         "programAST",
         "programBytecode",
@@ -1001,6 +1015,8 @@ fn camel_case_redaction_persists_across_reopen_queries_and_exports() {
     assert_eq!(raw["locale"], "en-US");
     assert_eq!(raw["resource_api"], "visible-resource-api");
     assert_eq!(raw["resource"], "visible-resource");
+    assert_eq!(raw["accesstokenized"], "visible-access-tokenized");
+    assert_eq!(raw["resourceapitoken"], "visible-resource-api-token");
     let export = reopened
         .export_run_json("camel-case-redaction")
         .unwrap()

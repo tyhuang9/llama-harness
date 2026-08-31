@@ -132,7 +132,10 @@ enum InspectCommand {
 struct InspectRunArgs {
     /// Application-visible run ID. It remains supported when it selects one
     /// logical execution; use --execution-id when an application reused it.
-    #[arg(required_unless_present = "execution_id")]
+    #[arg(
+        required_unless_present = "execution_id",
+        conflicts_with = "execution_id"
+    )]
     run_id: Option<String>,
     /// Core-generated execution ID from a trace listing.
     #[arg(long)]
@@ -678,6 +681,31 @@ mod tests {
             "--json",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn inspect_run_requires_exactly_one_run_selector() {
+        assert!(Cli::try_parse_from([
+            "llama-harness",
+            "inspect",
+            "run",
+            "--execution-id",
+            "execution-1",
+            "--db",
+            "traces.sqlite",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "llama-harness",
+            "inspect",
+            "run",
+            "run-1",
+            "--execution-id",
+            "execution-1",
+            "--db",
+            "traces.sqlite",
+        ])
+        .is_err());
     }
 
     #[test]

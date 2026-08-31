@@ -1115,6 +1115,18 @@ impl Execution {
         if items.len() > bound {
             return Err(resource("collection operation limit exceeded"));
         }
+        if matches!(kind, WorkKind::FanOut) && items.is_empty() {
+            let (slot, item_slot) = match self.program.code.get(pc) {
+                Some(Instruction::FanOut {
+                    slot, item_slot, ..
+                }) => (*slot, *item_slot),
+                _ => return Err(execution("fan-out state changed")),
+            };
+            self.locals[item_slot] = None;
+            self.store(slot, RuntimeValue::array(Vec::new())?)?;
+            self.pc += 1;
+            return Ok(());
+        }
         match kind {
             WorkKind::Map | WorkKind::Filter => {
                 let allocation = vector_allocation_bytes::<RuntimeValue>(items.len())?;
@@ -2807,6 +2819,20 @@ mod tests {
         ]}"#;
         let mut vm = execution(raw, 3, SandboxLimits::default());
         assert_eq!(complete(&mut vm, 1), json!(7));
+    }
+
+    #[test]
+    fn empty_fan_out_binds_an_empty_result_without_yielding() {
+        let raw = r#"{"version":1,"body":[
+          {"kind":"fan_out","name":"results","tool_id":"read","item":"item","collection":{"kind":"array","items":[]},"max_calls":1,"arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"variable","name":"item"}}]}},
+          {"kind":"return","value":{"kind":"variable","name":"results"}}
+        ]}"#;
+        let mut vm = execution(raw, 16, SandboxLimits::default());
+
+        assert_eq!(complete(&mut vm, 1), json!([]));
+        assert_eq!(vm.metrics().yields, 0);
+        assert_eq!(vm.metrics().fanout_batches, 0);
+        assert_eq!(vm.locals.iter().filter(|value| value.is_some()).count(), 1);
     }
 
     #[test]

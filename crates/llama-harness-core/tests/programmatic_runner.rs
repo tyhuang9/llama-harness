@@ -208,7 +208,7 @@ fn read_fanout_program(values: &[u64]) -> String {
     json!({"version":1,"body":[
         {"kind":"fan_out","name":"results","tool_id":"read","item":"i",
          "collection":{"kind":"array","items":values.iter().map(|value| json!({"kind":"integer","value":value})).collect::<Vec<_>>()},
-         "max_calls":values.len(),
+         "max_calls":values.len().max(1),
          "arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"variable","name":"i"}}]}},
         {"kind":"return","value":{"kind":"variable","name":"results"}}
     ]})
@@ -1820,6 +1820,58 @@ async fn programmatic_fanout_uses_the_minimum_of_host_agent_and_provider_caps() 
             assert_eq!(provider.requests().len(), 1);
         }
     }
+}
+
+#[tokio::test]
+async fn empty_programmatic_fanout_completes_without_broker_or_tool_calls() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(read_fanout_program(&[])),
+            final_response("done"),
+        ])
+        .with_capabilities(capabilities().with_parallel_tool_calls(true)),
+    );
+    let tool = Arc::new(CountingTool::new("read", true, true));
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let events = Arc::new(InMemoryEventSink::default());
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry)
+        .policy(Arc::new(AllowAllPolicy))
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(request(&["read"]), RunStrategy::Programmatic)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.final_output.as_deref(), Some("done"));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.requests().len(), 2);
+    let records = events.events();
+    assert!(records.iter().all(|record| {
+        !matches!(
+            record.event,
+            RunEvent::ToolEffectReused { .. }
+                | RunEvent::ToolRejected { .. }
+                | RunEvent::PolicyDecided { .. }
+                | RunEvent::ApprovalRequested { .. }
+                | RunEvent::ToolCompleted { .. }
+        )
+    }));
+    assert!(records.iter().any(|record| matches!(
+        record.event,
+        RunEvent::ProgramExecutionCompleted {
+            tool_yields: 0,
+            fanout_batches: 0,
+            ..
+        }
+    )));
+    assert!(records
+        .iter()
+        .any(|record| matches!(record.event, RunEvent::StrategyUsage { tool_calls: 0, .. })));
 }
 
 #[tokio::test]
