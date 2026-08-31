@@ -24,7 +24,7 @@ your application keeps ownership of its tools, data, policy, and UI.
 - One bounded `AgentRunner` for model calls and tool execution.
 - Application-defined providers, tools, policy, approvals, and event sinks.
 - Fail-closed defaults for state-changing tools and callback failures.
-- Optional Ollama, SQLite observability, evaluation, and Tauri integrations.
+- Optional Ollama, MCP tool catalog, SQLite observability, evaluation, and Tauri integrations.
 
 ## Install
 
@@ -51,6 +51,7 @@ Minimum supported Rust version: **1.88**.
 | `observability` | Redacted, local SQLite run and event storage |
 | `evals` | Deterministic evaluation and replay contracts |
 | `tauri` | Tauri event, approval, cancellation, and trace helpers |
+| `mcp` | Transport-neutral MCP tool catalog adapters; hosts own transport and credentials |
 
 ## Quick start with Ollama
 

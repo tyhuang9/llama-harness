@@ -30,6 +30,7 @@ llama-harness = { version = "0.1.0", features = ["ollama", "observability"] }
 | `evals` | `llama_harness::evals` | Deterministic evaluation and replay contracts |
 | `tauri` | `llama_harness::tauri` | Tauri event, approval, cancellation, and path helpers |
 | `programmatic` | `llama_harness::programmatic` | Explicitly opted-in deterministic program sandbox contracts |
+| `mcp` | `llama_harness::mcp` | Transport-neutral MCP tool catalog adapter |
 
 ## Run with Ollama
 

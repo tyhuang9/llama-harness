@@ -14,6 +14,7 @@ observability = ["llama-harness/observability"]
 evals = ["llama-harness/evals"]
 tauri = ["llama-harness/tauri"]
 programmatic = ["llama-harness/programmatic"]
+mcp = ["llama-harness/mcp"]
 
 [dependencies]
 llama-harness = "=0.1.0"

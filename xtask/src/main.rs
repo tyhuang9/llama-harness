@@ -13,7 +13,14 @@ const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 256;
-const FACADE_FEATURES: &[&str] = &["ollama", "observability", "evals", "tauri", "programmatic"];
+const FACADE_FEATURES: &[&str] = &[
+    "ollama",
+    "observability",
+    "evals",
+    "tauri",
+    "programmatic",
+    "mcp",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PublishableCrate {
@@ -38,6 +45,9 @@ const PUBLISHABLE_CRATES: &[PublishableCrate] = &[
     },
     PublishableCrate {
         name: "llama-harness-evals",
+    },
+    PublishableCrate {
+        name: "llama-harness-mcp",
     },
     PublishableCrate {
         name: "llama-harness",

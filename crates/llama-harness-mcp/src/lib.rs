@@ -16,6 +16,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashSet},
     sync::Arc,
+    time::Duration,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -166,6 +167,30 @@ pub struct McpLimits {
     /// Max schema JSON depth.
     pub max_json_depth: usize,
 }
+
+/// Bounded lifecycle deadlines. Calls are never retried after a timeout.
+#[derive(Clone, Debug)]
+pub struct McpTimeouts {
+    /// Connection and negotiation deadline.
+    pub connect: Duration,
+    /// Per-page listing deadline.
+    pub list: Duration,
+    /// Per-tool invocation deadline.
+    pub call: Duration,
+    /// Shutdown deadline.
+    pub close: Duration,
+}
+
+impl Default for McpTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            list: Duration::from_secs(10),
+            call: Duration::from_secs(30),
+            close: Duration::from_secs(5),
+        }
+    }
+}
 impl Default for McpLimits {
     fn default() -> Self {
         Self {
@@ -199,7 +224,16 @@ pub async fn import_catalog(
     limits: McpLimits,
 ) -> Result<Vec<McpToolProvenance>, McpError> {
     let server_id = validate_server_id(server_id.into())?;
-    let context = transport.connect(cancellation.child_token()).await?;
+    let timeouts = McpTimeouts::default();
+    let context = tokio::time::timeout(
+        timeouts.connect,
+        transport.connect(cancellation.child_token()),
+    )
+    .await
+    .map_err(|_| McpTransportError {
+        operation: McpOperation::Connect,
+        dispatch: McpDispatchState::PossiblyDispatched,
+    })??;
     if !matches!(
         (context.era, context.version.as_str()),
         (McpProtocolEra::Modern20260728, "2026-07-28")
@@ -216,9 +250,15 @@ pub async fn import_catalog(
     let mut tools = Vec::new();
     let mut bytes = 0usize;
     for _ in 0..limits.max_pages {
-        let page = transport
-            .list_tools(&context, cursor.as_deref(), cancellation.child_token())
-            .await?;
+        let page = tokio::time::timeout(
+            timeouts.list,
+            transport.list_tools(&context, cursor.as_deref(), cancellation.child_token()),
+        )
+        .await
+        .map_err(|_| McpTransportError {
+            operation: McpOperation::ListTools,
+            dispatch: McpDispatchState::PossiblyDispatched,
+        })??;
         bytes = bytes.saturating_add(
             serde_json::to_vec(&page)
                 .map_err(|_| McpError::InvalidCatalog("unserializable page".into()))?
@@ -267,6 +307,7 @@ pub async fn import_catalog(
             tool,
             context.clone(),
             Arc::clone(&transport),
+            timeouts.call,
         ));
         staged.register_with_discovery(adapter.clone(), ToolDiscoveryMetadata::deferred())?;
         adapters.push(adapter);
@@ -283,6 +324,7 @@ struct McpToolAdapter {
     transport: Arc<dyn McpTransport>,
     context: McpContext,
     native_name: String,
+    call_timeout: Duration,
 }
 impl McpToolAdapter {
     fn new(
@@ -291,6 +333,7 @@ impl McpToolAdapter {
         tool: McpTool,
         context: McpContext,
         transport: Arc<dyn McpTransport>,
+        call_timeout: Duration,
     ) -> Self {
         let native_name = tool.name.clone();
         let mut d = ToolDefinition::new(id, tool.name, tool.description, tool.input_schema)
@@ -317,6 +360,7 @@ impl McpToolAdapter {
             transport,
             context,
             native_name,
+            call_timeout,
         }
     }
 }
@@ -348,9 +392,9 @@ impl Tool for McpToolAdapter {
                 "MCP tools cannot be speculative".into(),
             ));
         }
-        let result = self
-            .transport
-            .call_tool(
+        let result = tokio::time::timeout(
+            self.call_timeout,
+            self.transport.call_tool(
                 &self.context,
                 McpCallRequest {
                     name: self.native_name.clone(),
@@ -358,9 +402,19 @@ impl Tool for McpToolAdapter {
                     context: call.clone(),
                 },
                 cancellation,
-            )
-            .await
-            .map_err(|_| HarnessError::Tool("MCP transport failure".into()))?;
+            ),
+        )
+        .await
+        .map_err(|_| HarnessError::TimedOut("MCP tool call".into()))?
+        .map_err(|_| HarnessError::Tool("MCP transport failure".into()))?;
+        if self.definition.output_schema.is_some()
+            && result.structured_content.is_none()
+            && !result.is_error
+        {
+            return Err(HarnessError::Tool(
+                "MCP structured content is required".into(),
+            ));
+        }
         let output = result
             .structured_content
             .or(result.content)
