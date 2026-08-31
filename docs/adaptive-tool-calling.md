@@ -39,17 +39,21 @@ require a finite deadline and VM admission. Admission applies only to bounded
 bounded at eight and additionally limited by the host, provider, Agent, and
 broker caps. Mutations are always serialized.
 
-One correction prompt is permitted only before an effect is dispatched. If the
-corrected program is still invalid and no effect was issued, the runner enters
-a fresh Direct scope as a continuation of the same logical run: it preserves
-the public run and trace IDs, event sequence, deadline, cumulative budgets,
-and broker state while recording `invalid_program` fallback metadata. A forced
-run therefore never claims that Programmatic succeeded. Program generation,
-repair, and final synthesis deliberately use the bounded completion path even
-when a provider advertises streaming; streaming is not a programmatic runtime
-contract yet. Cancellation, deadline, resource, invalid-output, tool, resume, or
-result failures after dispatch leave the effect uncertain and terminal. They
-never repair, restart, replay, speculate, or fall back.
+One correction prompt is permitted only before an effect is dispatched and
+only while more than one model call remains: one call stays reserved for final
+synthesis. A two-call budget therefore spends its second call on the approved
+zero-effect Direct fallback after an invalid initial program; a three-call
+budget can repair once and still synthesize the verified program's answer. If
+the corrected program is still invalid and no effect was issued, the runner
+enters a fresh Direct scope as a continuation of the same logical run: it
+preserves the public run and trace IDs, event sequence, deadline, cumulative
+budgets, and broker state while recording `invalid_program` fallback metadata.
+A forced run therefore never claims that Programmatic succeeded. Program
+generation, repair, and final synthesis deliberately use the bounded completion
+path even when a provider advertises streaming; streaming is not a programmatic
+runtime contract yet. Cancellation, deadline, resource, invalid-output, tool,
+resume, or result failures after dispatch leave the effect uncertain and
+terminal. They never repair, restart, replay, speculate, or fall back.
 
 To roll out safely, leave the feature disabled by default, gate the builder
 configuration in the host deployment, and force Programmatic only in an
@@ -59,6 +63,10 @@ already dispatched; rely on application-level idempotency and the broker's
 uncertain-effect boundary for recovery. Program lifecycle telemetry and SQLite
 kind hooks are metadata-only; source, AST, bytecode, constants, local values,
 arguments, results, raw errors, and model identifiers are not recorded there.
+`ProgramExecutionCompleted` is a nonterminal VM fact. A program attempt emits
+its only terminal lifecycle outcome only after final synthesis and output
+validation succeed; synthesis errors instead emit one final `failed`,
+`cancelled`, `timed_out`, or `limit_reached` outcome.
 
 ## Broker safety boundary
 
