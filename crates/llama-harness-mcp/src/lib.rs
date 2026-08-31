@@ -1608,6 +1608,9 @@ mod tests {
         pages: Mutex<Vec<McpToolPage>>,
         calls: AtomicU64,
         closes: AtomicU64,
+        block_connect: AtomicBool,
+        connect_started: AtomicBool,
+        connect_release: tokio::sync::Notify,
         hang_call: AtomicBool,
         fail_list: AtomicBool,
         call_failure: Mutex<Option<McpTransportError>>,
@@ -1631,6 +1634,9 @@ mod tests {
                 }]),
                 calls: AtomicU64::new(0),
                 closes: AtomicU64::new(0),
+                block_connect: AtomicBool::new(false),
+                connect_started: AtomicBool::new(false),
+                connect_release: tokio::sync::Notify::new(),
                 hang_call: AtomicBool::new(false),
                 fail_list: AtomicBool::new(false),
                 call_failure: Mutex::new(None),
@@ -1659,6 +1665,10 @@ mod tests {
     #[async_trait]
     impl McpTransport for FakeTransport {
         async fn connect(&self, _: CancellationToken) -> Result<McpContext, McpTransportError> {
+            if self.block_connect.load(Ordering::Relaxed) {
+                self.connect_started.store(true, Ordering::Release);
+                self.connect_release.notified().await;
+            }
             Ok(self.context.clone())
         }
         async fn list_tools(
@@ -1766,15 +1776,15 @@ mod tests {
     async fn modern_ttl_expires_without_sleep_and_prevents_dispatch() {
         let clock = Arc::new(FakeClock::default());
         let transport = Arc::new(FakeTransport::modern(10, vec![tool("one")]));
-        let manager = manager(transport.clone(), clock.clone(), None, None);
-        manager
+        let clock_manager = manager(transport.clone(), clock.clone(), None, None);
+        clock_manager
             .refresh(CancellationToken::new())
             .await
             .expect("refresh");
-        assert!(call_first(&manager).await.expect("fresh call").ok);
+        assert!(call_first(&clock_manager).await.expect("fresh call").ok);
         clock.set(11);
         assert!(matches!(
-            call_first(&manager).await,
+            call_first(&clock_manager).await,
             Err(HarnessError::InvalidTool(_))
         ));
         assert_eq!(transport.calls.load(Ordering::Relaxed), 1);
@@ -1825,16 +1835,72 @@ mod tests {
         let clock = Arc::new(FakeClock::default());
         clock.set(10);
         let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
-        let manager = manager(transport.clone(), clock.clone(), None, None);
-        manager
+        let clock_manager = manager(transport.clone(), clock.clone(), None, None);
+        clock_manager
             .refresh(CancellationToken::new())
             .await
             .expect("first refresh");
         clock.set(9);
         assert!(matches!(
-            manager.refresh(CancellationToken::new()).await,
+            clock_manager.refresh(CancellationToken::new()).await,
             Err(McpError::Clock)
         ));
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        transport.pages.lock().expect("test mutex")[0].ttl_ms = None;
+        let ttl_manager = manager(transport.clone(), clock, None, None);
+        assert!(matches!(
+            ttl_manager.refresh(CancellationToken::new()).await,
+            Err(McpError::InvalidCatalog(_))
+        ));
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+
+        let clock = Arc::new(FakeClock::default());
+        clock.set(u64::MAX);
+        let transport = Arc::new(FakeTransport::modern(1, vec![tool("one")]));
+        let overflow_manager = manager(transport.clone(), clock, None, None);
+        assert!(matches!(
+            overflow_manager.refresh(CancellationToken::new()).await,
+            Err(McpError::Clock)
+        ));
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let generation_manager = manager(transport.clone(), clock, None, None);
+        generation_manager
+            .state
+            .lock()
+            .expect("test mutex")
+            .next_generation = u64::MAX;
+        assert!(matches!(
+            generation_manager.refresh(CancellationToken::new()).await,
+            Err(McpError::Clock)
+        ));
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_close_after_connect_releases_the_uninstalled_context() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        transport.block_connect.store(true, Ordering::Relaxed);
+        let manager = manager(transport.clone(), clock, None, None);
+        let refresh = manager.refresh(CancellationToken::new());
+        let close = async {
+            while !transport.connect_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            manager
+                .close(CancellationToken::new())
+                .await
+                .expect("close");
+            transport.connect_release.notify_waiters();
+        };
+        let (refreshed, ()) = tokio::join!(refresh, close);
+        assert!(matches!(refreshed, Err(McpError::CatalogUnavailable)));
         assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
     }
 
