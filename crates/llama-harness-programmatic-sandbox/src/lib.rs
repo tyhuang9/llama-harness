@@ -19,15 +19,15 @@ mod compiler;
 mod error;
 mod limits;
 mod parser;
+mod value;
 mod vm;
 
-pub use ast::{
-    BinaryOperator, Expression, ObjectEntry, Program, Statement, UnaryOperator, PROGRAM_VERSION_V1,
-};
+pub(crate) use ast::{BinaryOperator, Expression, ObjectEntry, Statement, UnaryOperator};
+pub use ast::{Program, PROGRAM_VERSION_V1};
 pub use compiler::VerifiedProgram;
 pub use error::{SandboxError, SandboxErrorCode};
 pub use limits::{SandboxLimits, HARD_LIMITS};
 pub use vm::{
     Execution, ExecutionId, ExecutionMetrics, ResumeToken, StepOutcome, ToolBatch, ToolRequest,
-    ToolResponse,
+    ToolResponse, MAX_ATOMIC_KEY_BYTES, MAX_ATOMIC_STRING_BYTES,
 };

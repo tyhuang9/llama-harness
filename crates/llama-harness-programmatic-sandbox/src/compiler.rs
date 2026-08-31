@@ -2,7 +2,7 @@ use crate::{
     accounting::{key_retained_bytes, measure_value, string_retained_bytes},
     parser::validate_ast,
     BinaryOperator, Expression, Program, SandboxError, SandboxErrorCode, SandboxLimits, Statement,
-    UnaryOperator,
+    UnaryOperator, MAX_ATOMIC_KEY_BYTES, MAX_ATOMIC_STRING_BYTES,
 };
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -13,7 +13,6 @@ use alloc::{
 use serde_json::Value;
 
 /// An opaque, verified executable. Its bytecode is private and non-serializable.
-#[derive(Clone)]
 pub struct VerifiedProgram {
     pub(crate) code: Vec<Instruction>,
     pub(crate) local_count: usize,
@@ -55,6 +54,7 @@ pub(crate) enum Instruction {
         item_slot: usize,
         max_iterations: usize,
         end_target: usize,
+        body_slots: Vec<usize>,
     },
     LoopNext {
         body_target: usize,
@@ -218,6 +218,7 @@ impl Compiler {
                         item_slot,
                         max_iterations: *max_iterations as usize,
                         end_target: 0,
+                        body_slots: Vec::new(),
                     });
                     let body_target = self.code.len();
                     let mut body_environment = environment.clone();
@@ -226,10 +227,20 @@ impl Compiler {
                     self.reserve_instruction()?;
                     self.code.push(Instruction::LoopNext { body_target });
                     let end_target = self.code.len();
+                    let mut body_slots = Vec::new();
+                    body_slots
+                        .try_reserve_exact(self.next_slot.saturating_sub(item_slot + 1))
+                        .map_err(|_| resource("bytecode loop metadata allocation failed"))?;
+                    body_slots.extend(item_slot + 1..self.next_slot);
                     match &mut self.code[start_index] {
                         Instruction::LoopStart {
-                            end_target: target, ..
-                        } => *target = end_target,
+                            end_target: target,
+                            body_slots: slots,
+                            ..
+                        } => {
+                            *target = end_target;
+                            *slots = body_slots;
+                        }
                         _ => return Err(verify("compiler emitted invalid loop")),
                     }
                 }
@@ -506,6 +517,26 @@ fn instruction_slots(instruction: &Instruction) -> Vec<usize> {
     }
 }
 
+fn instruction_slots_in_region(
+    region: &[Instruction],
+    outer_item_slot: usize,
+) -> Result<Vec<usize>, SandboxError> {
+    let mut unique = BTreeSet::new();
+    for instruction in region {
+        for slot in instruction_slots(instruction) {
+            if slot != outer_item_slot {
+                unique.insert(slot);
+            }
+        }
+    }
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(unique.len())
+        .map_err(|_| resource("bytecode loop metadata allocation failed"))?;
+    slots.extend(unique);
+    Ok(slots)
+}
+
 /// Independently validates private compiler output before it is admitted to
 /// the VM. The verifier intentionally receives only bytecode, its local
 /// count, and immutable limits: it must not depend on compiler bookkeeping.
@@ -557,6 +588,7 @@ fn verify_bytecode(
                 item_slot,
                 max_iterations,
                 end_target,
+                body_slots,
                 ..
             } => {
                 if *max_iterations == 0 || *max_iterations > limits.max_loop_iterations {
@@ -577,6 +609,13 @@ fn verify_bytecode(
                     .is_some()
                 {
                     return Err(verify("bytecode loop body is ambiguous"));
+                }
+                let expected_slots = instruction_slots_in_region(
+                    &code[pc + 1..end_target.saturating_sub(1)],
+                    *item_slot,
+                )?;
+                if *body_slots != expected_slots {
+                    return Err(verify("bytecode loop local metadata is invalid"));
                 }
             }
             Instruction::LoopNext { body_target } => {
@@ -694,7 +733,10 @@ fn verify_instruction_expressions(
                     }
                     let mut unique = BTreeSet::new();
                     for key in keys {
-                        if key.is_empty() || key.len() > 256 || !unique.insert(key.as_str()) {
+                        if key.is_empty()
+                            || key.len() > MAX_ATOMIC_KEY_BYTES
+                            || !unique.insert(key.as_str())
+                        {
                             return Err(verify("bytecode object keys are invalid"));
                         }
                         add_constant_bytes(
@@ -718,32 +760,15 @@ fn verify_instruction_expressions(
 }
 
 fn verify_constant_domain(value: &Value) -> Result<(), SandboxError> {
-    let mut pending = Vec::new();
-    pending
-        .try_reserve_exact(1)
-        .map_err(|_| resource("constant verification allocation failed"))?;
-    pending.push(value);
-    while let Some(value) = pending.pop() {
-        match value {
-            Value::Number(number) if number.as_i64().is_none() => {
-                return Err(verify("bytecode constants must be signed integers"));
-            }
-            Value::Array(values) => {
-                pending
-                    .try_reserve(values.len())
-                    .map_err(|_| resource("constant verification allocation failed"))?;
-                pending.extend(values.iter());
-            }
-            Value::Object(values) => {
-                pending
-                    .try_reserve(values.len())
-                    .map_err(|_| resource("constant verification allocation failed"))?;
-                pending.extend(values.values());
-            }
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    match value {
+        Value::Number(number) if number.as_i64().is_none() => {
+            Err(verify("bytecode constants must be signed integers"))
         }
+        Value::Array(_) | Value::Object(_) => Err(verify(
+            "bytecode constants must be scalar language literals",
+        )),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(()),
     }
-    Ok(())
 }
 
 fn verify_definite_local_initialization(
@@ -770,6 +795,38 @@ fn verify_definite_local_initialization(
             .clone()
             .ok_or_else(|| verify("bytecode verifier state is invalid"))?;
         let instruction = &code[pc];
+        match instruction {
+            Instruction::Map {
+                slot, item_slot, ..
+            }
+            | Instruction::Filter {
+                slot, item_slot, ..
+            }
+            | Instruction::FanOut {
+                slot, item_slot, ..
+            } => {
+                if available.contains(item_slot) {
+                    return Err(verify("bytecode scoped local aliases a live binding"));
+                }
+                if slot == item_slot {
+                    return Err(verify("bytecode scoped local slots must be distinct"));
+                }
+            }
+            Instruction::Reduce {
+                slot,
+                item_slot,
+                accumulator_slot,
+                ..
+            } => {
+                if available.contains(item_slot) || available.contains(accumulator_slot) {
+                    return Err(verify("bytecode scoped local aliases a live binding"));
+                }
+                if slot == item_slot || slot == accumulator_slot || item_slot == accumulator_slot {
+                    return Err(verify("bytecode scoped local slots must be distinct"));
+                }
+            }
+            _ => {}
+        }
         verify_instruction_loads(instruction, &available, local_count)?;
 
         let mut propagate = |target: usize, state: BTreeSet<usize>| -> Result<(), SandboxError> {
@@ -944,7 +1001,7 @@ fn verify_pointer(pointer: &str) -> Result<(), SandboxError> {
 }
 
 fn verify_tool_id(tool_id: &str) -> Result<(), SandboxError> {
-    if tool_id.is_empty() || tool_id.len() > 256 {
+    if tool_id.is_empty() || tool_id.len() > MAX_ATOMIC_STRING_BYTES {
         return Err(verify("bytecode tool identifier is invalid"));
     }
     Ok(())
@@ -1223,6 +1280,7 @@ mod tests {
                 item_slot: 0,
                 max_iterations: 1,
                 end_target: 2,
+                body_slots: Vec::new(),
             },
             Instruction::Return {
                 value: ExprCode(vec![ExprInstruction::Constant(Value::Null)]),
@@ -1237,96 +1295,6 @@ mod tests {
     }
 
     #[test]
-    fn directly_constructed_public_ast_uses_the_strict_structural_validator() {
-        let limits = SandboxLimits::default();
-        let invalid_name = Program {
-            version: 1,
-            body: vec![
-                Statement::Let {
-                    name: "not-valid!".into(),
-                    value: Expression::Null,
-                },
-                Statement::Return {
-                    value: Expression::Null,
-                },
-            ],
-        };
-        assert_eq!(
-            invalid_name.compile(&limits).unwrap_err().code(),
-            SandboxErrorCode::InvalidProgram
-        );
-
-        let duplicate_keys = Program {
-            version: 1,
-            body: vec![Statement::Return {
-                value: Expression::Object {
-                    entries: vec![
-                        crate::ObjectEntry {
-                            key: "secret".into(),
-                            value: Expression::Null,
-                        },
-                        crate::ObjectEntry {
-                            key: "secret".into(),
-                            value: Expression::Boolean { value: true },
-                        },
-                    ],
-                },
-            }],
-        };
-        let debug = alloc::format!("{duplicate_keys:?}");
-        assert!(!debug.contains("secret"));
-        assert_eq!(
-            duplicate_keys.compile(&limits).unwrap_err().code(),
-            SandboxErrorCode::InvalidProgram
-        );
-
-        let invalid_bound = Program {
-            version: 1,
-            body: vec![
-                Statement::Map {
-                    name: "mapped".into(),
-                    item: "item".into(),
-                    collection: Expression::Array { items: Vec::new() },
-                    max_items: 0,
-                    value: Expression::Variable {
-                        name: "item".into(),
-                    },
-                },
-                Statement::Return {
-                    value: Expression::Null,
-                },
-            ],
-        };
-        assert_eq!(
-            invalid_bound.compile(&limits).unwrap_err().code(),
-            SandboxErrorCode::ResourceLimit
-        );
-
-        let deep_result = std::panic::catch_unwind(|| {
-            let mut value = Expression::Null;
-            for _ in 0..10_000 {
-                value = Expression::Path {
-                    value: alloc::boxed::Box::new(value),
-                    pointer: String::new(),
-                };
-            }
-            Program {
-                version: 1,
-                body: vec![Statement::Return { value }],
-            }
-            .compile(&limits)
-        });
-        assert!(
-            deep_result.is_ok(),
-            "deep direct AST must not overflow the stack"
-        );
-        assert_eq!(
-            deep_result.unwrap().unwrap_err().code(),
-            SandboxErrorCode::ResourceLimit
-        );
-    }
-
-    #[test]
     fn verifier_rejects_every_out_of_range_scoped_slot_before_vm_admission() {
         let limits = SandboxLimits::default();
         let empty = || ExprCode(vec![ExprInstruction::Array(0)]);
@@ -1337,6 +1305,7 @@ mod tests {
                 item_slot: 1,
                 max_iterations: 1,
                 end_target: 2,
+                body_slots: Vec::new(),
             }],
             vec![Instruction::Map {
                 slot: 0,
@@ -1377,6 +1346,94 @@ mod tests {
             assert_eq!(error.code(), SandboxErrorCode::Verification);
             assert_eq!(error.message(), "bytecode local slot is invalid");
         }
+    }
+
+    #[test]
+    fn verifier_rejects_scoped_slot_aliases_for_every_collection_instruction() {
+        let limits = SandboxLimits::default();
+        let null = || ExprCode(vec![ExprInstruction::Constant(Value::Null)]);
+        let empty = || ExprCode(vec![ExprInstruction::Array(0)]);
+        let prefix = || Instruction::Let {
+            slot: 0,
+            value: null(),
+        };
+        let return_slot = |slot| Instruction::Return {
+            value: ExprCode(vec![ExprInstruction::Load(slot)]),
+        };
+        let programs = [
+            vec![
+                prefix(),
+                Instruction::Map {
+                    slot: 1,
+                    item_slot: 0,
+                    collection: empty(),
+                    max_items: 1,
+                    value: null(),
+                },
+                return_slot(1),
+            ],
+            vec![
+                prefix(),
+                Instruction::Filter {
+                    slot: 1,
+                    item_slot: 0,
+                    collection: empty(),
+                    max_items: 1,
+                    predicate: null(),
+                },
+                return_slot(1),
+            ],
+            vec![
+                prefix(),
+                Instruction::FanOut {
+                    slot: 1,
+                    tool_id: "read".into(),
+                    item_slot: 0,
+                    collection: empty(),
+                    max_calls: 1,
+                    arguments: null(),
+                    call_site: 0,
+                },
+                return_slot(1),
+            ],
+            vec![
+                prefix(),
+                Instruction::Reduce {
+                    slot: 3,
+                    item_slot: 0,
+                    accumulator_slot: 2,
+                    collection: empty(),
+                    max_items: 1,
+                    initial: null(),
+                    value: null(),
+                },
+                return_slot(3),
+            ],
+        ];
+        for code in programs {
+            let error = verify_bytecode(&code, 4, &limits).unwrap_err();
+            assert_eq!(error.code(), SandboxErrorCode::Verification);
+            assert_eq!(
+                error.message(),
+                "bytecode scoped local aliases a live binding"
+            );
+        }
+
+        let reduce_aliases_itself = vec![
+            Instruction::Reduce {
+                slot: 1,
+                item_slot: 0,
+                accumulator_slot: 0,
+                collection: empty(),
+                max_items: 1,
+                initial: null(),
+                value: null(),
+            },
+            return_slot(1),
+        ];
+        let error = verify_bytecode(&reduce_aliases_itself, 2, &limits).unwrap_err();
+        assert_eq!(error.code(), SandboxErrorCode::Verification);
+        assert_eq!(error.message(), "bytecode reduce local slots must differ");
     }
 
     #[test]

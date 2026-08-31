@@ -10,13 +10,28 @@ use serde::{Deserialize, Serialize};
 pub const PROGRAM_VERSION_V1: u32 = 1;
 
 /// A strictly versioned program syntax tree.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// Programs can only be created through [`Program::from_json`], which applies
+/// the strict parser and hard structural limits before this opaque AST can be
+/// retained by a caller.
+///
+/// ```compile_fail
+/// use llama_harness_programmatic_sandbox::Program;
+///
+/// let _ = Program { version: 1, body: Vec::new() };
+/// ```
+///
+/// ```compile_fail
+/// use llama_harness_programmatic_sandbox::Program;
+///
+/// let _: Program = serde_json::from_str(r#"{"version":1,"body":[]}"#).unwrap();
+/// ```
+#[derive(Serialize)]
 pub struct Program {
     /// Must equal [`PROGRAM_VERSION_V1`].
-    pub version: u32,
+    pub(crate) version: u32,
     /// Statements executed in declared order.
-    pub body: Vec<Statement>,
+    pub(crate) body: Vec<Statement>,
 }
 
 impl core::fmt::Debug for Program {
@@ -35,6 +50,11 @@ impl Program {
         parse_program(input, limits)
     }
 
+    /// Returns the validated top-level statement count without exposing the AST.
+    pub fn statement_count(&self) -> usize {
+        self.body.len()
+    }
+
     /// Compiles and verifies this syntax tree into an opaque executable program.
     ///
     /// The private bytecode cannot be serialized or constructed by callers.
@@ -43,10 +63,30 @@ impl Program {
     }
 }
 
+/// Private serde wire form used only by the strict parser entry point.
+///
+/// Keeping this type private prevents callers from using a derived
+/// `Deserialize` implementation to instantiate a [`Program`] before the
+/// nesting, size, and structural checks in `parser::parse_program` run.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProgramWire {
+    version: u32,
+    body: Vec<Statement>,
+}
+
+pub(crate) fn deserialize_program(input: &[u8]) -> Result<Program, serde_json::Error> {
+    let wire: ProgramWire = serde_json::from_slice(input)?;
+    Ok(Program {
+        version: wire.version,
+        body: wire.body,
+    })
+}
+
 /// One immutable program operation.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Statement {
+pub(crate) enum Statement {
     /// Binds one expression to a new immutable local.
     Let {
         /// New local name.
@@ -169,20 +209,10 @@ impl core::fmt::Debug for Statement {
     }
 }
 
-impl Drop for Statement {
-    fn drop(&mut self) {
-        let mut pending = Vec::new();
-        detach_statement(self, &mut pending);
-        while let Some(mut statement) = pending.pop() {
-            detach_statement(&mut statement, &mut pending);
-        }
-    }
-}
-
 /// A deterministic expression without dynamic calls or mutable state.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Expression {
+pub(crate) enum Expression {
     /// JSON null.
     Null,
     /// Boolean literal.
@@ -261,24 +291,14 @@ impl core::fmt::Debug for Expression {
     }
 }
 
-impl Drop for Expression {
-    fn drop(&mut self) {
-        let mut pending = Vec::new();
-        detach_expression(self, &mut pending);
-        while let Some(mut expression) = pending.pop() {
-            detach_expression(&mut expression, &mut pending);
-        }
-    }
-}
-
 /// One object-construction entry.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ObjectEntry {
+pub(crate) struct ObjectEntry {
     /// Object key.
-    pub key: String,
+    pub(crate) key: String,
     /// Object value expression.
-    pub value: Expression,
+    pub(crate) value: Expression,
 }
 
 impl core::fmt::Debug for ObjectEntry {
@@ -291,96 +311,10 @@ impl core::fmt::Debug for ObjectEntry {
     }
 }
 
-fn detach_statement(statement: &mut Statement, pending: &mut Vec<Statement>) {
-    match statement {
-        Statement::Let { value, .. } | Statement::Return { value } => {
-            drop(core::mem::replace(value, Expression::Null));
-        }
-        Statement::Branch {
-            condition,
-            then_body,
-            else_body,
-        } => {
-            drop(core::mem::replace(condition, Expression::Null));
-            pending.append(then_body);
-            pending.append(else_body);
-        }
-        Statement::ForEach {
-            collection, body, ..
-        } => {
-            drop(core::mem::replace(collection, Expression::Null));
-            pending.append(body);
-        }
-        Statement::Map {
-            collection, value, ..
-        } => {
-            drop(core::mem::replace(collection, Expression::Null));
-            drop(core::mem::replace(value, Expression::Null));
-        }
-        Statement::Filter {
-            collection,
-            predicate,
-            ..
-        } => {
-            drop(core::mem::replace(collection, Expression::Null));
-            drop(core::mem::replace(predicate, Expression::Null));
-        }
-        Statement::Reduce {
-            collection,
-            initial,
-            value,
-            ..
-        } => {
-            drop(core::mem::replace(collection, Expression::Null));
-            drop(core::mem::replace(initial, Expression::Null));
-            drop(core::mem::replace(value, Expression::Null));
-        }
-        Statement::Invoke { arguments, .. } => {
-            drop(core::mem::replace(arguments, Expression::Null));
-        }
-        Statement::FanOut {
-            collection,
-            arguments,
-            ..
-        } => {
-            drop(core::mem::replace(collection, Expression::Null));
-            drop(core::mem::replace(arguments, Expression::Null));
-        }
-    }
-}
-
-fn detach_expression(expression: &mut Expression, pending: &mut Vec<Expression>) {
-    match expression {
-        Expression::Path { value, .. } | Expression::Unary { value, .. } => {
-            let child = core::mem::replace(value, alloc::boxed::Box::new(Expression::Null));
-            pending.push(*child);
-        }
-        Expression::Array { items } => pending.append(items),
-        Expression::Object { entries } => {
-            let entries = core::mem::take(entries);
-            pending.reserve(entries.len());
-            for entry in entries {
-                pending.push(entry.value);
-            }
-        }
-        Expression::Binary { left, right, .. } => {
-            let left = core::mem::replace(left, alloc::boxed::Box::new(Expression::Null));
-            let right = core::mem::replace(right, alloc::boxed::Box::new(Expression::Null));
-            pending.push(*left);
-            pending.push(*right);
-        }
-        Expression::Null
-        | Expression::Boolean { .. }
-        | Expression::Integer { .. }
-        | Expression::String { .. }
-        | Expression::Variable { .. } => {}
-    }
-}
-
 /// Deterministic binary operators.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum BinaryOperator {
+pub(crate) enum BinaryOperator {
     /// Checked integer addition.
     Add,
     /// Checked integer subtraction.
@@ -412,7 +346,7 @@ pub enum BinaryOperator {
 /// Deterministic unary and aggregation operators.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UnaryOperator {
+pub(crate) enum UnaryOperator {
     /// Boolean negation.
     Not,
     /// Checked integer negation.

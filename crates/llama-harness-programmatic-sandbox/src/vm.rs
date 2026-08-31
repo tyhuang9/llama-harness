@@ -1,33 +1,42 @@
 use crate::{
     accounting::{
-        array_framing_retained_bytes, checked_add, cloned_value_allocation_bytes,
-        key_retained_bytes, measure_value, object_framing_retained_bytes, primitive_retained_bytes,
-        serialized_string_len, string_retained_bytes, vector_allocation_bytes,
+        array_framing_retained_bytes, checked_add, key_retained_bytes,
+        object_framing_retained_bytes, primitive_retained_bytes, serialized_string_len,
+        string_retained_bytes, vector_allocation_bytes, ValueMeasurement,
     },
     compiler::{ExprCode, ExprInstruction, Instruction, VerifiedProgram},
-    BinaryOperator, SandboxError, SandboxErrorCode, UnaryOperator,
+    value::{RuntimeNode, RuntimeValue},
+    BinaryOperator, SandboxError, SandboxErrorCode, SandboxLimits, UnaryOperator,
 };
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 use serde_json::{Map, Number, Value};
+
+/// Maximum string bytes copied or decoded by one fuel unit.
+pub const MAX_ATOMIC_STRING_BYTES: usize = 64;
+/// Maximum key bytes copied or compared by one fuel unit.
+///
+/// Keys use the same 64-byte quantum as every other runtime string so an
+/// object construction, lookup, equality check, or materialization transition
+/// never scans or copies more input string data than one atomic fuel unit.
+pub const MAX_ATOMIC_KEY_BYTES: usize = MAX_ATOMIC_STRING_BYTES;
 
 /// Host-supplied identifier that scopes resume tokens to one live execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExecutionId(pub u64);
 
 /// One inert, statically named tool request yielded by the sandbox.
-#[derive(Clone, PartialEq)]
 pub struct ToolRequest {
-    /// Host execution identity.
+    /// Execution that issued this request.
     pub execution_id: ExecutionId,
-    /// Host-assigned repair/attempt ordinal.
+    /// Program attempt that issued this request.
     pub program_attempt: u32,
-    /// Stable static call-site ordinal in the verified program.
+    /// Static bytecode call site that issued this request.
     pub call_site: u32,
-    /// Stable dynamic occurrence ordinal in this execution.
+    /// Monotonic occurrence number within the execution.
     pub dynamic_ordinal: u64,
-    /// Static tool identifier embedded in the verified program.
+    /// Statically declared tool identifier.
     pub tool_id: String,
-    /// Fully evaluated owned JSON arguments.
+    /// Fully materialized, object-shaped request arguments.
     pub arguments: Value,
 }
 
@@ -46,7 +55,6 @@ impl core::fmt::Debug for ToolRequest {
 }
 
 /// One ordered batch of inert tool requests.
-#[derive(Clone, PartialEq)]
 pub struct ToolBatch {
     calls: Vec<ToolRequest>,
     read_only_fan_out: bool,
@@ -63,31 +71,33 @@ impl core::fmt::Debug for ToolBatch {
 }
 
 impl ToolBatch {
-    /// Returns calls in deterministic source-collection order.
+    /// Returns the requests in their required response order.
     pub fn calls(&self) -> &[ToolRequest] {
         &self.calls
     }
 
-    /// Whether the program requested read-only fan-out semantics.
-    ///
-    /// The host must still independently verify each tool is read-only and
-    /// parallel-safe before executing calls concurrently.
+    /// Reports whether every request is a static read-only fan-out call.
     pub const fn requests_read_only_fan_out(&self) -> bool {
         self.read_only_fan_out
     }
 }
 
-/// One host-produced response corresponding to a yielded request occurrence.
-#[derive(Clone, PartialEq)]
+/// One validated inert response. Construction borrows the host's JSON value,
+/// so rejected hostile trees remain owned and safely disposable by the host.
+///
+/// There is no unchecked constructor and no public field access, so a caller
+/// cannot inject an unmeasured recursive value into a suspended execution.
+///
+/// ```compile_fail
+/// use llama_harness_programmatic_sandbox::ToolResponse;
+///
+/// let _ = ToolResponse { call_site: 0 };
+/// ```
 pub struct ToolResponse {
-    /// Static call-site ordinal copied from the request.
-    pub call_site: u32,
-    /// Dynamic occurrence ordinal copied from the request.
-    pub dynamic_ordinal: u64,
-    /// Semantic tool success flag.
-    pub ok: bool,
-    /// Owned JSON output. It remains inert data inside the VM.
-    pub output: Value,
+    call_site: u32,
+    dynamic_ordinal: u64,
+    ok: bool,
+    output: RuntimeValue,
 }
 
 impl core::fmt::Debug for ToolResponse {
@@ -103,23 +113,33 @@ impl core::fmt::Debug for ToolResponse {
 }
 
 impl ToolResponse {
-    /// Creates a successful response.
-    pub fn success(request: &ToolRequest, output: Value) -> Self {
-        Self {
+    /// Validates and copies a successful response under host limits.
+    /// Resume independently reapplies the execution's effective limits.
+    pub fn success(
+        request: &ToolRequest,
+        output: &Value,
+        limits: &SandboxLimits,
+    ) -> Result<Self, SandboxError> {
+        limits.validate()?;
+        let output = RuntimeValue::from_json(output, limits)?;
+        if output.measurement().serialized > limits.max_output_bytes {
+            return Err(resource("response serialized byte limit exceeded"));
+        }
+        Ok(Self {
             call_site: request.call_site,
             dynamic_ordinal: request.dynamic_ordinal,
             ok: true,
             output,
-        }
+        })
     }
 
-    /// Creates a failed response without accepting an executable error channel.
+    /// Creates an inert, checked failure response for a yielded request.
     pub fn failure(request: &ToolRequest) -> Self {
         Self {
             call_site: request.call_site,
             dynamic_ordinal: request.dynamic_ordinal,
             ok: false,
-            output: Value::Null,
+            output: RuntimeValue::null(),
         }
     }
 }
@@ -133,19 +153,18 @@ pub struct ResumeToken {
 }
 
 /// Result of one bounded scheduling slice.
-#[derive(PartialEq)]
 #[non_exhaustive]
 pub enum StepOutcome {
-    /// The slice budget was consumed without completing or yielding a tool batch.
+    /// The requested scheduling slice ended after consuming all supplied fuel.
     Sliced,
-    /// Execution suspended with an inert batch and a single-use resume token.
+    /// Tool execution must be authorized and completed before resumption.
     Yielded {
-        /// Requests requiring host authorization and execution.
+        /// Ordered inert requests to execute.
         batch: ToolBatch,
-        /// Token consumed by [`Execution::resume`].
+        /// Single-use proof required by [`Execution::resume`].
         resume: ResumeToken,
     },
-    /// Execution returned a final owned JSON value.
+    /// The terminal JSON result of the program.
     Complete(Value),
 }
 
@@ -163,72 +182,59 @@ impl core::fmt::Debug for StepOutcome {
     }
 }
 
-/// Aggregate, value-free execution counters safe for host telemetry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Monotonic resource and control-flow counters for an execution.
 pub struct ExecutionMetrics {
-    /// Fuel charged before deterministic work.
+    /// Fuel units consumed so far.
     pub fuel_used: u64,
-    /// Number of suspended tool batches.
+    /// Tool-yield batches emitted so far.
     pub yields: u32,
-    /// Number of branch decisions executed.
+    /// Branch conditions evaluated so far.
     pub branches: u64,
-    /// Number of bounded loop iterations entered.
+    /// Loop items entered so far.
     pub loop_iterations: u64,
-    /// Number of read-only fan-out batches yielded.
+    /// Read-only fan-out batches emitted so far.
     pub fanout_batches: u32,
-    /// Conservatively retained value bytes.
+    /// Conservatively charged VM-owned bytes.
     pub retained_bytes: usize,
-    /// Cumulative value bytes charged.
+    /// Cumulatively charged VM-owned bytes.
     pub cumulative_bytes: usize,
 }
 
 struct LoopFrame {
-    items: Vec<Value>,
+    collection: RuntimeValue,
     index: usize,
     item_slot: usize,
     body_target: usize,
-    body_slots: Vec<usize>,
+    start_pc: usize,
 }
 
 enum Work {
     Map {
-        slot: usize,
-        item_slot: usize,
-        items: Vec<Value>,
+        pc: usize,
+        collection: RuntimeValue,
         index: usize,
-        value: ExprCode,
-        output: Vec<Value>,
-        fuel_remaining: u64,
+        output: Vec<RuntimeValue>,
+        measurement: ValueMeasurement,
     },
     Filter {
-        slot: usize,
-        item_slot: usize,
-        items: Vec<Value>,
+        pc: usize,
+        collection: RuntimeValue,
         index: usize,
-        predicate: ExprCode,
-        output: Vec<Value>,
-        fuel_remaining: u64,
+        output: Vec<RuntimeValue>,
+        measurement: ValueMeasurement,
     },
     Reduce {
-        slot: usize,
-        item_slot: usize,
-        accumulator_slot: usize,
-        items: Vec<Value>,
+        pc: usize,
+        collection: RuntimeValue,
         index: usize,
-        value: ExprCode,
-        accumulator: Value,
-        fuel_remaining: u64,
+        accumulator: RuntimeValue,
     },
     FanOut {
-        slot: usize,
-        tool_id: String,
-        item_slot: usize,
-        items: Vec<Value>,
+        pc: usize,
+        collection: RuntimeValue,
         index: usize,
-        arguments: ExprCode,
-        call_site: u32,
         calls: Vec<ToolRequest>,
-        fuel_remaining: u64,
     },
 }
 
@@ -239,15 +245,186 @@ struct Pending {
     fan_out: bool,
 }
 
-/// One live deterministic execution of a verified program.
+#[derive(Clone, Copy)]
+enum ExprLocation {
+    Let(usize),
+    Branch(usize),
+    LoopCollection(usize),
+    MapCollection(usize),
+    MapValue(usize),
+    FilterCollection(usize),
+    FilterPredicate(usize),
+    ReduceCollection(usize),
+    ReduceInitial(usize),
+    ReduceValue(usize),
+    InvokeArguments(usize),
+    FanOutCollection(usize),
+    FanOutArguments(usize),
+    Return(usize),
+}
+
+enum EvalPurpose {
+    Let,
+    Branch,
+    LoopCollection,
+    MapCollection,
+    MapValue,
+    FilterCollection,
+    FilterPredicate,
+    ReduceCollection,
+    ReduceInitial { collection: RuntimeValue },
+    ReduceValue,
+    InvokeArguments,
+    FanOutCollection,
+    FanOutArguments,
+    Return,
+}
+
+enum MaterializePurpose {
+    Invoke,
+    FanOut,
+    Return,
+}
+
+enum Active {
+    Eval {
+        purpose: EvalPurpose,
+        state: EvalState,
+    },
+    Materialize {
+        purpose: MaterializePurpose,
+        state: MaterializeState,
+    },
+    ClearLoop {
+        frame_index: usize,
+        slot_index: usize,
+        next_item: RuntimeValue,
+    },
+}
+
+struct EvalState {
+    location: ExprLocation,
+    ip: usize,
+    stack: Vec<RuntimeValue>,
+    operation: Option<EvalOperation>,
+}
+
+enum EvalOperation {
+    LiteralString {
+        opcode: usize,
+        offset: usize,
+        output: String,
+        serialized: usize,
+    },
+    Array(BuildArray),
+    Object(BuildObject),
+    Equality(EqualityState),
+    Aggregate(AggregateState),
+    Path(PathState),
+}
+
+struct BuildArray {
+    remaining: usize,
+    values: Vec<RuntimeValue>,
+    reverse_index: usize,
+    reversing: bool,
+    measurement: ValueMeasurement,
+}
+
+struct BuildObject {
+    opcode: usize,
+    remaining: usize,
+    values: Vec<RuntimeValue>,
+    reverse_index: usize,
+    phase: ObjectPhase,
+    entry_index: usize,
+    entries: Vec<(String, RuntimeValue)>,
+    measurement: ValueMeasurement,
+}
+
+enum ObjectPhase {
+    Pop,
+    Reverse,
+    Entries,
+}
+
+struct EqualityState {
+    negate: bool,
+    frames: Vec<EqualityFrame>,
+    string: Option<StringEquality>,
+    equal: bool,
+}
+
+enum EqualityFrame {
+    Values(RuntimeValue, RuntimeValue),
+    Array(RuntimeValue, RuntimeValue, usize),
+    Object(RuntimeValue, RuntimeValue, usize),
+}
+
+struct StringEquality {
+    left: RuntimeValue,
+    right: RuntimeValue,
+    offset: usize,
+}
+
+struct AggregateState {
+    operator: UnaryOperator,
+    collection: RuntimeValue,
+    index: usize,
+    integer: i64,
+    boolean: bool,
+}
+
+struct PathState {
+    opcode: usize,
+    current: RuntimeValue,
+    pointer_offset: usize,
+    segment: String,
+    phase: PathPhase,
+}
+
+enum PathPhase {
+    Decode,
+    ObjectLookup(usize),
+    ArrayIndex { offset: usize, value: usize },
+}
+
+struct MaterializeState {
+    current: Option<RuntimeValue>,
+    completed: Option<Value>,
+    frames: Vec<MaterializeFrame>,
+    string: Option<MaterializeString>,
+}
+
+enum MaterializeFrame {
+    Array {
+        source: RuntimeValue,
+        index: usize,
+        output: Vec<Value>,
+    },
+    Object {
+        source: RuntimeValue,
+        index: usize,
+        output: Map<String, Value>,
+    },
+}
+
+struct MaterializeString {
+    source: RuntimeValue,
+    offset: usize,
+    output: String,
+}
+
+/// A single bounded execution of a [`VerifiedProgram`].
 pub struct Execution {
     program: VerifiedProgram,
     execution_id: ExecutionId,
     program_attempt: u32,
     pc: usize,
-    locals: Vec<Option<Value>>,
+    locals: Vec<Option<RuntimeValue>>,
     loops: Vec<LoopFrame>,
     work: Option<Work>,
+    active: Option<Active>,
     pending: Option<Pending>,
     fuel_used: u64,
     yields: u32,
@@ -257,33 +434,33 @@ pub struct Execution {
     branches: u64,
     loop_iterations: u64,
     fanout_batches: u32,
-    instruction_meter: Option<(usize, u64)>,
     terminal: bool,
 }
 
+#[derive(Clone, Copy)]
+enum WorkKind {
+    Map,
+    Filter,
+    FanOut,
+}
+
 impl Execution {
-    /// Starts a fresh execution. The host must keep `execution_id` unique among
-    /// concurrently live executions and stable across this execution's resumes.
+    /// Starts a first attempt of a verified program under `execution_id`.
     pub fn new(program: VerifiedProgram, execution_id: ExecutionId) -> Result<Self, SandboxError> {
         Self::with_attempt(program, execution_id, 0)
     }
 
-    /// Starts a fresh execution with an explicit host repair/attempt ordinal.
+    /// Starts a specific host-assigned attempt of a verified program.
     pub fn with_attempt(
         program: VerifiedProgram,
         execution_id: ExecutionId,
         program_attempt: u32,
     ) -> Result<Self, SandboxError> {
         let structural_bytes = checked_add(
-            vector_allocation_bytes::<Option<Value>>(program.local_count)?,
+            vector_allocation_bytes::<Option<RuntimeValue>>(program.local_count)?,
             vector_allocation_bytes::<LoopFrame>(program.limits.max_control_stack)?,
         )?;
-        if structural_bytes > program.limits.max_live_bytes {
-            return Err(resource("live byte limit exceeded"));
-        }
-        if structural_bytes > program.limits.max_cumulative_bytes {
-            return Err(resource("cumulative byte limit exceeded"));
-        }
+        ensure_byte_limits(structural_bytes, structural_bytes, &program.limits)?;
         let mut locals = Vec::new();
         locals
             .try_reserve_exact(program.local_count)
@@ -301,6 +478,7 @@ impl Execution {
             locals,
             loops,
             work: None,
+            active: None,
             pending: None,
             fuel_used: 0,
             yields: 0,
@@ -310,12 +488,11 @@ impl Execution {
             branches: 0,
             loop_iterations: 0,
             fanout_batches: 0,
-            instruction_meter: None,
             terminal: false,
         })
     }
 
-    /// Returns aggregate value-free counters for this live execution.
+    /// Returns the execution's current monotonic metrics.
     pub const fn metrics(&self) -> ExecutionMetrics {
         ExecutionMetrics {
             fuel_used: self.fuel_used,
@@ -328,7 +505,8 @@ impl Execution {
         }
     }
 
-    /// Advances execution by at most `slice_fuel` deterministic work units.
+    /// Advances execution. One fuel unit performs at most one bytecode, value
+    /// node, collection-item, or bounded string-chunk transition.
     pub fn step(&mut self, slice_fuel: u64) -> Result<StepOutcome, SandboxError> {
         if self.terminal {
             return Err(execution("execution is already terminal"));
@@ -343,10 +521,7 @@ impl Execution {
         }
         let result = self.step_inner(slice_fuel);
         if result.is_err() {
-            self.terminal = true;
-            self.work = None;
-            self.pending = None;
-            self.instruction_meter = None;
+            self.terminalize();
         }
         result
     }
@@ -354,385 +529,753 @@ impl Execution {
     fn step_inner(&mut self, slice_fuel: u64) -> Result<StepOutcome, SandboxError> {
         let mut remaining = slice_fuel;
         loop {
-            if self.work.is_some() {
-                if !self.advance_work(&mut remaining)? {
-                    return Ok(StepOutcome::Sliced);
+            if remaining == 0 {
+                return Ok(StepOutcome::Sliced);
+            }
+            if self.active.is_some() {
+                if let Some(outcome) = self.advance_active(&mut remaining)? {
+                    return Ok(outcome);
                 }
-                if let Some(outcome) = self.finish_fanout_if_ready()? {
+                continue;
+            }
+            if self.work.is_some() {
+                if let Some(outcome) = self.advance_work(&mut remaining)? {
                     return Ok(outcome);
                 }
                 continue;
             }
             if self.pc >= self.program.code.len() {
-                self.terminal = true;
                 return Err(execution("verified program reached no-return state"));
             }
-            let instruction = self.program.code[self.pc].clone();
-            if self.instruction_meter.is_none() {
-                let mut cost =
-                    instruction_metered_cost(&instruction, &self.locals, &self.program.limits)?;
-                match &instruction {
-                    Instruction::LoopStart { end_target, .. } => {
-                        cost = checked_fuel_add(
-                            cost,
-                            usize_to_fuel(end_target.saturating_sub(self.pc))?,
-                        )?;
-                    }
-                    Instruction::LoopNext { body_target } => {
-                        if let Some(frame) = self.loops.last() {
-                            if frame.body_target != *body_target {
-                                return Err(execution("loop frame target mismatch"));
-                            }
-                            if let Some(item) = frame.items.get(frame.index.saturating_add(1)) {
-                                cost = checked_fuel_add(
-                                    cost,
-                                    usize_to_fuel(
-                                        measure_value(item, &self.program.limits)?.retained,
-                                    )?,
-                                )?;
-                                cost = checked_fuel_add(
-                                    cost,
-                                    usize_to_fuel(vector_allocation_bytes::<usize>(
-                                        frame.body_slots.len(),
-                                    )?)?,
-                                )?;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                self.instruction_meter = Some((self.pc, cost));
+            self.start_instruction(&mut remaining)?;
+        }
+    }
+
+    fn start_instruction(&mut self, remaining: &mut u64) -> Result<(), SandboxError> {
+        charge_one(&mut self.fuel_used, self.program.limits.max_fuel, remaining)?;
+        let pc = self.pc;
+        match self
+            .program
+            .code
+            .get(pc)
+            .ok_or_else(|| execution("program counter is invalid"))?
+        {
+            Instruction::Let { .. } => self.start_eval(ExprLocation::Let(pc), EvalPurpose::Let)?,
+            Instruction::Branch { .. } => {
+                self.start_eval(ExprLocation::Branch(pc), EvalPurpose::Branch)?
             }
-            let (metered_pc, fuel_remaining) = self
-                .instruction_meter
-                .as_mut()
-                .ok_or_else(|| execution("instruction meter is missing"))?;
-            if *metered_pc != self.pc {
-                return Err(execution("instruction meter program counter mismatch"));
+            Instruction::Jump { target } => self.pc = *target,
+            Instruction::LoopStart { .. } => self.start_eval(
+                ExprLocation::LoopCollection(pc),
+                EvalPurpose::LoopCollection,
+            )?,
+            Instruction::LoopNext { .. } => self.start_loop_next()?,
+            Instruction::Map { .. } => {
+                self.start_eval(ExprLocation::MapCollection(pc), EvalPurpose::MapCollection)?
             }
-            if !burn_fuel(
-                &mut self.fuel_used,
-                self.program.limits.max_fuel,
-                &mut remaining,
-                fuel_remaining,
-            )? {
-                return Ok(StepOutcome::Sliced);
+            Instruction::Filter { .. } => self.start_eval(
+                ExprLocation::FilterCollection(pc),
+                EvalPurpose::FilterCollection,
+            )?,
+            Instruction::Reduce { .. } => self.start_eval(
+                ExprLocation::ReduceCollection(pc),
+                EvalPurpose::ReduceCollection,
+            )?,
+            Instruction::Invoke { .. } => self.start_eval(
+                ExprLocation::InvokeArguments(pc),
+                EvalPurpose::InvokeArguments,
+            )?,
+            Instruction::FanOut { .. } => self.start_eval(
+                ExprLocation::FanOutCollection(pc),
+                EvalPurpose::FanOutCollection,
+            )?,
+            Instruction::Return { .. } => {
+                self.start_eval(ExprLocation::Return(pc), EvalPurpose::Return)?
             }
-            self.instruction_meter = None;
-            match instruction {
-                Instruction::Let { slot, value } => {
-                    let result = self.eval(&value)?;
-                    self.store_precharged(slot, result)?;
-                    self.pc += 1;
+        }
+        Ok(())
+    }
+
+    fn start_eval(
+        &mut self,
+        location: ExprLocation,
+        purpose: EvalPurpose,
+    ) -> Result<(), SandboxError> {
+        let stack_bytes =
+            vector_allocation_bytes::<RuntimeValue>(self.program.limits.max_operand_stack)?;
+        precharge(
+            &mut self.live_bytes,
+            &mut self.cumulative_bytes,
+            stack_bytes,
+            &self.program.limits,
+        )?;
+        let mut stack = Vec::new();
+        stack
+            .try_reserve_exact(self.program.limits.max_operand_stack)
+            .map_err(|_| resource("operand stack allocation failed"))?;
+        self.active = Some(Active::Eval {
+            purpose,
+            state: EvalState {
+                location,
+                ip: 0,
+                stack,
+                operation: None,
+            },
+        });
+        Ok(())
+    }
+
+    fn start_materialize(
+        &mut self,
+        value: RuntimeValue,
+        purpose: MaterializePurpose,
+    ) -> Result<(), SandboxError> {
+        let measurement = value.measurement();
+        let frame_capacity = measurement.max_depth.saturating_add(1);
+        let bytes = checked_add(
+            measurement.retained,
+            vector_allocation_bytes::<MaterializeFrame>(frame_capacity)?,
+        )?;
+        precharge(
+            &mut self.live_bytes,
+            &mut self.cumulative_bytes,
+            bytes,
+            &self.program.limits,
+        )?;
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(frame_capacity)
+            .map_err(|_| resource("materialization stack allocation failed"))?;
+        self.active = Some(Active::Materialize {
+            purpose,
+            state: MaterializeState {
+                current: Some(value),
+                completed: None,
+                frames,
+                string: None,
+            },
+        });
+        Ok(())
+    }
+
+    fn advance_active(&mut self, remaining: &mut u64) -> Result<Option<StepOutcome>, SandboxError> {
+        let mut active = self
+            .active
+            .take()
+            .ok_or_else(|| execution("active state is missing"))?;
+        charge_one(&mut self.fuel_used, self.program.limits.max_fuel, remaining)?;
+        match &mut active {
+            Active::Eval { purpose, state } => {
+                let result = advance_eval(
+                    &self.program,
+                    &self.locals,
+                    state,
+                    &mut self.live_bytes,
+                    &mut self.cumulative_bytes,
+                )?;
+                if let Some(value) = result {
+                    let purpose = core::mem::replace(purpose, EvalPurpose::Let);
+                    self.finish_eval(purpose, value)
+                } else {
+                    self.active = Some(active);
+                    Ok(None)
                 }
-                Instruction::Branch {
-                    condition,
-                    false_target,
-                } => {
-                    self.branches = self.branches.saturating_add(1);
-                    let condition = expect_bool(self.eval(&condition)?, "branch condition")?;
-                    self.pc = if condition { self.pc + 1 } else { false_target };
+            }
+            Active::Materialize { purpose, state } => {
+                if let Some(value) = advance_materialize(state)? {
+                    let purpose = core::mem::replace(purpose, MaterializePurpose::Return);
+                    self.finish_materialize(purpose, value)
+                } else {
+                    self.active = Some(active);
+                    Ok(None)
                 }
-                Instruction::Jump { target } => self.pc = target,
-                Instruction::LoopStart {
-                    collection,
-                    item_slot,
-                    max_iterations,
-                    end_target,
-                } => {
-                    let items = expect_array(self.eval(&collection)?, "loop collection")?;
-                    if items.len() > max_iterations {
-                        return Err(resource("loop iteration limit exceeded"));
-                    }
-                    if items.is_empty() {
-                        self.pc = end_target;
-                        continue;
-                    }
-                    self.precharge_cloned_value(&items[0])?;
-                    self.locals[item_slot] =
-                        Some(clone_json_value(&items[0], &self.program.limits)?);
+            }
+            Active::ClearLoop {
+                frame_index,
+                slot_index,
+                next_item,
+            } => {
+                let frame = self
+                    .loops
+                    .get(*frame_index)
+                    .ok_or_else(|| execution("loop frame is invalid"))?;
+                let body_slots = match self.program.code.get(frame.start_pc) {
+                    Some(Instruction::LoopStart { body_slots, .. }) => body_slots,
+                    _ => return Err(execution("loop metadata is invalid")),
+                };
+                if let Some(slot) = body_slots.get(*slot_index) {
+                    let local = self
+                        .locals
+                        .get_mut(*slot)
+                        .ok_or_else(|| execution("loop local slot is invalid"))?;
+                    *local = None;
+                    *slot_index += 1;
+                    self.active = Some(active);
+                    Ok(None)
+                } else {
+                    let frame = self
+                        .loops
+                        .get_mut(*frame_index)
+                        .ok_or_else(|| execution("loop frame is invalid"))?;
+                    precharge_cached_clone(
+                        &mut self.live_bytes,
+                        &mut self.cumulative_bytes,
+                        next_item,
+                        &self.program.limits,
+                    )?;
+                    self.locals[frame.item_slot] = Some(next_item.clone());
+                    frame.index += 1;
                     self.loop_iterations = self.loop_iterations.saturating_add(1);
-                    if self.loops.len() >= self.program.limits.max_control_stack {
-                        return Err(resource("control stack limit exceeded"));
-                    }
-                    let body_instruction_count = end_target
-                        .checked_sub(self.pc.saturating_add(2))
-                        .ok_or_else(|| execution("loop body target is invalid"))?;
-                    let body_slot_capacity = body_instruction_count
-                        .checked_mul(3)
-                        .ok_or_else(|| resource("loop local tracking limit exceeded"))?;
-                    self.precharge_bytes(vector_allocation_bytes::<usize>(body_slot_capacity)?)?;
-                    let body_slots = loop_body_slots(&self.program.code, self.pc + 1, end_target)?;
-                    self.loops.push(LoopFrame {
-                        items,
-                        index: 0,
-                        item_slot,
-                        body_target: self.pc + 1,
-                        body_slots,
-                    });
-                    self.pc += 1;
-                }
-                Instruction::LoopNext { body_target } => {
-                    let next = {
-                        let frame = self
-                            .loops
-                            .last_mut()
-                            .ok_or_else(|| execution("loop stack underflow"))?;
-                        if frame.body_target != body_target {
-                            return Err(execution("loop frame target mismatch"));
-                        }
-                        frame.index += 1;
-                        (frame.index < frame.items.len()).then_some((
-                            frame.item_slot,
-                            frame.index,
-                            frame.body_slots.len(),
-                        ))
-                    };
-                    if let Some((item_slot, item_index, body_slot_count)) = next {
-                        let item_retained = measure_value(
-                            &self
-                                .loops
-                                .last()
-                                .ok_or_else(|| execution("loop stack underflow"))?
-                                .items[item_index],
-                            &self.program.limits,
-                        )?
-                        .retained;
-                        self.precharge_bytes(item_retained)?;
-                        let clone_bytes = cloned_value_allocation_bytes(
-                            &self
-                                .loops
-                                .last()
-                                .ok_or_else(|| execution("loop stack underflow"))?
-                                .items[item_index],
-                            &self.program.limits,
-                        )?
-                        .checked_sub(item_retained)
-                        .ok_or_else(|| resource("value clone accounting underflowed"))?;
-                        self.precharge_bytes(clone_bytes)?;
-                        self.precharge_bytes(vector_allocation_bytes::<usize>(body_slot_count)?)?;
-                        let item = clone_json_value(
-                            &self
-                                .loops
-                                .last()
-                                .ok_or_else(|| execution("loop stack underflow"))?
-                                .items[item_index],
-                            &self.program.limits,
-                        )?;
-                        let mut body_slots = Vec::new();
-                        body_slots
-                            .try_reserve_exact(body_slot_count)
-                            .map_err(|_| resource("loop local tracking allocation failed"))?;
-                        body_slots.extend_from_slice(
-                            &self
-                                .loops
-                                .last()
-                                .ok_or_else(|| execution("loop stack underflow"))?
-                                .body_slots,
-                        );
-                        clear_loop_body_slots(&mut self.locals, &body_slots);
-                        self.loop_iterations = self.loop_iterations.saturating_add(1);
-                        self.locals[item_slot] = Some(item);
-                        self.pc = body_target;
-                    } else {
-                        let frame = self
-                            .loops
-                            .pop()
-                            .ok_or_else(|| execution("loop stack underflow"))?;
-                        clear_loop_body_slots(&mut self.locals, &frame.body_slots);
-                        self.locals[frame.item_slot] = None;
-                        self.pc += 1;
-                    }
-                }
-                Instruction::Map {
-                    slot,
-                    item_slot,
-                    collection,
-                    max_items,
-                    value,
-                } => {
-                    let items = expect_array(self.eval(&collection)?, "map collection")?;
-                    validate_items(
-                        items.len(),
-                        max_items,
-                        self.program.limits.max_collection_items,
-                    )?;
-                    self.precharge_bytes(array_framing_retained_bytes()?)?;
-                    self.precharge_bytes(vector_allocation_bytes::<Value>(items.len())?)?;
-                    let mut output = Vec::new();
-                    output
-                        .try_reserve_exact(items.len())
-                        .map_err(|_| resource("collection allocation failed"))?;
-                    self.work = Some(Work::Map {
-                        slot,
-                        item_slot,
-                        items,
-                        index: 0,
-                        value,
-                        output,
-                        fuel_remaining: 0,
-                    });
-                }
-                Instruction::Filter {
-                    slot,
-                    item_slot,
-                    collection,
-                    max_items,
-                    predicate,
-                } => {
-                    let items = expect_array(self.eval(&collection)?, "filter collection")?;
-                    validate_items(
-                        items.len(),
-                        max_items,
-                        self.program.limits.max_collection_items,
-                    )?;
-                    // Reserve the worst-case serialized array framing before the
-                    // output vector grows. A filtered result may retain fewer
-                    // elements, so this is deliberately conservative.
-                    self.precharge_bytes(array_framing_retained_bytes()?)?;
-                    self.precharge_bytes(vector_allocation_bytes::<Value>(items.len())?)?;
-                    let mut output = Vec::new();
-                    output
-                        .try_reserve_exact(items.len())
-                        .map_err(|_| resource("collection allocation failed"))?;
-                    self.work = Some(Work::Filter {
-                        slot,
-                        item_slot,
-                        items,
-                        index: 0,
-                        predicate,
-                        output,
-                        fuel_remaining: 0,
-                    });
-                }
-                Instruction::Reduce {
-                    slot,
-                    item_slot,
-                    accumulator_slot,
-                    collection,
-                    max_items,
-                    initial,
-                    value,
-                } => {
-                    let items = expect_array(self.eval(&collection)?, "reduce collection")?;
-                    validate_items(
-                        items.len(),
-                        max_items,
-                        self.program.limits.max_collection_items,
-                    )?;
-                    let accumulator = self.eval(&initial)?;
-                    self.work = Some(Work::Reduce {
-                        slot,
-                        item_slot,
-                        accumulator_slot,
-                        items,
-                        index: 0,
-                        value,
-                        accumulator,
-                        fuel_remaining: 0,
-                    });
-                }
-                Instruction::Invoke {
-                    slot,
-                    tool_id,
-                    arguments,
-                    call_site,
-                } => {
-                    let arguments = self.eval(&arguments)?;
-                    require_object(&arguments)?;
-                    self.precharge_bytes(string_retained_bytes(tool_id.len())?)?;
-                    let request = self.request(tool_id, call_site, arguments)?;
-                    self.precharge_bytes(vector_allocation_bytes::<ToolRequest>(1)?)?;
-                    let mut calls = Vec::new();
-                    calls
-                        .try_reserve_exact(1)
-                        .map_err(|_| resource("tool batch allocation failed"))?;
-                    calls.push(request);
-                    return self.suspend(slot, calls, false);
-                }
-                Instruction::FanOut {
-                    slot,
-                    tool_id,
-                    item_slot,
-                    collection,
-                    max_calls,
-                    arguments,
-                    call_site,
-                } => {
-                    let items = expect_array(self.eval(&collection)?, "fan-out collection")?;
-                    validate_items(items.len(), max_calls, self.program.limits.max_fanout)?;
-                    self.precharge_bytes(vector_allocation_bytes::<ToolRequest>(items.len())?)?;
-                    let mut calls = Vec::new();
-                    calls
-                        .try_reserve_exact(items.len())
-                        .map_err(|_| resource("fan-out allocation failed"))?;
-                    self.work = Some(Work::FanOut {
-                        slot,
-                        tool_id,
-                        item_slot,
-                        items,
-                        index: 0,
-                        arguments,
-                        call_site,
-                        calls,
-                        fuel_remaining: 0,
-                    });
-                }
-                Instruction::Return { value } => {
-                    let output = self.eval(&value)?;
-                    let measurement = measure_value(&output, &self.program.limits)?;
-                    if measurement.serialized > self.program.limits.max_output_bytes {
-                        return Err(resource("output byte limit exceeded"));
-                    }
-                    self.terminal = true;
-                    return Ok(StepOutcome::Complete(output));
+                    self.pc = frame.body_target;
+                    Ok(None)
                 }
             }
         }
     }
 
-    /// Resumes exactly the currently suspended yield. The token is consumed.
-    ///
-    /// Any invalid resume attempt terminalizes the execution. This makes token
-    /// loss explicit and prevents callers from replaying a yield after the
-    /// non-clone token has been consumed. Once token, batch identity, and all
-    /// response bounds are accepted, any later failure is also terminal.
+    fn finish_eval(
+        &mut self,
+        purpose: EvalPurpose,
+        value: RuntimeValue,
+    ) -> Result<Option<StepOutcome>, SandboxError> {
+        match purpose {
+            EvalPurpose::Let => {
+                let slot = match self.program.code.get(self.pc) {
+                    Some(Instruction::Let { slot, .. }) => *slot,
+                    _ => return Err(execution("let state changed")),
+                };
+                self.store(slot, value)?;
+                self.pc += 1;
+            }
+            EvalPurpose::Branch => {
+                let false_target = match self.program.code.get(self.pc) {
+                    Some(Instruction::Branch { false_target, .. }) => *false_target,
+                    _ => return Err(execution("branch state changed")),
+                };
+                self.branches = self.branches.saturating_add(1);
+                self.pc = if expect_bool(&value, "branch condition")? {
+                    self.pc + 1
+                } else {
+                    false_target
+                };
+            }
+            EvalPurpose::LoopCollection => self.finish_loop_collection(value)?,
+            EvalPurpose::MapCollection => self.start_collection_work(value, WorkKind::Map)?,
+            EvalPurpose::MapValue => self.finish_map_item(value)?,
+            EvalPurpose::FilterCollection => self.start_collection_work(value, WorkKind::Filter)?,
+            EvalPurpose::FilterPredicate => self.finish_filter_item(value)?,
+            EvalPurpose::ReduceCollection => self.start_eval(
+                ExprLocation::ReduceInitial(self.pc),
+                EvalPurpose::ReduceInitial { collection: value },
+            )?,
+            EvalPurpose::ReduceInitial { collection } => {
+                self.start_reduce_work(collection, value)?
+            }
+            EvalPurpose::ReduceValue => self.finish_reduce_item(value)?,
+            EvalPurpose::InvokeArguments => {
+                require_object(&value)?;
+                self.start_materialize(value, MaterializePurpose::Invoke)?;
+            }
+            EvalPurpose::FanOutCollection => self.start_collection_work(value, WorkKind::FanOut)?,
+            EvalPurpose::FanOutArguments => {
+                require_object(&value)?;
+                self.start_materialize(value, MaterializePurpose::FanOut)?;
+            }
+            EvalPurpose::Return => {
+                if value.measurement().serialized > self.program.limits.max_output_bytes {
+                    return Err(resource("output byte limit exceeded"));
+                }
+                self.start_materialize(value, MaterializePurpose::Return)?;
+            }
+        }
+        Ok(None)
+    }
+
+    fn finish_materialize(
+        &mut self,
+        purpose: MaterializePurpose,
+        value: Value,
+    ) -> Result<Option<StepOutcome>, SandboxError> {
+        match purpose {
+            MaterializePurpose::Return => {
+                self.terminal = true;
+                Ok(Some(StepOutcome::Complete(value)))
+            }
+            MaterializePurpose::Invoke => {
+                let (slot, tool_id, call_site) = match self.program.code.get(self.pc) {
+                    Some(Instruction::Invoke {
+                        slot,
+                        tool_id,
+                        call_site,
+                        ..
+                    }) => (*slot, clone_string(tool_id)?, *call_site),
+                    _ => return Err(execution("invoke state changed")),
+                };
+                precharge(
+                    &mut self.live_bytes,
+                    &mut self.cumulative_bytes,
+                    string_retained_bytes(tool_id.capacity())?,
+                    &self.program.limits,
+                )?;
+                let call = self.request(tool_id, call_site, value)?;
+                Ok(Some(self.suspend(slot, vec![call], false)?))
+            }
+            MaterializePurpose::FanOut => {
+                let (tool_id, call_site) = match self.program.code.get(self.pc) {
+                    Some(Instruction::FanOut {
+                        tool_id, call_site, ..
+                    }) => (clone_string(tool_id)?, *call_site),
+                    _ => return Err(execution("fan-out state changed")),
+                };
+                precharge(
+                    &mut self.live_bytes,
+                    &mut self.cumulative_bytes,
+                    string_retained_bytes(tool_id.capacity())?,
+                    &self.program.limits,
+                )?;
+                let call = self.request(tool_id, call_site, value)?;
+                match self.work.as_mut() {
+                    Some(Work::FanOut { index, calls, .. }) => {
+                        calls.push(call);
+                        *index += 1;
+                    }
+                    _ => return Err(execution("fan-out work state changed")),
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn finish_loop_collection(&mut self, value: RuntimeValue) -> Result<(), SandboxError> {
+        let items = expect_array(&value, "loop collection")?;
+        let (item_slot, max_iterations, end_target) = match self.program.code.get(self.pc) {
+            Some(Instruction::LoopStart {
+                item_slot,
+                max_iterations,
+                end_target,
+                ..
+            }) => (*item_slot, *max_iterations, *end_target),
+            _ => return Err(execution("loop state changed")),
+        };
+        if items.len() > max_iterations {
+            return Err(resource("loop iteration limit exceeded"));
+        }
+        if items.is_empty() {
+            self.pc = end_target;
+            return Ok(());
+        }
+        if self.loops.len() >= self.program.limits.max_control_stack {
+            return Err(resource("control stack limit exceeded"));
+        }
+        let first = items[0].clone();
+        precharge_cached_clone(
+            &mut self.live_bytes,
+            &mut self.cumulative_bytes,
+            &first,
+            &self.program.limits,
+        )?;
+        self.locals[item_slot] = Some(first);
+        self.loops.push(LoopFrame {
+            collection: value,
+            index: 0,
+            item_slot,
+            body_target: self.pc + 1,
+            start_pc: self.pc,
+        });
+        self.loop_iterations = self.loop_iterations.saturating_add(1);
+        self.pc += 1;
+        Ok(())
+    }
+
+    fn start_loop_next(&mut self) -> Result<(), SandboxError> {
+        let body_target = match self.program.code.get(self.pc) {
+            Some(Instruction::LoopNext { body_target }) => *body_target,
+            _ => return Err(execution("loop-next state changed")),
+        };
+        let frame_index = self
+            .loops
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| execution("loop frame is missing"))?;
+        let frame = &self.loops[frame_index];
+        if frame.body_target != body_target {
+            return Err(execution("loop frame target mismatch"));
+        }
+        let items = expect_array(&frame.collection, "loop collection")?;
+        if frame.index + 1 >= items.len() {
+            let frame = self
+                .loops
+                .pop()
+                .ok_or_else(|| execution("loop frame is missing"))?;
+            self.locals[frame.item_slot] = None;
+            self.pc += 1;
+            return Ok(());
+        }
+        self.active = Some(Active::ClearLoop {
+            frame_index,
+            slot_index: 0,
+            next_item: items[frame.index + 1].clone(),
+        });
+        Ok(())
+    }
+
+    fn advance_work(&mut self, remaining: &mut u64) -> Result<Option<StepOutcome>, SandboxError> {
+        charge_one(&mut self.fuel_used, self.program.limits.max_fuel, remaining)?;
+        let mut work = self
+            .work
+            .take()
+            .ok_or_else(|| execution("work state is missing"))?;
+        match &mut work {
+            Work::Map {
+                pc,
+                collection,
+                index,
+                output,
+                measurement,
+            } => {
+                let items = expect_array(collection, "map collection")?;
+                if *index == items.len() {
+                    let value = RuntimeValue::array_measured(core::mem::take(output), *measurement);
+                    let (slot, item_slot) = match self.program.code.get(*pc) {
+                        Some(Instruction::Map {
+                            slot, item_slot, ..
+                        }) => (*slot, *item_slot),
+                        _ => return Err(execution("map state changed")),
+                    };
+                    self.locals[item_slot] = None;
+                    self.store(slot, value)?;
+                    self.pc += 1;
+                } else {
+                    let item_slot = match self.program.code.get(*pc) {
+                        Some(Instruction::Map { item_slot, .. }) => *item_slot,
+                        _ => return Err(execution("map state changed")),
+                    };
+                    assign_scoped(
+                        &mut self.locals,
+                        item_slot,
+                        &items[*index],
+                        &mut self.live_bytes,
+                        &mut self.cumulative_bytes,
+                        &self.program.limits,
+                    )?;
+                    let location = ExprLocation::MapValue(*pc);
+                    self.work = Some(work);
+                    self.start_eval(location, EvalPurpose::MapValue)?;
+                    return Ok(None);
+                }
+            }
+            Work::Filter {
+                pc,
+                collection,
+                index,
+                output,
+                measurement,
+            } => {
+                let items = expect_array(collection, "filter collection")?;
+                if *index == items.len() {
+                    let value = RuntimeValue::array_measured(core::mem::take(output), *measurement);
+                    let (slot, item_slot) = match self.program.code.get(*pc) {
+                        Some(Instruction::Filter {
+                            slot, item_slot, ..
+                        }) => (*slot, *item_slot),
+                        _ => return Err(execution("filter state changed")),
+                    };
+                    self.locals[item_slot] = None;
+                    self.store(slot, value)?;
+                    self.pc += 1;
+                } else {
+                    let item_slot = match self.program.code.get(*pc) {
+                        Some(Instruction::Filter { item_slot, .. }) => *item_slot,
+                        _ => return Err(execution("filter state changed")),
+                    };
+                    assign_scoped(
+                        &mut self.locals,
+                        item_slot,
+                        &items[*index],
+                        &mut self.live_bytes,
+                        &mut self.cumulative_bytes,
+                        &self.program.limits,
+                    )?;
+                    let location = ExprLocation::FilterPredicate(*pc);
+                    self.work = Some(work);
+                    self.start_eval(location, EvalPurpose::FilterPredicate)?;
+                    return Ok(None);
+                }
+            }
+            Work::Reduce {
+                pc,
+                collection,
+                index,
+                accumulator,
+            } => {
+                let items = expect_array(collection, "reduce collection")?;
+                if *index == items.len() {
+                    let (slot, item_slot, accumulator_slot) = match self.program.code.get(*pc) {
+                        Some(Instruction::Reduce {
+                            slot,
+                            item_slot,
+                            accumulator_slot,
+                            ..
+                        }) => (*slot, *item_slot, *accumulator_slot),
+                        _ => return Err(execution("reduce state changed")),
+                    };
+                    self.locals[item_slot] = None;
+                    self.locals[accumulator_slot] = None;
+                    self.store(slot, accumulator.clone())?;
+                    self.pc += 1;
+                } else {
+                    let (item_slot, accumulator_slot) = match self.program.code.get(*pc) {
+                        Some(Instruction::Reduce {
+                            item_slot,
+                            accumulator_slot,
+                            ..
+                        }) => (*item_slot, *accumulator_slot),
+                        _ => return Err(execution("reduce state changed")),
+                    };
+                    assign_scoped(
+                        &mut self.locals,
+                        item_slot,
+                        &items[*index],
+                        &mut self.live_bytes,
+                        &mut self.cumulative_bytes,
+                        &self.program.limits,
+                    )?;
+                    assign_scoped(
+                        &mut self.locals,
+                        accumulator_slot,
+                        accumulator,
+                        &mut self.live_bytes,
+                        &mut self.cumulative_bytes,
+                        &self.program.limits,
+                    )?;
+                    let location = ExprLocation::ReduceValue(*pc);
+                    self.work = Some(work);
+                    self.start_eval(location, EvalPurpose::ReduceValue)?;
+                    return Ok(None);
+                }
+            }
+            Work::FanOut {
+                pc,
+                collection,
+                index,
+                calls,
+            } => {
+                let items = expect_array(collection, "fan-out collection")?;
+                if *index == items.len() {
+                    let (slot, item_slot) = match self.program.code.get(*pc) {
+                        Some(Instruction::FanOut {
+                            slot, item_slot, ..
+                        }) => (*slot, *item_slot),
+                        _ => return Err(execution("fan-out state changed")),
+                    };
+                    self.locals[item_slot] = None;
+                    return Ok(Some(self.suspend(slot, core::mem::take(calls), true)?));
+                }
+                let item_slot = match self.program.code.get(*pc) {
+                    Some(Instruction::FanOut { item_slot, .. }) => *item_slot,
+                    _ => return Err(execution("fan-out state changed")),
+                };
+                assign_scoped(
+                    &mut self.locals,
+                    item_slot,
+                    &items[*index],
+                    &mut self.live_bytes,
+                    &mut self.cumulative_bytes,
+                    &self.program.limits,
+                )?;
+                let location = ExprLocation::FanOutArguments(*pc);
+                self.work = Some(work);
+                self.start_eval(location, EvalPurpose::FanOutArguments)?;
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    }
+
+    fn start_collection_work(
+        &mut self,
+        collection: RuntimeValue,
+        kind: WorkKind,
+    ) -> Result<(), SandboxError> {
+        let items = expect_array(&collection, "collection operation")?;
+        let pc = self.pc;
+        let bound = match (kind, self.program.code.get(pc)) {
+            (WorkKind::Map, Some(Instruction::Map { max_items, .. }))
+            | (WorkKind::Filter, Some(Instruction::Filter { max_items, .. })) => *max_items,
+            (WorkKind::FanOut, Some(Instruction::FanOut { max_calls, .. })) => *max_calls,
+            _ => return Err(execution("collection work state changed")),
+        };
+        if items.len() > bound {
+            return Err(resource("collection operation limit exceeded"));
+        }
+        match kind {
+            WorkKind::Map | WorkKind::Filter => {
+                let allocation = vector_allocation_bytes::<RuntimeValue>(items.len())?;
+                precharge(
+                    &mut self.live_bytes,
+                    &mut self.cumulative_bytes,
+                    checked_add(array_framing_retained_bytes()?, allocation)?,
+                    &self.program.limits,
+                )?;
+                let mut output = Vec::new();
+                output
+                    .try_reserve_exact(items.len())
+                    .map_err(|_| resource("collection output allocation failed"))?;
+                let measurement = ValueMeasurement {
+                    retained: array_framing_retained_bytes()?,
+                    serialized: 2,
+                    nodes: 1,
+                    collection_items: 0,
+                    max_depth: 1,
+                };
+                self.work = Some(if matches!(kind, WorkKind::Map) {
+                    Work::Map {
+                        pc,
+                        collection,
+                        index: 0,
+                        output,
+                        measurement,
+                    }
+                } else {
+                    Work::Filter {
+                        pc,
+                        collection,
+                        index: 0,
+                        output,
+                        measurement,
+                    }
+                });
+            }
+            WorkKind::FanOut => {
+                let allocation = vector_allocation_bytes::<ToolRequest>(items.len())?;
+                precharge(
+                    &mut self.live_bytes,
+                    &mut self.cumulative_bytes,
+                    allocation,
+                    &self.program.limits,
+                )?;
+                let mut calls = Vec::new();
+                calls
+                    .try_reserve_exact(items.len())
+                    .map_err(|_| resource("fan-out request allocation failed"))?;
+                self.work = Some(Work::FanOut {
+                    pc,
+                    collection,
+                    index: 0,
+                    calls,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn start_reduce_work(
+        &mut self,
+        collection: RuntimeValue,
+        accumulator: RuntimeValue,
+    ) -> Result<(), SandboxError> {
+        let items = expect_array(&collection, "reduce collection")?;
+        let max_items = match self.program.code.get(self.pc) {
+            Some(Instruction::Reduce { max_items, .. }) => *max_items,
+            _ => return Err(execution("reduce state changed")),
+        };
+        if items.len() > max_items {
+            return Err(resource("collection operation limit exceeded"));
+        }
+        self.work = Some(Work::Reduce {
+            pc: self.pc,
+            collection,
+            index: 0,
+            accumulator,
+        });
+        Ok(())
+    }
+
+    fn finish_map_item(&mut self, value: RuntimeValue) -> Result<(), SandboxError> {
+        match self.work.as_mut() {
+            Some(Work::Map {
+                index,
+                output,
+                measurement,
+                ..
+            }) => {
+                append_array_measurement(measurement, value.measurement(), output.len())?;
+                output.push(value);
+                *index += 1;
+                Ok(())
+            }
+            _ => Err(execution("map work state changed")),
+        }
+    }
+
+    fn finish_filter_item(&mut self, value: RuntimeValue) -> Result<(), SandboxError> {
+        let include = expect_bool(&value, "filter predicate")?;
+        match self.work.as_mut() {
+            Some(Work::Filter {
+                collection,
+                index,
+                output,
+                measurement,
+                ..
+            }) => {
+                if include {
+                    let item = expect_array(collection, "filter collection")?[*index].clone();
+                    precharge_cached_clone(
+                        &mut self.live_bytes,
+                        &mut self.cumulative_bytes,
+                        &item,
+                        &self.program.limits,
+                    )?;
+                    append_array_measurement(measurement, item.measurement(), output.len())?;
+                    output.push(item);
+                }
+                *index += 1;
+                Ok(())
+            }
+            _ => Err(execution("filter work state changed")),
+        }
+    }
+
+    fn finish_reduce_item(&mut self, value: RuntimeValue) -> Result<(), SandboxError> {
+        match self.work.as_mut() {
+            Some(Work::Reduce {
+                index, accumulator, ..
+            }) => {
+                *accumulator = value;
+                *index += 1;
+                Ok(())
+            }
+            _ => Err(execution("reduce work state changed")),
+        }
+    }
+
+    /// Resumes exactly the current suspension. Every invalid attempt is terminal.
     pub fn resume(
         &mut self,
         token: ResumeToken,
         responses: Vec<ToolResponse>,
     ) -> Result<(), SandboxError> {
         if self.terminal {
-            discard_tool_responses(responses);
             return Err(execution("execution is already terminal"));
         }
-
-        let validation = self.validate_resume(&token, &responses);
-        let response_bytes = match validation {
-            Ok(bytes) => bytes,
+        let retained = match self.validate_resume(&token, &responses) {
+            Ok(retained) => retained,
             Err(error) => {
                 self.terminalize();
-                discard_tool_responses(responses);
                 return Err(error);
             }
         };
-
-        // Acceptance point: all caller-controlled data has been checked while
-        // the suspension was still intact. From here onward every failure is
-        // terminal and the accepted effect can never be yielded again.
         let result = (|| {
             let pending = self
                 .pending
                 .take()
                 .ok_or_else(|| resume_error("execution is not suspended"))?;
-            self.live_bytes = self
-                .live_bytes
-                .checked_add(response_bytes)
-                .ok_or_else(|| resource("live byte limit exceeded"))?;
-            self.cumulative_bytes = self
-                .cumulative_bytes
-                .checked_add(response_bytes)
-                .ok_or_else(|| resource("cumulative byte limit exceeded"))?;
+            precharge(
+                &mut self.live_bytes,
+                &mut self.cumulative_bytes,
+                retained,
+                &self.program.limits,
+            )?;
             self.apply_responses(pending, responses)
         })();
         if result.is_err() {
@@ -769,20 +1312,10 @@ impl Execution {
         if !pending.fan_out && responses.len() != 1 {
             return Err(resume_error("single-call response is missing"));
         }
-        if responses
-            .iter()
-            .zip(pending.requests.iter())
-            .any(|(response, expected)| (response.call_site, response.dynamic_ordinal) != *expected)
-        {
-            return Err(resume_error(
-                "response identity does not match yielded request order",
-            ));
-        }
-
         let mut retained = if pending.fan_out {
             checked_add(
                 array_framing_retained_bytes()?,
-                vector_allocation_bytes::<Value>(responses.len())?,
+                vector_allocation_bytes::<RuntimeValue>(responses.len())?,
             )?
         } else {
             0
@@ -792,39 +1325,42 @@ impl Execution {
         } else {
             0
         };
-        for response in responses {
-            let output = measure_value(&response.output, &self.program.limits)?;
+        for (response, expected) in responses.iter().zip(&pending.requests) {
+            if (response.call_site, response.dynamic_ordinal) != *expected {
+                return Err(resume_error(
+                    "response identity does not match yielded request order",
+                ));
+            }
+            let output = response.output.measurement();
             let wrapper_depth = output
                 .max_depth
                 .checked_add(if pending.fan_out { 2 } else { 1 })
                 .ok_or_else(|| resource("response nesting limit exceeded"))?;
-            if wrapper_depth > self.program.limits.max_nesting {
-                return Err(resource("response nesting limit exceeded"));
+            if wrapper_depth > self.program.limits.max_nesting
+                || output.collection_items > self.program.limits.max_collection_items
+                || output.retained > self.program.limits.max_live_bytes
+                || output.retained > self.program.limits.max_cumulative_bytes
+            {
+                return Err(resource("response value exceeds effective limits"));
             }
-            let wrapper = response_wrapper_retained_bytes(output.retained)?;
-            retained = checked_add(retained, wrapper)?;
+            retained = checked_add(retained, response_wrapper_retained(output.retained)?)?;
             serialized = checked_add(
                 serialized,
-                response_wrapper_serialized_bytes(response.ok, output.serialized)?,
+                response_wrapper_serialized(response.ok, output.serialized)?,
             )?;
         }
         if serialized > self.program.limits.max_output_bytes {
             return Err(resource("response serialized byte limit exceeded"));
         }
-        let next_live = self
-            .live_bytes
-            .checked_add(retained)
-            .ok_or_else(|| resource("live byte limit exceeded"))?;
-        let next_cumulative = self
-            .cumulative_bytes
-            .checked_add(retained)
-            .ok_or_else(|| resource("cumulative byte limit exceeded"))?;
-        if next_live > self.program.limits.max_live_bytes {
-            return Err(resource("live byte limit exceeded"));
-        }
-        if next_cumulative > self.program.limits.max_cumulative_bytes {
-            return Err(resource("cumulative byte limit exceeded"));
-        }
+        ensure_byte_limits(
+            self.live_bytes
+                .checked_add(retained)
+                .ok_or_else(|| resource("live byte limit exceeded"))?,
+            self.cumulative_bytes
+                .checked_add(retained)
+                .ok_or_else(|| resource("cumulative byte limit exceeded"))?,
+            &self.program.limits,
+        )?;
         Ok(retained)
     }
 
@@ -833,283 +1369,27 @@ impl Execution {
         pending: Pending,
         responses: Vec<ToolResponse>,
     ) -> Result<(), SandboxError> {
-        let mut values = Vec::new();
         if pending.fan_out {
+            let mut values = Vec::new();
             values
                 .try_reserve_exact(responses.len())
                 .map_err(|_| resource("response allocation failed"))?;
-        }
-        for response in responses {
-            let mut object = Map::new();
-            object.insert(clone_string("ok")?, Value::Bool(response.ok));
-            object.insert(clone_string("output")?, response.output);
-            if pending.fan_out {
-                values.push(Value::Object(object));
-            } else {
-                self.store_precharged(pending.slot, Value::Object(object))?;
+            for response in responses {
+                values.push(RuntimeValue::response(response.ok, response.output)?);
             }
+            self.store(pending.slot, RuntimeValue::array(values)?)?;
+        } else {
+            let response = responses
+                .into_iter()
+                .next()
+                .ok_or_else(|| resume_error("single-call response is missing"))?;
+            self.store(
+                pending.slot,
+                RuntimeValue::response(response.ok, response.output)?,
+            )?;
         }
-        if pending.fan_out {
-            self.store_precharged(pending.slot, Value::Array(values))?;
-        }
-        self.pc = self
-            .pc
-            .checked_add(1)
-            .ok_or_else(|| execution("program counter overflowed"))?;
+        self.pc += 1;
         Ok(())
-    }
-
-    fn terminalize(&mut self) {
-        self.terminal = true;
-        self.pending = None;
-        self.work = None;
-        self.instruction_meter = None;
-    }
-
-    fn advance_work(&mut self, remaining: &mut u64) -> Result<bool, SandboxError> {
-        let mut work = self
-            .work
-            .take()
-            .ok_or_else(|| execution("work state is missing"))?;
-        let done = match &mut work {
-            Work::Map {
-                slot,
-                item_slot,
-                items,
-                index,
-                value,
-                output,
-                fuel_remaining,
-            } => {
-                if *index == items.len() {
-                    self.store_precharged(*slot, Value::Array(core::mem::take(output)))?;
-                    self.locals[*item_slot] = None;
-                    self.pc += 1;
-                    true
-                } else {
-                    if *fuel_remaining == 0 {
-                        *fuel_remaining = expression_metered_cost_with_overrides(
-                            value,
-                            &self.locals,
-                            &self.program.limits,
-                            &[(*item_slot, &items[*index])],
-                        )?;
-                        *fuel_remaining = checked_fuel_add(
-                            *fuel_remaining,
-                            usize_to_fuel(
-                                measure_value(&items[*index], &self.program.limits)?.retained,
-                            )?,
-                        )?;
-                    }
-                    if !burn_fuel(
-                        &mut self.fuel_used,
-                        self.program.limits.max_fuel,
-                        remaining,
-                        fuel_remaining,
-                    )? {
-                        self.work = Some(work);
-                        return Ok(false);
-                    }
-                    self.precharge_cloned_value(&items[*index])?;
-                    self.locals[*item_slot] =
-                        Some(clone_json_value(&items[*index], &self.program.limits)?);
-                    let mapped = self.eval(value)?;
-                    output.push(mapped);
-                    *index += 1;
-                    *fuel_remaining = 0;
-                    false
-                }
-            }
-            Work::Filter {
-                slot,
-                item_slot,
-                items,
-                index,
-                predicate,
-                output,
-                fuel_remaining,
-            } => {
-                if *index == items.len() {
-                    self.store_precharged(*slot, Value::Array(core::mem::take(output)))?;
-                    self.locals[*item_slot] = None;
-                    self.pc += 1;
-                    true
-                } else {
-                    if *fuel_remaining == 0 {
-                        *fuel_remaining = expression_metered_cost_with_overrides(
-                            predicate,
-                            &self.locals,
-                            &self.program.limits,
-                            &[(*item_slot, &items[*index])],
-                        )?;
-                        *fuel_remaining = checked_fuel_add(
-                            *fuel_remaining,
-                            usize_to_fuel(
-                                measure_value(&items[*index], &self.program.limits)?.retained,
-                            )?,
-                        )?;
-                    }
-                    if !burn_fuel(
-                        &mut self.fuel_used,
-                        self.program.limits.max_fuel,
-                        remaining,
-                        fuel_remaining,
-                    )? {
-                        self.work = Some(work);
-                        return Ok(false);
-                    }
-                    self.precharge_cloned_value(&items[*index])?;
-                    self.locals[*item_slot] =
-                        Some(clone_json_value(&items[*index], &self.program.limits)?);
-                    if expect_bool(self.eval(predicate)?, "filter predicate")? {
-                        self.precharge_cloned_value(&items[*index])?;
-                        output.push(clone_json_value(&items[*index], &self.program.limits)?);
-                    }
-                    *index += 1;
-                    *fuel_remaining = 0;
-                    false
-                }
-            }
-            Work::Reduce {
-                slot,
-                item_slot,
-                accumulator_slot,
-                items,
-                index,
-                value,
-                accumulator,
-                fuel_remaining,
-            } => {
-                if *index == items.len() {
-                    let result = core::mem::replace(accumulator, Value::Null);
-                    self.store_precharged(*slot, result)?;
-                    self.locals[*item_slot] = None;
-                    self.locals[*accumulator_slot] = None;
-                    self.pc += 1;
-                    true
-                } else {
-                    if *fuel_remaining == 0 {
-                        *fuel_remaining = expression_metered_cost_with_overrides(
-                            value,
-                            &self.locals,
-                            &self.program.limits,
-                            &[
-                                (*item_slot, &items[*index]),
-                                (*accumulator_slot, accumulator),
-                            ],
-                        )?;
-                        *fuel_remaining = checked_fuel_add(
-                            *fuel_remaining,
-                            checked_fuel_add(
-                                usize_to_fuel(
-                                    measure_value(&items[*index], &self.program.limits)?.retained,
-                                )?,
-                                usize_to_fuel(
-                                    measure_value(accumulator, &self.program.limits)?.retained,
-                                )?,
-                            )?,
-                        )?;
-                    }
-                    if !burn_fuel(
-                        &mut self.fuel_used,
-                        self.program.limits.max_fuel,
-                        remaining,
-                        fuel_remaining,
-                    )? {
-                        self.work = Some(work);
-                        return Ok(false);
-                    }
-                    self.precharge_cloned_value(&items[*index])?;
-                    self.precharge_cloned_value(accumulator)?;
-                    self.locals[*item_slot] =
-                        Some(clone_json_value(&items[*index], &self.program.limits)?);
-                    self.locals[*accumulator_slot] =
-                        Some(clone_json_value(accumulator, &self.program.limits)?);
-                    *accumulator = self.eval(value)?;
-                    *index += 1;
-                    *fuel_remaining = 0;
-                    false
-                }
-            }
-            Work::FanOut {
-                item_slot,
-                items,
-                index,
-                arguments,
-                tool_id,
-                call_site,
-                calls,
-                fuel_remaining,
-                ..
-            } => {
-                if *index == items.len() {
-                    self.locals[*item_slot] = None;
-                    true
-                } else {
-                    if *fuel_remaining == 0 {
-                        *fuel_remaining = expression_metered_cost_with_overrides(
-                            arguments,
-                            &self.locals,
-                            &self.program.limits,
-                            &[(*item_slot, &items[*index])],
-                        )?;
-                        *fuel_remaining = checked_fuel_add(
-                            *fuel_remaining,
-                            checked_fuel_add(
-                                usize_to_fuel(
-                                    measure_value(&items[*index], &self.program.limits)?.retained,
-                                )?,
-                                usize_to_fuel(string_retained_bytes(tool_id.len())?)?,
-                            )?,
-                        )?;
-                    }
-                    if !burn_fuel(
-                        &mut self.fuel_used,
-                        self.program.limits.max_fuel,
-                        remaining,
-                        fuel_remaining,
-                    )? {
-                        self.work = Some(work);
-                        return Ok(false);
-                    }
-                    self.precharge_cloned_value(&items[*index])?;
-                    self.locals[*item_slot] =
-                        Some(clone_json_value(&items[*index], &self.program.limits)?);
-                    let args = self.eval(arguments)?;
-                    require_object(&args)?;
-                    self.precharge_bytes(string_retained_bytes(tool_id.len())?)?;
-                    calls.push(self.request(clone_string(tool_id)?, *call_site, args)?);
-                    *index += 1;
-                    *fuel_remaining = 0;
-                    false
-                }
-            }
-        };
-        if !done {
-            self.work = Some(work);
-        } else if !matches!(work, Work::FanOut { .. }) {
-            self.work = None;
-        } else {
-            self.work = Some(work);
-        }
-        Ok(true)
-    }
-
-    fn finish_fanout_if_ready(&mut self) -> Result<Option<StepOutcome>, SandboxError> {
-        let ready =
-            matches!(&self.work, Some(Work::FanOut { items, index, .. }) if *index == items.len());
-        if !ready {
-            return Ok(None);
-        }
-        let work = self
-            .work
-            .take()
-            .ok_or_else(|| execution("fan-out work state missing"))?;
-        if let Work::FanOut { slot, calls, .. } = work {
-            self.suspend(slot, calls, true).map(Some)
-        } else {
-            Err(execution("fan-out work state changed"))
-        }
     }
 
     fn suspend(
@@ -1129,14 +1409,22 @@ impl Execution {
         if fan_out {
             self.fanout_batches = self.fanout_batches.saturating_add(1);
         }
-        self.precharge_bytes(vector_allocation_bytes::<(u32, u64)>(calls.len())?)?;
+        let allocation = vector_allocation_bytes::<(u32, u64)>(calls.len())?;
+        precharge(
+            &mut self.live_bytes,
+            &mut self.cumulative_bytes,
+            allocation,
+            &self.program.limits,
+        )?;
         let mut requests = Vec::new();
         requests
             .try_reserve_exact(calls.len())
             .map_err(|_| resource("pending request allocation failed"))?;
-        for call in &calls {
-            requests.push((call.call_site, call.dynamic_ordinal));
-        }
+        requests.extend(
+            calls
+                .iter()
+                .map(|call| (call.call_site, call.dynamic_ordinal)),
+        );
         self.pending = Some(Pending {
             yield_ordinal,
             slot,
@@ -1177,126 +1465,7 @@ impl Execution {
         })
     }
 
-    fn eval(&mut self, code: &ExprCode) -> Result<Value, SandboxError> {
-        let mut stack = Vec::new();
-        let capacity = self.program.limits.max_operand_stack.min(code.0.len());
-        self.precharge_bytes(vector_allocation_bytes::<Value>(capacity)?)?;
-        stack
-            .try_reserve_exact(capacity)
-            .map_err(|_| resource("operand stack allocation failed"))?;
-        for instruction in &code.0 {
-            match instruction {
-                ExprInstruction::Constant(value) => {
-                    self.precharge_cloned_value(value)?;
-                    stack.push(clone_json_value(value, &self.program.limits)?);
-                }
-                ExprInstruction::Load(slot) => {
-                    let retained = measure_value(
-                        self.locals
-                            .get(*slot)
-                            .and_then(Option::as_ref)
-                            .ok_or_else(|| {
-                                execution("local is unavailable in this control-flow path")
-                            })?,
-                        &self.program.limits,
-                    )?
-                    .retained;
-                    self.precharge_bytes(retained)?;
-                    let clone_bytes = cloned_value_allocation_bytes(
-                        self.locals
-                            .get(*slot)
-                            .and_then(Option::as_ref)
-                            .ok_or_else(|| {
-                                execution("local is unavailable in this control-flow path")
-                            })?,
-                        &self.program.limits,
-                    )?
-                    .checked_sub(retained)
-                    .ok_or_else(|| resource("value clone accounting underflowed"))?;
-                    self.precharge_bytes(clone_bytes)?;
-                    let value =
-                        self.locals
-                            .get(*slot)
-                            .and_then(Option::as_ref)
-                            .ok_or_else(|| {
-                                execution("local is unavailable in this control-flow path")
-                            })?;
-                    stack.push(clone_json_value(value, &self.program.limits)?);
-                }
-                ExprInstruction::Path(pointer) => {
-                    let value = pop(&mut stack)?;
-                    let selected = value
-                        .pointer(pointer)
-                        .ok_or_else(|| execution("JSON pointer did not resolve"))?;
-                    self.precharge_cloned_value(selected)?;
-                    stack.push(clone_json_value(selected, &self.program.limits)?);
-                }
-                ExprInstruction::Array(count) => {
-                    let start = stack
-                        .len()
-                        .checked_sub(*count)
-                        .ok_or_else(|| execution("operand stack underflow"))?;
-                    self.precharge_bytes(array_framing_retained_bytes()?)?;
-                    self.precharge_bytes(vector_allocation_bytes::<Value>(*count)?)?;
-                    let mut items = Vec::new();
-                    items
-                        .try_reserve_exact(*count)
-                        .map_err(|_| resource("array allocation failed"))?;
-                    while stack.len() > start {
-                        items.push(pop(&mut stack)?);
-                    }
-                    items.reverse();
-                    stack.push(Value::Array(items));
-                }
-                ExprInstruction::Object(keys) => {
-                    let start = stack
-                        .len()
-                        .checked_sub(keys.len())
-                        .ok_or_else(|| execution("operand stack underflow"))?;
-                    self.precharge_bytes(object_framing_retained_bytes()?)?;
-                    for key in keys {
-                        self.precharge_bytes(key_retained_bytes(key.len())?)?;
-                    }
-                    let mut values = Vec::new();
-                    self.precharge_bytes(vector_allocation_bytes::<Value>(keys.len())?)?;
-                    values
-                        .try_reserve_exact(keys.len())
-                        .map_err(|_| resource("object staging allocation failed"))?;
-                    while stack.len() > start {
-                        values.push(pop(&mut stack)?);
-                    }
-                    values.reverse();
-                    let mut object = Map::new();
-                    for (key, value) in keys.iter().cloned().zip(values) {
-                        object.insert(key, value);
-                    }
-                    stack.push(Value::Object(object));
-                }
-                ExprInstruction::Binary(operator) => {
-                    let right = pop(&mut stack)?;
-                    let left = pop(&mut stack)?;
-                    let result = binary(*operator, left, right, &self.program.limits)?;
-                    self.precharge_value(&result)?;
-                    stack.push(result);
-                }
-                ExprInstruction::Unary(operator) => {
-                    let value = pop(&mut stack)?;
-                    let result = unary(*operator, value)?;
-                    self.precharge_value(&result)?;
-                    stack.push(result);
-                }
-            }
-        }
-        if stack.len() != 1 {
-            return Err(execution("expression did not produce one value"));
-        }
-        pop(&mut stack)
-    }
-
-    /// Stores a composite whose values and JSON framing were charged before its
-    /// backing collection grew. This avoids charging host responses twice when
-    /// they are wrapped as inert VM results.
-    fn store_precharged(&mut self, slot: usize, value: Value) -> Result<(), SandboxError> {
+    fn store(&mut self, slot: usize, value: RuntimeValue) -> Result<(), SandboxError> {
         let target = self
             .locals
             .get_mut(slot)
@@ -1308,656 +1477,1215 @@ impl Execution {
         Ok(())
     }
 
-    fn precharge_value(&mut self, value: &Value) -> Result<(), SandboxError> {
-        self.precharge_bytes(measure_value(value, &self.program.limits)?.retained)
-    }
-
-    fn precharge_cloned_value(&mut self, value: &Value) -> Result<(), SandboxError> {
-        self.precharge_bytes(cloned_value_allocation_bytes(value, &self.program.limits)?)
-    }
-
-    fn precharge_bytes(&mut self, bytes: usize) -> Result<(), SandboxError> {
-        let live_bytes = self
-            .live_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| resource("live byte limit exceeded"))?;
-        let cumulative_bytes = self
-            .cumulative_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| resource("cumulative byte limit exceeded"))?;
-        if live_bytes > self.program.limits.max_live_bytes {
-            return Err(resource("live byte limit exceeded"));
-        }
-        if cumulative_bytes > self.program.limits.max_cumulative_bytes {
-            return Err(resource("cumulative byte limit exceeded"));
-        }
-        self.live_bytes = live_bytes;
-        self.cumulative_bytes = cumulative_bytes;
-        Ok(())
+    fn terminalize(&mut self) {
+        self.terminal = true;
+        self.pending = None;
+        self.active = None;
+        self.work = None;
     }
 }
 
-fn instruction_metered_cost(
-    instruction: &Instruction,
-    locals: &[Option<Value>],
-    limits: &crate::SandboxLimits,
-) -> Result<u64, SandboxError> {
-    let mut cost = 1u64;
-    let expression_cost = |expression: &ExprCode| {
-        expression_metered_cost_with_overrides(expression, locals, limits, &[])
+fn expression(
+    program: &VerifiedProgram,
+    location: ExprLocation,
+) -> Result<&ExprCode, SandboxError> {
+    let (pc, selector) = match location {
+        ExprLocation::Let(pc) => (pc, 0),
+        ExprLocation::Branch(pc) => (pc, 0),
+        ExprLocation::LoopCollection(pc) => (pc, 0),
+        ExprLocation::MapCollection(pc) => (pc, 0),
+        ExprLocation::MapValue(pc) => (pc, 1),
+        ExprLocation::FilterCollection(pc) => (pc, 0),
+        ExprLocation::FilterPredicate(pc) => (pc, 1),
+        ExprLocation::ReduceCollection(pc) => (pc, 0),
+        ExprLocation::ReduceInitial(pc) => (pc, 1),
+        ExprLocation::ReduceValue(pc) => (pc, 2),
+        ExprLocation::InvokeArguments(pc) => (pc, 0),
+        ExprLocation::FanOutCollection(pc) => (pc, 0),
+        ExprLocation::FanOutArguments(pc) => (pc, 1),
+        ExprLocation::Return(pc) => (pc, 0),
     };
-    match instruction {
-        Instruction::Let { value, .. }
-        | Instruction::Branch {
-            condition: value, ..
-        } => {
-            cost = checked_fuel_add(cost, expression_cost(value)?)?;
-        }
-        Instruction::Return { value } => {
-            let evaluation = expression_metered_cost_with_overrides(value, locals, limits, &[])?;
-            // Returning traverses the completed value again to enforce exact
-            // compact-JSON output size, so reserve an equal conservative pass.
-            cost = checked_fuel_add(cost, checked_fuel_add(evaluation, evaluation)?)?;
-        }
-        Instruction::LoopStart { collection, .. }
-        | Instruction::Map { collection, .. }
-        | Instruction::Filter { collection, .. } => {
-            cost = checked_fuel_add(cost, expression_cost(collection)?)?;
-        }
-        Instruction::Reduce {
-            collection,
-            initial,
-            ..
-        } => {
-            cost = checked_fuel_add(cost, expression_cost(collection)?)?;
-            cost = checked_fuel_add(cost, expression_cost(initial)?)?;
-        }
-        Instruction::Invoke {
-            arguments, tool_id, ..
-        } => {
-            cost = checked_fuel_add(cost, expression_cost(arguments)?)?;
-            cost = checked_fuel_add(cost, usize_to_fuel(string_retained_bytes(tool_id.len())?)?)?;
-        }
-        Instruction::FanOut {
-            collection,
-            tool_id,
-            ..
-        } => {
-            cost = checked_fuel_add(cost, expression_cost(collection)?)?;
-            cost = checked_fuel_add(cost, usize_to_fuel(string_retained_bytes(tool_id.len())?)?)?;
-        }
-        Instruction::Jump { .. } | Instruction::LoopNext { .. } => {}
-    }
-    Ok(cost)
-}
-
-fn expression_metered_cost_with_overrides(
-    code: &ExprCode,
-    locals: &[Option<Value>],
-    limits: &crate::SandboxLimits,
-    overrides: &[(usize, &Value)],
-) -> Result<u64, SandboxError> {
-    #[derive(Clone, Copy)]
-    struct Weight {
-        retained: u64,
-        clone_cost: u64,
-    }
-
-    let mut weights = Vec::new();
-    weights
-        .try_reserve_exact(code.0.len())
-        .map_err(|_| resource("fuel metering allocation failed"))?;
-    let mut cost = usize_to_fuel(code.0.len())?.max(1);
-    for instruction in &code.0 {
-        match instruction {
-            ExprInstruction::Constant(value) => {
-                let weight = Weight {
-                    retained: usize_to_fuel(measure_value(value, limits)?.retained)?,
-                    clone_cost: usize_to_fuel(cloned_value_allocation_bytes(value, limits)?)?,
-                };
-                cost = checked_fuel_add(cost, weight.clone_cost)?;
-                weights.push(weight);
-            }
-            ExprInstruction::Load(slot) => {
-                let value = overrides
-                    .iter()
-                    .find_map(|(candidate, value)| (*candidate == *slot).then_some(*value))
-                    .or_else(|| locals.get(*slot).and_then(Option::as_ref))
-                    .ok_or_else(|| execution("local is unavailable in this control-flow path"))?;
-                let weight = Weight {
-                    retained: usize_to_fuel(measure_value(value, limits)?.retained)?,
-                    clone_cost: usize_to_fuel(cloned_value_allocation_bytes(value, limits)?)?,
-                };
-                cost = checked_fuel_add(cost, weight.clone_cost)?;
-                weights.push(weight);
-            }
-            ExprInstruction::Path(pointer) => {
-                let weight = weights
-                    .pop()
-                    .ok_or_else(|| execution("expression meter stack underflow"))?;
-                cost = checked_fuel_add(cost, usize_to_fuel(pointer.len())?)?;
-                cost = checked_fuel_add(cost, weight.clone_cost)?;
-                weights.push(weight);
-            }
-            ExprInstruction::Array(count) => {
-                let start = weights
-                    .len()
-                    .checked_sub(*count)
-                    .ok_or_else(|| execution("expression meter stack underflow"))?;
-                let mut children = Weight {
-                    retained: 0,
-                    clone_cost: 0,
-                };
-                for child in weights.drain(start..) {
-                    children.retained = checked_fuel_add(children.retained, child.retained)?;
-                    children.clone_cost = checked_fuel_add(children.clone_cost, child.clone_cost)?;
-                }
-                let framing = usize_to_fuel(array_framing_retained_bytes()?)?;
-                let allocation = usize_to_fuel(vector_allocation_bytes::<Value>(*count)?)?;
-                cost = checked_fuel_add(cost, usize_to_fuel(*count)?)?;
-                cost = checked_fuel_add(cost, checked_fuel_add(framing, allocation)?)?;
-                weights.push(Weight {
-                    retained: checked_fuel_add(children.retained, framing)?,
-                    clone_cost: checked_fuel_add(
-                        children.clone_cost,
-                        checked_fuel_add(framing, allocation)?,
-                    )?,
-                });
-            }
-            ExprInstruction::Object(keys) => {
-                let start = weights
-                    .len()
-                    .checked_sub(keys.len())
-                    .ok_or_else(|| execution("expression meter stack underflow"))?;
-                let mut children = Weight {
-                    retained: 0,
-                    clone_cost: 0,
-                };
-                for child in weights.drain(start..) {
-                    children.retained = checked_fuel_add(children.retained, child.retained)?;
-                    children.clone_cost = checked_fuel_add(children.clone_cost, child.clone_cost)?;
-                }
-                let mut framing = usize_to_fuel(object_framing_retained_bytes()?)?;
-                for key in keys {
-                    framing =
-                        checked_fuel_add(framing, usize_to_fuel(key_retained_bytes(key.len())?)?)?;
-                }
-                let staging = usize_to_fuel(vector_allocation_bytes::<Value>(keys.len())?)?;
-                cost = checked_fuel_add(cost, checked_fuel_add(framing, staging)?)?;
-                weights.push(Weight {
-                    retained: checked_fuel_add(children.retained, framing)?,
-                    clone_cost: checked_fuel_add(
-                        children.clone_cost,
-                        checked_fuel_add(framing, staging)?,
-                    )?,
-                });
-            }
-            ExprInstruction::Binary(operator) => {
-                let right = weights
-                    .pop()
-                    .ok_or_else(|| execution("expression meter stack underflow"))?;
-                let left = weights
-                    .pop()
-                    .ok_or_else(|| execution("expression meter stack underflow"))?;
-                if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) {
-                    cost =
-                        checked_fuel_add(cost, checked_fuel_add(left.retained, right.retained)?)?;
-                }
-                cost = checked_fuel_add(cost, usize_to_fuel(primitive_retained_bytes())?)?;
-                weights.push(Weight {
-                    retained: usize_to_fuel(primitive_retained_bytes())?,
-                    clone_cost: usize_to_fuel(cloned_value_allocation_bytes(
-                        &Value::Null,
-                        limits,
-                    )?)?,
-                });
-            }
-            ExprInstruction::Unary(operator) => {
-                let operand = weights
-                    .pop()
-                    .ok_or_else(|| execution("expression meter stack underflow"))?;
-                if matches!(
-                    operator,
-                    UnaryOperator::Sum | UnaryOperator::All | UnaryOperator::Any
-                ) {
-                    cost = checked_fuel_add(cost, operand.retained)?;
-                }
-                cost = checked_fuel_add(cost, usize_to_fuel(primitive_retained_bytes())?)?;
-                weights.push(Weight {
-                    retained: usize_to_fuel(primitive_retained_bytes())?,
-                    clone_cost: usize_to_fuel(cloned_value_allocation_bytes(
-                        &Value::Null,
-                        limits,
-                    )?)?,
-                });
-            }
-        }
-    }
-    if weights.len() != 1 {
-        return Err(execution("expression meter did not produce one value"));
-    }
-    Ok(cost.max(1))
-}
-
-fn burn_fuel(
-    fuel_used: &mut u64,
-    max_fuel: u64,
-    slice_remaining: &mut u64,
-    work_remaining: &mut u64,
-) -> Result<bool, SandboxError> {
-    if *work_remaining == 0 {
-        return Ok(true);
-    }
-    let available = max_fuel
-        .checked_sub(*fuel_used)
-        .ok_or_else(|| resource("fuel limit exceeded"))?;
-    if available == 0 {
-        return Err(resource("fuel limit exceeded"));
-    }
-    let charged = (*work_remaining).min(*slice_remaining).min(available);
-    *fuel_used = fuel_used
-        .checked_add(charged)
-        .ok_or_else(|| resource("fuel limit exceeded"))?;
-    *slice_remaining -= charged;
-    *work_remaining -= charged;
-    if *work_remaining > 0 && *slice_remaining > 0 && *fuel_used == max_fuel {
-        return Err(resource("fuel limit exceeded"));
-    }
-    Ok(*work_remaining == 0)
-}
-
-fn checked_fuel_add(left: u64, right: u64) -> Result<u64, SandboxError> {
-    left.checked_add(right)
-        .ok_or_else(|| resource("fuel cost overflowed"))
-}
-
-fn usize_to_fuel(value: usize) -> Result<u64, SandboxError> {
-    u64::try_from(value).map_err(|_| resource("fuel cost overflowed"))
-}
-
-fn pop(stack: &mut Vec<Value>) -> Result<Value, SandboxError> {
-    stack
-        .pop()
-        .ok_or_else(|| execution("operand stack underflow"))
-}
-fn expect_bool(value: Value, label: &str) -> Result<bool, SandboxError> {
-    value
-        .as_bool()
-        .ok_or_else(|| execution(alloc::format!("{label} must evaluate to a boolean")))
-}
-fn expect_array(value: Value, label: &str) -> Result<Vec<Value>, SandboxError> {
-    match value {
-        Value::Array(items) => Ok(items),
-        _ => Err(execution(alloc::format!(
-            "{label} must evaluate to an array"
-        ))),
-    }
-}
-fn require_object(value: &Value) -> Result<(), SandboxError> {
-    if value.is_object() {
-        Ok(())
-    } else {
-        Err(execution("tool arguments must evaluate to an object"))
-    }
-}
-fn validate_items(actual: usize, declared: usize, effective: usize) -> Result<(), SandboxError> {
-    if actual > declared || actual > effective {
-        Err(resource("collection item limit exceeded"))
-    } else {
-        Ok(())
-    }
-}
-
-fn response_wrapper_retained_bytes(output_retained: usize) -> Result<usize, SandboxError> {
-    let mut total = object_framing_retained_bytes()?;
-    total = checked_add(total, key_retained_bytes("ok".len())?)?;
-    total = checked_add(total, primitive_retained_bytes())?;
-    total = checked_add(total, key_retained_bytes("output".len())?)?;
-    checked_add(total, output_retained)
-}
-
-fn response_wrapper_serialized_bytes(
-    ok: bool,
-    output_serialized: usize,
-) -> Result<usize, SandboxError> {
-    checked_add(response_object_syntax_len(ok)?, output_serialized)
-}
-
-fn discard_tool_responses(responses: Vec<ToolResponse>) {
-    for response in responses {
-        discard_json_value(response.output);
-    }
-}
-
-fn discard_json_value(value: Value) {
-    let mut pending = Vec::new();
-    pending.push(value);
-    while let Some(value) = pending.pop() {
-        match value {
-            Value::Array(mut children) => pending.append(&mut children),
-            Value::Object(children) => {
-                for (_, child) in children {
-                    pending.push(child);
-                }
-            }
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-        }
-    }
-}
-
-enum CloneOperation<'a> {
-    Visit(&'a Value),
-    FinishArray(usize),
-    FinishObject(Vec<String>),
-}
-
-fn clone_json_value(source: &Value, limits: &crate::SandboxLimits) -> Result<Value, SandboxError> {
-    let measurement = measure_value(source, limits)?;
-    let mut operations = Vec::new();
-    operations
-        .try_reserve_exact(measurement.nodes.saturating_mul(2))
-        .map_err(|_| resource("value clone allocation failed"))?;
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(measurement.nodes)
-        .map_err(|_| resource("value clone allocation failed"))?;
-    operations.push(CloneOperation::Visit(source));
-
-    while let Some(operation) = operations.pop() {
-        match operation {
-            CloneOperation::Visit(value) => match value {
-                Value::Null => values.push(Value::Null),
-                Value::Bool(value) => values.push(Value::Bool(*value)),
-                Value::Number(value) => values.push(Value::Number(value.clone())),
-                Value::String(value) => values.push(Value::String(clone_string(value)?)),
-                Value::Array(items) => {
-                    operations.push(CloneOperation::FinishArray(items.len()));
-                    for item in items.iter().rev() {
-                        operations.push(CloneOperation::Visit(item));
-                    }
-                }
-                Value::Object(entries) => {
-                    let mut keys = Vec::new();
-                    keys.try_reserve_exact(entries.len())
-                        .map_err(|_| resource("value clone allocation failed"))?;
-                    for key in entries.keys() {
-                        keys.push(clone_string(key)?);
-                    }
-                    operations.push(CloneOperation::FinishObject(keys));
-                    for value in entries.values().rev() {
-                        operations.push(CloneOperation::Visit(value));
-                    }
-                }
+    let instruction = program
+        .code
+        .get(pc)
+        .ok_or_else(|| execution("expression program counter is invalid"))?;
+    match (instruction, selector) {
+        (Instruction::Let { value, .. }, 0)
+        | (
+            Instruction::Branch {
+                condition: value, ..
             },
-            CloneOperation::FinishArray(count) => {
-                let start = values
-                    .len()
-                    .checked_sub(count)
-                    .ok_or_else(|| execution("value clone stack underflow"))?;
-                let mut array = Vec::new();
-                array
-                    .try_reserve_exact(count)
-                    .map_err(|_| resource("value clone allocation failed"))?;
-                while values.len() > start {
-                    array.push(pop(&mut values)?);
-                }
-                array.reverse();
-                values.push(Value::Array(array));
+            0,
+        )
+        | (
+            Instruction::LoopStart {
+                collection: value, ..
+            },
+            0,
+        )
+        | (
+            Instruction::Map {
+                collection: value, ..
+            },
+            0,
+        )
+        | (
+            Instruction::Filter {
+                collection: value, ..
+            },
+            0,
+        )
+        | (
+            Instruction::Reduce {
+                collection: value, ..
+            },
+            0,
+        )
+        | (
+            Instruction::Invoke {
+                arguments: value, ..
+            },
+            0,
+        )
+        | (
+            Instruction::FanOut {
+                collection: value, ..
+            },
+            0,
+        )
+        | (Instruction::Return { value }, 0) => Ok(value),
+        (Instruction::Map { value, .. }, 1)
+        | (
+            Instruction::Filter {
+                predicate: value, ..
+            },
+            1,
+        )
+        | (Instruction::Reduce { initial: value, .. }, 1)
+        | (
+            Instruction::FanOut {
+                arguments: value, ..
+            },
+            1,
+        )
+        | (Instruction::Reduce { value, .. }, 2) => Ok(value),
+        _ => Err(execution("expression selector is invalid")),
+    }
+}
+
+fn advance_eval(
+    program: &VerifiedProgram,
+    locals: &[Option<RuntimeValue>],
+    state: &mut EvalState,
+    live: &mut usize,
+    cumulative: &mut usize,
+) -> Result<Option<RuntimeValue>, SandboxError> {
+    if let Some(mut operation) = state.operation.take() {
+        if !advance_eval_operation(program, state, &mut operation, live, cumulative)? {
+            state.operation = Some(operation);
+            return Ok(None);
+        }
+        if state.ip == expression(program, state.location)?.0.len() {
+            return finish_eval_state(state);
+        }
+        return Ok(None);
+    }
+
+    let code = expression(program, state.location)?;
+    let opcode_index = state.ip;
+    let opcode = code
+        .0
+        .get(opcode_index)
+        .ok_or_else(|| execution("expression instruction is missing"))?;
+    state.ip += 1;
+    match opcode {
+        ExprInstruction::Constant(Value::Null) => state.stack.push(RuntimeValue::null()),
+        ExprInstruction::Constant(Value::Bool(value)) => {
+            state.stack.push(RuntimeValue::boolean(*value));
+        }
+        ExprInstruction::Constant(Value::Number(value)) => {
+            state.stack.push(RuntimeValue::integer(
+                value
+                    .as_i64()
+                    .ok_or_else(|| execution("constant integer is invalid"))?,
+            ));
+        }
+        ExprInstruction::Constant(Value::String(value)) => {
+            precharge(
+                live,
+                cumulative,
+                string_retained_bytes(value.len())?,
+                &program.limits,
+            )?;
+            let mut output = String::new();
+            output
+                .try_reserve_exact(value.len())
+                .map_err(|_| resource("literal string allocation failed"))?;
+            state.operation = Some(EvalOperation::LiteralString {
+                opcode: opcode_index,
+                offset: 0,
+                output,
+                serialized: 2,
+            });
+        }
+        ExprInstruction::Constant(_) => {
+            return Err(execution("composite bytecode constant is invalid"));
+        }
+        ExprInstruction::Load(slot) => {
+            let value = locals
+                .get(*slot)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| execution("local is unavailable in this control-flow path"))?;
+            precharge_cached_clone(live, cumulative, value, &program.limits)?;
+            state.stack.push(value.clone());
+        }
+        ExprInstruction::Path(pointer) => {
+            let current = pop_runtime(&mut state.stack)?;
+            if pointer.is_empty() {
+                state.stack.push(current);
+            } else {
+                precharge(
+                    live,
+                    cumulative,
+                    string_retained_bytes(pointer.len())?,
+                    &program.limits,
+                )?;
+                let mut segment = String::new();
+                segment
+                    .try_reserve_exact(pointer.len())
+                    .map_err(|_| resource("JSON pointer allocation failed"))?;
+                state.operation = Some(EvalOperation::Path(PathState {
+                    opcode: opcode_index,
+                    current,
+                    pointer_offset: 1,
+                    segment,
+                    phase: PathPhase::Decode,
+                }));
             }
-            CloneOperation::FinishObject(keys) => {
-                let start = values
-                    .len()
-                    .checked_sub(keys.len())
-                    .ok_or_else(|| execution("value clone stack underflow"))?;
-                let mut children = Vec::new();
-                children
-                    .try_reserve_exact(keys.len())
-                    .map_err(|_| resource("value clone allocation failed"))?;
-                while values.len() > start {
-                    children.push(pop(&mut values)?);
-                }
-                children.reverse();
-                let mut object = Map::new();
-                for (key, value) in keys.into_iter().zip(children) {
-                    object.insert(key, value);
-                }
-                values.push(Value::Object(object));
+        }
+        ExprInstruction::Array(count) => {
+            if state.stack.len() < *count {
+                return Err(execution("operand stack underflow"));
+            }
+            let allocation = vector_allocation_bytes::<RuntimeValue>(*count)?;
+            precharge(
+                live,
+                cumulative,
+                checked_add(array_framing_retained_bytes()?, allocation)?,
+                &program.limits,
+            )?;
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(*count)
+                .map_err(|_| resource("array allocation failed"))?;
+            state.operation = Some(EvalOperation::Array(BuildArray {
+                remaining: *count,
+                values,
+                reverse_index: 0,
+                reversing: false,
+                measurement: ValueMeasurement {
+                    retained: array_framing_retained_bytes()?,
+                    serialized: 2,
+                    nodes: 1,
+                    collection_items: 0,
+                    max_depth: 1,
+                },
+            }));
+        }
+        ExprInstruction::Object(keys) => {
+            if state.stack.len() < keys.len() {
+                return Err(execution("operand stack underflow"));
+            }
+            let allocations = checked_add(
+                vector_allocation_bytes::<RuntimeValue>(keys.len())?,
+                vector_allocation_bytes::<(String, RuntimeValue)>(keys.len())?,
+            )?;
+            precharge(
+                live,
+                cumulative,
+                checked_add(object_framing_retained_bytes()?, allocations)?,
+                &program.limits,
+            )?;
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(keys.len())
+                .map_err(|_| resource("object value allocation failed"))?;
+            let mut entries = Vec::new();
+            entries
+                .try_reserve_exact(keys.len())
+                .map_err(|_| resource("object entry allocation failed"))?;
+            state.operation = Some(EvalOperation::Object(BuildObject {
+                opcode: opcode_index,
+                remaining: keys.len(),
+                values,
+                reverse_index: 0,
+                phase: ObjectPhase::Pop,
+                entry_index: 0,
+                entries,
+                measurement: ValueMeasurement {
+                    retained: object_framing_retained_bytes()?,
+                    serialized: 2,
+                    nodes: 1,
+                    collection_items: 0,
+                    max_depth: 1,
+                },
+            }));
+        }
+        ExprInstruction::Binary(operator) => {
+            let right = pop_runtime(&mut state.stack)?;
+            let left = pop_runtime(&mut state.stack)?;
+            if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) {
+                let depth = left
+                    .measurement()
+                    .max_depth
+                    .checked_add(right.measurement().max_depth)
+                    .and_then(|value| value.checked_add(2))
+                    .ok_or_else(|| resource("equality work limit exceeded"))?;
+                precharge(
+                    live,
+                    cumulative,
+                    vector_allocation_bytes::<EqualityFrame>(depth)?,
+                    &program.limits,
+                )?;
+                let mut frames = Vec::new();
+                frames
+                    .try_reserve_exact(depth)
+                    .map_err(|_| resource("equality allocation failed"))?;
+                frames.push(EqualityFrame::Values(left, right));
+                state.operation = Some(EvalOperation::Equality(EqualityState {
+                    negate: matches!(operator, BinaryOperator::NotEqual),
+                    frames,
+                    string: None,
+                    equal: true,
+                }));
+            } else {
+                precharge(
+                    live,
+                    cumulative,
+                    primitive_retained_bytes(),
+                    &program.limits,
+                )?;
+                state.stack.push(binary_scalar(*operator, &left, &right)?);
+            }
+        }
+        ExprInstruction::Unary(operator) => {
+            let value = pop_runtime(&mut state.stack)?;
+            if matches!(
+                operator,
+                UnaryOperator::Sum | UnaryOperator::All | UnaryOperator::Any
+            ) {
+                expect_array(&value, "aggregate operand")?;
+                state.operation = Some(EvalOperation::Aggregate(AggregateState {
+                    operator: *operator,
+                    collection: value,
+                    index: 0,
+                    integer: 0,
+                    boolean: matches!(operator, UnaryOperator::All),
+                }));
+            } else {
+                precharge(
+                    live,
+                    cumulative,
+                    primitive_retained_bytes(),
+                    &program.limits,
+                )?;
+                state.stack.push(unary_scalar(*operator, &value)?);
             }
         }
     }
-    if values.len() != 1 {
-        return Err(execution("value clone did not produce one value"));
+    if state.operation.is_none() && state.ip == code.0.len() {
+        finish_eval_state(state)
+    } else {
+        Ok(None)
     }
-    pop(&mut values)
 }
 
-fn clone_string(source: &str) -> Result<String, SandboxError> {
-    let mut cloned = String::new();
-    cloned
-        .try_reserve_exact(source.len())
-        .map_err(|_| resource("string clone allocation failed"))?;
-    cloned.push_str(source);
-    Ok(cloned)
+fn finish_eval_state(state: &mut EvalState) -> Result<Option<RuntimeValue>, SandboxError> {
+    if state.stack.len() != 1 {
+        return Err(execution("expression did not produce exactly one value"));
+    }
+    Ok(Some(pop_runtime(&mut state.stack)?))
 }
 
-fn values_equal(
-    left: &Value,
-    right: &Value,
-    limits: &crate::SandboxLimits,
+fn advance_eval_operation(
+    program: &VerifiedProgram,
+    state: &mut EvalState,
+    operation: &mut EvalOperation,
+    live: &mut usize,
+    cumulative: &mut usize,
 ) -> Result<bool, SandboxError> {
-    let mut pending = Vec::new();
-    pending
-        .try_reserve_exact(1)
-        .map_err(|_| resource("equality allocation failed"))?;
-    pending.push((left, right));
-    while let Some((left, right)) = pending.pop() {
-        match (left, right) {
-            (Value::Null, Value::Null) => {}
-            (Value::Bool(left), Value::Bool(right)) if left == right => {}
-            (Value::Number(left), Value::Number(right)) if left == right => {}
-            (Value::String(left), Value::String(right)) if left == right => {}
-            (Value::Array(left), Value::Array(right)) if left.len() == right.len() => {
-                if left.len() > limits.max_collection_items {
-                    return Err(resource("collection item limit exceeded"));
-                }
-                pending
-                    .try_reserve(left.len())
-                    .map_err(|_| resource("equality allocation failed"))?;
-                for pair in left.iter().zip(right).rev() {
-                    pending.push(pair);
-                }
+    match operation {
+        EvalOperation::LiteralString {
+            opcode,
+            offset,
+            output,
+            serialized,
+        } => {
+            let source = match expression(program, state.location)?.0.get(*opcode) {
+                Some(ExprInstruction::Constant(Value::String(source))) => source,
+                _ => return Err(execution("literal string state changed")),
+            };
+            let end = utf8_chunk_end(source, *offset, MAX_ATOMIC_STRING_BYTES);
+            for byte in source.as_bytes().get(*offset..end).unwrap_or_default() {
+                *serialized = checked_add(*serialized, escaped_byte_len(*byte))?;
             }
-            (Value::Object(left), Value::Object(right)) if left.len() == right.len() => {
-                if left.len() > limits.max_collection_items {
-                    return Err(resource("collection item limit exceeded"));
-                }
-                pending
-                    .try_reserve(left.len())
-                    .map_err(|_| resource("equality allocation failed"))?;
-                for ((left_key, left_value), (right_key, right_value)) in
-                    left.iter().zip(right).rev()
-                {
-                    if left_key != right_key {
-                        return Ok(false);
-                    }
-                    pending.push((left_value, right_value));
-                }
+            output.push_str(source.get(*offset..end).unwrap_or_default());
+            *offset = end;
+            if *offset == source.len() {
+                state.stack.push(RuntimeValue::string_measured(
+                    core::mem::take(output),
+                    *serialized,
+                )?);
+                Ok(true)
+            } else {
+                Ok(false)
             }
-            _ => return Ok(false),
+        }
+        EvalOperation::Array(build) => advance_array_build(build, &mut state.stack),
+        EvalOperation::Object(build) => advance_object_build(
+            program,
+            state.location,
+            build,
+            &mut state.stack,
+            live,
+            cumulative,
+        ),
+        EvalOperation::Equality(equality) => {
+            if advance_equality(equality)? {
+                precharge(
+                    live,
+                    cumulative,
+                    primitive_retained_bytes(),
+                    &program.limits,
+                )?;
+                state.stack.push(RuntimeValue::boolean(if equality.negate {
+                    !equality.equal
+                } else {
+                    equality.equal
+                }));
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        EvalOperation::Aggregate(aggregate) => {
+            if let Some(value) = advance_aggregate(aggregate)? {
+                precharge(
+                    live,
+                    cumulative,
+                    primitive_retained_bytes(),
+                    &program.limits,
+                )?;
+                state.stack.push(value);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        EvalOperation::Path(path) => {
+            if let Some(value) = advance_path(program, state.location, path)? {
+                precharge_cached_clone(live, cumulative, &value, &program.limits)?;
+                state.stack.push(value);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         }
     }
+}
+
+fn advance_array_build(
+    build: &mut BuildArray,
+    stack: &mut Vec<RuntimeValue>,
+) -> Result<bool, SandboxError> {
+    if !build.reversing {
+        if build.remaining > 0 {
+            let value = pop_runtime(stack)?;
+            append_array_measurement(
+                &mut build.measurement,
+                value.measurement(),
+                build.values.len(),
+            )?;
+            build.values.push(value);
+            build.remaining -= 1;
+            return Ok(false);
+        }
+        build.reversing = true;
+    }
+    let len = build.values.len();
+    if build.reverse_index < len / 2 {
+        build
+            .values
+            .swap(build.reverse_index, len - build.reverse_index - 1);
+        build.reverse_index += 1;
+        return Ok(false);
+    }
+    stack.push(RuntimeValue::array_measured(
+        core::mem::take(&mut build.values),
+        build.measurement,
+    ));
     Ok(true)
 }
 
-fn loop_body_slots(
-    code: &[Instruction],
-    body_target: usize,
-    end_target: usize,
-) -> Result<Vec<usize>, SandboxError> {
-    let end = end_target
-        .checked_sub(1)
-        .ok_or_else(|| execution("loop body target is invalid"))?;
-    let body = code
-        .get(body_target..end)
-        .ok_or_else(|| execution("loop body target is invalid"))?;
-    let mut slots = Vec::new();
-    let capacity = body
-        .len()
-        .checked_mul(3)
-        .ok_or_else(|| resource("loop local tracking limit exceeded"))?;
-    slots
-        .try_reserve_exact(capacity)
-        .map_err(|_| resource("loop local tracking allocation failed"))?;
-    for instruction in body {
-        match instruction {
-            Instruction::Let { slot, .. }
-            | Instruction::Map { slot, .. }
-            | Instruction::Filter { slot, .. }
-            | Instruction::Invoke { slot, .. }
-            | Instruction::FanOut { slot, .. } => slots.push(*slot),
-            Instruction::LoopStart { item_slot, .. } => slots.push(*item_slot),
-            Instruction::Reduce {
-                slot,
-                item_slot,
-                accumulator_slot,
-                ..
-            } => {
-                slots.push(*slot);
-                slots.push(*item_slot);
-                slots.push(*accumulator_slot);
-            }
-            Instruction::Branch { .. }
-            | Instruction::Jump { .. }
-            | Instruction::LoopNext { .. }
-            | Instruction::Return { .. } => {}
-        }
-    }
-    slots.sort_unstable();
-    slots.dedup();
-    Ok(slots)
-}
-
-fn clear_loop_body_slots(locals: &mut [Option<Value>], slots: &[usize]) {
-    for slot in slots {
-        if let Some(local) = locals.get_mut(*slot) {
-            *local = None;
-        }
-    }
-}
-
-fn integer(value: &Value) -> Result<i64, SandboxError> {
-    value
-        .as_i64()
-        .ok_or_else(|| execution("integer operation requires i64 operands"))
-}
-fn binary(
-    operator: BinaryOperator,
-    left: Value,
-    right: Value,
-    limits: &crate::SandboxLimits,
-) -> Result<Value, SandboxError> {
-    use BinaryOperator::*;
-    let value = match operator {
-        Add => Value::Number(Number::from(
-            integer(&left)?
-                .checked_add(integer(&right)?)
-                .ok_or_else(|| execution("checked integer addition overflowed"))?,
-        )),
-        Subtract => Value::Number(Number::from(
-            integer(&left)?
-                .checked_sub(integer(&right)?)
-                .ok_or_else(|| execution("checked integer subtraction overflowed"))?,
-        )),
-        Multiply => Value::Number(Number::from(
-            integer(&left)?
-                .checked_mul(integer(&right)?)
-                .ok_or_else(|| execution("checked integer multiplication overflowed"))?,
-        )),
-        Divide => Value::Number(Number::from(
-            integer(&left)?
-                .checked_div(integer(&right)?)
-                .ok_or_else(|| execution("checked integer division failed"))?,
-        )),
-        Remainder => Value::Number(Number::from(
-            integer(&left)?
-                .checked_rem(integer(&right)?)
-                .ok_or_else(|| execution("checked integer remainder failed"))?,
-        )),
-        Equal => Value::Bool(values_equal(&left, &right, limits)?),
-        NotEqual => Value::Bool(!values_equal(&left, &right, limits)?),
-        LessThan => Value::Bool(integer(&left)? < integer(&right)?),
-        LessThanOrEqual => Value::Bool(integer(&left)? <= integer(&right)?),
-        GreaterThan => Value::Bool(integer(&left)? > integer(&right)?),
-        GreaterThanOrEqual => Value::Bool(integer(&left)? >= integer(&right)?),
-        And => {
-            Value::Bool(expect_bool(left, "left operand")? && expect_bool(right, "right operand")?)
-        }
-        Or => {
-            Value::Bool(expect_bool(left, "left operand")? || expect_bool(right, "right operand")?)
-        }
+fn advance_object_build(
+    program: &VerifiedProgram,
+    location: ExprLocation,
+    build: &mut BuildObject,
+    stack: &mut Vec<RuntimeValue>,
+    live: &mut usize,
+    cumulative: &mut usize,
+) -> Result<bool, SandboxError> {
+    let keys = match expression(program, location)?.0.get(build.opcode) {
+        Some(ExprInstruction::Object(keys)) => keys,
+        _ => return Err(execution("object construction state changed")),
     };
-    Ok(value)
+    match build.phase {
+        ObjectPhase::Pop => {
+            if build.remaining > 0 {
+                build.values.push(pop_runtime(stack)?);
+                build.remaining -= 1;
+            } else {
+                build.phase = ObjectPhase::Reverse;
+            }
+            Ok(false)
+        }
+        ObjectPhase::Reverse => {
+            let len = build.values.len();
+            if build.reverse_index < len / 2 {
+                build
+                    .values
+                    .swap(build.reverse_index, len - build.reverse_index - 1);
+                build.reverse_index += 1;
+            } else {
+                build.phase = ObjectPhase::Entries;
+            }
+            Ok(false)
+        }
+        ObjectPhase::Entries => {
+            if build.entry_index < keys.len() {
+                let key = &keys[build.entry_index];
+                debug_assert!(key.len() <= MAX_ATOMIC_KEY_BYTES);
+                precharge(
+                    live,
+                    cumulative,
+                    key_retained_bytes(key.len())?,
+                    &program.limits,
+                )?;
+                let value = build
+                    .values
+                    .get(build.entry_index)
+                    .ok_or_else(|| execution("object construction value is missing"))?
+                    .clone();
+                append_object_measurement(
+                    &mut build.measurement,
+                    key,
+                    value.measurement(),
+                    build.entry_index,
+                )?;
+                build.entries.push((clone_string(key)?, value));
+                build.entry_index += 1;
+                Ok(false)
+            } else {
+                stack.push(RuntimeValue::object_measured(
+                    core::mem::take(&mut build.entries),
+                    build.measurement,
+                ));
+                Ok(true)
+            }
+        }
+    }
 }
 
-fn unary(operator: UnaryOperator, value: Value) -> Result<Value, SandboxError> {
+fn advance_equality(state: &mut EqualityState) -> Result<bool, SandboxError> {
+    if !state.equal {
+        state.frames.clear();
+        state.string = None;
+        return Ok(true);
+    }
+    if let Some(string) = state.string.as_mut() {
+        let (left, right) = match (string.left.node(), string.right.node()) {
+            (RuntimeNode::String(left), RuntimeNode::String(right)) => (left, right),
+            _ => return Err(execution("string equality state changed")),
+        };
+        if left.len() != right.len() {
+            state.equal = false;
+            state.string = None;
+            return Ok(true);
+        }
+        let end = string
+            .offset
+            .saturating_add(MAX_ATOMIC_STRING_BYTES)
+            .min(left.len());
+        if left.as_bytes().get(string.offset..end) != right.as_bytes().get(string.offset..end) {
+            state.equal = false;
+            state.string = None;
+            return Ok(true);
+        }
+        string.offset = end;
+        if end == left.len() {
+            state.string = None;
+        }
+        return Ok(state.string.is_none() && state.frames.is_empty());
+    }
+    let Some(frame) = state.frames.pop() else {
+        return Ok(true);
+    };
+    match frame {
+        EqualityFrame::Values(left, right) => match (left.node(), right.node()) {
+            (RuntimeNode::Null, RuntimeNode::Null) => {}
+            (RuntimeNode::Bool(left), RuntimeNode::Bool(right)) => state.equal = left == right,
+            (RuntimeNode::Integer(left), RuntimeNode::Integer(right)) => {
+                state.equal = left == right;
+            }
+            (RuntimeNode::String(left_value), RuntimeNode::String(right_value)) => {
+                if left_value.len() != right_value.len() {
+                    state.equal = false;
+                } else if left_value.is_empty() {
+                } else {
+                    state.string = Some(StringEquality {
+                        left,
+                        right,
+                        offset: 0,
+                    });
+                }
+            }
+            (RuntimeNode::Array(left_values), RuntimeNode::Array(right_values)) => {
+                if left_values.len() != right_values.len() {
+                    state.equal = false;
+                } else if !left_values.is_empty() {
+                    state.frames.push(EqualityFrame::Array(left, right, 0));
+                }
+            }
+            (RuntimeNode::Object(left_values), RuntimeNode::Object(right_values)) => {
+                if left_values.len() != right_values.len() {
+                    state.equal = false;
+                } else if !left_values.is_empty() {
+                    state.frames.push(EqualityFrame::Object(left, right, 0));
+                }
+            }
+            _ => state.equal = false,
+        },
+        EqualityFrame::Array(left, right, index) => {
+            let (left_values, right_values) = match (left.node(), right.node()) {
+                (RuntimeNode::Array(left), RuntimeNode::Array(right)) => (left, right),
+                _ => return Err(execution("array equality state changed")),
+            };
+            if index < left_values.len() {
+                state
+                    .frames
+                    .push(EqualityFrame::Array(left.clone(), right.clone(), index + 1));
+                state.frames.push(EqualityFrame::Values(
+                    left_values[index].clone(),
+                    right_values[index].clone(),
+                ));
+            }
+        }
+        EqualityFrame::Object(left, right, index) => {
+            let (left_values, right_values) = match (left.node(), right.node()) {
+                (RuntimeNode::Object(left), RuntimeNode::Object(right)) => (left, right),
+                _ => return Err(execution("object equality state changed")),
+            };
+            if index < left_values.len() {
+                let (left_key, left_value) = &left_values[index];
+                let (right_key, right_value) = &right_values[index];
+                debug_assert!(left_key.len() <= MAX_ATOMIC_KEY_BYTES);
+                if left_key != right_key {
+                    state.equal = false;
+                } else {
+                    state.frames.push(EqualityFrame::Object(
+                        left.clone(),
+                        right.clone(),
+                        index + 1,
+                    ));
+                    state.frames.push(EqualityFrame::Values(
+                        left_value.clone(),
+                        right_value.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok((!state.equal || state.frames.is_empty()) && state.string.is_none())
+}
+
+fn advance_aggregate(state: &mut AggregateState) -> Result<Option<RuntimeValue>, SandboxError> {
+    let items = expect_array(&state.collection, "aggregate operand")?;
+    if state.index == items.len() {
+        return Ok(Some(match state.operator {
+            UnaryOperator::Sum => RuntimeValue::integer(state.integer),
+            UnaryOperator::All | UnaryOperator::Any => RuntimeValue::boolean(state.boolean),
+            _ => return Err(execution("aggregate operator is invalid")),
+        }));
+    }
+    match state.operator {
+        UnaryOperator::Sum => {
+            state.integer = state
+                .integer
+                .checked_add(integer(&items[state.index])?)
+                .ok_or_else(|| execution("checked integer sum overflowed"))?;
+        }
+        UnaryOperator::All => {
+            state.boolean &= expect_bool(&items[state.index], "all item")?;
+        }
+        UnaryOperator::Any => {
+            state.boolean |= expect_bool(&items[state.index], "any item")?;
+        }
+        _ => return Err(execution("aggregate operator is invalid")),
+    }
+    state.index += 1;
+    Ok(None)
+}
+
+fn advance_path(
+    program: &VerifiedProgram,
+    location: ExprLocation,
+    state: &mut PathState,
+) -> Result<Option<RuntimeValue>, SandboxError> {
+    let pointer = match expression(program, location)?.0.get(state.opcode) {
+        Some(ExprInstruction::Path(pointer)) => pointer,
+        _ => return Err(execution("JSON pointer state changed")),
+    };
+    match state.phase {
+        PathPhase::Decode => {
+            let bytes = pointer.as_bytes();
+            let mut traversed = 0usize;
+            while state.pointer_offset < bytes.len() && traversed < MAX_ATOMIC_STRING_BYTES {
+                let byte = bytes[state.pointer_offset];
+                if byte == b'/' {
+                    state.pointer_offset += 1;
+                    break;
+                }
+                if byte == b'~' {
+                    let escaped = *bytes
+                        .get(state.pointer_offset + 1)
+                        .ok_or_else(|| execution("JSON pointer escape is incomplete"))?;
+                    state.segment.push(match escaped {
+                        b'0' => '~',
+                        b'1' => '/',
+                        _ => return Err(execution("JSON pointer escape is invalid")),
+                    });
+                    state.pointer_offset += 2;
+                    traversed += 2;
+                } else {
+                    let character = pointer[state.pointer_offset..]
+                        .chars()
+                        .next()
+                        .ok_or_else(|| execution("JSON pointer character is invalid"))?;
+                    state.segment.push(character);
+                    state.pointer_offset += character.len_utf8();
+                    traversed += character.len_utf8();
+                }
+            }
+            let segment_complete = state.pointer_offset == pointer.len()
+                || bytes.get(state.pointer_offset.saturating_sub(1)) == Some(&b'/');
+            if segment_complete {
+                state.phase = match state.current.node() {
+                    RuntimeNode::Object(_) => PathPhase::ObjectLookup(0),
+                    RuntimeNode::Array(_) => PathPhase::ArrayIndex {
+                        offset: 0,
+                        value: 0,
+                    },
+                    _ => return Err(execution("JSON pointer did not resolve")),
+                };
+            }
+            Ok(None)
+        }
+        PathPhase::ObjectLookup(index) => {
+            let entries = state
+                .current
+                .as_object()
+                .ok_or_else(|| execution("JSON pointer object state changed"))?;
+            let Some((key, value)) = entries.get(index) else {
+                return Err(execution("JSON pointer did not resolve"));
+            };
+            debug_assert!(key.len() <= MAX_ATOMIC_KEY_BYTES);
+            if key == &state.segment {
+                let selected = value.clone();
+                if state.pointer_offset == pointer.len() {
+                    Ok(Some(selected))
+                } else {
+                    state.current = selected;
+                    state.segment.clear();
+                    state.phase = PathPhase::Decode;
+                    Ok(None)
+                }
+            } else {
+                state.phase = PathPhase::ObjectLookup(index + 1);
+                Ok(None)
+            }
+        }
+        PathPhase::ArrayIndex {
+            mut offset,
+            mut value,
+        } => {
+            let bytes = state.segment.as_bytes();
+            let end = offset
+                .saturating_add(MAX_ATOMIC_STRING_BYTES)
+                .min(bytes.len());
+            while offset < end {
+                let digit = bytes[offset];
+                if !digit.is_ascii_digit() || (offset == 0 && bytes.len() > 1 && digit == b'0') {
+                    return Err(execution("JSON pointer array index is invalid"));
+                }
+                value = value
+                    .checked_mul(10)
+                    .and_then(|current| current.checked_add((digit - b'0') as usize))
+                    .ok_or_else(|| execution("JSON pointer array index overflowed"))?;
+                offset += 1;
+            }
+            if offset < bytes.len() {
+                state.phase = PathPhase::ArrayIndex { offset, value };
+                return Ok(None);
+            }
+            let selected = state
+                .current
+                .as_array()
+                .and_then(|items| items.get(value))
+                .cloned()
+                .ok_or_else(|| execution("JSON pointer did not resolve"))?;
+            if state.pointer_offset == pointer.len() {
+                Ok(Some(selected))
+            } else {
+                state.current = selected;
+                state.segment.clear();
+                state.phase = PathPhase::Decode;
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn advance_materialize(state: &mut MaterializeState) -> Result<Option<Value>, SandboxError> {
+    if let Some(string) = state.string.as_mut() {
+        let source = match string.source.node() {
+            RuntimeNode::String(source) => source,
+            _ => return Err(execution("string materialization state changed")),
+        };
+        let end = utf8_chunk_end(source, string.offset, MAX_ATOMIC_STRING_BYTES);
+        string
+            .output
+            .push_str(source.get(string.offset..end).unwrap_or_default());
+        string.offset = end;
+        if end == source.len() {
+            let string = state
+                .string
+                .take()
+                .ok_or_else(|| execution("string materialization is missing"))?;
+            state.completed = Some(Value::String(string.output));
+        }
+        return Ok(None);
+    }
+
+    if let Some(value) = state.completed.take() {
+        if let Some(frame) = state.frames.last_mut() {
+            match frame {
+                MaterializeFrame::Array { index, output, .. } => {
+                    output.push(value);
+                    *index += 1;
+                }
+                MaterializeFrame::Object {
+                    source,
+                    index,
+                    output,
+                } => {
+                    let entries = source
+                        .as_object()
+                        .ok_or_else(|| execution("object materialization state changed"))?;
+                    let key = entries
+                        .get(*index)
+                        .map(|(key, _)| key)
+                        .ok_or_else(|| execution("object materialization key is missing"))?;
+                    debug_assert!(key.len() <= MAX_ATOMIC_KEY_BYTES);
+                    output.insert(clone_string(key)?, value);
+                    *index += 1;
+                }
+            }
+            return Ok(None);
+        }
+        return Ok(Some(value));
+    }
+
+    if let Some(current) = state.current.take() {
+        match current.node() {
+            RuntimeNode::Null => state.completed = Some(Value::Null),
+            RuntimeNode::Bool(value) => state.completed = Some(Value::Bool(*value)),
+            RuntimeNode::Integer(value) => {
+                state.completed = Some(Value::Number(Number::from(*value)));
+            }
+            RuntimeNode::String(source) => {
+                let mut output = String::new();
+                output
+                    .try_reserve_exact(source.len())
+                    .map_err(|_| resource("string materialization allocation failed"))?;
+                if source.is_empty() {
+                    state.completed = Some(Value::String(output));
+                } else {
+                    state.string = Some(MaterializeString {
+                        source: current,
+                        offset: 0,
+                        output,
+                    });
+                }
+            }
+            RuntimeNode::Array(values) => {
+                let mut output = Vec::new();
+                output
+                    .try_reserve_exact(values.len())
+                    .map_err(|_| resource("array materialization allocation failed"))?;
+                state.frames.push(MaterializeFrame::Array {
+                    source: current,
+                    index: 0,
+                    output,
+                });
+            }
+            RuntimeNode::Object(_) => {
+                state.frames.push(MaterializeFrame::Object {
+                    source: current,
+                    index: 0,
+                    output: Map::new(),
+                });
+            }
+        }
+        return Ok(None);
+    }
+
+    let frame = state
+        .frames
+        .last_mut()
+        .ok_or_else(|| execution("materialization state is empty"))?;
+    match frame {
+        MaterializeFrame::Array {
+            source,
+            index,
+            output: _,
+        } => {
+            let values = source
+                .as_array()
+                .ok_or_else(|| execution("array materialization state changed"))?;
+            if *index < values.len() {
+                state.current = Some(values[*index].clone());
+            } else {
+                let frame = state
+                    .frames
+                    .pop()
+                    .ok_or_else(|| execution("array materialization frame is missing"))?;
+                if let MaterializeFrame::Array { output, .. } = frame {
+                    state.completed = Some(Value::Array(output));
+                }
+            }
+        }
+        MaterializeFrame::Object {
+            source,
+            index,
+            output: _,
+        } => {
+            let values = source
+                .as_object()
+                .ok_or_else(|| execution("object materialization state changed"))?;
+            if *index < values.len() {
+                state.current = Some(values[*index].1.clone());
+            } else {
+                let frame = state
+                    .frames
+                    .pop()
+                    .ok_or_else(|| execution("object materialization frame is missing"))?;
+                if let MaterializeFrame::Object { output, .. } = frame {
+                    state.completed = Some(Value::Object(output));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn binary_scalar(
+    operator: BinaryOperator,
+    left: &RuntimeValue,
+    right: &RuntimeValue,
+) -> Result<RuntimeValue, SandboxError> {
+    use BinaryOperator::*;
+    Ok(match operator {
+        Add => RuntimeValue::integer(
+            integer(left)?
+                .checked_add(integer(right)?)
+                .ok_or_else(|| execution("checked integer addition overflowed"))?,
+        ),
+        Subtract => RuntimeValue::integer(
+            integer(left)?
+                .checked_sub(integer(right)?)
+                .ok_or_else(|| execution("checked integer subtraction overflowed"))?,
+        ),
+        Multiply => RuntimeValue::integer(
+            integer(left)?
+                .checked_mul(integer(right)?)
+                .ok_or_else(|| execution("checked integer multiplication overflowed"))?,
+        ),
+        Divide => RuntimeValue::integer(
+            integer(left)?
+                .checked_div(integer(right)?)
+                .ok_or_else(|| execution("checked integer division failed"))?,
+        ),
+        Remainder => RuntimeValue::integer(
+            integer(left)?
+                .checked_rem(integer(right)?)
+                .ok_or_else(|| execution("checked integer remainder failed"))?,
+        ),
+        LessThan => RuntimeValue::boolean(integer(left)? < integer(right)?),
+        LessThanOrEqual => RuntimeValue::boolean(integer(left)? <= integer(right)?),
+        GreaterThan => RuntimeValue::boolean(integer(left)? > integer(right)?),
+        GreaterThanOrEqual => RuntimeValue::boolean(integer(left)? >= integer(right)?),
+        And => RuntimeValue::boolean(
+            expect_bool(left, "left operand")? && expect_bool(right, "right operand")?,
+        ),
+        Or => RuntimeValue::boolean(
+            expect_bool(left, "left operand")? || expect_bool(right, "right operand")?,
+        ),
+        Equal | NotEqual => return Err(execution("equality must use its continuation")),
+    })
+}
+
+fn unary_scalar(
+    operator: UnaryOperator,
+    value: &RuntimeValue,
+) -> Result<RuntimeValue, SandboxError> {
     use UnaryOperator::*;
-    match operator {
-        Not => Ok(Value::Bool(!expect_bool(value, "not operand")?)),
-        Negate => Ok(Value::Number(Number::from(
-            integer(&value)?
+    Ok(match operator {
+        Not => RuntimeValue::boolean(!expect_bool(value, "not operand")?),
+        Negate => RuntimeValue::integer(
+            integer(value)?
                 .checked_neg()
                 .ok_or_else(|| execution("checked integer negation overflowed"))?,
-        ))),
-        Count => match value {
-            Value::Array(values) => Ok(Value::Number(Number::from(values.len() as u64))),
-            Value::Object(values) => Ok(Value::Number(Number::from(values.len() as u64))),
-            _ => Err(execution("count requires an array or object")),
-        },
-        Sum => {
-            let values = expect_array(value, "sum operand")?;
-            let mut total = 0i64;
-            for value in values {
-                total = total
-                    .checked_add(integer(&value)?)
-                    .ok_or_else(|| execution("checked integer sum overflowed"))?;
-            }
-            Ok(Value::Number(Number::from(total)))
+        ),
+        Count => {
+            let count = match value.node() {
+                RuntimeNode::Array(values) => values.len(),
+                RuntimeNode::Object(values) => values.len(),
+                _ => return Err(execution("count requires an array or object")),
+            };
+            RuntimeValue::integer(
+                i64::try_from(count).map_err(|_| execution("count result overflowed"))?,
+            )
         }
-        All => {
-            let values = expect_array(value, "all operand")?;
-            let mut result = true;
-            for value in values {
-                result &= expect_bool(value, "all item")?;
-            }
-            Ok(Value::Bool(result))
-        }
-        Any => {
-            let values = expect_array(value, "any operand")?;
-            let mut result = false;
-            for value in values {
-                result |= expect_bool(value, "any item")?;
-            }
-            Ok(Value::Bool(result))
-        }
+        Sum | All | Any => return Err(execution("aggregate must use its continuation")),
+    })
+}
+
+fn expect_bool(value: &RuntimeValue, context: &'static str) -> Result<bool, SandboxError> {
+    value
+        .as_bool()
+        .ok_or_else(|| execution(alloc::format!("{context} must be boolean")))
+}
+
+fn integer(value: &RuntimeValue) -> Result<i64, SandboxError> {
+    value
+        .as_integer()
+        .ok_or_else(|| execution("integer operation requires i64 operands"))
+}
+
+fn expect_array<'a>(
+    value: &'a RuntimeValue,
+    context: &'static str,
+) -> Result<&'a [RuntimeValue], SandboxError> {
+    value
+        .as_array()
+        .ok_or_else(|| execution(alloc::format!("{context} must be an array")))
+}
+
+fn require_object(value: &RuntimeValue) -> Result<(), SandboxError> {
+    if value.as_object().is_some() {
+        Ok(())
+    } else {
+        Err(execution("tool arguments must be an object"))
     }
 }
 
-fn response_object_syntax_len(ok: bool) -> Result<usize, SandboxError> {
+fn pop_runtime(values: &mut Vec<RuntimeValue>) -> Result<RuntimeValue, SandboxError> {
+    values
+        .pop()
+        .ok_or_else(|| execution("operand stack underflow"))
+}
+
+fn assign_scoped(
+    locals: &mut [Option<RuntimeValue>],
+    slot: usize,
+    value: &RuntimeValue,
+    live: &mut usize,
+    cumulative: &mut usize,
+    limits: &SandboxLimits,
+) -> Result<(), SandboxError> {
+    precharge_cached_clone(live, cumulative, value, limits)?;
+    let local = locals
+        .get_mut(slot)
+        .ok_or_else(|| execution("scoped local slot is invalid"))?;
+    *local = Some(value.clone());
+    Ok(())
+}
+
+fn append_array_measurement(
+    measurement: &mut ValueMeasurement,
+    child: ValueMeasurement,
+    existing_items: usize,
+) -> Result<(), SandboxError> {
+    if existing_items > 0 {
+        measurement.serialized = checked_add(measurement.serialized, 1)?;
+    }
+    accumulate_measurement(measurement, child)?;
+    measurement.collection_items = checked_add(measurement.collection_items, 1)?;
+    Ok(())
+}
+
+fn append_object_measurement(
+    measurement: &mut ValueMeasurement,
+    key: &str,
+    child: ValueMeasurement,
+    existing_items: usize,
+) -> Result<(), SandboxError> {
+    if existing_items > 0 {
+        measurement.serialized = checked_add(measurement.serialized, 1)?;
+    }
+    measurement.retained = checked_add(measurement.retained, key_retained_bytes(key.len())?)?;
+    measurement.serialized = checked_add(
+        measurement.serialized,
+        checked_add(serialized_string_len(key)?, 1)?,
+    )?;
+    accumulate_measurement(measurement, child)?;
+    measurement.collection_items = checked_add(measurement.collection_items, 1)?;
+    Ok(())
+}
+
+fn accumulate_measurement(
+    measurement: &mut ValueMeasurement,
+    child: ValueMeasurement,
+) -> Result<(), SandboxError> {
+    measurement.retained = checked_add(measurement.retained, child.retained)?;
+    measurement.serialized = checked_add(measurement.serialized, child.serialized)?;
+    measurement.nodes = checked_add(measurement.nodes, child.nodes)?;
+    measurement.collection_items =
+        checked_add(measurement.collection_items, child.collection_items)?;
+    measurement.max_depth = measurement.max_depth.max(
+        child
+            .max_depth
+            .checked_add(1)
+            .ok_or_else(|| resource("value nesting limit exceeded"))?,
+    );
+    Ok(())
+}
+
+fn precharge_cached_clone(
+    live: &mut usize,
+    cumulative: &mut usize,
+    value: &RuntimeValue,
+    limits: &SandboxLimits,
+) -> Result<(), SandboxError> {
+    precharge(live, cumulative, value.measurement().retained, limits)
+}
+
+fn precharge(
+    live: &mut usize,
+    cumulative: &mut usize,
+    bytes: usize,
+    limits: &SandboxLimits,
+) -> Result<(), SandboxError> {
+    let next_live = live
+        .checked_add(bytes)
+        .ok_or_else(|| resource("live byte limit exceeded"))?;
+    let next_cumulative = cumulative
+        .checked_add(bytes)
+        .ok_or_else(|| resource("cumulative byte limit exceeded"))?;
+    ensure_byte_limits(next_live, next_cumulative, limits)?;
+    *live = next_live;
+    *cumulative = next_cumulative;
+    Ok(())
+}
+
+fn ensure_byte_limits(
+    live: usize,
+    cumulative: usize,
+    limits: &SandboxLimits,
+) -> Result<(), SandboxError> {
+    if live > limits.max_live_bytes {
+        return Err(resource("live byte limit exceeded"));
+    }
+    if cumulative > limits.max_cumulative_bytes {
+        return Err(resource("cumulative byte limit exceeded"));
+    }
+    Ok(())
+}
+
+fn charge_one(fuel_used: &mut u64, max_fuel: u64, remaining: &mut u64) -> Result<(), SandboxError> {
+    if *remaining == 0 {
+        return Err(execution("scheduler attempted work without slice fuel"));
+    }
+    if *fuel_used >= max_fuel {
+        return Err(resource("fuel limit exceeded"));
+    }
+    *fuel_used = fuel_used
+        .checked_add(1)
+        .ok_or_else(|| resource("fuel limit exceeded"))?;
+    *remaining -= 1;
+    Ok(())
+}
+
+fn response_wrapper_retained(output: usize) -> Result<usize, SandboxError> {
+    let mut total = object_framing_retained_bytes()?;
+    total = checked_add(total, key_retained_bytes(2)?)?;
+    total = checked_add(total, primitive_retained_bytes())?;
+    total = checked_add(total, key_retained_bytes(6)?)?;
+    checked_add(total, output)
+}
+
+fn response_wrapper_serialized(ok: bool, output: usize) -> Result<usize, SandboxError> {
     let mut total = 2usize;
     total = checked_add(total, serialized_string_len("ok")?)?;
     total = checked_add(total, 1)?;
     total = checked_add(total, if ok { 4 } else { 5 })?;
     total = checked_add(total, 1)?;
     total = checked_add(total, serialized_string_len("output")?)?;
-    checked_add(total, 1)
+    total = checked_add(total, 1)?;
+    checked_add(total, output)
+}
+
+fn clone_string(source: &str) -> Result<String, SandboxError> {
+    let mut output = String::new();
+    output
+        .try_reserve_exact(source.len())
+        .map_err(|_| resource("string allocation failed"))?;
+    output.push_str(source);
+    Ok(output)
+}
+
+fn utf8_chunk_end(source: &str, offset: usize, maximum: usize) -> usize {
+    let mut end = offset.saturating_add(maximum).min(source.len());
+    while end > offset && !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == offset && offset < source.len() {
+        end = offset
+            + source[offset..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(0);
+    }
+    end
+}
+
+const fn escaped_byte_len(byte: u8) -> usize {
+    match byte {
+        b'"' | b'\\' => 2,
+        0x00..=0x1f => 6,
+        _ => 1,
+    }
 }
 
 fn resource(message: impl Into<String>) -> SandboxError {
     SandboxError::new(SandboxErrorCode::ResourceLimit, message)
 }
+
 fn execution(message: impl Into<String>) -> SandboxError {
     SandboxError::new(SandboxErrorCode::Execution, message)
 }
+
 fn resume_error(message: impl Into<String>) -> SandboxError {
     SandboxError::new(SandboxErrorCode::InvalidResume, message)
 }
@@ -1965,704 +2693,301 @@ fn resume_error(message: impl Into<String>) -> SandboxError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Program, SandboxLimits};
-    use alloc::vec;
+    use crate::Program;
+    use alloc::{format, vec};
     use serde_json::json;
 
-    fn execution(program: serde_json::Value, id: u64) -> Execution {
-        let limits = SandboxLimits::default();
-        execution_with_limits(program, id, limits)
-    }
-
-    fn execution_with_limits(
-        program: serde_json::Value,
-        id: u64,
-        limits: SandboxLimits,
-    ) -> Execution {
-        let bytes = serde_json::to_vec(&program).unwrap();
-        let verified = Program::from_json(&bytes, &limits)
+    fn execution(raw: &str, id: u64, limits: SandboxLimits) -> Execution {
+        let program = Program::from_json(raw.as_bytes(), &limits)
             .unwrap()
             .compile(&limits)
             .unwrap();
-        Execution::new(verified, ExecutionId(id)).unwrap()
+        Execution::new(program, ExecutionId(id)).unwrap()
     }
 
-    fn run(mut execution: Execution) -> Value {
+    fn complete(vm: &mut Execution, slice: u64) -> Value {
         loop {
-            match execution.step(1_024).unwrap() {
+            match vm.step(slice).unwrap() {
                 StepOutcome::Sliced => {}
                 StepOutcome::Complete(value) => return value,
-                StepOutcome::Yielded { .. } => panic!("unexpected tool yield"),
+                StepOutcome::Yielded { .. } => panic!("unexpected yield"),
             }
         }
     }
 
-    fn next_event(execution: &mut Execution, slice_fuel: u64) -> Result<StepOutcome, SandboxError> {
+    fn yield_once(vm: &mut Execution) -> (ToolBatch, ResumeToken) {
         loop {
-            let before = execution.metrics().fuel_used;
-            match execution.step(slice_fuel)? {
-                StepOutcome::Sliced => {
-                    assert!(
-                        execution.metrics().fuel_used > before,
-                        "every sliced transition must consume fuel"
-                    );
-                }
-                outcome => return Ok(outcome),
+            match vm.step(1).unwrap() {
+                StepOutcome::Sliced => {}
+                StepOutcome::Yielded { batch, resume } => return (batch, resume),
+                StepOutcome::Complete(_) => panic!("expected yield"),
             }
         }
     }
 
     #[test]
-    fn executes_branching_map_filter_and_reduce_deterministically() {
-        let program = json!({"version":1,"body":[
-            {"kind":"let","name":"xs","value":{"kind":"array","items":[
-                {"kind":"integer","value":1},{"kind":"integer","value":2},{"kind":"integer","value":3}
-            ]}},
-            {"kind":"for_each","item":"loop_item","collection":{"kind":"variable","name":"xs"},"max_iterations":3,
-             "body":[{"kind":"let","name":"per_iteration","value":{"kind":"variable","name":"loop_item"}}]},
-            {"kind":"map","name":"doubled","item":"i","collection":{"kind":"variable","name":"xs"},"max_items":3,
-             "value":{"kind":"binary","operator":"multiply","left":{"kind":"variable","name":"i"},"right":{"kind":"integer","value":2}}},
-            {"kind":"filter","name":"even","item":"i","collection":{"kind":"variable","name":"doubled"},"max_items":3,
-             "predicate":{"kind":"binary","operator":"equal","left":{"kind":"binary","operator":"remainder","left":{"kind":"variable","name":"i"},"right":{"kind":"integer","value":2}},"right":{"kind":"integer","value":0}}},
-            {"kind":"reduce","name":"total","item":"i","accumulator":"acc","collection":{"kind":"variable","name":"even"},"max_items":3,
-             "initial":{"kind":"integer","value":0},"value":{"kind":"binary","operator":"add","left":{"kind":"variable","name":"acc"},"right":{"kind":"variable","name":"i"}}},
-            {"kind":"branch","condition":{"kind":"binary","operator":"equal","left":{"kind":"variable","name":"total"},"right":{"kind":"integer","value":12}},
-             "then_body":[{"kind":"return","value":{"kind":"string","value":"ok"}}],
-             "else_body":[{"kind":"return","value":{"kind":"string","value":"bad"}}]}
-        ]});
-        assert_eq!(run(execution(program, 1)), json!("ok"));
-    }
-
-    #[test]
-    fn fanout_yields_ordered_occurrences_and_preserves_partial_failure() {
-        let program = json!({"version":1,"body":[
-            {"kind":"fan_out","name":"results","tool_id":"read.item","item":"i",
-             "collection":{"kind":"array","items":[{"kind":"integer","value":2},{"kind":"integer","value":1}]},"max_calls":2,
-             "arguments":{"kind":"object","entries":[{"key":"id","value":{"kind":"variable","name":"i"}}]}},
-            {"kind":"return","value":{"kind":"variable","name":"results"}}
-        ]});
-        let mut vm = execution(program, 7);
-        let (batch, token) = match next_event(&mut vm, 1).unwrap() {
-            StepOutcome::Yielded { batch, resume } => (batch, resume),
-            other => panic!("expected yield, got {other:?}"),
-        };
-        assert!(batch.requests_read_only_fan_out());
-        let debug = alloc::format!("{batch:?}");
-        assert!(!debug.contains("read.item"));
-        assert!(!debug.contains("safe"));
-        assert_eq!(batch.calls().len(), 2);
-        assert_eq!(batch.calls()[0].arguments, json!({"id":2}));
-        assert_eq!(batch.calls()[1].arguments, json!({"id":1}));
-        assert_ne!(
-            batch.calls()[0].dynamic_ordinal,
-            batch.calls()[1].dynamic_ordinal
+    fn slice_one_completes_long_literal_and_every_slice_charges_one() {
+        let literal = "x".repeat(MAX_ATOMIC_STRING_BYTES * 8 + 3);
+        let raw = format!(
+            "{{\"version\":1,\"body\":[{{\"kind\":\"return\",\"value\":{{\"kind\":\"string\",\"value\":{}}}}}]}}",
+            serde_json::to_string(&literal).unwrap()
         );
-        vm.resume(
-            token,
-            vec![
-                ToolResponse::success(&batch.calls()[0], json!({"value":"safe"})),
-                ToolResponse::failure(&batch.calls()[1]),
-            ],
-        )
-        .unwrap();
-        assert_eq!(
-            next_event(&mut vm, 1).unwrap(),
-            StepOutcome::Complete(json!([
-                {"ok":true,"output":{"value":"safe"}},
-                {"ok":false,"output":null}
-            ]))
-        );
-    }
-
-    #[test]
-    fn resume_tokens_are_cross_run_and_order_bound() {
-        let program = || {
-            json!({"version":1,"body":[
-                {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[]}},
-                {"kind":"return","value":{"kind":"variable","name":"result"}}
-            ]})
-        };
-        let mut first = execution(program(), 1);
-        let mut second = execution(program(), 2);
-        let (first_batch, first_token) = match next_event(&mut first, 1).unwrap() {
-            StepOutcome::Yielded { batch, resume } => (batch, resume),
-            _ => unreachable!(),
-        };
-        let (second_batch, _second_token) = match next_event(&mut second, 1).unwrap() {
-            StepOutcome::Yielded { batch, resume } => (batch, resume),
-            _ => unreachable!(),
-        };
-        assert_eq!(
-            second
-                .resume(
-                    first_token,
-                    vec![ToolResponse::success(&second_batch.calls()[0], json!(1))]
-                )
-                .unwrap_err()
-                .code(),
-            SandboxErrorCode::InvalidResume
-        );
-        assert_eq!(
-            second.step(100).unwrap_err().code(),
-            SandboxErrorCode::Execution
-        );
-        assert_eq!(
-            first.step(100).unwrap_err().code(),
-            SandboxErrorCode::InvalidResume
-        );
-
-        let mut valid = execution(program(), 3);
-        let (valid_batch, valid_token) = match next_event(&mut valid, 1).unwrap() {
-            StepOutcome::Yielded { batch, resume } => (batch, resume),
-            _ => unreachable!(),
-        };
-        valid
-            .resume(
-                valid_token,
-                vec![ToolResponse::success(&valid_batch.calls()[0], json!(3))],
-            )
-            .unwrap();
-        assert!(matches!(
-            next_event(&mut valid, 1).unwrap(),
-            StepOutcome::Complete(_)
-        ));
-        drop(first_batch);
-    }
-
-    #[test]
-    fn invalid_resume_terminalizes_without_reopening_or_replaying_the_yield() {
-        let program = json!({"version":1,"body":[
-            {"kind":"fan_out","name":"results","tool_id":"read","item":"item",
-             "collection":{"kind":"array","items":[{"kind":"integer","value":1},{"kind":"integer","value":2}]},"max_calls":2,
-             "arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"variable","name":"item"}}]}},
-            {"kind":"return","value":{"kind":"variable","name":"results"}}
-        ]});
-        let suspend = |id| {
-            let mut vm = execution(program.clone(), id);
-            let yielded = next_event(&mut vm, 1).unwrap();
-            match yielded {
-                StepOutcome::Yielded { batch, resume } => (vm, batch, resume),
-                other => panic!("expected yield, got {other:?}"),
-            }
-        };
-
-        let (mut count_vm, count_batch, count_token) = suspend(42);
-        let first = ToolResponse::success(&count_batch.calls()[0], json!("first"));
-        assert_eq!(
-            count_vm
-                .resume(count_token, vec![first])
-                .unwrap_err()
-                .code(),
-            SandboxErrorCode::InvalidResume
-        );
-        assert_eq!(
-            count_vm.step(100).unwrap_err().code(),
-            SandboxErrorCode::Execution
-        );
-
-        let (mut order_vm, order_batch, order_token) = suspend(43);
-        let reversed = vec![
-            ToolResponse::success(&order_batch.calls()[1], json!("second")),
-            ToolResponse::success(&order_batch.calls()[0], json!("first")),
-        ];
-        assert_eq!(
-            order_vm.resume(order_token, reversed).unwrap_err().code(),
-            SandboxErrorCode::InvalidResume
-        );
-        assert_eq!(
-            order_vm.step(100).unwrap_err().code(),
-            SandboxErrorCode::Execution
-        );
-
-        let (mut valid_vm, valid_batch, valid_token) = suspend(44);
-        let ordered = vec![
-            ToolResponse::success(&valid_batch.calls()[0], json!("first")),
-            ToolResponse::success(&valid_batch.calls()[1], json!("second")),
-        ];
-        valid_vm.resume(valid_token, ordered).unwrap();
-        assert!(matches!(
-            next_event(&mut valid_vm, 1).unwrap(),
-            StepOutcome::Complete(_)
-        ));
-        assert_eq!(
-            valid_vm.step(100).unwrap_err().code(),
-            SandboxErrorCode::Execution
-        );
-    }
-
-    #[test]
-    fn tool_response_boundary_rejects_hostile_values_before_vm_mutation() {
-        let program = json!({"version":1,"body":[
-            {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[]}},
-            {"kind":"return","value":{"kind":"variable","name":"result"}}
-        ]});
         let limits = SandboxLimits {
-            max_nesting: 16,
-            max_collection_items: 2,
+            max_slice_fuel: 1,
             ..SandboxLimits::default()
         };
-        let attempt = |id: u64, output: Value| {
-            let mut vm = execution_with_limits(program.clone(), id, limits);
-            let (batch, token) = match next_event(&mut vm, 1).unwrap() {
-                StepOutcome::Yielded { batch, resume } => (batch, resume),
-                other => panic!("expected yield, got {other:?}"),
-            };
-            let before = vm.metrics();
-            let result = vm.resume(
-                token,
-                vec![ToolResponse::success(&batch.calls()[0], output)],
-            );
-            (vm, before, result)
-        };
-
-        let mut too_deep = Value::Null;
-        for _ in 0..limits.max_nesting {
-            too_deep = Value::Array(vec![too_deep]);
+        let mut vm = execution(&raw, 1, limits);
+        loop {
+            let before = vm.metrics().fuel_used;
+            match vm.step(1).unwrap() {
+                StepOutcome::Sliced => assert_eq!(vm.metrics().fuel_used, before + 1),
+                StepOutcome::Complete(Value::String(value)) => {
+                    assert_eq!(value, literal);
+                    break;
+                }
+                other => panic!("unexpected outcome: {other:?}"),
+            }
         }
-        let mut extremely_deep = Value::Null;
-        for _ in 0..10_000 {
-            extremely_deep = Value::Array(vec![extremely_deep]);
-        }
-        for (id, hostile) in [
-            (51, too_deep),
-            (52, Value::Array(vec![Value::Null; 3])),
-            (53, json!(1.5)),
-            (54, extremely_deep),
-        ] {
-            let (mut vm, before, result) = attempt(id, hostile);
-            assert_eq!(result.unwrap_err().code(), SandboxErrorCode::ResourceLimit);
-            assert_eq!(vm.metrics().retained_bytes, before.retained_bytes);
-            assert_eq!(vm.metrics().cumulative_bytes, before.cumulative_bytes);
-            assert_eq!(vm.metrics().yields, before.yields);
-            assert_eq!(vm.step(1).unwrap_err().code(), SandboxErrorCode::Execution);
-        }
-
-        let inert = json!({"kind":"invoke","tool_id":"danger","arguments":{"kind":"return"}});
-        let mut vm = execution(program, 55);
-        let (batch, token) = match next_event(&mut vm, 1).unwrap() {
-            StepOutcome::Yielded { batch, resume } => (batch, resume),
-            other => panic!("expected yield, got {other:?}"),
-        };
-        vm.resume(
-            token,
-            vec![ToolResponse::success(&batch.calls()[0], inert.clone())],
-        )
-        .unwrap();
-        let output = match next_event(&mut vm, 1).unwrap() {
-            StepOutcome::Complete(output) => output,
-            other => panic!("expected completion, got {other:?}"),
-        };
-        assert_eq!(output, json!({"ok":true,"output":inert}));
-        assert_eq!(vm.metrics().yields, 1, "response-shaped code stays inert");
     }
 
     #[test]
-    fn response_serialized_boundary_is_inclusive() {
-        let program = json!({"version":1,"body":[
-            {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[]}},
-            {"kind":"return","value":{"kind":"variable","name":"result"}}
-        ]});
-        let output = json!("x");
-        let output_bytes = measure_value(&output, &SandboxLimits::default())
-            .unwrap()
-            .serialized;
-        let exact = response_wrapper_serialized_bytes(true, output_bytes).unwrap();
-        let attempt = |limit, id| {
-            let limits = SandboxLimits {
-                max_output_bytes: limit,
-                ..SandboxLimits::default()
-            };
-            let mut vm = execution_with_limits(program.clone(), id, limits);
-            let (batch, token) = match next_event(&mut vm, 1).unwrap() {
-                StepOutcome::Yielded { batch, resume } => (batch, resume),
-                _ => unreachable!(),
-            };
-            vm.resume(
-                token,
-                vec![ToolResponse::success(&batch.calls()[0], output.clone())],
-            )
-        };
-        assert_eq!(
-            attempt(exact - 1, 55).unwrap_err().code(),
-            SandboxErrorCode::ResourceLimit
+    fn equality_and_aggregates_advance_per_chunk_or_item() {
+        let string = "q".repeat(MAX_ATOMIC_STRING_BYTES * 12);
+        let values = (0..128).map(|_| json!(1)).collect::<Vec<_>>();
+        let raw = format!(
+            "{{\"version\":1,\"body\":[
+              {{\"kind\":\"let\",\"name\":\"same\",\"value\":{{\"kind\":\"binary\",\"operator\":\"equal\",\"left\":{{\"kind\":\"string\",\"value\":{0}}},\"right\":{{\"kind\":\"string\",\"value\":{0}}}}}}},
+              {{\"kind\":\"let\",\"name\":\"total\",\"value\":{{\"kind\":\"unary\",\"operator\":\"sum\",\"value\":{{\"kind\":\"array\",\"items\":{1}}}}}}},
+              {{\"kind\":\"return\",\"value\":{{\"kind\":\"array\",\"items\":[{{\"kind\":\"variable\",\"name\":\"same\"}},{{\"kind\":\"variable\",\"name\":\"total\"}}]}}}}
+            ]}}",
+            serde_json::to_string(&string).unwrap(),
+            serde_json::to_string(&values.iter().map(|value| json!({"kind":"integer","value":value})).collect::<Vec<_>>()).unwrap()
         );
-        assert!(attempt(exact, 56).is_ok());
-        assert!(attempt(exact + 1, 57).is_ok());
+        let mut vm = execution(&raw, 2, SandboxLimits::default());
+        assert_eq!(complete(&mut vm, 1), json!([true, 128]));
+        assert!(vm.metrics().fuel_used > 128 + (string.len() / MAX_ATOMIC_STRING_BYTES) as u64);
     }
 
     #[test]
-    fn every_nonterminal_slice_charges_fuel_and_fuel_limit_is_terminal() {
-        let program = json!({"version":1,"body":[
-            {"kind":"let","name":"value","value":{"kind":"integer","value":1}},
-            {"kind":"return","value":{"kind":"variable","name":"value"}}
-        ]});
-        let mut vm = execution(program, 43);
+    fn map_filter_reduce_remain_deterministic_at_slice_one() {
+        let raw = r#"{"version":1,"body":[
+          {"kind":"map","name":"mapped","item":"item","collection":{"kind":"array","items":[{"kind":"integer","value":1},{"kind":"integer","value":2},{"kind":"integer","value":3}]},"max_items":3,"value":{"kind":"binary","operator":"add","left":{"kind":"variable","name":"item"},"right":{"kind":"integer","value":1}}},
+          {"kind":"filter","name":"filtered","item":"item","collection":{"kind":"variable","name":"mapped"},"max_items":3,"predicate":{"kind":"binary","operator":"greater_than","left":{"kind":"variable","name":"item"},"right":{"kind":"integer","value":2}}},
+          {"kind":"reduce","name":"total","item":"item","accumulator":"acc","collection":{"kind":"variable","name":"filtered"},"max_items":3,"initial":{"kind":"integer","value":0},"value":{"kind":"binary","operator":"add","left":{"kind":"variable","name":"acc"},"right":{"kind":"variable","name":"item"}}},
+          {"kind":"return","value":{"kind":"variable","name":"total"}}
+        ]}"#;
+        let mut vm = execution(raw, 3, SandboxLimits::default());
+        assert_eq!(complete(&mut vm, 1), json!(7));
+    }
+
+    #[test]
+    fn loop_local_clearing_is_metered_at_slice_one() {
+        let raw = r#"{"version":1,"body":[
+          {"kind":"for_each","item":"item","collection":{"kind":"array","items":[{"kind":"integer","value":1},{"kind":"integer","value":2}]},"max_iterations":2,"body":[
+            {"kind":"let","name":"first","value":{"kind":"variable","name":"item"}},
+            {"kind":"let","name":"second","value":{"kind":"variable","name":"first"}},
+            {"kind":"let","name":"third","value":{"kind":"variable","name":"second"}}
+          ]},
+          {"kind":"return","value":{"kind":"null"}}
+        ]}"#;
+        let limits = SandboxLimits {
+            max_slice_fuel: 1,
+            ..SandboxLimits::default()
+        };
+        let mut vm = execution(raw, 15, limits);
         let mut slices = 0usize;
         loop {
             let before = vm.metrics().fuel_used;
             match vm.step(1).unwrap() {
                 StepOutcome::Sliced => {
-                    slices += 1;
                     assert_eq!(vm.metrics().fuel_used, before + 1);
+                    slices += 1;
                 }
-                StepOutcome::Complete(value) => {
-                    assert_eq!(value, json!(1));
-                    break;
-                }
-                StepOutcome::Yielded { .. } => unreachable!(),
+                StepOutcome::Complete(Value::Null) => break,
+                other => panic!("unexpected outcome: {other:?}"),
             }
         }
         assert!(
-            slices > 1,
-            "expression work must resume across slice-one calls"
+            slices >= 3,
+            "the second iteration must clear three body slots"
         );
+    }
 
-        let limits = SandboxLimits {
-            max_fuel: 1,
-            max_slice_fuel: 1,
-            ..SandboxLimits::default()
-        };
-        let bytes = serde_json::to_vec(&json!({"version":1,"body":[
-            {"kind":"let","name":"value","value":{"kind":"integer","value":1}},
-            {"kind":"return","value":{"kind":"variable","name":"value"}}
-        ]}))
-        .unwrap();
-        let verified = Program::from_json(&bytes, &limits)
-            .unwrap()
-            .compile(&limits)
-            .unwrap();
-        let mut exhausted = Execution::new(verified, ExecutionId(44)).unwrap();
-        assert_eq!(exhausted.step(1).unwrap(), StepOutcome::Sliced);
+    #[test]
+    fn path_lookup_and_materialization_are_resumable() {
+        let key = "k".repeat(MAX_ATOMIC_KEY_BYTES);
+        let raw = format!(
+            "{{\"version\":1,\"body\":[{{\"kind\":\"return\",\"value\":{{\"kind\":\"path\",\"value\":{{\"kind\":\"object\",\"entries\":[{{\"key\":{0},\"value\":{{\"kind\":\"string\",\"value\":\"found\"}}}}]}},\"pointer\":{1}}}}}]}}",
+            serde_json::to_string(&key).unwrap(),
+            serde_json::to_string(&format!("/{key}")).unwrap()
+        );
+        let mut vm = execution(&raw, 4, SandboxLimits::default());
+        assert_eq!(complete(&mut vm, 1), json!("found"));
+    }
+
+    #[test]
+    fn checked_response_admission_is_inert_and_resume_is_atomic() {
+        let raw = r#"{"version":1,"body":[
+          {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[]}},
+          {"kind":"return","value":{"kind":"path","value":{"kind":"variable","name":"result"},"pointer":"/output/value"}}
+        ]}"#;
+        let limits = SandboxLimits::default();
+        let mut vm = execution(raw, 5, limits);
+        let (batch, token) = yield_once(&mut vm);
+        let output = json!({"value":{"kind":"invoke","tool_id":"danger"}});
+        let response = ToolResponse::success(&batch.calls()[0], &output, &limits).unwrap();
+        vm.resume(token, vec![response]).unwrap();
+        assert_eq!(complete(&mut vm, 1), output["value"]);
+        assert!(vm.step(1).is_err());
+    }
+
+    #[test]
+    fn cross_execution_token_terminalizes_without_replay() {
+        let raw = r#"{"version":1,"body":[{"kind":"invoke","name":"r","tool_id":"read","arguments":{"kind":"object","entries":[]}},{"kind":"return","value":{"kind":"null"}}]}"#;
+        let limits = SandboxLimits::default();
+        let mut first = execution(raw, 6, limits);
+        let mut second = execution(raw, 7, limits);
+        let (_first_batch, first_token) = yield_once(&mut first);
+        let (second_batch, _second_token) = yield_once(&mut second);
+        let response = ToolResponse::failure(&second_batch.calls()[0]);
         assert_eq!(
-            exhausted.step(1).unwrap_err().code(),
+            second
+                .resume(first_token, vec![response])
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::InvalidResume
+        );
+        assert!(second.step(1).is_err());
+    }
+
+    #[test]
+    fn hostile_borrowed_response_is_rejected_without_recursive_cleanup() {
+        let raw = r#"{"version":1,"body":[{"kind":"invoke","name":"r","tool_id":"read","arguments":{"kind":"object","entries":[]}},{"kind":"return","value":{"kind":"null"}}]}"#;
+        let limits = SandboxLimits::default();
+        let mut vm = execution(raw, 8, limits);
+        let (batch, _token) = yield_once(&mut vm);
+        let mut hostile = Value::Null;
+        for _ in 0..10_000 {
+            hostile = Value::Array(vec![hostile]);
+        }
+        let result = std::panic::catch_unwind(|| {
+            ToolResponse::success(&batch.calls()[0], &hostile, &limits)
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().unwrap_err().code(),
             SandboxErrorCode::ResourceLimit
         );
+        discard_host_value(hostile);
     }
 
     #[test]
-    fn slice_one_completes_expression_larger_than_the_default_slice_deterministically() {
-        let items = (0..64)
-            .map(|value| json!({"kind":"integer","value":value}))
-            .collect::<Vec<_>>();
-        let program = json!({"version":1,"body":[{
-            "kind":"return","value":{"kind":"array","items":items}
-        }]});
+    fn float_and_collection_boundaries_are_rejected_at_constructor() {
+        let raw = r#"{"version":1,"body":[{"kind":"invoke","name":"r","tool_id":"read","arguments":{"kind":"object","entries":[]}},{"kind":"return","value":{"kind":"null"}}]}"#;
         let limits = SandboxLimits {
-            max_slice_fuel: 1,
+            max_collection_items: 2,
             ..SandboxLimits::default()
         };
-        let execute = |id| {
-            let mut vm = execution_with_limits(program.clone(), id, limits);
-            let mut slices = 0u64;
-            loop {
-                let before = vm.metrics().fuel_used;
-                match vm.step(1).unwrap() {
-                    StepOutcome::Sliced => {
-                        slices += 1;
-                        assert_eq!(vm.metrics().fuel_used, before + 1);
-                    }
-                    StepOutcome::Complete(output) => {
-                        return (output, vm.metrics(), slices);
-                    }
-                    StepOutcome::Yielded { .. } => unreachable!(),
-                }
-            }
-        };
-        let first = execute(58);
-        let second = execute(58);
-        assert_eq!(first, second);
-        assert!(
-            first.2 > SandboxLimits::default().max_slice_fuel,
-            "the expression must exceed the former atomic slice size"
-        );
+        let mut vm = execution(raw, 9, limits);
+        let (batch, _) = yield_once(&mut vm);
+        assert!(ToolResponse::success(&batch.calls()[0], &json!(1.5), &limits).is_err());
+        assert!(ToolResponse::success(&batch.calls()[0], &json!([1, 2]), &limits).is_ok());
+        assert!(ToolResponse::success(&batch.calls()[0], &json!([1, 2, 3]), &limits).is_err());
     }
 
     #[test]
-    fn fuel_boundary_is_exact_at_n_minus_one_n_and_n_plus_one() {
-        let program = json!({"version":1,"body":[{
-            "kind":"return","value":{"kind":"null"}
-        }]});
-        let mut baseline = execution(program.clone(), 59);
-        assert_eq!(
-            next_event(&mut baseline, 1).unwrap(),
-            StepOutcome::Complete(Value::Null)
-        );
-        let exact = baseline.metrics().fuel_used;
-        let attempt = |max_fuel, id| {
+    fn response_constructor_enforces_serialized_limit_at_n_minus_one_n_and_n_plus_one() {
+        let raw = r#"{"version":1,"body":[{"kind":"invoke","name":"r","tool_id":"read","arguments":{"kind":"object","entries":[]}},{"kind":"return","value":{"kind":"null"}}]}"#;
+        let mut vm = execution(raw, 10, SandboxLimits::default());
+        let (batch, _) = yield_once(&mut vm);
+        let output = json!("abc");
+        let serialized = 5;
+        for (limit, accepted) in [
+            (serialized - 1, false),
+            (serialized, true),
+            (serialized + 1, true),
+        ] {
             let limits = SandboxLimits {
-                max_fuel,
-                max_slice_fuel: 1,
+                max_output_bytes: limit,
                 ..SandboxLimits::default()
             };
-            let mut vm = execution_with_limits(program.clone(), id, limits);
-            let outcome = next_event(&mut vm, 1);
-            (outcome, vm.metrics())
-        };
-        assert_eq!(
-            attempt(exact - 1, 60).0.unwrap_err().code(),
-            SandboxErrorCode::ResourceLimit
-        );
-        for (limit, id) in [(exact, 61), (exact + 1, 62)] {
-            let (outcome, metrics) = attempt(limit, id);
-            assert_eq!(outcome.unwrap(), StepOutcome::Complete(Value::Null));
-            assert_eq!(metrics.fuel_used, exact);
-        }
-    }
-
-    #[test]
-    fn identical_public_resume_sequences_are_deterministic() {
-        let program = json!({"version":1,"body":[
-            {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[
-                {"key":"id","value":{"kind":"integer","value":7}}
-            ]}},
-            {"kind":"return","value":{"kind":"variable","name":"result"}}
-        ]});
-        let execute = || {
-            let mut vm = execution(program.clone(), 63);
-            let (batch, token) = match next_event(&mut vm, 1).unwrap() {
-                StepOutcome::Yielded { batch, resume } => (batch, resume),
-                other => panic!("expected yield, got {other:?}"),
-            };
-            let request = batch.calls()[0].clone();
-            vm.resume(
-                token,
-                vec![ToolResponse::success(&request, json!({"value":9}))],
-            )
-            .unwrap();
-            let output = match next_event(&mut vm, 1).unwrap() {
-                StepOutcome::Complete(output) => output,
-                other => panic!("expected completion, got {other:?}"),
-            };
-            (request, output, vm.metrics())
-        };
-        assert_eq!(execute(), execute());
-    }
-
-    #[test]
-    fn slice_and_yield_bounds_are_inclusive_and_refuse_the_next_unit_of_work() {
-        let program = json!({"version":1,"body":[
-            {"kind":"invoke","name":"first","tool_id":"read","arguments":{"kind":"object","entries":[]}},
-            {"kind":"invoke","name":"second","tool_id":"read","arguments":{"kind":"object","entries":[]}},
-            {"kind":"return","value":{"kind":"variable","name":"second"}}
-        ]});
-        let limits = SandboxLimits {
-            max_yields: 1,
-            max_slice_fuel: 1,
-            ..SandboxLimits::default()
-        };
-        let verified = Program::from_json(&serde_json::to_vec(&program).unwrap(), &limits)
-            .unwrap()
-            .compile(&limits)
-            .unwrap();
-        let mut vm = Execution::new(verified, ExecutionId(45)).unwrap();
-        assert_eq!(
-            vm.step(0).unwrap_err().code(),
-            SandboxErrorCode::ResourceLimit
-        );
-        assert_eq!(
-            vm.step(2).unwrap_err().code(),
-            SandboxErrorCode::ResourceLimit
-        );
-        let (batch, token) = match next_event(&mut vm, 1).unwrap() {
-            StepOutcome::Yielded { batch, resume } => (batch, resume),
-            other => panic!("expected first yield, got {other:?}"),
-        };
-        vm.resume(
-            token,
-            vec![ToolResponse::success(&batch.calls()[0], json!(1))],
-        )
-        .unwrap();
-        loop {
-            match vm.step(1) {
-                Ok(StepOutcome::Sliced) => {}
-                Err(error) => {
-                    assert_eq!(error.code(), SandboxErrorCode::ResourceLimit);
-                    break;
-                }
-                Ok(other) => panic!("expected yield-limit failure, got {other:?}"),
-            }
-        }
-        assert_eq!(vm.metrics().yields, 1);
-    }
-
-    #[test]
-    fn bounded_hostile_program_corpus_never_panics() {
-        let limits = SandboxLimits {
-            max_program_bytes: 128,
-            max_ast_nodes: 16,
-            max_nesting: 8,
-            max_bytecode_instructions: 32,
-            max_constant_bytes: 32,
-            max_locals: 4,
-            max_operand_stack: 8,
-            max_control_stack: 4,
-            max_fuel: 32,
-            max_slice_fuel: 8,
-            max_collection_items: 4,
-            max_loop_iterations: 4,
-            max_yields: 2,
-            max_fanout: 2,
-            max_live_bytes: 256,
-            max_cumulative_bytes: 256,
-            max_output_bytes: 128,
-        };
-        let corpus: &[&[u8]] = &[
-            b"",
-            b"\xff",
-            br#"{"version":1,"body":[{"kind":"return","value":{"kind":"integer","value":1e999}}]}"#,
-            br#"{"version":1,"body":[{"kind":"return","value":{"kind":"array","items":[[[[[[[[[0]]]]]]]]}}]}"#,
-            br#"{"version":1,"body":[{"kind":"return","value":{"kind":"string","value":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}"#,
-            br#"{"version":1,"body":[{"kind":"invoke","name":"x","tool_id":"read","arguments":{"kind":"null"}},{"kind":"return","value":{"kind":"variable","name":"x"}}]}"#,
-        ];
-        for raw in corpus {
-            let result = std::panic::catch_unwind(|| {
-                let _ = Program::from_json(raw, &limits)
-                    .and_then(|program| program.compile(&limits))
-                    .and_then(|verified| Execution::new(verified, ExecutionId(99)))
-                    .and_then(|mut execution| execution.step(1));
-            });
-            assert!(
-                result.is_ok(),
-                "hostile input must be reported, never panic"
+            assert_eq!(
+                ToolResponse::success(&batch.calls()[0], &output, &limits).is_ok(),
+                accepted
             );
         }
     }
 
     #[test]
-    fn checked_integer_overflow_is_terminal_error() {
-        let program = json!({"version":1,"body":[{"kind":"return","value":{"kind":"binary","operator":"add","left":{"kind":"integer","value":9223372036854775807i64},"right":{"kind":"integer","value":1}}} ]});
-        let mut vm = execution(program, 9);
+    fn response_keys_and_program_tool_ids_respect_the_string_quantum() {
+        let raw = r#"{"version":1,"body":[{"kind":"invoke","name":"r","tool_id":"read","arguments":{"kind":"object","entries":[]}},{"kind":"return","value":{"kind":"null"}}]}"#;
+        let mut vm = execution(raw, 11, SandboxLimits::default());
+        let (batch, _) = yield_once(&mut vm);
+        let mut object = Map::new();
+        object.insert("k".repeat(MAX_ATOMIC_KEY_BYTES + 1), Value::Null);
         assert_eq!(
-            next_event(&mut vm, 1).unwrap_err().code(),
-            SandboxErrorCode::Execution
+            ToolResponse::success(
+                &batch.calls()[0],
+                &Value::Object(object),
+                &SandboxLimits::default(),
+            )
+            .unwrap_err()
+            .code(),
+            SandboxErrorCode::ResourceLimit
+        );
+
+        let too_long_tool = "t".repeat(MAX_ATOMIC_STRING_BYTES + 1);
+        let raw = format!(
+            r#"{{"version":1,"body":[{{"kind":"invoke","name":"r","tool_id":"{too_long_tool}","arguments":{{"kind":"object","entries":[]}}}},{{"kind":"return","value":{{"kind":"null"}}}}]}}"#
+        );
+        assert_eq!(
+            Program::from_json(raw.as_bytes(), &SandboxLimits::default())
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::InvalidProgram
         );
     }
 
     #[test]
-    fn output_and_value_accounting_are_exact_at_boundaries() {
-        fn compile_with(value: &str, max_output_bytes: usize) -> Execution {
-            let program = json!({"version":1,"body":[{"kind":"return","value":{"kind":"string","value":value}}]});
-            let limits = SandboxLimits {
-                max_output_bytes,
-                ..SandboxLimits::default()
-            };
-            let bytes = serde_json::to_vec(&program).unwrap();
-            let verified = Program::from_json(&bytes, &limits)
-                .unwrap()
-                .compile(&limits)
-                .unwrap();
-            Execution::new(verified, ExecutionId(22)).unwrap()
-        }
-
-        assert_eq!(
-            next_event(&mut compile_with("1234", 7), 1).unwrap(),
-            StepOutcome::Complete(json!("1234"))
-        );
-        assert_eq!(
-            next_event(&mut compile_with("12345", 7), 1).unwrap(),
-            StepOutcome::Complete(json!("12345"))
-        );
-        assert_eq!(
-            next_event(&mut compile_with("123456", 7), 1)
-                .unwrap_err()
-                .code(),
-            SandboxErrorCode::ResourceLimit
-        );
-
-        let response_program = json!({"version":1,"body":[
-            {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[]}},
-            {"kind":"return","value":{"kind":"variable","name":"result"}}
-        ]});
-        let build_response_vm = |limit| {
-            let limits = SandboxLimits {
-                max_live_bytes: limit,
-                max_cumulative_bytes: limit,
-                ..SandboxLimits::default()
-            };
-            let verified =
-                Program::from_json(&serde_json::to_vec(&response_program).unwrap(), &limits)
-                    .unwrap()
-                    .compile(&limits)
-                    .unwrap();
-            Execution::new(verified, ExecutionId(23)).unwrap()
+    fn fuel_exhaustion_is_terminal_at_exact_boundary() {
+        let raw = r#"{"version":1,"body":[{"kind":"return","value":{"kind":"array","items":[{"kind":"integer","value":1},{"kind":"integer","value":2}]}}]}"#;
+        let mut baseline = execution(raw, 12, SandboxLimits::default());
+        let expected = complete(&mut baseline, 1);
+        assert_eq!(expected, json!([1, 2]));
+        let used = baseline.metrics().fuel_used;
+        let limits = SandboxLimits {
+            max_fuel: used - 1,
+            max_slice_fuel: 1,
+            ..SandboxLimits::default()
         };
-        let execute_response = |limit| -> Result<usize, SandboxError> {
-            let mut vm = build_response_vm(limit);
-            let (batch, token) = match next_event(&mut vm, 1)? {
-                StepOutcome::Yielded { batch, resume } => (batch, resume),
-                _ => {
-                    return Err(SandboxError::new(
-                        SandboxErrorCode::Execution,
-                        "expected response test yield",
-                    ));
-                }
-            };
-            vm.resume(
-                token,
-                vec![ToolResponse::success(&batch.calls()[0], json!("x"))],
-            )?;
-            if !matches!(next_event(&mut vm, 1)?, StepOutcome::Complete(_)) {
-                return Err(SandboxError::new(
-                    SandboxErrorCode::Execution,
-                    "expected response test completion",
-                ));
-            }
-            Ok(vm.metrics().cumulative_bytes)
-        };
-        let expected = execute_response(SandboxLimits::default().max_cumulative_bytes).unwrap();
-        assert_eq!(execute_response(expected).unwrap(), expected);
-        assert_eq!(
-            execute_response(expected - 1).unwrap_err().code(),
-            SandboxErrorCode::ResourceLimit
-        );
+        let mut exhausted = execution(raw, 13, limits);
+        while matches!(exhausted.step(1), Ok(StepOutcome::Sliced)) {}
+        assert!(exhausted.step(1).is_err());
+    }
 
-        let intermediate_program = json!({"version":1,"body":[
-            {"kind":"let","name":"xs","value":{"kind":"array","items":[{"kind":"string","value":"a"},{"kind":"string","value":"b"}]}},
-            {"kind":"map","name":"mapped","item":"item","collection":{"kind":"variable","name":"xs"},"max_items":2,"value":{"kind":"variable","name":"item"}},
-            {"kind":"return","value":{"kind":"variable","name":"mapped"}}
-        ]});
-        let build_intermediate_vm = |limit| {
-            let limits = SandboxLimits {
-                max_live_bytes: limit,
-                max_cumulative_bytes: limit,
-                ..SandboxLimits::default()
-            };
-            let verified =
-                Program::from_json(&serde_json::to_vec(&intermediate_program).unwrap(), &limits)
-                    .unwrap()
-                    .compile(&limits)
-                    .unwrap();
-            Execution::new(verified, ExecutionId(24)).unwrap()
-        };
-        let mut baseline = build_intermediate_vm(64 * 1024);
-        loop {
-            match baseline.step(1_024).unwrap() {
-                StepOutcome::Sliced => {}
-                StepOutcome::Complete(value) => {
-                    assert_eq!(value, json!(["a", "b"]));
-                    break;
-                }
-                StepOutcome::Yielded { .. } => unreachable!(),
-            }
-        }
-        let intermediate_limit = baseline.metrics().cumulative_bytes;
-        assert!(matches!(
-            run(build_intermediate_vm(intermediate_limit + 1)),
-            Value::Array(_)
-        ));
-        assert!(matches!(
-            run(build_intermediate_vm(intermediate_limit)),
-            Value::Array(_)
-        ));
-        let mut oversized = build_intermediate_vm(intermediate_limit - 1);
-        loop {
-            match oversized.step(1_024) {
-                Ok(StepOutcome::Sliced) => {}
-                Ok(_) => panic!("expected an intermediate resource limit"),
-                Err(error) => {
-                    assert_eq!(error.code(), SandboxErrorCode::ResourceLimit);
-                    break;
-                }
+    #[test]
+    fn public_debug_is_value_redacted() {
+        let raw = r#"{"version":1,"body":[{"kind":"invoke","name":"r","tool_id":"CANARY","arguments":{"kind":"object","entries":[]}},{"kind":"return","value":{"kind":"null"}}]}"#;
+        let mut vm = execution(raw, 14, SandboxLimits::default());
+        let (batch, _) = yield_once(&mut vm);
+        assert!(!format!("{batch:?}").contains("CANARY"));
+        let response = ToolResponse::success(
+            &batch.calls()[0],
+            &json!({"secret":"CANARY"}),
+            &SandboxLimits::default(),
+        )
+        .unwrap();
+        assert!(!format!("{response:?}").contains("CANARY"));
+    }
+
+    fn discard_host_value(value: Value) {
+        let mut pending = Vec::with_capacity(10_001);
+        pending.push(value);
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::Array(mut values) => pending.append(&mut values),
+                Value::Object(values) => pending.extend(values.into_iter().map(|(_, value)| value)),
+                _ => {}
             }
         }
     }

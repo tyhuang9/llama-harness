@@ -1,7 +1,8 @@
 use crate::{
     accounting::{key_retained_bytes, primitive_retained_bytes, string_retained_bytes},
+    ast::deserialize_program,
     Expression, ObjectEntry, Program, SandboxError, SandboxErrorCode, SandboxLimits, Statement,
-    PROGRAM_VERSION_V1,
+    MAX_ATOMIC_KEY_BYTES, MAX_ATOMIC_STRING_BYTES, PROGRAM_VERSION_V1,
 };
 use alloc::{collections::BTreeSet, string::ToString, vec::Vec};
 
@@ -12,7 +13,7 @@ pub(crate) fn parse_program(input: &[u8], limits: &SandboxLimits) -> Result<Prog
     }
     core::str::from_utf8(input).map_err(|_| invalid("program must be valid UTF-8"))?;
     validate_json_nesting(input, limits.max_nesting)?;
-    let program: Program = serde_json::from_slice(input)
+    let program = deserialize_program(input)
         .map_err(|_| invalid("program does not match the strict V1 JSON schema"))?;
     validate_ast(&program, limits)?;
     Ok(program)
@@ -224,8 +225,8 @@ pub(crate) fn validate_ast(program: &Program, limits: &SandboxLimits) -> Result<
                         validate_count(entries.len(), limits.max_collection_items, "collection")?;
                         let mut keys = BTreeSet::new();
                         for ObjectEntry { key, value } in entries.iter().rev() {
-                            if key.is_empty() || key.len() > 256 {
-                                return Err(invalid("object keys must contain 1..=256 bytes"));
+                            if key.is_empty() || key.len() > MAX_ATOMIC_KEY_BYTES {
+                                return Err(invalid("object keys must contain 1..=64 bytes"));
                             }
                             if !keys.insert(key.as_str()) {
                                 return Err(invalid("object keys must be unique"));
@@ -310,8 +311,8 @@ fn validate_name(name: &str) -> Result<(), SandboxError> {
 }
 
 fn validate_tool_id(tool_id: &str) -> Result<(), SandboxError> {
-    if tool_id.is_empty() || tool_id.len() > 256 {
-        return Err(invalid("tool IDs must contain 1..=256 bytes"));
+    if tool_id.is_empty() || tool_id.len() > MAX_ATOMIC_STRING_BYTES {
+        return Err(invalid("tool IDs must contain 1..=64 bytes"));
     }
     Ok(())
 }
@@ -404,6 +405,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(program.version, 1);
+        assert_eq!(program.statement_count(), 1);
     }
 
     #[test]

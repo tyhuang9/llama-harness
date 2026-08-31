@@ -1,4 +1,4 @@
-use crate::{SandboxError, SandboxErrorCode, SandboxLimits};
+use crate::{SandboxError, SandboxErrorCode, SandboxLimits, MAX_ATOMIC_KEY_BYTES};
 use alloc::{string::ToString, vec::Vec};
 use core::mem::size_of;
 use serde_json::Value;
@@ -53,33 +53,6 @@ pub(crate) fn vector_allocation_bytes<T>(capacity: usize) -> Result<usize, Sandb
         size_of::<T>()
             .checked_mul(capacity)
             .ok_or_else(|| resource("value byte limit exceeded"))?,
-    )
-}
-
-pub(crate) fn cloned_value_allocation_bytes(
-    value: &Value,
-    limits: &SandboxLimits,
-) -> Result<usize, SandboxError> {
-    let measurement = measure_value(value, limits)?;
-    let operation_slots = measurement
-        .nodes
-        .checked_mul(2)
-        .ok_or_else(|| resource("value clone byte limit exceeded"))?;
-    let mut total = measurement.retained;
-    total = checked_add(
-        total,
-        vector_allocation_bytes::<(usize, usize, usize)>(operation_slots)?,
-    )?;
-    total = checked_add(total, vector_allocation_bytes::<Value>(measurement.nodes)?)?;
-    total = checked_add(
-        total,
-        vector_allocation_bytes::<alloc::string::String>(measurement.collection_items)?,
-    )?;
-    checked_add(
-        total,
-        ALLOCATION_OVERHEAD
-            .checked_mul(measurement.nodes)
-            .ok_or_else(|| resource("value clone byte limit exceeded"))?,
     )
 }
 
@@ -166,8 +139,8 @@ pub(crate) fn measure_value(
                     .try_reserve(values.len())
                     .map_err(|_| resource("value measurement allocation failed"))?;
                 for (key, child) in values.iter().rev() {
-                    if key.is_empty() || key.len() > 256 {
-                        return Err(resource("object keys must contain 1..=256 bytes"));
+                    if key.is_empty() || key.len() > MAX_ATOMIC_KEY_BYTES {
+                        return Err(resource("object keys must contain 1..=64 bytes"));
                     }
                     measurement.retained =
                         checked_add(measurement.retained, key_retained_bytes(key.capacity())?)?;
