@@ -74,13 +74,13 @@ select Programmatic.
 | Forced case | Required observation |
 | --- | --- |
 | Direct baseline | Completes through the existing sequential broker path. |
-| Adaptive baseline | Selects only Direct or declarative planning; never Programmatic. |
+| Adaptive baseline | Executes through the real `AgentRunner`, records its actual Direct or declarative selection, and never selects Programmatic. |
 | Programmatic, conforming provider | Records forced Programmatic selection, bounded lifecycle metadata, broker-audited calls, and a final result. |
 | Missing host feature/configuration or false/zero provider capability | Fails closed before a program tool call; it is not a Direct fallback. |
 | First invalid program, corrected program valid | Uses at most one pre-dispatch repair and records the repair lifecycle. |
 | Invalid program after the one repair, no dispatched effect | Continues the same run through a fresh Direct scope and records `invalid_program`; IDs, event sequence, deadline, budgets, and broker state remain continuous. Do not count it as Programmatic success. |
 | Any failure after dispatch, including cancellation, deadline, invalid output, or resource limit | Ends terminally with the effect uncertain; no repair, restart, replay, fallback, or speculation. |
-| Read-only parallel-safe fan-out | Preserves source order, validates and reserves the entire bounded batch before dispatch, and respects the effective cap of eight. |
+| Read-only parallel-safe fan-out | Preserves source order, validates and reserves the entire bounded worst-case canonical transcript envelope before policy, approval, or dispatch, and respects the effective cap of eight. |
 | Mutation in fan-out or mixed read/write batch | Rejects the batch before dispatch; state-changing calls remain serial. |
 
 For every Programmatic case, assert the existing tool-sequence, exact canonical
@@ -95,6 +95,14 @@ debug formatting omit program source, AST, bytecode, constants, locals,
 arguments, and tool results. Evaluation artifacts retain only the explicit
 fixture, normalized outcome, and permitted trace reference; they never recover
 raw program payloads or hidden reasoning.
+
+Sandbox failures use a stable value-free public mapping: sandbox resource limits
+become `resource_limit`; resume or deterministic execution failures become
+`tool_error`; malformed programs, invalid sandbox limits, and verification
+failures become `invalid_output`. Direct and Adaptive retain their existing
+broker and error contracts; only a forced, explicitly configured Programmatic
+request reaches this mapping. A pre-effect invalid Programmatic generation may
+continue through Direct under the same logical run; capability failures do not.
 
 Reports are serializable normalized JSON. Browse a saved report locally with:
 
@@ -114,11 +122,19 @@ The CLI can inspect a saved artifact with `llama-harness replay regression.json 
 ```bash
 llama-harness inspect run <run-id> --db traces.sqlite
 llama-harness inspect run <run-id> --db traces.sqlite --export-json
+llama-harness inspect run --execution-id <execution-id> --db traces.sqlite --export-json
 llama-harness models health
 llama-harness models list
 ```
 
-Trace inspection reads the optional local SQLite store. Exports contain only persisted, redacted values; raw payloads remain unavailable when trace storage had its default raw-data setting. No evaluation artifact or report collects hidden chain-of-thought.
+Trace inspection reads the optional local SQLite store. Every event emitter
+creates one opaque execution ID, independently of an application-provided run
+ID. Listing, ordering, retention, event reads, and exports operate by that
+execution ID and sequence; the public run-ID form remains compatible only when
+it identifies a single execution, otherwise the CLI asks for `--execution-id`.
+Exports contain only persisted, redacted values; raw payloads remain unavailable
+when trace storage had its default raw-data setting. No evaluation artifact or
+report collects hidden chain-of-thought.
 
 ## Promptfoo
 

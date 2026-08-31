@@ -3,34 +3,34 @@ id: programmatic-acceptance
 name: Deterministic Programmatic Acceptance Matrix
 agent: fixture-agent
 models: [fixture-model]
-strategies: [direct, declarative_plan, programmatic]
+strategies: [direct, declarative_plan, programmatic, adaptive]
 defaults:
   repeat: 1
 cases:
   - id: branch
     fixture: {id: branch, data: {scenario: branch, tools: [read]}}
     input: Execute a conditional read.
-    expected: {status: completed, required_tools: [read], max_model_calls: 2, max_tool_calls: 1}
+    expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 1}
   - id: loop
     fixture: {id: loop, data: {scenario: loop, tools: [read, read]}}
     input: Execute two bounded reads.
-    expected: {status: completed, required_tools: [read], max_model_calls: 2, max_tool_calls: 2}
+    expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 2}
   - id: fanout
     fixture: {id: fanout, data: {scenario: fanout, tools: [read, read, read]}}
     input: Execute bounded parallel reads.
-    expected: {status: completed, required_tools: [read], max_model_calls: 2, max_tool_calls: 3}
+    expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 3}
   - id: filter
     fixture: {id: filter, data: {scenario: filter, tools: [read]}}
     input: Filter the read results.
-    expected: {status: completed, required_tools: [read], max_model_calls: 2, max_tool_calls: 1}
+    expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 1}
   - id: reduce-aggregate
     fixture: {id: reduce-aggregate, data: {scenario: reduce-aggregate, tools: [read, read]}}
     input: Reduce and aggregate read results.
-    expected: {status: completed, required_tools: [read], max_model_calls: 2, max_tool_calls: 2}
+    expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 2}
   - id: mixed-approval
     fixture: {id: mixed-approval, data: {scenario: mixed-approval, tools: [read, write], approval_tools: [write]}}
     input: Read then approve a write.
-    expected: {status: completed, required_tools: [read, write], required_approval_tools: [write], max_model_calls: 2, max_tool_calls: 2}
+    expected: {status: completed, required_tools: [read, write], required_approval_tools: [write], max_model_calls: 3, max_tool_calls: 2}
   - id: partial-failure
     strategy: programmatic
     fixture: {id: partial-failure, data: {scenario: partial-failure, tools: [read, read], partial_failure: true}}

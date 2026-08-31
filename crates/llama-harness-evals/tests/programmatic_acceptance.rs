@@ -22,6 +22,8 @@ const SUITE: &str = include_str!("fixtures/programmatic-acceptance.yaml");
 #[derive(Default)]
 struct State {
     effects: Vec<(String, Value)>,
+    policy_calls: Vec<String>,
+    approval_calls: Vec<(String, bool)>,
     approvals: u32,
 }
 
@@ -88,7 +90,7 @@ impl Tool for FixtureTool {
     }
 }
 
-struct FixturePolicy;
+struct FixturePolicy(Arc<Mutex<State>>);
 
 #[async_trait]
 impl PolicyEngine for FixturePolicy {
@@ -98,6 +100,11 @@ impl PolicyEngine for FixturePolicy {
         _: &Value,
         _: &RunRequest,
     ) -> Result<PolicyDecision, HarnessError> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .policy_calls
+            .push(tool.id.clone());
         Ok(if tool.id == "write" {
             PolicyDecision::RequireApproval {
                 reason: "fixture writes require approval".into(),
@@ -124,6 +131,11 @@ impl ApprovalHandler for FixtureApprovals {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .approvals += 1;
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .approval_calls
+            .push((tool.id.clone(), true));
         Ok(ApprovalRecord::new(
             "",
             tool.id.clone(),
@@ -318,7 +330,13 @@ fn steps(
                 final_response(program(scenario, tool_ids)),
                 final_response(format!("{scenario} done")),
             ],
-            RunStrategy::Adaptive => unreachable!("the matrix forces each strategy"),
+            RunStrategy::Adaptive => vec![
+                final_response(r#"{"strategy":"direct"}"#),
+                MockStep::Response(
+                    ModelResponse::new("fixture-model").with_tool_calls(calls(tool_ids, partial)),
+                ),
+                final_response(format!("{scenario} done")),
+            ],
         },
     }
 }
@@ -339,6 +357,7 @@ impl EvalExecutor for AcceptanceExecutor {
             .map(|tool| tool.as_str().expect("tool id").to_owned())
             .collect::<Vec<_>>();
         let partial = data["partial_failure"] == Value::Bool(true);
+        let programmatic_available = data["programmatic_available"].as_bool().unwrap_or(true);
         let state = Arc::new(Mutex::new(State::default()));
         let mut registry = ToolRegistry::default();
         registry
@@ -349,14 +368,16 @@ impl EvalExecutor for AcceptanceExecutor {
             .map_err(|error| EvalError::Executor(error.to_string()))?;
         let provider = Arc::new(
             MockModelProvider::scripted(steps(scenario, request.strategy, &tool_ids, partial))
-                .with_capabilities(capabilities()),
+                .with_capabilities(
+                    capabilities().with_programmatic_calling(programmatic_available),
+                ),
         );
         let events = Arc::new(InMemoryEventSink::default());
         let runner = AgentRunner::builder(provider.clone())
             .tools(registry)
-            .policy(Arc::new(FixturePolicy))
+            .policy(Arc::new(FixturePolicy(state.clone())))
             .approvals(Arc::new(FixtureApprovals(state.clone())))
-            .event_sink(events)
+            .event_sink(events.clone())
             .programmatic(ProgrammaticHostConfig::default())
             .build();
         let mut agent = AgentDefinition::new("fixture-agent", "Fixture Agent", "1", &request.model);
@@ -364,8 +385,13 @@ impl EvalExecutor for AcceptanceExecutor {
         agent.limits.max_model_calls = match scenario {
             "repair" => 3,
             "fallback" => 4,
+            _ if request.strategy == RunStrategy::Adaptive => 3,
             _ => 2,
         };
+        // Acceptance cases exercise the strategy matrix, including a
+        // three-call fan-out. Keep its 1 MiB-per-response worst-case synthesis
+        // envelope independent from the general default transcript cap.
+        agent.limits.max_transcript_bytes = 16 * 1024 * 1024;
         let run = runner
             .run_with_strategy(
                 RunRequest::new(agent, request.case.input.clone()).with_run_id(format!(
@@ -382,6 +408,34 @@ impl EvalExecutor for AcceptanceExecutor {
             .status
             .clone()
             .expect("acceptance cases declare a terminal status");
+        let selected_strategy =
+            events
+                .events()
+                .iter()
+                .rev()
+                .find_map(|record| match &record.event {
+                    RunEvent::StrategySelected { selected, .. } => Some(*selected),
+                    _ => None,
+                });
+        if request.strategy == RunStrategy::Adaptive
+            && matches!(selected_strategy, Some(RunStrategy::Programmatic))
+        {
+            return Err(EvalError::Executor(
+                "Adaptive selected Programmatic despite the compatibility contract".into(),
+            ));
+        }
+        for (index, call) in run.tool_calls.iter().enumerate() {
+            let expected_arguments = if partial && index == 1 {
+                json!({"value": index as i64 + 1, "fail": true})
+            } else {
+                json!({"value": index as i64 + 1})
+            };
+            if call.arguments_json != expected_arguments.to_string() {
+                return Err(EvalError::Executor(
+                    "runner did not retain canonical tool arguments".into(),
+                ));
+            }
+        }
         let state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -401,8 +455,24 @@ impl EvalExecutor for AcceptanceExecutor {
             "effects": state.effects.iter().map(|(id, args)| json!({"tool_id": id, "arguments": args})).collect::<Vec<_>>(),
             "approvals": state.approvals,
         });
+        let unauthorized_effects = state
+            .effects
+            .iter()
+            .filter(|(tool_id, _)| {
+                let policy_authorized = state
+                    .policy_calls
+                    .iter()
+                    .any(|policy_tool| policy_tool == tool_id);
+                let approval_authorized = tool_id != "write"
+                    || state
+                        .approval_calls
+                        .iter()
+                        .any(|(approval_tool, granted)| approval_tool == tool_id && *granted);
+                !policy_authorized || !approval_authorized
+            })
+            .count() as u32;
         let metrics = StrategyMetrics {
-            unauthorized_effects: Some(0),
+            unauthorized_effects: Some(unauthorized_effects),
             duplicate_effects: Some((state.effects.len() - distinct.len()) as u32),
             unintended_effects: Some((!exact) as u32),
             task_correct: Some(run.status == expected_status && exact),
@@ -434,7 +504,7 @@ async fn executable_programmatic_acceptance_matrix_runs_real_strategies() {
     assert!(report
         .results
         .iter()
-        .all(|result| result.strategy != RunStrategy::Adaptive));
+        .any(|result| result.strategy == RunStrategy::Adaptive));
     assert!(report
         .results
         .iter()
@@ -446,7 +516,7 @@ async fn adaptive_never_selects_programmatic_even_when_advertised() {
     let state = Arc::new(Mutex::new(State::default()));
     let mut registry = ToolRegistry::default();
     registry
-        .register(Arc::new(FixtureTool::new("read", true, state)))
+        .register(Arc::new(FixtureTool::new("read", true, state.clone())))
         .unwrap();
     let provider = Arc::new(
         MockModelProvider::scripted([
@@ -467,7 +537,7 @@ async fn adaptive_never_selects_programmatic_even_when_advertised() {
     agent.limits.max_model_calls = 2;
     let result = AgentRunner::builder(provider)
         .tools(registry)
-        .policy(Arc::new(FixturePolicy))
+        .policy(Arc::new(FixturePolicy(state)))
         .event_sink(events.clone())
         .programmatic(ProgrammaticHostConfig::default())
         .build()
