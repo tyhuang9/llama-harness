@@ -14,7 +14,7 @@ use std::{
 };
 use thiserror::Error;
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 const DEFAULT_MAX_EVENT_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_RAW_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_QUERY_LIMIT: u32 = 1_000;
@@ -70,6 +70,9 @@ pub struct PersistedEvent {
 #[non_exhaustive]
 /// Aggregate information for one persisted run.
 pub struct RunSummary {
+    /// Core-generated execution identity. This is the primary query and
+    /// retention identity when an application reuses a public run ID.
+    pub execution_id: String,
     /// Application-visible run identifier.
     pub run_id: String,
     /// Trace identifier shared by the run's events.
@@ -124,6 +127,8 @@ pub struct RetentionResult {
 #[non_exhaustive]
 /// Serializable export of one run and its events.
 pub struct ExportedRun {
+    /// Core-generated execution identity for this logical run.
+    pub execution_id: String,
     /// Application-visible run identifier.
     pub run_id: String,
     /// Trace identifier shared by the exported events.
@@ -169,6 +174,12 @@ pub enum TraceStoreError {
         run_id: String,
         /// Sequence number occupied by different event data.
         sequence: u64,
+    },
+    #[error("public run ID {run_id} matches multiple executions; select an execution ID")]
+    /// A public run identifier is not unique enough to select one logical run.
+    AmbiguousRun {
+        /// Application-visible identifier shared by multiple executions.
+        run_id: String,
     },
     #[error("trace store mutex is poisoned")]
     /// A store lock was poisoned by a failed thread.
@@ -265,34 +276,57 @@ impl SqliteEventSink {
         Ok(outcomes)
     }
 
-    /// Returns persisted events for a run in sequence order.
-    pub fn events_for_run(
+    /// Returns persisted events for one execution in sequence order.
+    pub fn events_for_execution(
         &self,
-        run_id: &str,
+        execution_id: &str,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<PersistedEvent>, TraceStoreError> {
         let limit = checked_limit(limit)?;
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT event_json, raw_payload_json
+            "SELECT execution_id, event_json, raw_payload_json
              FROM trace_events
-             WHERE run_id = ?1
+             WHERE execution_id = ?1
              ORDER BY sequence ASC
              LIMIT ?2 OFFSET ?3",
         )?;
         let rows = statement.query_map(
-            params![run_id, i64::from(limit), i64::from(offset)],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            params![execution_id, i64::from(limit), i64::from(offset)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )?;
         rows.map(|row| decode_persisted_event(row?)).collect()
+    }
+
+    /// Returns persisted events for a unique public run ID in sequence order.
+    ///
+    /// Applications that can reuse a public ID must select the
+    /// [`RunSummary::execution_id`] returned by [`Self::list_runs`] and call
+    /// [`Self::events_for_execution`] instead.
+    pub fn events_for_run(
+        &self,
+        run_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<PersistedEvent>, TraceStoreError> {
+        let Some(execution_id) = self.unique_execution_id_for_run(run_id)? else {
+            return Ok(Vec::new());
+        };
+        self.events_for_execution(&execution_id, limit, offset)
     }
 
     /// Lists run summaries matching the supplied filters.
     pub fn list_runs(&self, query: RunListQuery) -> Result<Vec<RunSummary>, TraceStoreError> {
         let limit = checked_limit(query.limit)?;
         let mut sql = String::from(
-            "SELECT run_id, trace_id, MIN(timestamp_ms), MAX(timestamp_ms), COUNT(*), MAX(status)
+            "SELECT execution_id, run_id, trace_id, MIN(timestamp_ms), MAX(timestamp_ms), COUNT(*), MAX(status)
              FROM trace_events WHERE 1 = 1",
         );
         let mut values: Vec<SqlValue> = Vec::new();
@@ -308,12 +342,12 @@ impl SqliteEventSink {
             sql.push_str(" AND timestamp_ms <= ?");
             values.push(SqlValue::Integer(to_sql_integer(before)?));
         }
-        sql.push_str(" GROUP BY run_id, trace_id");
+        sql.push_str(" GROUP BY execution_id, run_id, trace_id");
         if let Some(status) = query.status {
             sql.push_str(" HAVING MAX(status) = ?");
             values.push(SqlValue::Text(status_text(&status).into()));
         }
-        sql.push_str(" ORDER BY MAX(timestamp_ms) DESC, run_id DESC LIMIT ? OFFSET ?");
+        sql.push_str(" ORDER BY MAX(timestamp_ms) DESC, execution_id DESC LIMIT ? OFFSET ?");
         values.push(SqlValue::Integer(i64::from(limit)));
         values.push(SqlValue::Integer(i64::from(query.offset)));
 
@@ -323,22 +357,23 @@ impl SqliteEventSink {
             rusqlite::params_from_iter(values.iter().map(|value| value as &dyn ToSql)),
             |row| {
                 let status = row
-                    .get::<_, Option<String>>(5)?
+                    .get::<_, Option<String>>(6)?
                     .map(|status| parse_status(&status))
                     .transpose()
                     .map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            5,
+                            6,
                             rusqlite::types::Type::Text,
                             Box::new(error),
                         )
                     })?;
                 Ok(RunSummary {
-                    run_id: row.get(0)?,
-                    trace_id: row.get(1)?,
-                    started_at_ms: from_sql_integer(row.get(2)?)?,
-                    updated_at_ms: from_sql_integer(row.get(3)?)?,
-                    event_count: from_sql_integer(row.get(4)?)?,
+                    execution_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    trace_id: row.get(2)?,
+                    started_at_ms: from_sql_integer(row.get(3)?)?,
+                    updated_at_ms: from_sql_integer(row.get(4)?)?,
+                    event_count: from_sql_integer(row.get(5)?)?,
                     status,
                 })
             },
@@ -347,25 +382,29 @@ impl SqliteEventSink {
             .map_err(TraceStoreError::from)
     }
 
-    /// Exports all events for a run, or `None` when the run is unknown.
-    pub fn export_run(&self, run_id: &str) -> Result<Option<ExportedRun>, TraceStoreError> {
-        let event_count = self.event_count_for_run(run_id)?;
+    /// Exports all events for one execution, or `None` when it is unknown.
+    pub fn export_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<ExportedRun>, TraceStoreError> {
+        let event_count = self.event_count_for_execution(execution_id)?;
         if event_count == 0 {
             return Ok(None);
         }
         if event_count > u64::from(MAX_QUERY_LIMIT) {
             return Err(TraceStoreError::ResourceLimit(format!(
-                "run {run_id} has {event_count} events; JSON export is limited to {MAX_QUERY_LIMIT} events"
+                "execution {execution_id} has {event_count} events; JSON export is limited to {MAX_QUERY_LIMIT} events"
             )));
         }
-        let events = self.events_for_run(run_id, MAX_QUERY_LIMIT, 0)?;
+        let events = self.events_for_execution(execution_id, MAX_QUERY_LIMIT, 0)?;
         let Some(first) = events.first() else {
             return Err(TraceStoreError::InvalidRecord(format!(
-                "run {run_id} disappeared during export"
+                "execution {execution_id} disappeared during export"
             )));
         };
         Ok(Some(ExportedRun {
-            run_id: run_id.into(),
+            execution_id: execution_id.into(),
+            run_id: first.record.run_id.clone(),
             trace_id: first.record.trace_id.clone(),
             events: events
                 .into_iter()
@@ -375,6 +414,17 @@ impl SqliteEventSink {
                 })
                 .collect(),
         }))
+    }
+
+    /// Exports all events for a unique public run ID, or `None` when unknown.
+    ///
+    /// Use [`Self::export_execution`] after selecting a summary when public
+    /// run IDs can be reused.
+    pub fn export_run(&self, run_id: &str) -> Result<Option<ExportedRun>, TraceStoreError> {
+        let Some(execution_id) = self.unique_execution_id_for_run(run_id)? else {
+            return Ok(None);
+        };
+        self.export_execution(&execution_id)
     }
 
     /// Serializes a run export as pretty-printed JSON.
@@ -403,10 +453,10 @@ impl SqliteEventSink {
         if let Some(max_runs) = policy.max_runs {
             let run_ids = {
                 let mut statement = transaction.prepare(
-                    "SELECT run_id
+                    "SELECT execution_id
                      FROM trace_events
-                     GROUP BY run_id
-                     ORDER BY MAX(timestamp_ms) DESC, run_id DESC
+                     GROUP BY execution_id
+                     ORDER BY MAX(timestamp_ms) DESC, execution_id DESC
                      LIMIT -1 OFFSET ?1",
                 )?;
                 let run_ids = statement
@@ -414,10 +464,10 @@ impl SqliteEventSink {
                     .collect::<Result<Vec<_>, _>>()?;
                 run_ids
             };
-            for run_id in run_ids {
+            for execution_id in run_ids {
                 result.events_deleted += transaction.execute(
-                    "DELETE FROM trace_events WHERE run_id = ?1",
-                    params![run_id],
+                    "DELETE FROM trace_events WHERE execution_id = ?1",
+                    params![execution_id],
                 )? as u64;
                 result.runs_deleted += 1;
             }
@@ -426,23 +476,48 @@ impl SqliteEventSink {
         Ok(result)
     }
 
-    /// Deletes all events belonging to a run and returns the number removed.
-    pub fn delete_run(&self, run_id: &str) -> Result<u64, TraceStoreError> {
+    /// Deletes all events belonging to one execution and returns the number removed.
+    pub fn delete_execution(&self, execution_id: &str) -> Result<u64, TraceStoreError> {
         let connection = self.connection()?;
         Ok(connection.execute(
-            "DELETE FROM trace_events WHERE run_id = ?1",
-            params![run_id],
+            "DELETE FROM trace_events WHERE execution_id = ?1",
+            params![execution_id],
         )? as u64)
     }
 
-    fn event_count_for_run(&self, run_id: &str) -> Result<u64, TraceStoreError> {
+    /// Deletes all events belonging to a unique public run ID.
+    pub fn delete_run(&self, run_id: &str) -> Result<u64, TraceStoreError> {
+        let Some(execution_id) = self.unique_execution_id_for_run(run_id)? else {
+            return Ok(0);
+        };
+        self.delete_execution(&execution_id)
+    }
+
+    fn event_count_for_execution(&self, execution_id: &str) -> Result<u64, TraceStoreError> {
         let connection = self.connection()?;
         let count = connection.query_row(
-            "SELECT COUNT(*) FROM trace_events WHERE run_id = ?1",
-            params![run_id],
+            "SELECT COUNT(*) FROM trace_events WHERE execution_id = ?1",
+            params![execution_id],
             |row| row.get::<_, i64>(0),
         )?;
         from_sql_integer(count).map_err(TraceStoreError::from)
+    }
+
+    fn unique_execution_id_for_run(&self, run_id: &str) -> Result<Option<String>, TraceStoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT execution_id FROM trace_events WHERE run_id = ?1 GROUP BY execution_id LIMIT 2",
+        )?;
+        let execution_ids = statement
+            .query_map(params![run_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        match execution_ids.as_slice() {
+            [] => Ok(None),
+            [execution_id] => Ok(Some(execution_id.clone())),
+            _ => Err(TraceStoreError::AmbiguousRun {
+                run_id: run_id.into(),
+            }),
+        }
     }
 
     /// Reclaims unused SQLite pages after deletions.
@@ -542,17 +617,17 @@ fn append_prepared(
     transaction: &Transaction<'_>,
     event: &PreparedEvent,
 ) -> Result<AppendOutcome, TraceStoreError> {
-    let existing_trace_id = transaction
+    let existing_identity = transaction
         .query_row(
-            "SELECT trace_id FROM trace_events WHERE execution_id = ?1 LIMIT 1",
+            "SELECT run_id, trace_id FROM trace_events WHERE execution_id = ?1 LIMIT 1",
             params![event.record.execution_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    if let Some(existing_trace_id) = existing_trace_id {
-        if existing_trace_id != event.record.trace_id {
+    if let Some((existing_run_id, existing_trace_id)) = existing_identity {
+        if existing_run_id != event.record.run_id || existing_trace_id != event.record.trace_id {
             return Err(TraceStoreError::InvalidRecord(format!(
-                "execution {} already belongs to trace {existing_trace_id}",
+                "execution {} already belongs to run {existing_run_id} and trace {existing_trace_id}",
                 event.record.execution_id
             )));
         }
@@ -651,7 +726,9 @@ fn configure_and_migrate(
              );
              INSERT INTO trace_events_v2
                  (run_id, execution_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json)
-             SELECT run_id, run_id || ':' || trace_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json
+             SELECT run_id,
+                    'legacy-v3:' || length(run_id) || ':' || run_id || ':' || length(trace_id) || ':' || trace_id,
+                    trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json
              FROM trace_events;
              DROP TABLE trace_events;
              ALTER TABLE trace_events_v2 RENAME TO trace_events;
@@ -664,6 +741,25 @@ fn configure_and_migrate(
              COMMIT;",
         )?;
     }
+    if version < 3 {
+        connection.execute_batch(
+            "BEGIN;
+             UPDATE trace_events
+             SET execution_id = 'legacy-v3:' || length(run_id) || ':' || run_id || ':' || length(trace_id) || ':' || trace_id
+             WHERE execution_id = run_id || ':' || trace_id;
+             COMMIT;",
+        )?;
+    }
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS trace_events_trace_timestamp_idx
+             ON trace_events(trace_id, timestamp_ms DESC);
+         CREATE INDEX IF NOT EXISTS trace_events_run_execution_idx
+             ON trace_events(run_id, execution_id, timestamp_ms DESC);
+         CREATE INDEX IF NOT EXISTS trace_events_timestamp_idx
+             ON trace_events(timestamp_ms DESC);
+         CREATE INDEX IF NOT EXISTS trace_events_status_idx
+             ON trace_events(status);",
+    )?;
     if version < CURRENT_SCHEMA_VERSION {
         connection.execute(
             "INSERT INTO schema_migrations(version) VALUES (?1)",
@@ -688,10 +784,14 @@ fn validate_config(config: &TraceStoreConfig) -> Result<(), TraceStoreError> {
 }
 
 fn decode_persisted_event(
-    (event_json, raw_payload_json): (String, Option<String>),
+    (execution_id, event_json, raw_payload_json): (String, String, Option<String>),
 ) -> Result<PersistedEvent, TraceStoreError> {
+    let mut record: EventRecord = serde_json::from_str(&event_json)?;
+    // Legacy JSON records predate execution IDs. The selected database column
+    // is authoritative and keeps repeated reads deterministic.
+    record.execution_id = execution_id;
     Ok(PersistedEvent {
-        record: serde_json::from_str(&event_json)?,
+        record,
         raw_payload: raw_payload_json
             .map(|payload| serde_json::from_str(&payload))
             .transpose()?,

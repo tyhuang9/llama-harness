@@ -11,6 +11,11 @@ cargo run -p local-task-agent -- --trace-db local-task-agent-traces.sqlite
 cargo run -p llama-harness-cli -- inspect run <run-id> --db local-task-agent-traces.sqlite --export-json
 ```
 
+Each runner execution also has a core-generated execution ID in the local trace
+listing. If an application intentionally reuses a public run ID, select that
+execution explicitly with `inspect run --execution-id <execution-id> ...`; the
+store never combines the two timelines.
+
 The example has an optional live Ollama route; it checks health and installed models and never pulls a model:
 
 ```bash

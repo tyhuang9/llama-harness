@@ -22,7 +22,11 @@ fn record(
     timestamp_ms: u64,
     event: RunEvent,
 ) -> EventRecord {
-    EventRecord::new(run_id, trace_id, sequence, timestamp_ms, event)
+    let mut record = EventRecord::new(run_id, trace_id, sequence, timestamp_ms, event);
+    // Test records model one EventEmitter execution unless a test deliberately
+    // overrides this identity to model reuse of a public run ID.
+    record.execution_id = format!("test-execution:{run_id}:{trace_id}");
+    record
 }
 
 #[test]
@@ -438,6 +442,80 @@ fn migration_append_query_reopen_and_conflict_are_deterministic() {
 }
 
 #[test]
+fn legacy_migration_uses_collision_free_execution_ids_and_stable_roundtrips() {
+    let path = temporary_database("legacy-execution-ids");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL);
+             INSERT INTO schema_migrations(version) VALUES (1);
+             CREATE TABLE trace_events (
+                 run_id TEXT NOT NULL,
+                 trace_id TEXT NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 timestamp_ms INTEGER NOT NULL,
+                 event_kind TEXT NOT NULL,
+                 status TEXT,
+                 event_json TEXT NOT NULL,
+                 raw_payload_json TEXT,
+                 PRIMARY KEY (run_id, sequence)
+             );",
+        )
+        .unwrap();
+    for (run_id, trace_id) in [("a:b", "c"), ("a", "b:c")] {
+        let legacy_record = json!({
+            "run_id": run_id,
+            "trace_id": trace_id,
+            "sequence": 1,
+            "timestamp_ms": 1,
+            "event": {"type": "model_responded", "call_number": 1}
+        })
+        .to_string();
+        connection
+            .execute(
+                "INSERT INTO trace_events
+                 (run_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json)
+                 VALUES (?1, ?2, 1, 1, 'model.responded', NULL, ?3)",
+                rusqlite::params![run_id, trace_id, legacy_record],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let store = SqliteEventSink::open(&path, TraceStoreConfig::default()).unwrap();
+    let runs = store
+        .list_runs(RunListQuery {
+            limit: 10,
+            ..RunListQuery::default()
+        })
+        .unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_ne!(runs[0].execution_id, runs[1].execution_id);
+    for run in runs {
+        let once = store
+            .events_for_execution(&run.execution_id, 10, 0)
+            .unwrap();
+        let twice = store
+            .events_for_execution(&run.execution_id, 10, 0)
+            .unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(once[0].record.execution_id, run.execution_id);
+        assert_eq!(once[0].record.run_id, run.run_id);
+        assert_eq!(once[0].record.trace_id, run.trace_id);
+        assert_eq!(
+            store
+                .export_execution(&run.execution_id)
+                .unwrap()
+                .unwrap()
+                .execution_id,
+            run.execution_id
+        );
+    }
+    drop(store);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn read_only_open_inspects_existing_traces_without_permitting_writes() {
     let path = temporary_database("read-only");
     let writer = SqliteEventSink::open(&path, TraceStoreConfig::default()).unwrap();
@@ -540,13 +618,14 @@ fn repeated_public_run_ids_use_distinct_execution_keys_without_sequence_conflict
         1,
         RunEvent::ModelResponded { call_number: 1 },
     );
-    let explicit_second = record(
+    let mut explicit_second = record(
         "public-run-id",
         "public-trace-id",
         1,
         2,
         RunEvent::ModelResponded { call_number: 1 },
     );
+    explicit_second.execution_id = "test-execution:public-run-id:second".into();
     assert_ne!(explicit_first.execution_id, explicit_second.execution_id);
     assert_eq!(
         store.append(&explicit_first).unwrap(),
@@ -564,13 +643,14 @@ fn repeated_public_run_ids_use_distinct_execution_keys_without_sequence_conflict
         3,
         RunEvent::ModelResponded { call_number: 1 },
     );
-    let generated_second = record(
+    let mut generated_second = record(
         "generated-run-id",
         "generated-trace-id",
         1,
         4,
         RunEvent::ModelResponded { call_number: 1 },
     );
+    generated_second.execution_id = "test-execution:generated-run-id:second".into();
     assert_eq!(
         store.append(&generated_first).unwrap(),
         AppendOutcome::Inserted
@@ -579,16 +659,27 @@ fn repeated_public_run_ids_use_distinct_execution_keys_without_sequence_conflict
         store.append(&generated_second).unwrap(),
         AppendOutcome::Inserted
     );
+    assert!(matches!(
+        store.events_for_run("public-run-id", 10, 0),
+        Err(TraceStoreError::AmbiguousRun { .. })
+    ));
+    assert!(matches!(
+        store.events_for_run("generated-run-id", 10, 0),
+        Err(TraceStoreError::AmbiguousRun { .. })
+    ));
     assert_eq!(
-        store.events_for_run("public-run-id", 10, 0).unwrap().len(),
-        2
+        store
+            .events_for_execution(&explicit_first.execution_id, 10, 0)
+            .unwrap()
+            .len(),
+        1
     );
     assert_eq!(
         store
-            .events_for_run("generated-run-id", 10, 0)
+            .events_for_execution(&generated_second.execution_id, 10, 0)
             .unwrap()
             .len(),
-        2
+        1
     );
 }
 
@@ -598,6 +689,10 @@ fn default_redaction_matches_artifact_key_tokens_without_hiding_capabilities() {
         "program": "program-source",
         "program_source": "program-source",
         "vm-locals": "program-source",
+        "openai_api_key": "api-secret",
+        "x-api-key": "api-secret",
+        "api_keynote": "visible",
+        "resource_api": "visible",
         "programmatic_conformance": "strict_json_ast_v1",
         "locale": "en-US",
         "resource": "programmatic-resource"
@@ -605,6 +700,10 @@ fn default_redaction_matches_artifact_key_tokens_without_hiding_capabilities() {
     assert_eq!(redacted["program"], REDACTED_VALUE);
     assert_eq!(redacted["program_source"], REDACTED_VALUE);
     assert_eq!(redacted["vm-locals"], REDACTED_VALUE);
+    assert_eq!(redacted["openai_api_key"], REDACTED_VALUE);
+    assert_eq!(redacted["x-api-key"], REDACTED_VALUE);
+    assert_eq!(redacted["api_keynote"], "visible");
+    assert_eq!(redacted["resource_api"], "visible");
     assert_eq!(redacted["programmatic_conformance"], "strict_json_ast_v1");
     assert_eq!(redacted["locale"], "en-US");
     assert_eq!(redacted["resource"], "programmatic-resource");

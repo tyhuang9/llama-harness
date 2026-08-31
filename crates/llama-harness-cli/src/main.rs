@@ -130,7 +130,13 @@ enum InspectCommand {
 
 #[derive(Args)]
 struct InspectRunArgs {
-    run_id: String,
+    /// Application-visible run ID. It remains supported when it selects one
+    /// logical execution; use --execution-id when an application reused it.
+    #[arg(required_unless_present = "execution_id")]
+    run_id: Option<String>,
+    /// Core-generated execution ID from a trace listing.
+    #[arg(long)]
+    execution_id: Option<String>,
     /// Project-local SQLite trace database.
     #[arg(long)]
     db: PathBuf,
@@ -469,10 +475,23 @@ fn run_inspect(command: InspectCommand) -> Result<(), CliError> {
     match command {
         InspectCommand::Run(arguments) => {
             let store = SqliteEventSink::open(arguments.db, TraceStoreConfig::default())?;
-            let Some(export) = store.export_run(&arguments.run_id)? else {
+            let selected = arguments.execution_id.as_deref();
+            let export = match selected {
+                Some(execution_id) => store.export_execution(execution_id)?,
+                None => store.export_run(
+                    arguments
+                        .run_id
+                        .as_deref()
+                        .expect("clap requires run ID or execution ID"),
+                )?,
+            };
+            let Some(export) = export else {
+                let label = selected
+                    .map(|execution_id| format!("execution {execution_id}"))
+                    .or_else(|| arguments.run_id.map(|run_id| format!("run {run_id}")))
+                    .expect("clap requires run ID or execution ID");
                 return Err(CliError::NotFound(format!(
-                    "run {} in the selected trace database",
-                    arguments.run_id
+                    "{label} in the selected trace database"
                 )));
             };
             println!("{}", render_inspected_run(&export, arguments.export_json)?);
@@ -564,8 +583,9 @@ fn render_inspected_run(export: &ExportedRun, as_json: bool) -> Result<String, C
         return Ok(serde_json::to_string_pretty(export)?);
     }
     let mut lines = vec![format!(
-        "run {} trace {}: {} event(s)",
+        "run {} execution {} trace {}: {} event(s)",
         export.run_id,
+        export.execution_id,
         export.trace_id,
         export.events.len()
     )];
@@ -684,7 +704,8 @@ mod tests {
         let human = render_inspected_run(&export, false).unwrap();
         assert!(!json.contains("private credential"));
         assert!(!human.contains("private credential"));
-        assert!(human.contains("run run-1 trace trace-1: 1 event(s)"));
+        assert!(human.contains("run run-1 execution"));
+        assert!(human.contains("trace trace-1: 1 event(s)"));
     }
 
     #[test]

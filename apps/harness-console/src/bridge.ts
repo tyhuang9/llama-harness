@@ -22,8 +22,8 @@ export const tauriConsoleApi: ConsoleApi = {
   savePreferences: (update: ConsolePreferences) =>
     invoke<ConsolePreferences>("save_preferences", { update }),
   listRuns: (query) => invoke<ConsoleRun[]>("list_runs", { query }),
-  listRunEvents: (runId: string) =>
-    invoke<ConsoleEvent[]>("list_run_events", { runId }),
+  listRunEvents: (executionId: string) =>
+    invoke<ConsoleEvent[]>("list_run_events", { executionId }),
   listModels: () => invoke<ConsoleModels>("list_models"),
   listAgents: () => invoke<AgentDefinition[]>("list_agents"),
   listEvaluationArtifacts: () =>

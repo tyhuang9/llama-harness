@@ -55,6 +55,7 @@ pub struct RunQuery {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsoleRun {
+    pub execution_id: String,
     pub run_id: String,
     pub trace_id: String,
     pub started_at_ms: u64,
@@ -251,6 +252,7 @@ fn list_runs(query: RunQuery, state: State<'_, ConsoleState>) -> Result<Vec<Cons
         .map(|runs| {
             runs.into_iter()
                 .map(|run| ConsoleRun {
+                    execution_id: run.execution_id,
                     run_id: run.run_id,
                     trace_id: run.trace_id,
                     started_at_ms: run.started_at_ms,
@@ -264,13 +266,13 @@ fn list_runs(query: RunQuery, state: State<'_, ConsoleState>) -> Result<Vec<Cons
 
 #[tauri::command]
 fn list_run_events(
-    run_id: String,
+    execution_id: String,
     state: State<'_, ConsoleState>,
 ) -> Result<Vec<ConsoleEvent>, String> {
     let workspace = state.workspace()?;
     let store = open_trace_store(&workspace)?;
     store
-        .events_for_run(&run_id, MAX_EVENTS_PER_RUN, 0)
+        .events_for_execution(&execution_id, MAX_EVENTS_PER_RUN, 0)
         .map_err(|error| format!("Could not read local trace events: {error}"))
         .and_then(|events| {
             events

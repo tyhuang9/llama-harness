@@ -235,6 +235,14 @@ removed or overwritten. A GitHub release or tag never makes an incomplete or
 bad registry release safe; communicate the issue and ship the smallest safe
 forward fix.
 
+For this Programmatic release, rollback is also behavior-sensitive: retain the
+execution-ID SQLite migration and trace schema together with core. Reverting
+only the trace reader can merge reused public run IDs or lose stable legacy
+identity selection. Before a forward rollback release, verify Direct and
+Adaptive compatibility, Programmatic's value-free sandbox-error mapping, and
+the bounded completion-only Programmatic path; streaming remains intentionally
+deferred until a separately bounded contract is released.
+
 ## Sidecar SDK distribution
 
 The release workflow at `.github/workflows/release.yml` is manual-dispatch only. It builds `llama-harness-runtime` for supported Windows x64, macOS arm64, and Linux x64 targets, generates checksums and a machine-readable manifest, and stages a matching platform-specific npm runtime package plus Python wheel. It does not build model images, pull models, or package Ollama.

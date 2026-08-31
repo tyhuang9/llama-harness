@@ -6,8 +6,8 @@ pub const REDACTED_VALUE: &str = "[REDACTED]";
 /// Redaction rules applied before any event or raw payload is serialized for persistence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RedactionConfig {
-    /// Case-insensitive exact key names or delimited key tokens whose values
-    /// must be redacted recursively.
+    /// Case-insensitive exact key names or delimited token sequences whose
+    /// values must be redacted recursively.
     pub key_fragments: Vec<String>,
     /// Literal secret values to remove anywhere they occur in a string.
     pub secret_values: Vec<String>,
@@ -66,13 +66,20 @@ impl RedactionConfig {
 
     fn redacts_key(&self, key: &str) -> bool {
         let normalized = key.to_ascii_lowercase();
-        let tokens = normalized
-            .split(|character: char| character == '_' || !character.is_ascii_alphanumeric())
-            .filter(|token| !token.is_empty());
+        let tokens = key_tokens(&normalized);
         self.key_fragments.iter().any(|configured| {
             let configured = configured.trim().to_ascii_lowercase();
-            !configured.is_empty()
-                && (normalized == configured || tokens.clone().any(|token| token == configured))
+            if configured.is_empty() {
+                return false;
+            }
+            if normalized == configured {
+                return true;
+            }
+            let configured_tokens = key_tokens(&configured);
+            !configured_tokens.is_empty()
+                && tokens
+                    .windows(configured_tokens.len())
+                    .any(|candidate| candidate == configured_tokens.as_slice())
         })
     }
 
@@ -84,4 +91,10 @@ impl RedactionConfig {
                 value.replace(secret, &self.replacement)
             })
     }
+}
+
+fn key_tokens(key: &str) -> Vec<&str> {
+    key.split(|character: char| character == '_' || !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect()
 }
