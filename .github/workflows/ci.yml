@@ -23,12 +23,12 @@ jobs:
       - name: Reject Tauri from the portable facade dependency graph
         shell: pwsh
         run: |
-          $tree = cargo tree --locked --package llama-harness --no-default-features --features "ollama,observability,evals,programmatic"
+          $tree = cargo tree --locked --package llama-harness --no-default-features --features "ollama,observability,evals,programmatic,mcp"
           if ($tree -match '(?m)(llama-harness-tauri|tauri) v') {
             throw "The portable facade dependency graph unexpectedly contains Tauri."
           }
       - name: Test the portable facade and integrations
-        run: cargo test --locked --package llama-harness --no-default-features --features ollama,observability,evals,programmatic
+        run: cargo test --locked --package llama-harness --no-default-features --features ollama,observability,evals,programmatic,mcp
 
   rust-full-platform:
     name: Full workspace / stable / ${{ matrix.os }}
@@ -119,6 +119,7 @@ jobs:
           --package llama-harness-ollama
           --package llama-harness-observability
           --package llama-harness-evals
+          --package llama-harness-mcp
           --package llama-harness-tauri
           --package llama-harness
 

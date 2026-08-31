@@ -101,6 +101,22 @@ pub trait McpTransport: Send + Sync {
         cancellation: CancellationToken,
     ) -> Result<(), McpTransportError>;
 }
+
+/// Closes a negotiated context with a bounded deadline. Hosts should call this
+/// after a catalog is no longer used; it never exposes transport details.
+pub async fn close_context(
+    transport: &dyn McpTransport,
+    context: McpContext,
+    cancellation: CancellationToken,
+    timeout: Duration,
+) -> Result<(), McpTransportError> {
+    tokio::time::timeout(timeout, transport.close(context, cancellation))
+        .await
+        .map_err(|_| McpTransportError {
+            operation: McpOperation::Close,
+            dispatch: McpDispatchState::PossiblyDispatched,
+        })?
+}
 /// One remote tool declaration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpTool {
