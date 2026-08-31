@@ -7,7 +7,7 @@ use llama_harness_core::{
     InMemoryEventSink, ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
     PolicyDecision, PolicyEngine, ProgramLifecycleOutcome, ProgrammaticConformance,
     ProgrammaticHostConfig, ProviderCapabilityLimits, ProviderHealth, RunEvent, RunRequest,
-    RunStatus, RunStrategy, StrategyFallbackReason, Tool, ToolCallContext, ToolCaller,
+    RunResult, RunStatus, RunStrategy, StrategyFallbackReason, Tool, ToolCallContext, ToolCaller,
     ToolDefinition, ToolRegistry, ToolResult, ToolRisk, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
     HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
 };
@@ -223,6 +223,65 @@ impl Tool for AdmissionBarrierTool {
                 Ok(ToolResult::success(arguments))
             }
         }
+    }
+}
+
+struct ReentrantProgrammaticTool {
+    definition: ToolDefinition,
+    calls: AtomicU32,
+    runner: Mutex<Option<Arc<AgentRunner>>>,
+    nested_result: Mutex<Option<RunResult>>,
+    nested_finished: Arc<Notify>,
+}
+
+impl ReentrantProgrammaticTool {
+    fn new() -> Self {
+        Self {
+            definition: ToolDefinition::new(
+                "reenter",
+                "reenter",
+                "starts a nested programmatic run",
+                json!({"type":"object","additionalProperties":false}),
+            )
+            .with_risk(ToolRisk::Low)
+            .with_read_only(true)
+            .with_parallel_safe(true)
+            .with_allowed_callers([ToolCaller::Programmatic]),
+            calls: AtomicU32::new(0),
+            runner: Mutex::new(None),
+            nested_result: Mutex::new(None),
+            nested_finished: Arc::new(Notify::new()),
+        }
+    }
+
+    fn attach_runner(&self, runner: Arc<AgentRunner>) {
+        *self.runner.lock().unwrap() = Some(runner);
+    }
+}
+
+#[async_trait]
+impl Tool for ReentrantProgrammaticTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(&self, _: Value, _: CancellationToken) -> Result<ToolResult, HarnessError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let runner = self
+            .runner
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("reentrant test tool is attached to a runner");
+        let nested_result = runner
+            .run_with_strategy(
+                request(&[]).with_run_id("reentrant-nested-programmatic"),
+                RunStrategy::Programmatic,
+            )
+            .await?;
+        *self.nested_result.lock().unwrap() = Some(nested_result);
+        self.nested_finished.notify_one();
+        Ok(ToolResult::success(json!({"nested_run_finished": true})))
     }
 }
 
@@ -768,8 +827,8 @@ async fn concurrent_reused_public_run_ids_keep_full_execution_nonces_distinct() 
     }
 }
 
-#[tokio::test]
-async fn live_vm_admission_bounds_suspended_executions_and_aggregate_memory() {
+#[tokio::test(start_paused = true)]
+async fn live_vm_admission_rejects_n_plus_one_and_reuses_released_capacity() {
     const MAX_ACTIVE_VMS: usize = 2;
     const PER_VM_LIVE_BYTES: usize = 4 * 1024 * 1024;
     let program = json!({"version":1,"body":[
@@ -838,14 +897,68 @@ async fn live_vm_admission_bounds_suspended_executions_and_aggregate_memory() {
             .await
             .unwrap()
     });
-    generated.acquire().await.unwrap().forget();
-    tokio::task::yield_now().await;
+    let third = tokio::time::timeout(Duration::from_millis(1), third)
+        .await
+        .expect("the N+1 candidate must fail without waiting for a live VM slot")
+        .unwrap();
+    assert_eq!(third.status, RunStatus::LimitReached);
+    assert!(third.final_output.is_none());
+    assert_eq!(third.errors.len(), 1);
+    assert_eq!(third.errors[0].code, "resource_limit");
     assert_eq!(tool.calls.load(Ordering::SeqCst), MAX_ACTIVE_VMS as u32);
     assert!(
-        tokio::time::timeout(Duration::from_millis(25), tool.entered.acquire())
-            .await
-            .is_err(),
-        "the N+1 candidate must wait before constructing a retained VM"
+        generated.try_acquire().is_err(),
+        "the rejected candidate must not spend a planning model call"
+    );
+
+    let third_events = events
+        .events()
+        .into_iter()
+        .filter(|record| record.run_id == "live-vm-third")
+        .collect::<Vec<_>>();
+    let lifecycle = third_events
+        .iter()
+        .filter_map(|record| match record.event {
+            RunEvent::ProgramLifecycle { attempt, outcome } => Some((attempt, outcome)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle,
+        vec![
+            (1, ProgramLifecycleOutcome::Started),
+            (1, ProgramLifecycleOutcome::LimitReached),
+        ]
+    );
+    assert!(third_events.iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            strategy: RunStrategy::Programmatic,
+            model_calls: 0,
+            planning_model_calls: 0,
+            repair_model_calls: 0,
+            final_synthesis_model_calls: 0,
+            tool_calls: 0,
+            tool_issued: 0,
+            ..
+        }
+    )));
+    assert!(!third_events
+        .iter()
+        .any(|record| matches!(record.event, RunEvent::ProgramExecutionCompleted { .. })));
+    assert_eq!(
+        third_events
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    RunEvent::Completed {
+                        status: RunStatus::LimitReached
+                    }
+                )
+            })
+            .count(),
+        1
     );
 
     tool.releases.add_permits(1);
@@ -861,6 +974,17 @@ async fn live_vm_admission_bounds_suspended_executions_and_aggregate_memory() {
             false
         }
     };
+    let replacement_runner = runner.clone();
+    let replacement = tokio::spawn(async move {
+        replacement_runner
+            .run_with_strategy(
+                request(&["read"]).with_run_id("live-vm-replacement"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+    generated.acquire().await.unwrap().forget();
     tool.entered.acquire().await.unwrap().forget();
     assert_eq!(tool.calls.load(Ordering::SeqCst), 3);
 
@@ -871,7 +995,7 @@ async fn live_vm_admission_bounds_suspended_executions_and_aggregate_memory() {
     if first_finished {
         assert_eq!(second.await.unwrap().status, RunStatus::Completed);
     }
-    assert_eq!(third.await.unwrap().status, RunStatus::Completed);
+    assert_eq!(replacement.await.unwrap().status, RunStatus::Completed);
 
     let peaks = events
         .events()
@@ -891,6 +1015,142 @@ async fn live_vm_admission_bounds_suspended_executions_and_aggregate_memory() {
         8 * 1024 * 1024,
         "active slots bound aggregate retained sandbox memory"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn reentrant_programmatic_admission_fails_fast_without_nested_effects_and_reuses_capacity() {
+    let outer_program = json!({"version":1,"body":[
+        {"kind":"invoke","name":"nested","tool_id":"reenter","arguments":{"kind":"object","entries":[]}},
+        {"kind":"return","value":{"kind":"variable","name":"nested"}}
+    ]})
+    .to_string();
+    let later_program = json!({"version":1,"body":[{
+        "kind":"return","value":{"kind":"string","value":"reused"}
+    }]})
+    .to_string();
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(outer_program),
+            final_response("outer synthesized"),
+            final_response(later_program),
+            final_response("reused synthesized"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let events = Arc::new(InMemoryEventSink::default());
+    let tool = Arc::new(ReentrantProgrammaticTool::new());
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .event_sink(events.clone())
+            .programmatic(ProgrammaticHostConfig {
+                max_active_vms: 1,
+                ..ProgrammaticHostConfig::default()
+            })
+            .build(),
+    );
+    tool.attach_runner(runner.clone());
+
+    let nested_finished = tool.nested_finished.clone();
+    let nested_wait = nested_finished.notified();
+    let outer_runner = runner.clone();
+    let outer = tokio::spawn(async move {
+        outer_runner
+            .run_with_strategy(
+                request(&["reenter"]).with_run_id("reentrant-outer-programmatic"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+
+    tokio::time::timeout(Duration::from_millis(1), nested_wait)
+        .await
+        .expect("nested run must fail without waiting for the outer tool-held VM slot");
+    let outer = outer.await.unwrap();
+    assert_eq!(outer.status, RunStatus::Completed, "{:?}", outer.errors);
+    assert_eq!(outer.final_output.as_deref(), Some("outer synthesized"));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+
+    let nested = tool
+        .nested_result
+        .lock()
+        .unwrap()
+        .take()
+        .expect("outer tool completed its nested run");
+    assert_eq!(nested.status, RunStatus::LimitReached);
+    assert!(nested.final_output.is_none());
+    assert!(nested.tool_calls.is_empty());
+    assert_eq!(nested.errors.len(), 1);
+    assert_eq!(nested.errors[0].code, "resource_limit");
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the nested capacity rejection must not call the model"
+    );
+
+    let nested_events = events
+        .events()
+        .into_iter()
+        .filter(|record| record.run_id == "reentrant-nested-programmatic")
+        .collect::<Vec<_>>();
+    let lifecycle = nested_events
+        .iter()
+        .filter_map(|record| match record.event {
+            RunEvent::ProgramLifecycle { attempt, outcome } => Some((attempt, outcome)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle,
+        vec![
+            (1, ProgramLifecycleOutcome::Started),
+            (1, ProgramLifecycleOutcome::LimitReached),
+        ]
+    );
+    assert!(nested_events.iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            strategy: RunStrategy::Programmatic,
+            model_calls: 0,
+            planning_model_calls: 0,
+            repair_model_calls: 0,
+            final_synthesis_model_calls: 0,
+            tool_calls: 0,
+            tool_issued: 0,
+            ..
+        }
+    )));
+    assert!(!nested_events
+        .iter()
+        .any(|record| matches!(record.event, RunEvent::ProgramExecutionCompleted { .. })));
+    assert_eq!(
+        nested_events
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    RunEvent::Completed {
+                        status: RunStatus::LimitReached
+                    }
+                )
+            })
+            .count(),
+        1
+    );
+
+    let reused = runner
+        .run_with_strategy(
+            request(&[]).with_run_id("reentrant-capacity-reused"),
+            RunStrategy::Programmatic,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused.status, RunStatus::Completed, "{:?}", reused.errors);
+    assert_eq!(reused.final_output.as_deref(), Some("reused synthesized"));
+    assert_eq!(provider.requests().len(), 4);
 }
 
 #[tokio::test]

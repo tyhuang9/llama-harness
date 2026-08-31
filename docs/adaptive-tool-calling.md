@@ -33,12 +33,14 @@ and tool scope, canonical arguments, schema validation, policy, approval,
 effect ledger, deadlines, cancellation, transcript limits, and audited events.
 The effective bound for each resource is the minimum applicable library hard
 cap, host sandbox setting, Agent limit, and provider capability. Program runs
-require a finite deadline and live-VM admission. A slot is acquired before a
-candidate is parsed and compiled, remains held while its `Execution` retains
-state across broker, policy, approval, or tool waits, and is released only
-after terminal VM state is dropped. `max_active_vms` therefore bounds aggregate
-sandbox retention to that many effective per-VM live-byte caps; it is not a
-per-slice compute throttle. Read-only, parallel-safe fan-out is
+require a finite deadline and live-VM admission. A slot is acquired
+nonblocking before a candidate program is requested, parsed, and compiled.
+If all slots are held, the candidate immediately ends as `LimitReached` with
+no model or tool work. An admitted slot remains held while its `Execution`
+retains state across broker, policy, approval, or tool waits, and is released
+only after terminal VM state is dropped. `max_active_vms` therefore bounds
+aggregate sandbox retention to that many effective per-VM live-byte caps; it
+is not a per-slice compute throttle. Read-only, parallel-safe fan-out is
 bounded at eight and additionally limited by the host, provider, Agent, and
 broker caps. Mutations are always serialized.
 

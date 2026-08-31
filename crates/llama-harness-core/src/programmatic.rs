@@ -284,10 +284,13 @@ pub struct ProgrammaticHostConfig {
     pub max_duration_ms: u64,
     /// Maximum concurrently retained sandbox VM states admitted by this runner.
     ///
-    /// Admission begins before candidate parsing and compilation, remains held
-    /// while a VM is suspended on broker, policy, approval, or tool work, and
-    /// ends only after a terminal VM is dropped. This bounds aggregate retained
-    /// sandbox memory to this count times the effective per-VM live-byte cap.
+    /// Admission is nonblocking and begins before a candidate program is
+    /// requested, parsed, or compiled. When every slot is occupied, the run
+    /// fails immediately with a resource limit rather than queueing. A held
+    /// permit remains while a VM is suspended on broker, policy, approval, or
+    /// tool work, and ends only after a terminal VM is dropped. This bounds
+    /// aggregate retained sandbox memory to this count times the effective
+    /// per-VM live-byte cap.
     pub max_active_vms: usize,
     /// Maximum concurrent read-only, parallel-safe calls in a fan-out batch.
     pub max_fanout_concurrency: usize,
@@ -463,6 +466,24 @@ impl AgentRunner {
                     attempt: program_attempt.saturating_add(1),
                     outcome: ProgramLifecycleOutcome::Started,
                 });
+                check_stopped(
+                    &request.cancellation,
+                    deadline,
+                    "programmatic run deadline reached",
+                )?;
+                // This permit intentionally spans program generation, parsing,
+                // compilation, VM construction, and every later suspension. It
+                // is a retained VM-memory admission, not a per-slice compute
+                // permit. The nonblocking check prevents a tool-held VM from
+                // deadlocking a reentrant programmatic run and avoids model or
+                // tool work for a rejected candidate.
+                let live_vm_permit = Arc::clone(&self.programmatic_admission)
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        HarnessError::ResourceLimit(
+                            "programmatic VM admission limit reached".into(),
+                        )
+                    })?;
                 let phase_calls = if program_attempt == 0 {
                     &mut planning_calls
                 } else {
@@ -480,26 +501,6 @@ impl AgentRunner {
                         &mut events,
                     )
                     .await?;
-                // This permit intentionally spans parsing, compilation, VM
-                // construction, and every later suspension. It is a retained
-                // VM-memory admission, not a per-slice compute permit.
-                let live_vm_permit = await_guarded(
-                    async {
-                        Arc::clone(&self.programmatic_admission)
-                            .acquire_owned()
-                            .await
-                            .map_err(|_| {
-                                HarnessError::ResourceLimit(
-                                    "programmatic VM admission closed".into(),
-                                )
-                            })
-                    },
-                    &request.cancellation,
-                    deadline,
-                    "programmatic VM admission exceeded run deadline",
-                    None,
-                )
-                .await?;
                 let source = response.final_output.as_deref().ok_or_else(|| {
                     HarnessError::InvalidOutput("provider returned no program".into())
                 });
