@@ -1,12 +1,14 @@
 use crate::{
     broker::{BrokerState, FinalizeOutcome, PrepareOutcome, PreparedCall, ToolBroker},
-    discovery::{ToolDiscoveryStats, ToolScope},
+    discovery::{ToolDiscoveryStats, ToolScope, ToolScopeSelection},
     event::EventEmitter,
     limits::serialized_len,
     plan::{MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES},
     runner::{
-        apply_terminal_error, emit_discovery, ensure_transcript, initial_messages,
-        merge_generation, pre_event_terminal_result, preflight_request, preflight_terminal_result,
+        apply_terminal_error, discovery_limit_terminal_result,
+        discovery_limit_terminal_result_with_scopes, emit_discovery, ensure_transcript,
+        initial_messages, merge_generation, pre_event_terminal_result,
+        pre_event_terminal_result_with_scopes, preflight_request, preflight_terminal_result,
         provider_deadline, push_tool_message, validate_model_response, validate_output,
         DirectStrategyEvents, RunPreflight,
     },
@@ -78,6 +80,7 @@ struct PreparedPlanScope {
 enum PlanningReadiness {
     Ready(PreparedPlanScope),
     Downgrade(&'static str),
+    LimitReached(ToolDiscoveryStats),
 }
 
 struct PreparedNode {
@@ -178,6 +181,19 @@ impl AgentRunner {
                     PlanningReadiness::Downgrade(reason) => {
                         Err(HarnessError::UnsupportedCapability(reason.into()))
                     }
+                    PlanningReadiness::LimitReached(stats) => Ok(discovery_limit_terminal_result(
+                        &request,
+                        ToolCaller::DeclarativePlan,
+                        stats,
+                        &self.events,
+                        RunStrategy::DeclarativePlan,
+                        preflight.started,
+                        Some(DirectStrategyEvents {
+                            requested: RunStrategy::DeclarativePlan,
+                            reason: StrategySelectionReason::Forced,
+                            fallback: None,
+                        }),
+                    )),
                 }
             }
             RunStrategy::Adaptive => {
@@ -211,6 +227,15 @@ impl AgentRunner {
                         self.run_planned(request, RunStrategy::Adaptive, prepared, preflight)
                             .await
                     }
+                    PlanningReadiness::LimitReached(stats) => Ok(discovery_limit_terminal_result(
+                        &request,
+                        ToolCaller::DeclarativePlan,
+                        stats,
+                        &self.events,
+                        RunStrategy::Adaptive,
+                        preflight.started,
+                        None,
+                    )),
                 }
             }
         }
@@ -239,7 +264,7 @@ impl AgentRunner {
                 "provider advertises no structured-plan capacity",
             ));
         }
-        let (scope, discovery) = self.tools.select_scope_for_run(
+        let selection = self.tools.select_scope_for_run(
             &request.input,
             &request.agent.tool_allowlist,
             ToolCaller::DeclarativePlan,
@@ -248,6 +273,12 @@ impl AgentRunner {
             &request.cancellation,
             deadline,
         )?;
+        let (scope, discovery) = match selection {
+            ToolScopeSelection::Selected(scope, stats) => (scope, stats),
+            ToolScopeSelection::LimitReached(stats) => {
+                return Ok(PlanningReadiness::LimitReached(stats));
+            }
+        };
         if scope.is_empty() {
             return Ok(PlanningReadiness::Downgrade(
                 "no allowed tools permit declarative plan calls",
@@ -267,7 +298,57 @@ impl AgentRunner {
         preflight: RunPreflight,
     ) -> Result<RunResult, HarnessError> {
         let started = preflight.started;
-        let mut run = match StrategyRun::new(self, &request, requested, prepared_plan, preflight) {
+        let direct_selection = self.tools.select_scope_for_run(
+            &request.input,
+            &request.agent.tool_allowlist,
+            ToolCaller::Direct,
+            self.discovery_limits,
+            &self.provider.capabilities().limits,
+            &request.cancellation,
+            preflight.deadline,
+        );
+        let (direct_scope, direct_discovery) = match direct_selection {
+            Ok(ToolScopeSelection::Selected(scope, stats)) => (scope, stats),
+            Ok(ToolScopeSelection::LimitReached(stats)) => {
+                let strategy_events =
+                    (requested == RunStrategy::DeclarativePlan).then_some(DirectStrategyEvents {
+                        requested,
+                        reason: StrategySelectionReason::Forced,
+                        fallback: None,
+                    });
+                return Ok(discovery_limit_terminal_result_with_scopes(
+                    &request,
+                    &[
+                        (ToolCaller::DeclarativePlan, prepared_plan.discovery),
+                        (ToolCaller::Direct, stats),
+                    ],
+                    &self.events,
+                    requested,
+                    started,
+                    strategy_events,
+                ));
+            }
+            Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
+                return Ok(pre_event_terminal_result_with_scopes(
+                    &request,
+                    error,
+                    &self.events,
+                    requested,
+                    started,
+                    &[(ToolCaller::DeclarativePlan, prepared_plan.discovery)],
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let mut run = match StrategyRun::new(
+            self,
+            &request,
+            requested,
+            prepared_plan,
+            direct_scope,
+            direct_discovery,
+            preflight,
+        ) {
             Ok(run) => run,
             Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
                 return Ok(pre_event_terminal_result(
@@ -620,18 +701,10 @@ impl<'a> StrategyRun<'a> {
         request: &'a RunRequest,
         requested: RunStrategy,
         prepared_plan: PreparedPlanScope,
+        direct_scope: ToolScope,
+        direct_discovery: ToolDiscoveryStats,
         preflight: RunPreflight,
     ) -> Result<Self, HarnessError> {
-        let capabilities = runner.provider.capabilities();
-        let (direct_scope, direct_discovery) = runner.tools.select_scope_for_run(
-            &request.input,
-            &request.agent.tool_allowlist,
-            ToolCaller::Direct,
-            runner.discovery_limits,
-            &capabilities.limits,
-            &request.cancellation,
-            preflight.deadline,
-        )?;
         let started = preflight.started;
         let run_id = request
             .run_id

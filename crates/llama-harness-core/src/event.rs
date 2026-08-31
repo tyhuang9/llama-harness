@@ -75,14 +75,38 @@ pub enum RunEvent {
     ToolDiscoveryCompleted {
         /// Caller whose immutable scope was selected.
         caller: ToolCaller,
+        /// Stable outcome of the completed selection attempt.
+        #[serde(default)]
+        outcome: ToolDiscoveryOutcome,
+        /// Stable category describing how the scope was selected.
+        #[serde(default)]
+        selection: ToolDiscoverySelection,
         /// Number of allowed, caller-compatible catalog candidates.
         candidate_count: u32,
         /// Number of definitions selected for model exposure.
         selected_count: u32,
         /// Number of candidates explicitly configured as deferred.
         deferred_candidate_count: u32,
+        /// Effective maximum number of tools for this caller scope.
+        #[serde(default)]
+        effective_tool_count_budget: u32,
+        /// Effective maximum serialized tool-definition bytes for this scope.
+        #[serde(default)]
+        effective_schema_byte_budget: u64,
+        /// Exact serialized definition-array bytes selected or required.
+        #[serde(default)]
+        selected_schema_bytes: u64,
+        /// Number of deferred candidates admitted by bounded expansion.
+        #[serde(default)]
+        expansion_count: u32,
+        /// Configured maximum bounded expansion count.
+        #[serde(default)]
+        expansion_limit: u32,
         /// Whether the complete candidate catalog exceeded the effective budget.
         catalog_exceeded_budget: bool,
+        /// Elapsed time spent selecting this caller scope.
+        #[serde(default)]
+        duration_ms: u64,
     },
     /// The runner selected an execution strategy using metadata-only inputs.
     StrategySelected {
@@ -225,6 +249,46 @@ pub enum RunEvent {
         /// Terminal run status.
         status: RunStatus,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Stable, value-free outcome of a completed tool-discovery selection.
+pub enum ToolDiscoveryOutcome {
+    /// A usable scope, including an intentionally empty scope, was selected.
+    #[default]
+    Selected,
+    /// Mandatory tools could not fit the effective count or schema-byte budget.
+    LimitReached,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Stable, value-free category for a completed tool-discovery selection.
+pub enum ToolDiscoverySelection {
+    /// The authorized caller catalog was empty.
+    EmptyCatalog,
+    /// The provider advertised insufficient capacity for any tool scope.
+    NoCapacity,
+    /// The complete authorized catalog fit the effective budget.
+    #[default]
+    FullCatalog,
+    /// Only mandatory hot tools were selected.
+    HotOnly,
+    /// A unique exact identifier, name, namespace, or alias selected tools.
+    Exact,
+    /// A high-margin lexical match selected one deferred tool.
+    LexicalConfident,
+    /// A low-margin lexical match selected a bounded expansion.
+    LexicalExpanded,
+    /// No deferred candidate matched the query.
+    NoMatch,
+    /// Mandatory tools exceeded the effective tool-count budget.
+    CountLimit,
+    /// Mandatory tools exceeded the effective serialized-schema-byte budget.
+    SchemaByteLimit,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

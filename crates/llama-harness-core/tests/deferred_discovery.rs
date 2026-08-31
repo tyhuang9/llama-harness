@@ -3,8 +3,9 @@ use llama_harness_core::{
     mock::{final_response, tool_response, MockModelProvider, MockStep},
     AgentDefinition, AgentRunner, HarnessError, InMemoryEventSink, ModelCapabilities, ModelInfo,
     ModelProvider, ModelRequest, ModelResponse, ProviderCapabilityLimits, ProviderHealth, RunEvent,
-    RunRequest, RunStatus, RunStrategy, Tool, ToolCall, ToolCaller, ToolDefinition,
-    ToolDiscoveryLimits, ToolDiscoveryMetadata, ToolRegistry, ToolResult,
+    RunRequest, RunResult, RunStatus, RunStrategy, Tool, ToolCall, ToolCaller, ToolDefinition,
+    ToolDiscoveryLimits, ToolDiscoveryMetadata, ToolDiscoveryOutcome, ToolDiscoverySelection,
+    ToolRegistry, ToolResult,
 };
 use serde_json::{json, Value};
 use std::sync::{
@@ -587,14 +588,26 @@ async fn hot_overflow_fails_before_model_use_and_zero_provider_capacity_is_no_to
     }
     let mut hot_request = request(0, "hot.0");
     hot_request.agent.tool_allowlist = vec!["hot.0".into(), "hot.1".into()];
-    let error = AgentRunner::builder(provider.clone())
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider.clone())
         .tools(hot)
+        .event_sink(events.clone())
         .build()
         .run_with_strategy(hot_request, RunStrategy::Direct)
         .await
-        .unwrap_err();
-    assert!(matches!(error, HarnessError::ResourceLimit(_)));
+        .unwrap();
+    assert_eq!(result.status, RunStatus::LimitReached);
     assert!(provider.requests().is_empty());
+    assert!(matches!(
+        events.events()[1].event,
+        RunEvent::ToolDiscoveryCompleted {
+            outcome: ToolDiscoveryOutcome::LimitReached,
+            selection: ToolDiscoverySelection::CountLimit,
+            candidate_count: 2,
+            selected_count: 2,
+            ..
+        }
+    ));
 
     let zero_provider = Arc::new(
         MockModelProvider::scripted([final_response("no tools")])
@@ -632,7 +645,7 @@ async fn hot_overflow_fails_before_model_use_and_zero_provider_capacity_is_no_to
 }
 
 #[tokio::test]
-async fn exact_namespace_overflow_fails_before_provider_model_tool_or_events() {
+async fn exact_namespace_overflow_is_a_zero_effect_terminal_limit() {
     for strategy in [
         RunStrategy::Direct,
         RunStrategy::Adaptive,
@@ -657,17 +670,57 @@ async fn exact_namespace_overflow_fails_before_provider_model_tool_or_events() {
         }
         let mut agent = AgentDefinition::new("exact", "Exact", "1", "mock-model");
         agent.tool_allowlist = vec!["exact.one".into(), "exact.two".into()];
-        let error = AgentRunner::builder(provider.clone())
+        let result = AgentRunner::builder(provider.clone())
             .tools(registry)
             .event_sink(events.clone())
             .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
             .build()
             .run_with_strategy(RunRequest::new(agent, "exact"), strategy)
             .await
-            .unwrap_err();
-        assert!(matches!(error, HarnessError::ResourceLimit(_)));
+            .unwrap();
+        assert_eq!(result.status, RunStatus::LimitReached);
+        assert!(result.final_output.is_none());
+        assert!(result.tool_calls.is_empty());
+        assert!(result.policy_decisions.is_empty());
+        assert!(result.approvals.is_empty());
         assert!(provider.requests().is_empty());
-        assert!(events.events().is_empty());
+        let records = events.events();
+        let discoveries = records
+            .iter()
+            .filter(|record| matches!(record.event, RunEvent::ToolDiscoveryCompleted { .. }))
+            .collect::<Vec<_>>();
+        assert!(!discoveries.is_empty());
+        let RunEvent::ToolDiscoveryCompleted {
+            outcome,
+            selection,
+            effective_tool_count_budget,
+            selected_count,
+            expansion_limit,
+            ..
+        } = discoveries.last().unwrap().event
+        else {
+            unreachable!()
+        };
+        assert_eq!(outcome, ToolDiscoveryOutcome::LimitReached);
+        assert_eq!(selection, ToolDiscoverySelection::CountLimit);
+        assert_eq!(effective_tool_count_budget, 1);
+        assert_eq!(selected_count, 2);
+        assert_eq!(expansion_limit, 8);
+        assert!(matches!(records[0].event, RunEvent::Started { .. }));
+        assert!(matches!(
+            records[records.len() - 2].event,
+            RunEvent::StrategyUsage {
+                model_calls: 0,
+                tool_calls: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            records.last().unwrap().event,
+            RunEvent::Completed {
+                status: RunStatus::LimitReached
+            }
+        ));
         assert_eq!(
             tools
                 .iter()
@@ -675,6 +728,311 @@ async fn exact_namespace_overflow_fails_before_provider_model_tool_or_events() {
                 .sum::<u32>(),
             0
         );
+    }
+}
+
+#[tokio::test]
+async fn discovery_events_cover_every_value_free_selection_category() {
+    async fn selection_for(
+        registry: ToolRegistry,
+        allowlist: Vec<String>,
+        input: &str,
+        limits: ToolDiscoveryLimits,
+        capabilities: ModelCapabilities,
+    ) -> (RunResult, RunEvent) {
+        let provider = Arc::new(
+            MockModelProvider::scripted([final_response("done")]).with_capabilities(capabilities),
+        );
+        let events = Arc::new(InMemoryEventSink::default());
+        let mut agent = AgentDefinition::new("categories", "Categories", "1", "mock-model");
+        agent.tool_allowlist = allowlist;
+        let result = AgentRunner::builder(provider)
+            .tools(registry)
+            .event_sink(events.clone())
+            .discovery_limits(limits)
+            .build()
+            .run_with_strategy(RunRequest::new(agent, input), RunStrategy::Direct)
+            .await
+            .unwrap();
+        let discoveries = events
+            .events()
+            .into_iter()
+            .filter_map(|record| {
+                matches!(record.event, RunEvent::ToolDiscoveryCompleted { .. })
+                    .then_some(record.event)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(discoveries.len(), 1);
+        (result, discoveries.into_iter().next().unwrap())
+    }
+
+    let (_, empty) = selection_for(
+        ToolRegistry::default(),
+        vec![],
+        "nothing",
+        ToolDiscoveryLimits::new(),
+        capabilities(8, false),
+    )
+    .await;
+    assert!(matches!(
+        empty,
+        RunEvent::ToolDiscoveryCompleted {
+            selection: ToolDiscoverySelection::EmptyCatalog,
+            candidate_count: 0,
+            selected_count: 0,
+            selected_schema_bytes: 2,
+            catalog_exceeded_budget: false,
+            ..
+        }
+    ));
+
+    let (full_registry, _) = registry(1);
+    let (_, full) = selection_for(
+        full_registry,
+        vec!["catalog.tool.000".into()],
+        "anything",
+        ToolDiscoveryLimits::new(),
+        capabilities(8, false),
+    )
+    .await;
+    assert!(matches!(
+        full,
+        RunEvent::ToolDiscoveryCompleted {
+            selection: ToolDiscoverySelection::FullCatalog,
+            candidate_count: 1,
+            selected_count: 1,
+            catalog_exceeded_budget: false,
+            ..
+        }
+    ));
+
+    let (no_capacity_registry, _) = registry(1);
+    let (_, no_capacity) = selection_for(
+        no_capacity_registry,
+        vec!["catalog.tool.000".into()],
+        "catalog.tool.000",
+        ToolDiscoveryLimits::new(),
+        capabilities(0, false),
+    )
+    .await;
+    assert!(matches!(
+        no_capacity,
+        RunEvent::ToolDiscoveryCompleted {
+            selection: ToolDiscoverySelection::NoCapacity,
+            effective_tool_count_budget: 0,
+            selected_count: 0,
+            ..
+        }
+    ));
+
+    let mut hot_registry = ToolRegistry::default();
+    let hot = Arc::new(CountingTool::new("always.hot"));
+    let deferred = Arc::new(CountingTool::new("deferred.weather"));
+    hot_registry.register(hot).unwrap();
+    hot_registry
+        .register_with_discovery(deferred, ToolDiscoveryMetadata::deferred())
+        .unwrap();
+    let (_, hot_only) = selection_for(
+        hot_registry,
+        vec!["always.hot".into(), "deferred.weather".into()],
+        "unmatched query",
+        ToolDiscoveryLimits::new().with_max_tools(1),
+        capabilities(8, false),
+    )
+    .await;
+    assert!(matches!(
+        hot_only,
+        RunEvent::ToolDiscoveryCompleted {
+            selection: ToolDiscoverySelection::HotOnly,
+            selected_count: 1,
+            deferred_candidate_count: 1,
+            catalog_exceeded_budget: true,
+            ..
+        }
+    ));
+
+    let (exact_registry, _) = registry(30);
+    let (_, exact) = selection_for(
+        exact_registry,
+        (0..30)
+            .map(|index| format!("catalog.tool.{index:03}"))
+            .collect(),
+        "catalog.tool.017",
+        ToolDiscoveryLimits::new().with_max_tools(2),
+        capabilities(8, false),
+    )
+    .await;
+    assert!(matches!(
+        exact,
+        RunEvent::ToolDiscoveryCompleted {
+            selection: ToolDiscoverySelection::Exact,
+            selected_count: 1,
+            expansion_count: 0,
+            ..
+        }
+    ));
+
+    let (lexical_registry, _) = registry(30);
+    let (_, lexical) = selection_for(
+        lexical_registry,
+        (0..30)
+            .map(|index| format!("catalog.tool.{index:03}"))
+            .collect(),
+        "please use catalog tool 017 now",
+        ToolDiscoveryLimits::new().with_max_tools(2),
+        capabilities(8, false),
+    )
+    .await;
+    assert!(matches!(
+        lexical,
+        RunEvent::ToolDiscoveryCompleted {
+            selection: ToolDiscoverySelection::LexicalConfident,
+            selected_count: 1,
+            ..
+        }
+    ));
+
+    let mut expanded_registry = ToolRegistry::default();
+    for id in ["weather.one", "weather.two"] {
+        expanded_registry
+            .register_with_discovery(
+                Arc::new(CountingTool::new(id)),
+                ToolDiscoveryMetadata::deferred().with_aliases(["weather-forecast"]),
+            )
+            .unwrap();
+    }
+    expanded_registry
+        .register_with_discovery(
+            Arc::new(CountingTool::new("calendar.only")),
+            ToolDiscoveryMetadata::deferred(),
+        )
+        .unwrap();
+    let (_, expanded) = selection_for(
+        expanded_registry,
+        vec![
+            "weather.one".into(),
+            "weather.two".into(),
+            "calendar.only".into(),
+        ],
+        "weather",
+        ToolDiscoveryLimits::new()
+            .with_max_tools(2)
+            .with_max_expansion_tools(2),
+        capabilities(8, false),
+    )
+    .await;
+    assert!(
+        matches!(
+            &expanded,
+            RunEvent::ToolDiscoveryCompleted {
+                selection: ToolDiscoverySelection::LexicalExpanded,
+                selected_count: 2,
+                expansion_count: 2,
+                expansion_limit: 2,
+                ..
+            }
+        ),
+        "{expanded:?}"
+    );
+
+    let (no_match_registry, _) = registry(30);
+    let (_, no_match) = selection_for(
+        no_match_registry,
+        (0..30)
+            .map(|index| format!("catalog.tool.{index:03}"))
+            .collect(),
+        "unrelated gibberish",
+        ToolDiscoveryLimits::new().with_max_tools(2),
+        capabilities(8, false),
+    )
+    .await;
+    assert!(matches!(
+        no_match,
+        RunEvent::ToolDiscoveryCompleted {
+            selection: ToolDiscoverySelection::NoMatch,
+            selected_count: 0,
+            catalog_exceeded_budget: true,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn schema_budget_limit_is_terminal_and_duration_reconciles_for_every_strategy() {
+    for strategy in [
+        RunStrategy::Direct,
+        RunStrategy::Adaptive,
+        RunStrategy::DeclarativePlan,
+    ] {
+        let provider = Arc::new(
+            MockModelProvider::scripted([final_response("unused")])
+                .with_capabilities(capabilities(8, true)),
+        );
+        let events = Arc::new(InMemoryEventSink::default());
+        let tool = Arc::new(CountingTool::new("mandatory.hot"));
+        let mut registry = ToolRegistry::default();
+        registry.register(tool.clone()).unwrap();
+        let mut agent = AgentDefinition::new("schema-limit", "Schema limit", "1", "mock-model");
+        agent.tool_allowlist = vec!["mandatory.hot".into()];
+        let result = AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .event_sink(events.clone())
+            .discovery_limits(
+                ToolDiscoveryLimits::new()
+                    .with_max_tools(8)
+                    .with_max_tool_schema_bytes(2),
+            )
+            .build()
+            .run_with_strategy(RunRequest::new(agent, "read"), strategy)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, RunStatus::LimitReached);
+        assert!(result.final_output.is_none());
+        assert!(result.tool_calls.is_empty());
+        assert!(result.policy_decisions.is_empty());
+        assert!(result.approvals.is_empty());
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert!(provider.requests().is_empty());
+
+        let records = events.events();
+        assert!(matches!(records[0].event, RunEvent::Started { .. }));
+        let discovery_index = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record.event,
+                    RunEvent::ToolDiscoveryCompleted {
+                        outcome: ToolDiscoveryOutcome::LimitReached,
+                        selection: ToolDiscoverySelection::SchemaByteLimit,
+                        effective_schema_byte_budget: 2,
+                        selected_count: 1,
+                        catalog_exceeded_budget: true,
+                        ..
+                    }
+                )
+            })
+            .expect("schema limit discovery event");
+        assert_eq!(discovery_index, 1);
+        let usage = records
+            .iter()
+            .find_map(|record| match record.event {
+                RunEvent::StrategyUsage {
+                    model_calls,
+                    tool_calls,
+                    duration_ms,
+                    ..
+                } => Some((model_calls, tool_calls, duration_ms)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(usage, (0, 0, result.duration_ms));
+        assert!(matches!(
+            records.last().unwrap().event,
+            RunEvent::Completed {
+                status: RunStatus::LimitReached
+            }
+        ));
     }
 }
 

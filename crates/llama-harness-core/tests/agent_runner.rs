@@ -322,6 +322,7 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
                 run_id: String::new(),
                 trace_id: String::new(),
             }),
+            std::mem::discriminant(&events.events()[1].event),
             std::mem::discriminant(&RunEvent::StrategySelected {
                 requested: RunStrategy::Direct,
                 selected: RunStrategy::Direct,

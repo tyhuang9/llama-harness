@@ -1,6 +1,6 @@
 use crate::{
     runner::check_stopped, HarnessError, PreparedToolCatalog, ProviderCapabilityLimits, ToolCaller,
-    ToolDefinition, ToolRegistry,
+    ToolDefinition, ToolDiscoveryOutcome, ToolDiscoverySelection, ToolRegistry,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,6 +9,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Instant as StdInstant,
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -271,11 +272,24 @@ impl ToolScope {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ToolDiscoveryStats {
+    pub(crate) outcome: ToolDiscoveryOutcome,
+    pub(crate) selection: ToolDiscoverySelection,
     pub(crate) candidate_count: u32,
     pub(crate) selected_count: u32,
     pub(crate) deferred_candidate_count: u32,
+    pub(crate) effective_tool_count_budget: u32,
+    pub(crate) effective_schema_byte_budget: u64,
+    pub(crate) selected_schema_bytes: u64,
+    pub(crate) expansion_count: u32,
+    pub(crate) expansion_limit: u32,
     pub(crate) catalog_exceeded_budget: bool,
+    pub(crate) duration_ms: u64,
     pub(crate) cache_hit: bool,
+}
+
+pub(crate) enum ToolScopeSelection {
+    Selected(ToolScope, ToolDiscoveryStats),
+    LimitReached(ToolDiscoveryStats),
 }
 
 #[derive(Clone)]
@@ -767,14 +781,19 @@ impl ToolRegistry {
         host_limits: ToolDiscoveryLimits,
         provider_limits: &ProviderCapabilityLimits,
     ) -> Result<(ToolScope, ToolDiscoveryStats), HarnessError> {
-        self.select_scope_guarded(
+        match self.select_scope_guarded(
             query,
             allowlist,
             caller,
             host_limits,
             provider_limits,
             &mut || Ok(()),
-        )
+        )? {
+            ToolScopeSelection::Selected(scope, stats) => Ok((scope, stats)),
+            ToolScopeSelection::LimitReached(_) => Err(HarnessError::ResourceLimit(
+                "mandatory tool scope exceeds discovery budget".into(),
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -787,7 +806,7 @@ impl ToolRegistry {
         provider_limits: &ProviderCapabilityLimits,
         cancellation: &CancellationToken,
         deadline: Option<Instant>,
-    ) -> Result<(ToolScope, ToolDiscoveryStats), HarnessError> {
+    ) -> Result<ToolScopeSelection, HarnessError> {
         let mut guard = || {
             #[cfg(test)]
             if let Some(checkpoint) = &self.discovery_checkpoint {
@@ -813,7 +832,8 @@ impl ToolRegistry {
         host_limits: ToolDiscoveryLimits,
         provider_limits: &ProviderCapabilityLimits,
         guard: &mut impl FnMut() -> Result<(), HarnessError>,
-    ) -> Result<(ToolScope, ToolDiscoveryStats), HarnessError> {
+    ) -> Result<ToolScopeSelection, HarnessError> {
+        let selection_started = StdInstant::now();
         guard()?;
         let limits = host_limits.effective(provider_limits);
         let allowed = self.allowed_catalog_guarded(allowlist, caller, guard)?;
@@ -828,25 +848,57 @@ impl ToolRegistry {
         }
         guard()?;
         let mut base_stats = ToolDiscoveryStats {
-            candidate_count: allowed.len() as u32,
+            outcome: ToolDiscoveryOutcome::Selected,
+            selection: ToolDiscoverySelection::EmptyCatalog,
+            candidate_count: u32::try_from(allowed.len()).unwrap_or(u32::MAX),
             selected_count: 0,
-            deferred_candidate_count: deferred_count as u32,
+            deferred_candidate_count: u32::try_from(deferred_count).unwrap_or(u32::MAX),
+            effective_tool_count_budget: limits.max_tools,
+            effective_schema_byte_budget: limits.max_bytes,
+            selected_schema_bytes: 2,
+            expansion_count: 0,
+            expansion_limit: limits.max_expansion,
             catalog_exceeded_budget: false,
+            duration_ms: 0,
             cache_hit: false,
         };
 
         // A serialized tool-definition array is at least `[]`. Treat providers
         // that cannot carry even that representation as having no tool
         // capacity, without constructing or consulting the catalog index.
-        if limits.max_tools == 0 || limits.max_bytes < 2 || allowed.is_empty() {
+        if allowed.is_empty() {
             guard()?;
-            return Ok((ToolScope::empty(caller), base_stats));
+            finish_discovery_stats(&mut base_stats, selection_started);
+            return Ok(ToolScopeSelection::Selected(
+                ToolScope::empty(caller),
+                base_stats,
+            ));
+        }
+        if limits.max_tools == 0 || limits.max_bytes < 2 {
+            guard()?;
+            base_stats.selection = ToolDiscoverySelection::NoCapacity;
+            finish_discovery_stats(&mut base_stats, selection_started);
+            return Ok(ToolScopeSelection::Selected(
+                ToolScope::empty(caller),
+                base_stats,
+            ));
         }
         if fits(&allowed, limits, guard)? {
             guard()?;
             let selected = collect_all(&allowed, guard)?;
-            return scope_with_stats(self, caller, selected, base_stats, false, guard);
+            base_stats.selection = ToolDiscoverySelection::FullCatalog;
+            return scope_with_stats(
+                self,
+                caller,
+                selected,
+                base_stats,
+                false,
+                selection_started,
+                guard,
+            )
+            .map(|(scope, stats)| ToolScopeSelection::Selected(scope, stats));
         }
+        base_stats.catalog_exceeded_budget = true;
 
         let mut required = BTreeSet::new();
         for (position, entry) in allowed.iter().enumerate() {
@@ -859,10 +911,13 @@ impl ToolRegistry {
         }
         guard()?;
         let hot = collect_required(&allowed, &required, guard)?;
-        if !fits_refs(&hot, limits, guard)? {
-            return Err(HarnessError::ResourceLimit(
-                "mandatory hot tool scope exceeds discovery budget".into(),
-            ));
+        if let Some((selection, bytes)) = budget_limit_refs(&hot, limits, guard)? {
+            base_stats.outcome = ToolDiscoveryOutcome::LimitReached;
+            base_stats.selection = selection;
+            base_stats.selected_count = u32::try_from(hot.len()).unwrap_or(u32::MAX);
+            base_stats.selected_schema_bytes = bytes;
+            finish_discovery_stats(&mut base_stats, selection_started);
+            return Ok(ToolScopeSelection::LimitReached(base_stats));
         }
         let (index, cache_hit) = self.catalog_index_for_scope(&allowed, caller, guard)?;
         base_stats.cache_hit = cache_hit;
@@ -878,10 +933,13 @@ impl ToolRegistry {
             }
             guard()?;
             let exact_entries = collect_required(&allowed, &required, guard)?;
-            if !fits_refs(&exact_entries, limits, guard)? {
-                return Err(HarnessError::ResourceLimit(
-                    "mandatory hot or exact-match tool scope exceeds discovery budget".into(),
-                ));
+            if let Some((selection, bytes)) = budget_limit_refs(&exact_entries, limits, guard)? {
+                base_stats.outcome = ToolDiscoveryOutcome::LimitReached;
+                base_stats.selection = selection;
+                base_stats.selected_count = u32::try_from(exact_entries.len()).unwrap_or(u32::MAX);
+                base_stats.selected_schema_bytes = bytes;
+                finish_discovery_stats(&mut base_stats, selection_started);
+                return Ok(ToolScopeSelection::LimitReached(base_stats));
             }
         } else {
             for (ranked_position, id) in ranked.ids().iter().enumerate() {
@@ -913,8 +971,52 @@ impl ToolRegistry {
         }
         guard()?;
         let selected = collect_required(&allowed, &required, guard)?;
-        scope_with_stats(self, caller, selected, base_stats, true, guard)
+        let selected_deferred = selected
+            .iter()
+            .filter(|entry| entry.metadata.exposure == ToolExposure::Deferred)
+            .count();
+        let selected_deferred = u32::try_from(selected_deferred).unwrap_or(u32::MAX);
+        base_stats.selection = match ranked {
+            RankedSelection::Exact(ids) if ids.is_empty() => {
+                if selected.is_empty() {
+                    ToolDiscoverySelection::NoMatch
+                } else {
+                    ToolDiscoverySelection::HotOnly
+                }
+            }
+            RankedSelection::Exact(_) => ToolDiscoverySelection::Exact,
+            RankedSelection::Lexical { ids, .. } if ids.is_empty() || selected_deferred == 0 => {
+                if selected.is_empty() {
+                    ToolDiscoverySelection::NoMatch
+                } else {
+                    ToolDiscoverySelection::HotOnly
+                }
+            }
+            RankedSelection::Lexical {
+                confident: true, ..
+            } => ToolDiscoverySelection::LexicalConfident,
+            RankedSelection::Lexical {
+                confident: false, ..
+            } => {
+                base_stats.expansion_count = selected_deferred;
+                ToolDiscoverySelection::LexicalExpanded
+            }
+        };
+        scope_with_stats(
+            self,
+            caller,
+            selected,
+            base_stats,
+            true,
+            selection_started,
+            guard,
+        )
+        .map(|(scope, stats)| ToolScopeSelection::Selected(scope, stats))
     }
+}
+
+fn finish_discovery_stats(stats: &mut ToolDiscoveryStats, started: StdInstant) {
+    stats.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 }
 
 fn collect_all<'a>(
@@ -956,10 +1058,13 @@ fn scope_with_stats(
     mut entries: Vec<&AllowedCatalogEntry<'_>>,
     mut stats: ToolDiscoveryStats,
     exceeded: bool,
+    selection_started: StdInstant,
     guard: &mut impl FnMut() -> Result<(), HarnessError>,
 ) -> Result<(ToolScope, ToolDiscoveryStats), HarnessError> {
     if entries.is_empty() {
         stats.catalog_exceeded_budget = exceeded;
+        stats.selected_schema_bytes = 2;
+        finish_discovery_stats(&mut stats, selection_started);
         return Ok((ToolScope::empty(caller), stats));
     }
     if exceeded {
@@ -982,7 +1087,8 @@ fn scope_with_stats(
     };
     guard()?;
     if let Some(prepared) = cached {
-        stats.selected_count = prepared.definitions().len() as u32;
+        stats.selected_count = u32::try_from(prepared.definitions().len()).unwrap_or(u32::MAX);
+        stats.selected_schema_bytes = prepared.serialized_definitions().len() as u64;
         stats.catalog_exceeded_budget = exceeded;
         let mut tool_ids = BTreeSet::new();
         for (position, definition) in prepared.definitions().iter().enumerate() {
@@ -992,6 +1098,7 @@ fn scope_with_stats(
             tool_ids.insert(definition.id.clone());
         }
         guard()?;
+        finish_discovery_stats(&mut stats, selection_started);
         return Ok((
             ToolScope {
                 caller,
@@ -1021,7 +1128,8 @@ fn scope_with_stats(
     .map_err(|error| {
         HarnessError::InvalidTool(format!("prepared tool JSON is invalid: {error}"))
     })?;
-    stats.selected_count = definitions.len() as u32;
+    stats.selected_count = u32::try_from(definitions.len()).unwrap_or(u32::MAX);
+    stats.selected_schema_bytes = serialized_definitions.len() as u64;
     let prepared = Arc::new(PreparedToolCatalog::new(
         Arc::from(definitions),
         serialized_definitions,
@@ -1046,6 +1154,7 @@ fn scope_with_stats(
     };
     drop(cache);
     guard()?;
+    finish_discovery_stats(&mut stats, selection_started);
     Ok((
         ToolScope {
             caller,
@@ -1146,12 +1255,42 @@ fn fits_refs(
     )
 }
 
+fn budget_limit_refs(
+    entries: &[&AllowedCatalogEntry<'_>],
+    limits: EffectiveLimits,
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
+) -> Result<Option<(ToolDiscoverySelection, u64)>, HarnessError> {
+    let bytes = serialized_array_bytes(
+        entries.len(),
+        entries
+            .iter()
+            .map(|entry| entry.serialized_definition.len() as u64),
+        guard,
+    )?;
+    if entries.len() > limits.max_tools as usize {
+        Ok(Some((ToolDiscoverySelection::CountLimit, bytes)))
+    } else if bytes > limits.max_bytes {
+        Ok(Some((ToolDiscoverySelection::SchemaByteLimit, bytes)))
+    } else {
+        Ok(None)
+    }
+}
+
 fn fits_lengths(
     count: usize,
     mut lengths: impl Iterator<Item = u64>,
     limits: EffectiveLimits,
     guard: &mut impl FnMut() -> Result<(), HarnessError>,
 ) -> Result<bool, HarnessError> {
+    let bytes = serialized_array_bytes(count, lengths.by_ref(), guard)?;
+    Ok(count <= limits.max_tools as usize && bytes <= limits.max_bytes)
+}
+
+fn serialized_array_bytes(
+    count: usize,
+    mut lengths: impl Iterator<Item = u64>,
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
+) -> Result<u64, HarnessError> {
     let mut elements = Some(0u64);
     for (position, length) in lengths.by_ref().enumerate() {
         if position % DISCOVERY_GUARD_INTERVAL == 0 {
@@ -1169,18 +1308,18 @@ fn fits_lengths(
         .ok_or_else(|| {
             HarnessError::ResourceLimit("tool catalog serialized byte accounting overflowed".into())
         })?;
-    Ok(count <= limits.max_tools as usize && bytes <= limits.max_bytes)
+    Ok(bytes)
 }
 
 enum RankedSelection {
     Exact(Vec<String>),
-    Lexical(Vec<String>),
+    Lexical { ids: Vec<String>, confident: bool },
 }
 
 impl RankedSelection {
     fn ids(&self) -> &[String] {
         match self {
-            Self::Exact(ids) | Self::Lexical(ids) => ids,
+            Self::Exact(ids) | Self::Lexical { ids, .. } => ids,
         }
     }
 }
@@ -1269,16 +1408,25 @@ fn rank_with_counts(
     }
     if max_expansion == 0 {
         guard()?;
-        return Ok(RankedSelection::Lexical(Vec::new()));
+        return Ok(RankedSelection::Lexical {
+            ids: Vec::new(),
+            confident: false,
+        });
     }
     if query_terms.is_empty() {
         guard()?;
-        return Ok(RankedSelection::Lexical(Vec::new()));
+        return Ok(RankedSelection::Lexical {
+            ids: Vec::new(),
+            confident: false,
+        });
     }
     let documents = entries.len() as u128;
     if index.total_document_len == 0 {
         guard()?;
-        return Ok(RankedSelection::Lexical(Vec::new()));
+        return Ok(RankedSelection::Lexical {
+            ids: Vec::new(),
+            confident: false,
+        });
     }
     let mut document_scores = vec![0u64; entries.len()];
     let mut matching_postings = 0usize;
@@ -1331,15 +1479,19 @@ fn rank_with_counts(
     }
     guard()?;
     let Some((best, _)) = scored.first() else {
-        return Ok(RankedSelection::Lexical(Vec::new()));
+        return Ok(RankedSelection::Lexical {
+            ids: Vec::new(),
+            confident: false,
+        });
     };
     let confident = scored
         .get(1)
         .is_none_or(|(second, _)| best.saturating_sub(*second) >= MIN_CONFIDENCE_MARGIN);
     let take = if confident { 1 } else { max_expansion };
-    Ok(RankedSelection::Lexical(
-        scored.into_iter().take(take).map(|(_, id)| id).collect(),
-    ))
+    Ok(RankedSelection::Lexical {
+        ids: scored.into_iter().take(take).map(|(_, id)| id).collect(),
+        confident,
+    })
 }
 
 fn collect_exact_ids(
@@ -2002,7 +2154,10 @@ mod tests {
                     },
                 )
                 .unwrap();
-            (selected, checkpoints)
+            let ToolScopeSelection::Selected(scope, stats) = selected else {
+                panic!("test selection unexpectedly reached a limit");
+            };
+            ((scope, stats), checkpoints)
         };
 
         let ((baseline, baseline_stats), baseline_checkpoints) = select(&registry(), usize::MAX);
@@ -2360,7 +2515,10 @@ mod tests {
                     Ok(())
                 },
             );
-            (result.unwrap(), checkpoints)
+            let ToolScopeSelection::Selected(scope, stats) = result.unwrap() else {
+                panic!("test selection unexpectedly reached a limit");
+            };
+            ((scope, stats), checkpoints)
         };
         let ((baseline_scope, baseline_stats), baseline_checkpoints) = guarded_select(&baseline);
         let ((polluted_scope, polluted_stats), polluted_checkpoints) = guarded_select(&polluted);

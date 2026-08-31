@@ -1,7 +1,7 @@
 use crate::{
     agent::{RunRequest, RunResult, RunStatus},
     broker::{BrokerState, PrepareOutcome, ToolBroker, ToolConcurrencyLimiter},
-    discovery::ToolScope,
+    discovery::{ToolScope, ToolScopeSelection},
     event::{EventEmitter, EventSink, InMemoryEventSink, RunEvent},
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len, AgentLimits},
     message::Message,
@@ -79,7 +79,18 @@ impl AgentRunner {
             preflight.deadline,
         );
         let (tool_scope, discovery) = match selection {
-            Ok(selection) => selection,
+            Ok(ToolScopeSelection::Selected(scope, stats)) => (scope, stats),
+            Ok(ToolScopeSelection::LimitReached(stats)) => {
+                return Ok(discovery_limit_terminal_result(
+                    &request,
+                    ToolCaller::Direct,
+                    stats,
+                    &self.events,
+                    crate::RunStrategy::Direct,
+                    preflight.started,
+                    strategy_events,
+                ));
+            }
             Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
                 return Ok(pre_event_terminal_result(
                     &request,
@@ -478,6 +489,96 @@ impl AgentRunner {
     }
 }
 
+pub(crate) fn discovery_limit_terminal_result(
+    request: &RunRequest,
+    caller: ToolCaller,
+    stats: crate::discovery::ToolDiscoveryStats,
+    event_sink: &Arc<dyn EventSink>,
+    strategy: crate::RunStrategy,
+    started: StdInstant,
+    strategy_events: Option<DirectStrategyEvents>,
+) -> RunResult {
+    discovery_limit_terminal_result_with_scopes(
+        request,
+        &[(caller, stats)],
+        event_sink,
+        strategy,
+        started,
+        strategy_events,
+    )
+}
+
+pub(crate) fn discovery_limit_terminal_result_with_scopes(
+    request: &RunRequest,
+    completed_scopes: &[(ToolCaller, crate::discovery::ToolDiscoveryStats)],
+    event_sink: &Arc<dyn EventSink>,
+    strategy: crate::RunStrategy,
+    started: StdInstant,
+    strategy_events: Option<DirectStrategyEvents>,
+) -> RunResult {
+    let mut result = preflight_terminal_result(
+        request,
+        HarnessError::ResourceLimit("tool discovery budget reached".into()),
+    );
+    result.duration_ms = started.elapsed().as_millis() as u64;
+    let mut events = EventEmitter::new(
+        result.id.clone(),
+        result.trace_id.clone(),
+        Arc::clone(event_sink),
+    );
+    events.emit(RunEvent::Started {
+        run_id: result.id.clone(),
+        trace_id: result.trace_id.clone(),
+    });
+    for (caller, stats) in completed_scopes {
+        emit_discovery(&mut events, *caller, *stats);
+    }
+    if let Some(strategy_events) = strategy_events {
+        if let Some(reason) = strategy_events.fallback {
+            events.emit(RunEvent::StrategyFallback {
+                from: strategy_events.requested,
+                to: strategy,
+                reason,
+            });
+        }
+        events.emit(RunEvent::StrategySelected {
+            requested: strategy_events.requested,
+            selected: strategy,
+            reason: strategy_events.reason,
+        });
+    }
+    emit_zero_strategy_usage(&mut events, strategy, result.duration_ms);
+    events.emit(RunEvent::Completed {
+        status: result.status.clone(),
+    });
+    result
+}
+
+fn emit_zero_strategy_usage(
+    events: &mut EventEmitter,
+    strategy: crate::RunStrategy,
+    duration_ms: u64,
+) {
+    events.emit(RunEvent::StrategyUsage {
+        strategy,
+        model_calls: 0,
+        planning_model_calls: 0,
+        repair_model_calls: 0,
+        recovery_model_calls: 0,
+        final_synthesis_model_calls: 0,
+        reactive_model_calls: 0,
+        tool_calls: 0,
+        tool_issued: 0,
+        tool_reused: 0,
+        tool_rejected: 0,
+        tool_pre_dispatch_aborted: 0,
+        tool_completed: 0,
+        tool_failed: 0,
+        tool_cancelled: 0,
+        duration_ms,
+    });
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct DirectStrategyEvents {
     pub(crate) requested: crate::RunStrategy,
@@ -535,15 +636,20 @@ pub(crate) fn emit_discovery(
     caller: ToolCaller,
     stats: crate::discovery::ToolDiscoveryStats,
 ) {
-    if stats.deferred_candidate_count == 0 && !stats.catalog_exceeded_budget {
-        return;
-    }
     events.emit(RunEvent::ToolDiscoveryCompleted {
         caller,
+        outcome: stats.outcome,
+        selection: stats.selection,
         candidate_count: stats.candidate_count,
         selected_count: stats.selected_count,
         deferred_candidate_count: stats.deferred_candidate_count,
+        effective_tool_count_budget: stats.effective_tool_count_budget,
+        effective_schema_byte_budget: stats.effective_schema_byte_budget,
+        selected_schema_bytes: stats.selected_schema_bytes,
+        expansion_count: stats.expansion_count,
+        expansion_limit: stats.expansion_limit,
         catalog_exceeded_budget: stats.catalog_exceeded_budget,
+        duration_ms: stats.duration_ms,
     });
 }
 
@@ -667,6 +773,17 @@ pub(crate) fn pre_event_terminal_result(
     strategy: crate::RunStrategy,
     started: StdInstant,
 ) -> RunResult {
+    pre_event_terminal_result_with_scopes(request, error, event_sink, strategy, started, &[])
+}
+
+pub(crate) fn pre_event_terminal_result_with_scopes(
+    request: &RunRequest,
+    error: HarnessError,
+    event_sink: &Arc<dyn EventSink>,
+    strategy: crate::RunStrategy,
+    started: StdInstant,
+    completed_scopes: &[(ToolCaller, crate::discovery::ToolDiscoveryStats)],
+) -> RunResult {
     debug_assert!(matches!(
         error,
         HarnessError::Cancelled | HarnessError::TimedOut(_)
@@ -682,24 +799,10 @@ pub(crate) fn pre_event_terminal_result(
         run_id: result.id.clone(),
         trace_id: result.trace_id.clone(),
     });
-    events.emit(RunEvent::StrategyUsage {
-        strategy,
-        model_calls: 0,
-        planning_model_calls: 0,
-        repair_model_calls: 0,
-        recovery_model_calls: 0,
-        final_synthesis_model_calls: 0,
-        reactive_model_calls: 0,
-        tool_calls: 0,
-        tool_issued: 0,
-        tool_reused: 0,
-        tool_rejected: 0,
-        tool_pre_dispatch_aborted: 0,
-        tool_completed: 0,
-        tool_failed: 0,
-        tool_cancelled: 0,
-        duration_ms: result.duration_ms,
-    });
+    for (caller, stats) in completed_scopes {
+        emit_discovery(&mut events, *caller, *stats);
+    }
+    emit_zero_strategy_usage(&mut events, strategy, result.duration_ms);
     events.emit(RunEvent::Completed {
         status: result.status.clone(),
     });

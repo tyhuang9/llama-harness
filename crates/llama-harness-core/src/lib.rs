@@ -35,7 +35,8 @@ pub use discovery::{
 pub use error::{HarnessError, ModelStreamFailureKind, RunError};
 pub use event::{
     EventRecord, EventSink, InMemoryEventSink, PlanLifecycleOutcome, PlanNodeOutcome, PlanPhase,
-    RunEvent, StrategyFallbackReason, StrategySelectionReason,
+    RunEvent, StrategyFallbackReason, StrategySelectionReason, ToolDiscoveryOutcome,
+    ToolDiscoverySelection,
 };
 pub use limits::{AgentLimits, GenerationOptions};
 pub use message::{Message, MessageRole};
