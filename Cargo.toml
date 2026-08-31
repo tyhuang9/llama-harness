@@ -6,6 +6,7 @@ members = [
   "crates/llama-harness-scripted-runtime",
   "crates/llama-harness-tauri",
   "crates/llama-harness-core",
+  "crates/llama-harness-programmatic-sandbox",
   "crates/llama-harness-ollama",
   "crates/llama-harness-observability",
   "crates/llama-harness-evals",
