@@ -151,7 +151,7 @@ cargo publish --locked --package llama-harness-mcp
 
 #### 4. Evaluations
 
-Wait for all three integration versions to be index-visible, build fresh
+Wait for all four integration versions to be index-visible, build fresh
 exact-version consumers for each newly available crate, then dry-run and
 publish `llama-harness-evals`:
 

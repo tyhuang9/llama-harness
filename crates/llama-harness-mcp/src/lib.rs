@@ -395,6 +395,15 @@ pub struct McpObserverHealth {
     pub failures: u64,
 }
 
+/// Local shutdown cleanup health without transport details.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct McpShutdownHealth {
+    /// Contexts retained for a later independent shutdown retry.
+    pub pending_contexts: u64,
+    /// Bounded close attempts that did not complete.
+    pub close_failures: u64,
+}
+
 #[derive(Default)]
 struct ObserverHub {
     observer: Option<Arc<dyn McpObserver>>,
@@ -476,7 +485,11 @@ struct CatalogState {
     invalidated: bool,
     last_now_ms: u64,
     next_generation: u64,
+    retired_contexts: Vec<McpContext>,
+    close_failures: u64,
 }
+
+type McpIdDeriver = dyn Fn(&str, &str) -> String + Send + Sync;
 
 impl Default for CatalogState {
     fn default() -> Self {
@@ -486,6 +499,8 @@ impl Default for CatalogState {
             invalidated: false,
             last_now_ms: 0,
             next_generation: 1,
+            retired_contexts: Vec::new(),
+            close_failures: 0,
         }
     }
 }
@@ -504,9 +519,11 @@ pub struct McpCatalogManager {
     clock: Arc<dyn McpClock>,
     state: Arc<Mutex<CatalogState>>,
     refresh_lock: tokio::sync::Mutex<()>,
+    close_lock: tokio::sync::Mutex<()>,
     observer: Arc<ObserverHub>,
     registration_group: ToolRegistrationGroup,
     in_flight: Arc<InFlightCalls>,
+    id_deriver: Arc<McpIdDeriver>,
 }
 
 impl McpCatalogManager {
@@ -551,6 +568,7 @@ impl McpCatalogManager {
             clock,
             state: Arc::new(Mutex::new(CatalogState::default())),
             refresh_lock: tokio::sync::Mutex::new(()),
+            close_lock: tokio::sync::Mutex::new(()),
             observer: Arc::new(ObserverHub {
                 observer,
                 ..ObserverHub::default()
@@ -558,6 +576,7 @@ impl McpCatalogManager {
             registration_group: ToolRegistrationGroup::new(format!("mcp:{server_id}"))
                 .map_err(McpError::Core)?,
             in_flight: Arc::new(InFlightCalls::default()),
+            id_deriver: Arc::new(generated_id),
         })
     }
 
@@ -598,7 +617,11 @@ impl McpCatalogManager {
         };
         let now = match self.checked_now() {
             Ok(now) => now,
-            Err(error) => return self.fail_refresh_context(context, error).await,
+            Err(error) => {
+                return self
+                    .fail_refresh_context(context, error, started, bytes, pages)
+                    .await
+            }
         };
         let ttl = match context.era {
             McpProtocolEra::Modern20260728 => match tools.cache_ttl {
@@ -608,27 +631,46 @@ impl McpCatalogManager {
                         .fail_refresh_context(
                             context,
                             McpError::InvalidCatalog("modern catalog omitted ttl".into()),
+                            started,
+                            bytes,
+                            pages,
                         )
                         .await
                 }
             },
             McpProtocolEra::Legacy20251125 => match duration_ms(self.cache_policy.legacy_ttl) {
                 Ok(ttl) => ttl,
-                Err(error) => return self.fail_refresh_context(context, error).await,
+                Err(error) => {
+                    return self
+                        .fail_refresh_context(context, error, started, bytes, pages)
+                        .await
+                }
             },
         };
         let expires_at_ms = match now.checked_add(ttl) {
             Some(value) => value,
-            None => return self.fail_refresh_context(context, McpError::Clock).await,
+            None => {
+                return self
+                    .fail_refresh_context(context, McpError::Clock, started, bytes, pages)
+                    .await
+            }
         };
         let max_stale = match self.cache_policy.max_stale.map(duration_ms).transpose() {
             Ok(value) => value.unwrap_or(0),
-            Err(error) => return self.fail_refresh_context(context, error).await,
+            Err(error) => {
+                return self
+                    .fail_refresh_context(context, error, started, bytes, pages)
+                    .await
+            }
         };
         let stale_until_ms = expires_at_ms.checked_add(max_stale).ok_or(McpError::Clock);
         let stale_until_ms = match stale_until_ms {
             Ok(value) => value,
-            Err(error) => return self.fail_refresh_context(context, error).await,
+            Err(error) => {
+                return self
+                    .fail_refresh_context(context, error, started, bytes, pages)
+                    .await
+            }
         };
         let generation = match (|| {
             let mut state = self
@@ -646,7 +688,11 @@ impl McpCatalogManager {
             Ok(generation)
         })() {
             Ok(generation) => generation,
-            Err(error) => return self.fail_refresh_context(context, error).await,
+            Err(error) => {
+                return self
+                    .fail_refresh_context(context, error, started, bytes, pages)
+                    .await
+            }
         };
         let managed = tools
             .items
@@ -654,7 +700,7 @@ impl McpCatalogManager {
             .map(|tool| {
                 Arc::new(ManagedMcpToolAdapter::new(
                     Arc::new(McpToolAdapter::new(
-                        generated_id(&self.server_id, &tool.name),
+                        (self.id_deriver)(&self.server_id, &tool.name),
                         self.server_id.clone(),
                         tool,
                         context.clone(),
@@ -679,6 +725,9 @@ impl McpCatalogManager {
                 .fail_refresh_context(
                     context,
                     McpError::InvalidCatalog("generated ID collision".into()),
+                    started,
+                    bytes,
+                    pages,
                 )
                 .await;
         }
@@ -709,7 +758,7 @@ impl McpCatalogManager {
             Ok(previous) => previous,
             Err(error) => {
                 return self
-                    .fail_refresh_context(snapshot.context.clone(), error)
+                    .fail_refresh_context(snapshot.context.clone(), error, started, bytes, pages)
                     .await
             }
         };
@@ -784,42 +833,43 @@ impl McpCatalogManager {
 
     /// Closes the manager. The local state is closed before bounded transport shutdown.
     pub async fn close(&self, cancellation: CancellationToken) -> Result<(), McpError> {
-        let context = {
+        let _close = self.close_lock.lock().await;
+        let contexts = {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| McpError::CatalogUnavailable)?;
-            if state.closed {
-                return Ok(());
-            }
-            state.closed = true;
-            state.invalidated = true;
-            state.active.take().map(|snapshot| snapshot.context.clone())
-        };
-        let started = Instant::now();
-        let result = match context {
-            Some(context) => {
-                if tokio::time::timeout(self.timeouts.close, wait_for_drain(&self.in_flight))
-                    .await
-                    .is_err()
-                {
-                    self.schedule_close_after_drain(context);
-                    Err(McpError::Transport(McpTransportError {
-                        operation: McpOperation::Close,
-                        dispatch: McpDispatchState::PossiblyDispatched,
-                    }))
-                } else {
-                    close_context(
-                        self.transport.as_ref(),
-                        context,
-                        cancellation.child_token(),
-                        self.timeouts.close,
-                    )
-                    .await
-                    .map_err(McpError::from)
+            if !state.closed {
+                state.closed = true;
+                state.invalidated = true;
+                if let Some(snapshot) = state.active.take() {
+                    state.retired_contexts.push(snapshot.context.clone());
                 }
             }
-            None => Ok(()),
+            std::mem::take(&mut state.retired_contexts)
+        };
+        let started = Instant::now();
+        let mut failed = false;
+        for context in contexts {
+            if tokio::time::timeout(self.timeouts.close, wait_for_drain(&self.in_flight))
+                .await
+                .is_err()
+            {
+                self.schedule_close_after_drain(context);
+                failed = true;
+                continue;
+            }
+            if !self.try_close_or_retain(context).await {
+                failed = true;
+            }
+        }
+        let result = if failed {
+            Err(McpError::Transport(McpTransportError {
+                operation: McpOperation::Close,
+                dispatch: McpDispatchState::PossiblyDispatched,
+            }))
+        } else {
+            Ok(())
         };
         self.observer.emit(event(
             McpLifecycleOperation::Close,
@@ -844,26 +894,63 @@ impl McpCatalogManager {
         self.observer.health()
     }
 
+    /// Returns retained shutdown work without transport details.
+    pub fn shutdown_health(&self) -> McpShutdownHealth {
+        self.state.lock().map_or_else(
+            |_| McpShutdownHealth {
+                pending_contexts: u64::MAX,
+                close_failures: u64::MAX,
+            },
+            |state| McpShutdownHealth {
+                pending_contexts: u64::try_from(state.retired_contexts.len()).unwrap_or(u64::MAX),
+                close_failures: state.close_failures,
+            },
+        )
+    }
+
     fn is_closed(&self) -> bool {
         self.state.lock().map(|state| state.closed).unwrap_or(true)
     }
 
-    async fn discard_context(&self, context: McpContext) {
-        let _ = close_context(
+    async fn try_close_or_retain(&self, context: McpContext) -> bool {
+        let closed = close_context(
             self.transport.as_ref(),
-            context,
+            context.clone(),
             CancellationToken::new(),
             self.timeouts.close,
         )
-        .await;
+        .await
+        .is_ok();
+        if !closed {
+            if let Ok(mut state) = self.state.lock() {
+                state.retired_contexts.push(context);
+                state.close_failures = state.close_failures.saturating_add(1);
+            }
+        }
+        closed
     }
 
     async fn fail_refresh_context<T>(
         &self,
         context: McpContext,
         error: McpError,
+        started: Instant,
+        bytes: u64,
+        pages: u64,
     ) -> Result<T, McpError> {
-        self.discard_context(context).await;
+        self.try_close_or_retain(context).await;
+        self.observer.emit(event(
+            McpLifecycleOperation::Refresh,
+            outcome_for_error(&error),
+            elapsed_ms(started),
+            0,
+            bytes,
+            pages,
+            false,
+            false,
+            McpDispatchState::Responded,
+            None,
+        ));
         Err(error)
     }
 
@@ -872,16 +959,23 @@ impl McpCatalogManager {
         let calls = Arc::clone(&self.in_flight);
         let timeout = self.timeouts.close;
         let observer = Arc::clone(&self.observer);
+        let state = Arc::clone(&self.state);
         tokio::spawn(async move {
             wait_for_drain(&calls).await;
             let started = Instant::now();
             let result = close_context(
                 transport.as_ref(),
-                context,
+                context.clone(),
                 CancellationToken::new(),
                 timeout,
             )
             .await;
+            if result.is_err() {
+                if let Ok(mut state) = state.lock() {
+                    state.retired_contexts.push(context);
+                    state.close_failures = state.close_failures.saturating_add(1);
+                }
+            }
             observer.emit(event(
                 McpLifecycleOperation::Close,
                 if result.is_ok() {
@@ -926,7 +1020,7 @@ impl McpCatalogManager {
         if !supported_context(&context) {
             // Once connected, this function owns the context until it is
             // transferred in its successful return value.
-            self.discard_context(context).await;
+            self.try_close_or_retain(context).await;
             return Err(McpError::InvalidCatalog(
                 "unsupported version or missing tools capability".into(),
             ));
@@ -954,13 +1048,7 @@ impl McpCatalogManager {
         let fetched = match fetched {
             Ok(fetched) => fetched,
             Err(error) => {
-                let _ = close_context(
-                    self.transport.as_ref(),
-                    context,
-                    CancellationToken::new(),
-                    self.timeouts.close,
-                )
-                .await;
+                self.try_close_or_retain(context).await;
                 return Err(error);
             }
         };
@@ -1608,6 +1696,9 @@ mod tests {
         pages: Mutex<Vec<McpToolPage>>,
         calls: AtomicU64,
         closes: AtomicU64,
+        yield_close: AtomicBool,
+        hang_close: AtomicBool,
+        fail_close: AtomicBool,
         block_connect: AtomicBool,
         connect_started: AtomicBool,
         connect_release: tokio::sync::Notify,
@@ -1634,6 +1725,9 @@ mod tests {
                 }]),
                 calls: AtomicU64::new(0),
                 closes: AtomicU64::new(0),
+                yield_close: AtomicBool::new(false),
+                hang_close: AtomicBool::new(false),
+                fail_close: AtomicBool::new(false),
                 block_connect: AtomicBool::new(false),
                 connect_started: AtomicBool::new(false),
                 connect_release: tokio::sync::Notify::new(),
@@ -1707,7 +1801,20 @@ mod tests {
             _: CancellationToken,
         ) -> Result<(), McpTransportError> {
             self.closes.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            if self.hang_close.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
+            if self.yield_close.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+            if self.fail_close.load(Ordering::Relaxed) {
+                Err(McpTransportError {
+                    operation: McpOperation::Close,
+                    dispatch: McpDispatchState::NotDispatched,
+                })
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1909,15 +2016,92 @@ mod tests {
         let clock = Arc::new(FakeClock::default());
         let transport = Arc::new(FakeTransport::modern(
             100,
-            vec![tool("same-name"), tool("same-name")],
+            vec![tool("first"), tool("second")],
         ));
-        let manager = manager(transport.clone(), clock, None, None);
+        let mut manager = manager(transport.clone(), clock, None, None);
+        manager.id_deriver = Arc::new(|_, _| "forced-generated-id".into());
         assert!(matches!(
             manager.refresh(CancellationToken::new()).await,
             Err(McpError::InvalidCatalog(_))
         ));
         assert!(manager.active_snapshot().is_none());
         assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn post_fetch_rejections_emit_one_responded_refresh_event_after_cleanup() {
+        let clock = Arc::new(FakeClock::default());
+        clock.set(10);
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let observer = Arc::new(RecordingObserver(Mutex::new(Vec::new()), false));
+        let manager = manager(
+            transport.clone(),
+            clock.clone(),
+            None,
+            Some(observer.clone()),
+        );
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("first refresh");
+        observer.0.lock().expect("test mutex").clear();
+        clock.set(9);
+        assert!(manager.refresh(CancellationToken::new()).await.is_err());
+        let events = observer.0.lock().expect("test mutex");
+        assert_eq!(events.len(), 2, "{events:?}");
+        let refresh = events.last().expect("refresh event");
+        assert_eq!(refresh.operation, McpLifecycleOperation::Refresh);
+        assert_eq!(refresh.outcome, McpLifecycleOutcome::Rejected);
+        assert_eq!(refresh.dispatch, McpDispatchState::Responded);
+        drop(events);
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn close_retains_failed_cleanup_and_retries_independently_of_caller_cancellation() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        transport.hang_close.store(true, Ordering::Relaxed);
+        let mut manager = manager(transport.clone(), clock, None, None);
+        manager.timeouts.close = Duration::ZERO;
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(manager.close(cancelled).await.is_err());
+        assert_eq!(manager.shutdown_health().pending_contexts, 1);
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+
+        transport.hang_close.store(false, Ordering::Relaxed);
+        manager.timeouts.close = Duration::from_millis(50);
+        assert!(manager.close(CancellationToken::new()).await.is_ok());
+        assert_eq!(manager.shutdown_health().pending_contexts, 0);
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn permanent_close_failure_remains_observable_and_is_not_double_closed() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        transport.fail_close.store(true, Ordering::Relaxed);
+        let manager = manager(transport.clone(), clock, None, None);
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        assert!(manager.close(CancellationToken::new()).await.is_err());
+        assert_eq!(manager.shutdown_health().pending_contexts, 1);
+        assert_eq!(manager.shutdown_health().close_failures, 1);
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+        assert!(manager.close(CancellationToken::new()).await.is_err());
+        assert_eq!(manager.shutdown_health().pending_contexts, 1);
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 2);
+        transport.fail_close.store(false, Ordering::Relaxed);
+        assert!(manager.close(CancellationToken::new()).await.is_ok());
+        assert_eq!(manager.shutdown_health().pending_contexts, 0);
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

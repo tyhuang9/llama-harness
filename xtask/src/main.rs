@@ -795,6 +795,16 @@ mod tests {
             .contains("The preflight validates the exact eight-crate set"));
         assert!(include_str!("../../.github/workflows/release-rust.yml")
             .contains("Test only the eight crates in the Rust release"));
+        assert!(include_str!("../../.github/workflows/ci.yml")
+            .contains("features \"ollama,observability,evals,programmatic,mcp\""));
+        let notes = include_str!("../../.github/releases/v0.1.0.md");
+        assert!(notes
+            .contains("`llama-harness-mcp` — optional, provider-neutral MCP tool integration."));
+        assert!(notes.contains("`evals`, `tauri`, `programmatic`, and `mcp` features."));
+        assert!(include_str!("../../docs/releasing.md")
+            .contains("Wait for all four integration versions to be index-visible"));
+        assert!(include_str!("../../docs/guides/releasing.html")
+            .contains("Wait for all four integration versions to be index-visible"));
     }
 
     #[test]
