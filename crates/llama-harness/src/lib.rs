@@ -96,5 +96,9 @@ mod tests {
         assert_eq!(context.run_id, "run");
         let prepared = PreparedToolCatalog::from_definitions(Vec::new()).unwrap();
         assert!(prepared.definitions().is_empty());
+        let outcome: ToolDiscoveryOutcome = serde_json::from_str("\"selected\"").unwrap();
+        let selection: ToolDiscoverySelection = serde_json::from_str("\"no_match\"").unwrap();
+        assert_eq!(outcome, ToolDiscoveryOutcome::Selected);
+        assert_eq!(selection, ToolDiscoverySelection::NoMatch);
     }
 }

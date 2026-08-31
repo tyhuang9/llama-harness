@@ -278,10 +278,25 @@ async fn direct_e2e_reuses_one_immutable_selected_scope_and_emits_private_counte
     assert_eq!(discovery.1, 1);
     assert_eq!(discovery.2, 1_000);
     assert!(discovery.3);
-    assert!(!discovery.4.contains(target));
-    assert!(!discovery.4.contains("alias"));
-    assert!(!discovery.4.contains("fingerprint"));
-    assert!(!discovery.4.contains("cache"));
+    for forbidden in [
+        target,
+        "safe catalog description",
+        "\"query\":",
+        "\"tool_ids\":",
+        "\"name\":",
+        "\"namespace\":",
+        "\"aliases\":",
+        "\"description\":",
+        "\"schema\":",
+        "fingerprint",
+        "cache_hit",
+        "cache_build",
+        "eviction",
+        "model_output",
+        "raw_error",
+    ] {
+        assert!(!discovery.4.contains(forbidden), "leaked {forbidden}");
+    }
 }
 
 #[tokio::test]
@@ -1033,6 +1048,85 @@ async fn schema_budget_limit_is_terminal_and_duration_reconciles_for_every_strat
                 status: RunStatus::LimitReached
             }
         ));
+    }
+}
+
+#[tokio::test]
+async fn empty_and_no_capacity_scopes_emit_once_for_every_attempted_caller() {
+    for no_capacity in [false, true] {
+        for strategy in [
+            RunStrategy::Direct,
+            RunStrategy::Adaptive,
+            RunStrategy::DeclarativePlan,
+        ] {
+            let responses = if strategy == RunStrategy::DeclarativePlan {
+                vec![final_response("invalid"), final_response("still invalid")]
+            } else {
+                vec![final_response("done")]
+            };
+            let max_tools = if no_capacity { 0 } else { 8 };
+            let provider = Arc::new(
+                MockModelProvider::scripted(responses)
+                    .with_capabilities(capabilities(max_tools, true)),
+            );
+            let events = Arc::new(InMemoryEventSink::default());
+            let mut registry = ToolRegistry::default();
+            let mut agent = AgentDefinition::new("empty", "Empty", "1", "mock-model");
+            if no_capacity {
+                registry
+                    .register_with_discovery(
+                        Arc::new(CountingTool::new("capacity.tool")),
+                        ToolDiscoveryMetadata::deferred(),
+                    )
+                    .unwrap();
+                agent.tool_allowlist = vec!["capacity.tool".into()];
+            }
+            let result = AgentRunner::builder(provider)
+                .tools(registry)
+                .event_sink(events.clone())
+                .build()
+                .run_with_strategy(RunRequest::new(agent, "answer"), strategy)
+                .await
+                .unwrap();
+            if strategy == RunStrategy::DeclarativePlan {
+                assert_eq!(result.status, RunStatus::Failed);
+            } else {
+                assert_eq!(result.status, RunStatus::Completed);
+            }
+            let discoveries = events
+                .events()
+                .into_iter()
+                .filter_map(|record| match record.event {
+                    RunEvent::ToolDiscoveryCompleted {
+                        caller,
+                        outcome,
+                        selection,
+                        ..
+                    } => Some((caller, outcome, selection)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let expected_callers = if strategy == RunStrategy::Direct {
+                vec![ToolCaller::Direct]
+            } else {
+                vec![ToolCaller::DeclarativePlan, ToolCaller::Direct]
+            };
+            assert_eq!(
+                discoveries
+                    .iter()
+                    .map(|(caller, _, _)| *caller)
+                    .collect::<Vec<_>>(),
+                expected_callers
+            );
+            let expected_selection = if no_capacity {
+                ToolDiscoverySelection::NoCapacity
+            } else {
+                ToolDiscoverySelection::EmptyCatalog
+            };
+            assert!(discoveries.iter().all(|(_, outcome, selection)| {
+                *outcome == ToolDiscoveryOutcome::Selected && *selection == expected_selection
+            }));
+        }
     }
 }
 

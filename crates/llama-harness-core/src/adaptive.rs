@@ -79,6 +79,7 @@ struct PreparedPlanScope {
 
 enum PlanningReadiness {
     Ready(PreparedPlanScope),
+    NoTools(PreparedPlanScope),
     Downgrade(&'static str),
     LimitReached(ToolDiscoveryStats),
 }
@@ -153,6 +154,7 @@ impl AgentRunner {
                         requested: RunStrategy::Direct,
                         reason: StrategySelectionReason::Forced,
                         fallback: None,
+                        prior_discovery: None,
                     }),
                     preflight,
                 )
@@ -178,6 +180,10 @@ impl AgentRunner {
                         self.run_planned(request, RunStrategy::DeclarativePlan, prepared, preflight)
                             .await
                     }
+                    PlanningReadiness::NoTools(prepared) => {
+                        self.run_planned(request, RunStrategy::DeclarativePlan, prepared, preflight)
+                            .await
+                    }
                     PlanningReadiness::Downgrade(reason) => {
                         Err(HarnessError::UnsupportedCapability(reason.into()))
                     }
@@ -192,6 +198,7 @@ impl AgentRunner {
                             requested: RunStrategy::DeclarativePlan,
                             reason: StrategySelectionReason::Forced,
                             fallback: None,
+                            prior_discovery: None,
                         }),
                     )),
                 }
@@ -218,6 +225,7 @@ impl AgentRunner {
                                 requested: RunStrategy::Adaptive,
                                 reason: StrategySelectionReason::CapabilityDowngrade,
                                 fallback: Some(StrategyFallbackReason::UnsupportedCapability),
+                                prior_discovery: None,
                             }),
                             preflight,
                         )
@@ -226,6 +234,22 @@ impl AgentRunner {
                     PlanningReadiness::Ready(prepared) => {
                         self.run_planned(request, RunStrategy::Adaptive, prepared, preflight)
                             .await
+                    }
+                    PlanningReadiness::NoTools(prepared) => {
+                        self.run_direct(
+                            request,
+                            Some(DirectStrategyEvents {
+                                requested: RunStrategy::Adaptive,
+                                reason: StrategySelectionReason::CapabilityDowngrade,
+                                fallback: Some(StrategyFallbackReason::UnsupportedCapability),
+                                prior_discovery: Some((
+                                    ToolCaller::DeclarativePlan,
+                                    prepared.discovery,
+                                )),
+                            }),
+                            preflight,
+                        )
+                        .await
                     }
                     PlanningReadiness::LimitReached(stats) => Ok(discovery_limit_terminal_result(
                         &request,
@@ -280,9 +304,10 @@ impl AgentRunner {
             }
         };
         if scope.is_empty() {
-            return Ok(PlanningReadiness::Downgrade(
-                "no allowed tools permit declarative plan calls",
-            ));
+            return Ok(PlanningReadiness::NoTools(PreparedPlanScope {
+                scope,
+                discovery,
+            }));
         }
         Ok(PlanningReadiness::Ready(PreparedPlanScope {
             scope,
@@ -315,6 +340,7 @@ impl AgentRunner {
                         requested,
                         reason: StrategySelectionReason::Forced,
                         fallback: None,
+                        prior_discovery: None,
                     });
                 return Ok(discovery_limit_terminal_result_with_scopes(
                     &request,

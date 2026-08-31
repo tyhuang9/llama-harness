@@ -81,10 +81,16 @@ impl AgentRunner {
         let (tool_scope, discovery) = match selection {
             Ok(ToolScopeSelection::Selected(scope, stats)) => (scope, stats),
             Ok(ToolScopeSelection::LimitReached(stats)) => {
-                return Ok(discovery_limit_terminal_result(
+                let mut completed_scopes = Vec::with_capacity(2);
+                if let Some((caller, prior)) =
+                    strategy_events.and_then(|events| events.prior_discovery)
+                {
+                    completed_scopes.push((caller, prior));
+                }
+                completed_scopes.push((ToolCaller::Direct, stats));
+                return Ok(discovery_limit_terminal_result_with_scopes(
                     &request,
-                    ToolCaller::Direct,
-                    stats,
+                    &completed_scopes,
                     &self.events,
                     crate::RunStrategy::Direct,
                     preflight.started,
@@ -92,12 +98,17 @@ impl AgentRunner {
                 ));
             }
             Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
-                return Ok(pre_event_terminal_result(
+                let prior = strategy_events
+                    .and_then(|events| events.prior_discovery)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                return Ok(pre_event_terminal_result_with_scopes(
                     &request,
                     error,
                     &self.events,
                     crate::RunStrategy::Direct,
                     preflight.started,
+                    &prior,
                 ));
             }
             Err(error) => return Err(error),
@@ -136,6 +147,9 @@ impl AgentRunner {
         let mut events =
             EventEmitter::new(run_id.clone(), trace_id.clone(), Arc::clone(&self.events));
         events.emit(RunEvent::Started { run_id, trace_id });
+        if let Some((caller, prior)) = strategy_events.and_then(|events| events.prior_discovery) {
+            emit_discovery(&mut events, caller, prior);
+        }
         emit_discovery(&mut events, ToolCaller::Direct, discovery);
         if let Some(strategy_events) = strategy_events {
             if let Some(reason) = strategy_events.fallback {
@@ -584,6 +598,7 @@ pub(crate) struct DirectStrategyEvents {
     pub(crate) requested: crate::RunStrategy,
     pub(crate) reason: crate::StrategySelectionReason,
     pub(crate) fallback: Option<crate::StrategyFallbackReason>,
+    pub(crate) prior_discovery: Option<(ToolCaller, crate::discovery::ToolDiscoveryStats)>,
 }
 
 impl AgentRunnerBuilder {
