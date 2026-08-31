@@ -924,6 +924,9 @@ impl McpCatalogManager {
             result = tokio::time::timeout(self.timeouts.connect, self.transport.connect(cancellation.child_token())) => result.map_err(|_| McpTransportError { operation: McpOperation::Connect, dispatch: McpDispatchState::PossiblyDispatched })??,
         };
         if !supported_context(&context) {
+            // Once connected, this function owns the context until it is
+            // transferred in its successful return value.
+            self.discard_context(context).await;
             return Err(McpError::InvalidCatalog(
                 "unsupported version or missing tools capability".into(),
             ));
@@ -1306,6 +1309,18 @@ impl McpToolAdapter {
         stale: bool,
     ) -> Result<ToolResult, HarnessError> {
         if call.caller == Some(ToolCaller::Speculative) {
+            self.observer.emit(event(
+                McpLifecycleOperation::Call,
+                McpLifecycleOutcome::Rejected,
+                0,
+                0,
+                0,
+                0,
+                stale,
+                false,
+                McpDispatchState::NotDispatched,
+                Some(McpCallCorrelation::from(call)),
+            ));
             return Err(HarnessError::InvalidTool(
                 "MCP tools cannot be speculative".into(),
             ));
@@ -1327,12 +1342,17 @@ impl McpToolAdapter {
         }
         let started = Instant::now();
         let correlation = Some(McpCallCorrelation::from(call));
+        enum CallFailure {
+            Cancelled,
+            TimedOut,
+            Transport(McpTransportError),
+        }
         let result = tokio::select! {
-            _ = cancellation.cancelled() => Err(HarnessError::Cancelled),
+            _ = cancellation.cancelled() => Err(CallFailure::Cancelled),
             result = tokio::time::timeout(self.call_timeout, self.transport.call_tool(&self.context, McpCallRequest { name: self.native_name.clone(), arguments, context: call.clone() }, cancellation.child_token())) => match result {
                 Ok(Ok(result)) => Ok(result),
-                Ok(Err(_)) => Err(HarnessError::Tool("MCP transport failure".into())),
-                Err(_) => Err(HarnessError::TimedOut("MCP tool call".into())),
+                Ok(Err(error)) => Err(CallFailure::Transport(error)),
+                Err(_) => Err(CallFailure::TimedOut),
             },
         };
         let elapsed = elapsed_ms(started);
@@ -1366,12 +1386,26 @@ impl McpToolAdapter {
                 normalized
             }
             Err(error) => {
-                let outcome = match error {
-                    HarnessError::Cancelled => McpLifecycleOutcome::Cancelled,
-                    HarnessError::TimedOut(_) => McpLifecycleOutcome::TimedOut,
-                    _ => McpLifecycleOutcome::Failed,
+                let (outcome, cancelled, dispatch, returned) = match error {
+                    CallFailure::Cancelled => (
+                        McpLifecycleOutcome::Cancelled,
+                        true,
+                        McpDispatchState::PossiblyDispatched,
+                        HarnessError::Cancelled,
+                    ),
+                    CallFailure::TimedOut => (
+                        McpLifecycleOutcome::TimedOut,
+                        false,
+                        McpDispatchState::PossiblyDispatched,
+                        HarnessError::TimedOut("MCP tool call".into()),
+                    ),
+                    CallFailure::Transport(error) => (
+                        McpLifecycleOutcome::Failed,
+                        false,
+                        error.dispatch,
+                        HarnessError::Tool("MCP transport failure".into()),
+                    ),
                 };
-                let cancelled = matches!(error, HarnessError::Cancelled);
                 self.observer.emit(event(
                     McpLifecycleOperation::Call,
                     outcome,
@@ -1381,10 +1415,10 @@ impl McpToolAdapter {
                     0,
                     stale,
                     cancelled,
-                    McpDispatchState::PossiblyDispatched,
+                    dispatch,
                     correlation,
                 ));
-                Err(error)
+                Err(returned)
             }
         }
     }
@@ -1573,8 +1607,10 @@ mod tests {
         context: McpContext,
         pages: Mutex<Vec<McpToolPage>>,
         calls: AtomicU64,
+        closes: AtomicU64,
         hang_call: AtomicBool,
         fail_list: AtomicBool,
+        call_failure: Mutex<Option<McpTransportError>>,
         result: Mutex<McpCallResult>,
     }
 
@@ -1594,8 +1630,10 @@ mod tests {
                     cache_scope: Some("public".into()),
                 }]),
                 calls: AtomicU64::new(0),
+                closes: AtomicU64::new(0),
                 hang_call: AtomicBool::new(false),
                 fail_list: AtomicBool::new(false),
+                call_failure: Mutex::new(None),
                 result: Mutex::new(McpCallResult {
                     structured_content: Some(serde_json::json!({"ok":true})),
                     content: None,
@@ -1644,6 +1682,9 @@ mod tests {
             _: CancellationToken,
         ) -> Result<McpCallResult, McpTransportError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(error) = self.call_failure.lock().expect("test mutex").clone() {
+                return Err(error);
+            }
             if self.hang_call.load(Ordering::Relaxed) {
                 std::future::pending::<()>().await;
                 unreachable!("pending future completed")
@@ -1655,6 +1696,7 @@ mod tests {
             _: McpContext,
             _: CancellationToken,
         ) -> Result<(), McpTransportError> {
+            self.closes.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -1759,11 +1801,57 @@ mod tests {
         let clock = Arc::new(FakeClock::default());
         let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
         transport.pages.lock().expect("test mutex")[0].cache_scope = Some("private".into());
-        let manager = manager(transport, clock, None, None);
+        let unsupported_manager = manager(transport.clone(), clock, None, None);
+        assert!(matches!(
+            unsupported_manager.refresh(CancellationToken::new()).await,
+            Err(McpError::InvalidCatalog(_))
+        ));
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn every_post_connect_refresh_failure_releases_the_new_context() {
+        let clock = Arc::new(FakeClock::default());
+        let mut unsupported_transport = FakeTransport::modern(100, vec![tool("one")]);
+        unsupported_transport.context.capabilities.clear();
+        let transport = Arc::new(unsupported_transport);
+        let unsupported_manager = manager(transport.clone(), clock, None, None);
+        assert!(matches!(
+            unsupported_manager.refresh(CancellationToken::new()).await,
+            Err(McpError::InvalidCatalog(_))
+        ));
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+
+        let clock = Arc::new(FakeClock::default());
+        clock.set(10);
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let manager = manager(transport.clone(), clock.clone(), None, None);
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("first refresh");
+        clock.set(9);
+        assert!(matches!(
+            manager.refresh(CancellationToken::new()).await,
+            Err(McpError::Clock)
+        ));
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn generated_id_collision_rejects_the_complete_snapshot_and_releases_context() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(
+            100,
+            vec![tool("same-name"), tool("same-name")],
+        ));
+        let manager = manager(transport.clone(), clock, None, None);
         assert!(matches!(
             manager.refresh(CancellationToken::new()).await,
             Err(McpError::InvalidCatalog(_))
         ));
+        assert!(manager.active_snapshot().is_none());
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1833,6 +1921,7 @@ mod tests {
                 .expect("prior snapshot remains callable")
                 .ok
         );
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1879,6 +1968,57 @@ mod tests {
             Err(HarnessError::InvalidTool(_))
         ));
         assert_eq!(transport.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn close_timeout_retains_context_until_the_inflight_call_drains() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        transport.hang_call.store(true, Ordering::Relaxed);
+        let manager = McpCatalogManager::with_configuration(
+            transport.clone(),
+            "server",
+            McpLimits::default(),
+            McpTimeouts {
+                close: Duration::ZERO,
+                ..McpTimeouts::default()
+            },
+            McpCachePolicy::default(),
+            clock,
+            None,
+        )
+        .expect("manager");
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        let tool = manager.active_tools().remove(0);
+        let call_cancellation = CancellationToken::new();
+        let task_cancellation = call_cancellation.clone();
+        let task =
+            tokio::spawn(
+                async move { tool.execute(serde_json::json!({}), task_cancellation).await },
+            );
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            manager.close(CancellationToken::new()).await,
+            Err(McpError::Transport(_))
+        ));
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 0);
+        call_cancellation.cancel();
+        assert!(matches!(
+            task.await.expect("call task"),
+            Err(HarnessError::Cancelled)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transport.closes.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred close after drain");
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1963,6 +2103,119 @@ mod tests {
         assert_eq!(refresh.outcome, McpLifecycleOutcome::Failed);
         assert_eq!(refresh.dispatch, McpDispatchState::NotDispatched);
         assert!(!refresh.cancelled);
+    }
+
+    #[tokio::test]
+    async fn observer_reports_sanitized_call_outcomes_and_dispatch_certainty() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let observer = Arc::new(RecordingObserver(Mutex::new(Vec::new()), false));
+        let manager = manager(transport.clone(), clock, None, Some(observer.clone()));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        let tool = manager.active_tools().remove(0);
+
+        let mut speculative = ToolCallContext::new("run", "trace", "call", "tool");
+        speculative.caller = Some(ToolCaller::Speculative);
+        assert!(matches!(
+            tool.execute_with_context(
+                &speculative,
+                serde_json::json!({}),
+                CancellationToken::new()
+            )
+            .await,
+            Err(HarnessError::InvalidTool(_))
+        ));
+
+        *transport.call_failure.lock().expect("test mutex") = Some(McpTransportError {
+            operation: McpOperation::CallTool,
+            dispatch: McpDispatchState::NotDispatched,
+        });
+        assert!(matches!(
+            tool.execute(serde_json::json!({}), CancellationToken::new())
+                .await,
+            Err(HarnessError::Tool(_))
+        ));
+        *transport.call_failure.lock().expect("test mutex") = Some(McpTransportError {
+            operation: McpOperation::CallTool,
+            dispatch: McpDispatchState::PossiblyDispatched,
+        });
+        assert!(matches!(
+            tool.execute(serde_json::json!({}), CancellationToken::new())
+                .await,
+            Err(HarnessError::Tool(_))
+        ));
+        *transport.call_failure.lock().expect("test mutex") = None;
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            tool.execute(serde_json::json!({}), cancelled).await,
+            Err(HarnessError::Cancelled)
+        ));
+
+        let events = observer.0.lock().expect("test mutex");
+        let calls = events
+            .iter()
+            .filter(|event| event.operation == McpLifecycleOperation::Call)
+            .collect::<Vec<_>>();
+        assert!(calls.iter().any(|event| {
+            event.outcome == McpLifecycleOutcome::Rejected
+                && event.dispatch == McpDispatchState::NotDispatched
+        }));
+        assert!(calls.iter().any(|event| {
+            event.outcome == McpLifecycleOutcome::Failed
+                && event.dispatch == McpDispatchState::NotDispatched
+        }));
+        assert!(calls.iter().any(|event| {
+            event.outcome == McpLifecycleOutcome::Failed
+                && event.dispatch == McpDispatchState::PossiblyDispatched
+        }));
+        assert!(calls.iter().any(|event| {
+            event.outcome == McpLifecycleOutcome::Cancelled
+                && event.cancelled
+                && event.dispatch == McpDispatchState::NotDispatched
+        }));
+    }
+
+    #[tokio::test]
+    async fn observer_reports_timeout_as_possibly_dispatched() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        transport.hang_call.store(true, Ordering::Relaxed);
+        let observer = Arc::new(RecordingObserver(Mutex::new(Vec::new()), false));
+        let manager = McpCatalogManager::with_configuration(
+            transport,
+            "server",
+            McpLimits::default(),
+            McpTimeouts {
+                call: Duration::ZERO,
+                ..McpTimeouts::default()
+            },
+            McpCachePolicy::default(),
+            clock,
+            Some(observer.clone()),
+        )
+        .expect("manager");
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        assert!(matches!(
+            call_first(&manager).await,
+            Err(HarnessError::TimedOut(_))
+        ));
+        let event = observer
+            .0
+            .lock()
+            .expect("test mutex")
+            .iter()
+            .find(|event| event.operation == McpLifecycleOperation::Call)
+            .expect("call event")
+            .clone();
+        assert_eq!(event.outcome, McpLifecycleOutcome::TimedOut);
+        assert_eq!(event.dispatch, McpDispatchState::PossiblyDispatched);
     }
 
     #[test]

@@ -788,6 +788,16 @@ mod tests {
     }
 
     #[test]
+    fn release_docs_and_ci_state_the_exact_eight_crate_contract() {
+        assert!(include_str!("../../docs/distribution.md")
+            .contains("These eight Rust-facing crates are the 0.1 publication set."));
+        assert!(include_str!("../../docs/releasing.md")
+            .contains("The preflight validates the exact eight-crate set"));
+        assert!(include_str!("../../.github/workflows/release-rust.yml")
+            .contains("Test only the eight crates in the Rust release"));
+    }
+
+    #[test]
     fn release_commands_select_only_the_publishable_crates() {
         let arguments = publishable_cargo_arguments(["test", "--locked"], ["--all-features"])
             .into_iter()
