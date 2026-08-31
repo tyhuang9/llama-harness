@@ -19,7 +19,11 @@ use llama_harness_programmatic_sandbox::{
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    sync::Arc,
+    io::{self, Write},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant as StdInstant},
 };
 use tokio::time::Instant;
@@ -31,9 +35,16 @@ const DEFAULT_VM_ADMISSION: usize = 4;
 const HARD_VM_ADMISSION: usize = 16;
 const MAX_FANOUT_CONCURRENCY: usize = 8;
 
+// The sandbox only needs a process-local opaque resume scope. Public broker
+// occurrence and effect identities use the full UUID below; this counter is
+// deliberately never used as an externally visible execution identity.
+static NEXT_SANDBOX_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
+
 const PROGRAM_PROMPT: &str = r#"Return only a strict llama-harness program JSON object. Use version 1 and a body array. Statements are let, branch, for_each, map, filter, reduce, invoke, fan_out, and return. Expressions are null, boolean, integer, string, variable, path, array, object, binary, and unary. Tool IDs in invoke/fan_out must be static IDs from the supplied catalog. All loops and collections require explicit bounded limits. Do not use markdown, floats, dynamic tool names, code strings, imports, functions, recursion, mutation, reflection, exceptions, regex, or prose."#;
 
 const REPAIR_PROMPT: &str = "The previous program failed strict structural verification. Return one corrected version-1 program JSON object only. Do not add markdown or prose.";
+
+const SYNTHESIS_PROMPT: &str = "A verified program completed. Produce the final answer using only the inert program return and broker-audited tool transcript in the next user message.";
 
 #[derive(Clone, Serialize)]
 struct ProgrammaticTranscriptEntry {
@@ -44,9 +55,224 @@ struct ProgrammaticTranscriptEntry {
 }
 
 #[derive(Serialize)]
+struct ProgrammaticTranscriptEntryRef<'a> {
+    tool_id: &'a str,
+    arguments: &'a Value,
+    ok: bool,
+    output: &'a Value,
+}
+
+#[derive(Serialize)]
 struct ProgrammaticSynthesisInput<'a> {
     program_return: &'a Value,
     broker_calls: &'a [ProgrammaticTranscriptEntry],
+}
+
+/// Bounded, canonical evidence passed to the final synthesis call.
+///
+/// The accounting intentionally reserves a full potential batch before the
+/// broker can issue any effect, then measures each entry without allocating a
+/// second serialized copy before retaining it. This makes a later synthesis
+/// capacity failure impossible for accepted sandbox/tool bounds.
+struct ProgrammaticTranscript {
+    entries: Vec<ProgrammaticTranscriptEntry>,
+    initial_message_bytes: u64,
+    limit: u64,
+    maximum_program_return_bytes: u64,
+}
+
+impl ProgrammaticTranscript {
+    fn new(request: &RunRequest, limits: &SandboxLimits) -> Result<Self, HarnessError> {
+        let initial_message_bytes = initial_messages(request)
+            .iter()
+            .map(Message::transcript_bytes)
+            .sum();
+        let transcript = Self {
+            entries: Vec::new(),
+            initial_message_bytes,
+            limit: request.agent.limits.max_transcript_bytes,
+            maximum_program_return_bytes: u64::try_from(limits.max_output_bytes).map_err(|_| {
+                HarnessError::ResourceLimit(
+                    "program return byte limit does not fit accounting".into(),
+                )
+            })?,
+        };
+        transcript.ensure_projected(0, 0, transcript.maximum_program_return_bytes)?;
+        Ok(transcript)
+    }
+
+    fn reserve_batch(&self, batch: &ToolBatch, request: &RunRequest) -> Result<(), HarnessError> {
+        let mut maximum_new_entries = 0u64;
+        for call in batch.calls() {
+            let tool_id_bytes = count_json_bytes(&call.tool_id)?;
+            let argument_bytes = count_json_bytes(&call.arguments)?;
+            let entry_bytes = checked_transcript_sum([
+                96,
+                tool_id_bytes,
+                argument_bytes,
+                request.agent.limits.max_tool_result_bytes,
+            ])?;
+            maximum_new_entries = checked_transcript_sum([maximum_new_entries, entry_bytes])?;
+        }
+        self.ensure_projected(
+            maximum_new_entries,
+            u64::try_from(batch.calls().len()).map_err(|_| {
+                HarnessError::ResourceLimit(
+                    "programmatic batch length does not fit accounting".into(),
+                )
+            })?,
+            self.maximum_program_return_bytes,
+        )
+    }
+
+    fn append(
+        &mut self,
+        tool_id: &str,
+        arguments: &Value,
+        ok: bool,
+        output: &Value,
+    ) -> Result<(), HarnessError> {
+        let entry = ProgrammaticTranscriptEntryRef {
+            tool_id,
+            arguments,
+            ok,
+            output,
+        };
+        let entry_bytes = count_json_bytes(&entry)?;
+        self.ensure_projected(entry_bytes, 1, self.maximum_program_return_bytes)?;
+        self.entries.try_reserve(1).map_err(|_| {
+            HarnessError::ResourceLimit("programmatic transcript allocation failed".into())
+        })?;
+        self.entries.push(ProgrammaticTranscriptEntry {
+            tool_id: tool_id.into(),
+            arguments: arguments.clone(),
+            ok,
+            output: output.clone(),
+        });
+        Ok(())
+    }
+
+    fn synthesis_payload_capacity(&self, program_return: &Value) -> Result<usize, HarnessError> {
+        let program_return_bytes = count_json_bytes(program_return)?;
+        let entry_bytes = self
+            .entries
+            .iter()
+            .map(count_json_bytes)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .try_fold(0u64, |total, bytes| checked_transcript_sum([total, bytes]))?;
+        self.ensure_projected(0, 0, program_return_bytes)?;
+        let payload_bytes =
+            synthesis_payload_bytes(program_return_bytes, entry_bytes, self.entries.len() as u64)?;
+        usize::try_from(payload_bytes).map_err(|_| {
+            HarnessError::ResourceLimit("programmatic synthesis payload does not fit memory".into())
+        })
+    }
+
+    fn ensure_projected(
+        &self,
+        additional_entry_bytes: u64,
+        additional_entries: u64,
+        program_return_bytes: u64,
+    ) -> Result<(), HarnessError> {
+        let retained_entry_bytes = self
+            .entries
+            .iter()
+            .map(count_json_bytes)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .try_fold(0u64, |total, bytes| checked_transcript_sum([total, bytes]))?;
+        let payload_bytes = synthesis_payload_bytes(
+            program_return_bytes,
+            checked_transcript_sum([retained_entry_bytes, additional_entry_bytes])?,
+            checked_transcript_sum([self.entries.len() as u64, additional_entries])?,
+        )?;
+        let projected = checked_transcript_sum([
+            self.initial_message_bytes,
+            SYNTHESIS_PROMPT.len() as u64,
+            payload_bytes,
+        ])?;
+        if projected > self.limit {
+            return Err(HarnessError::ResourceLimit(format!(
+                "programmatic synthesis transcript exceeds {} bytes",
+                self.limit
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn synthesis_payload_bytes(
+    program_return_bytes: u64,
+    entry_bytes: u64,
+    entry_count: u64,
+) -> Result<u64, HarnessError> {
+    // {"program_return":<value>,"broker_calls":[<entries>]}. The fixed
+    // punctuation and member names contribute 37 bytes.
+    checked_transcript_sum([
+        37,
+        program_return_bytes,
+        entry_bytes,
+        entry_count.saturating_sub(1),
+    ])
+}
+
+fn checked_transcript_sum(values: impl IntoIterator<Item = u64>) -> Result<u64, HarnessError> {
+    values.into_iter().try_fold(0u64, |total, value| {
+        total.checked_add(value).ok_or_else(|| {
+            HarnessError::ResourceLimit("programmatic transcript accounting overflowed".into())
+        })
+    })
+}
+
+struct JsonByteCounter(u64);
+
+impl Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(
+                u64::try_from(bytes.len()).map_err(|_| io::Error::other("length overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn count_json_bytes(value: &impl Serialize) -> Result<u64, HarnessError> {
+    let mut counter = JsonByteCounter(0);
+    serde_json::to_writer(&mut counter, value).map_err(|_| {
+        HarnessError::InvalidOutput("programmatic transcript could not be serialized".into())
+    })?;
+    Ok(counter.0)
+}
+
+fn serialize_synthesis_input(
+    program_return: &Value,
+    transcript: &ProgrammaticTranscript,
+) -> Result<String, HarnessError> {
+    let capacity = transcript.synthesis_payload_capacity(program_return)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|_| {
+        HarnessError::ResourceLimit("programmatic synthesis allocation failed".into())
+    })?;
+    serde_json::to_writer(
+        &mut bytes,
+        &ProgrammaticSynthesisInput {
+            program_return,
+            broker_calls: &transcript.entries,
+        },
+    )
+    .map_err(|_| {
+        HarnessError::InvalidOutput("program synthesis input could not be serialized".into())
+    })?;
+    debug_assert!(bytes.len() <= capacity);
+    String::from_utf8(bytes)
+        .map_err(|_| HarnessError::InvalidOutput("program synthesis input was not UTF-8".into()))
 }
 
 /// Explicit host opt-in and resource bounds for programmatic execution.
@@ -102,7 +328,7 @@ impl AgentRunner {
     pub(crate) async fn run_programmatic(
         &self,
         request: RunRequest,
-        preflight: RunPreflight,
+        mut preflight: RunPreflight,
     ) -> Result<RunResult, HarnessError> {
         let config = self.programmatic.as_ref().ok_or_else(|| {
             HarnessError::UnsupportedCapability(
@@ -211,7 +437,6 @@ impl AgentRunner {
         let mut repair_calls = 0u32;
         let mut synthesis_calls = 0u32;
         let mut broker_state = BrokerState::default();
-        let mut broker_transcript = Vec::new();
         let broker = ToolBroker::new(
             &self.tools,
             &scope,
@@ -222,6 +447,7 @@ impl AgentRunner {
         let mut dispatched = false;
         let mut invalid_program_exhausted = false;
         let terminal = async {
+            let mut broker_transcript = ProgrammaticTranscript::new(&request, &limits)?;
             let mut generation_messages = initial_messages(&request);
             generation_messages.push(Message::system(PROGRAM_PROMPT));
             ensure_transcript(&generation_messages, &request.agent.limits)?;
@@ -232,6 +458,11 @@ impl AgentRunner {
                     attempt: program_attempt.saturating_add(1),
                     outcome: ProgramLifecycleOutcome::Started,
                 });
+                let phase_calls = if program_attempt == 0 {
+                    &mut planning_calls
+                } else {
+                    &mut repair_calls
+                };
                 let response = self
                     .programmatic_completion(
                         &request,
@@ -240,14 +471,10 @@ impl AgentRunner {
                         Some(&scope),
                         deadline,
                         &mut model_calls,
+                        phase_calls,
                         &mut events,
                     )
                     .await?;
-                if program_attempt == 0 {
-                    planning_calls += 1;
-                } else {
-                    repair_calls += 1;
-                }
                 let source = response.final_output.as_deref().ok_or_else(|| {
                     HarnessError::InvalidOutput("provider returned no program".into())
                 });
@@ -255,7 +482,8 @@ impl AgentRunner {
                 let compiled = source.and_then(|source| {
                     Program::from_json(source.as_bytes(), &limits)
                         .and_then(|program| {
-                            statement_count = program.body.len().min(u32::MAX as usize) as u32;
+                            statement_count =
+                                program.statement_count().min(u32::MAX as usize) as u32;
                             program.compile(&limits)
                         })
                         .map_err(sandbox_error)
@@ -283,7 +511,9 @@ impl AgentRunner {
                             outcome: ProgramLifecycleOutcome::Invalid,
                         });
                         program_attempt = 1;
-                        generation_messages.push(Message::assistant(response.final_output.unwrap_or_default()));
+                        generation_messages.push(Message::assistant(
+                            response.final_output.unwrap_or_default(),
+                        ));
                         generation_messages.push(Message::system(REPAIR_PROMPT));
                         ensure_transcript(&generation_messages, &request.agent.limits)?;
                     }
@@ -298,12 +528,20 @@ impl AgentRunner {
                 }
             };
 
-            let execution_number = execution_id();
-            let mut vm = Execution::with_attempt(verified, ExecutionId(execution_number), program_attempt)
-                .map_err(sandbox_error)?;
+            let execution_nonce = Uuid::new_v4();
+            let mut vm = Execution::with_attempt(
+                verified,
+                ExecutionId(next_sandbox_execution_id()),
+                program_attempt,
+            )
+            .map_err(sandbox_error)?;
             let vm_started = StdInstant::now();
             let program_output = loop {
-                check_stopped(&request.cancellation, deadline, "programmatic run deadline reached")?;
+                check_stopped(
+                    &request.cancellation,
+                    deadline,
+                    "programmatic run deadline reached",
+                )?;
                 // VM admission covers synchronous compute only. The permit is
                 // released before any provider, policy, approval, or tool await.
                 let step = {
@@ -338,11 +576,32 @@ impl AgentRunner {
                                 &mut events,
                                 &mut broker_state,
                                 &batch,
+                                &execution_nonce,
+                                &limits,
                                 deadline,
                                 &mut dispatched,
                                 &mut broker_transcript,
                             )
                             .await?;
+                        // Resuming may materialize and retain a bounded tool
+                        // response tree, so it is VM compute just like step.
+                        let _admission = await_guarded(
+                            async {
+                                Arc::clone(&self.programmatic_admission)
+                                    .acquire_owned()
+                                    .await
+                                    .map_err(|_| {
+                                        HarnessError::ResourceLimit(
+                                            "programmatic VM admission closed".into(),
+                                        )
+                                    })
+                            },
+                            &request.cancellation,
+                            deadline,
+                            "programmatic VM admission exceeded run deadline",
+                            None,
+                        )
+                        .await?;
                         vm.resume(resume, responses).map_err(sandbox_error)?;
                     }
                     _ => {
@@ -371,15 +630,9 @@ impl AgentRunner {
                 duration_ms: vm_started.elapsed().as_millis() as u64,
             });
 
-            let output_json = serde_json::to_string(&ProgrammaticSynthesisInput {
-                program_return: &program_output,
-                broker_calls: &broker_transcript,
-            })
-            .map_err(|_| HarnessError::InvalidOutput("program synthesis input could not be serialized".into()))?;
+            let output_json = serialize_synthesis_input(&program_output, &broker_transcript)?;
             let mut synthesis_messages = initial_messages(&request);
-            synthesis_messages.push(Message::system(
-                "A verified program completed. Produce the final answer using only the inert program return and broker-audited tool transcript in the next user message.",
-            ));
+            synthesis_messages.push(Message::system(SYNTHESIS_PROMPT));
             synthesis_messages.push(Message::user(output_json));
             ensure_transcript(&synthesis_messages, &request.agent.limits)?;
             let response = self
@@ -390,10 +643,10 @@ impl AgentRunner {
                     None,
                     deadline,
                     &mut model_calls,
+                    &mut synthesis_calls,
                     &mut events,
                 )
                 .await?;
-            synthesis_calls += 1;
             let output = response.final_output.ok_or_else(|| {
                 HarnessError::InvalidOutput("final synthesis returned no output".into())
             })?;
@@ -418,6 +671,10 @@ impl AgentRunner {
                 attempt: repair_calls.saturating_add(1),
                 outcome: ProgramLifecycleOutcome::Fallback,
             });
+            // The continuation is one logical run, including its tightened
+            // programmatic host deadline rather than the preflight request
+            // deadline that may be longer.
+            preflight.deadline = deadline;
             return self
                 .run_direct_continuation(
                     request,
@@ -494,6 +751,7 @@ impl AgentRunner {
         scope: Option<&ToolScope>,
         deadline: Option<Instant>,
         model_calls: &mut u32,
+        phase_calls: &mut u32,
         events: &mut EventEmitter,
     ) -> Result<ModelResponse, HarnessError> {
         if *model_calls >= request.agent.limits.max_model_calls {
@@ -502,6 +760,7 @@ impl AgentRunner {
             ));
         }
         *model_calls += 1;
+        *phase_calls += 1;
         events.emit(RunEvent::ModelRequested {
             call_number: *model_calls,
             model: model.into(),
@@ -549,9 +808,11 @@ impl AgentRunner {
         events: &mut EventEmitter,
         state: &mut BrokerState,
         batch: &ToolBatch,
+        execution_nonce: &Uuid,
+        limits: &SandboxLimits,
         deadline: Option<Instant>,
         dispatched: &mut bool,
-        transcript: &mut Vec<ProgrammaticTranscriptEntry>,
+        transcript: &mut ProgrammaticTranscript,
     ) -> Result<Vec<ToolResponse>, HarnessError> {
         // A fan-out is an all-or-nothing static admission decision. Check every
         // requested call before the broker can consult policy or approval for
@@ -604,10 +865,20 @@ impl AgentRunner {
             }
         }
 
+        // Reserve the full worst-case canonical broker envelope before the
+        // batch enters policy or approval. A later tool result therefore
+        // cannot make the synthesis payload exceed its budget after an effect
+        // has started.
+        transcript.reserve_batch(batch, request)?;
+
         let mut prepared: Vec<(usize, Box<PreparedCall>)> = Vec::new();
-        let mut responses: Vec<Option<ToolResponse>> = vec![None; batch.calls().len()];
+        let mut responses: Vec<Option<ToolResponse>> = std::iter::repeat_with(|| None)
+            .take(batch.calls().len())
+            .collect();
         let mut transcript_slots: Vec<Option<ProgrammaticTranscriptEntry>> =
-            vec![None; batch.calls().len()];
+            std::iter::repeat_with(|| None)
+                .take(batch.calls().len())
+                .collect();
         for (index, request_call) in batch.calls().iter().enumerate() {
             check_stopped(
                 &request.cancellation,
@@ -618,7 +889,7 @@ impl AgentRunner {
                 format!(
                     "programmatic-{}-{}-{}-{}",
                     request_call.program_attempt,
-                    request_call.execution_id.0,
+                    execution_nonce,
                     request_call.call_site,
                     request_call.dynamic_ordinal
                 ),
@@ -672,7 +943,7 @@ impl AgentRunner {
                     ));
                 }
                 PrepareOutcome::Reused(value) => {
-                    responses[index] = Some(tool_response(request_call, value.as_ref()));
+                    responses[index] = Some(tool_response(request_call, value.as_ref(), limits)?);
                     transcript_slots[index] = Some(ProgrammaticTranscriptEntry {
                         tool_id: request_call.tool_id.clone(),
                         arguments: request_call.arguments.clone(),
@@ -754,13 +1025,37 @@ impl AgentRunner {
                     continue;
                 }
             };
-            events.emit(RunEvent::ToolCompleted {
-                call_id: call.call.id.clone(),
-                tool_id: call.call.tool_id.clone(),
-                ok: true,
-            });
-            broker.record_execution(state, call, &execution);
-            responses[*index] = Some(tool_response(request_call, execution.result.as_ref()));
+            match tool_response(request_call, execution.result.as_ref(), limits) {
+                Ok(response) => {
+                    responses[*index] = Some(response);
+                    events.emit(RunEvent::ToolCompleted {
+                        call_id: call.call.id.clone(),
+                        tool_id: call.call.tool_id.clone(),
+                        ok: true,
+                    });
+                    broker.record_execution(state, call, &execution);
+                }
+                Err(error) => {
+                    // The tool did run successfully but its response cannot
+                    // safely be retained by the VM. Its external effect is
+                    // therefore terminally uncertain and never resumed.
+                    state.record_execution_error(&error);
+                    broker.mark_uncertain(state, call);
+                    events.emit(RunEvent::ToolCompleted {
+                        call_id: call.call.id.clone(),
+                        tool_id: call.call.tool_id.clone(),
+                        ok: false,
+                    });
+                    first_execution_error.get_or_insert(error);
+                    transcript_slots[*index] = Some(ProgrammaticTranscriptEntry {
+                        tool_id: call.call.tool_id.clone(),
+                        arguments: call.arguments.clone(),
+                        ok: false,
+                        output: Value::Null,
+                    });
+                    continue;
+                }
+            }
             transcript_slots[*index] = Some(ProgrammaticTranscriptEntry {
                 tool_id: call.call.tool_id.clone(),
                 arguments: call.arguments.clone(),
@@ -768,7 +1063,9 @@ impl AgentRunner {
                 output: execution.result.output.clone(),
             });
         }
-        transcript.extend(transcript_slots.into_iter().flatten());
+        for entry in transcript_slots.into_iter().flatten() {
+            transcript.append(&entry.tool_id, &entry.arguments, entry.ok, &entry.output)?;
+        }
         if let Some(error) = first_execution_error {
             return Err(error);
         }
@@ -782,11 +1079,12 @@ impl AgentRunner {
 fn tool_response(
     request: &llama_harness_programmatic_sandbox::ToolRequest,
     result: &ToolResult,
-) -> ToolResponse {
+    limits: &SandboxLimits,
+) -> Result<ToolResponse, HarnessError> {
     if result.ok {
-        ToolResponse::success(request, result.output.clone())
+        ToolResponse::success(request, &result.output, limits).map_err(sandbox_error)
     } else {
-        ToolResponse::failure(request)
+        Ok(ToolResponse::failure(request))
     }
 }
 
@@ -809,7 +1107,6 @@ fn terminal_lifecycle_outcome(error: &HarnessError) -> ProgramLifecycleOutcome {
     }
 }
 
-fn execution_id() -> u64 {
-    let nonce = Uuid::new_v4().as_u128();
-    (nonce as u64) ^ ((nonce >> 64) as u64)
+fn next_sandbox_execution_id() -> u64 {
+    NEXT_SANDBOX_EXECUTION_ID.fetch_add(1, Ordering::Relaxed)
 }

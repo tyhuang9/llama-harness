@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use llama_harness_core::{
     mock::{final_response, MockModelProvider},
     AgentDefinition, AgentRunner, AllowAllPolicy, ApprovalHandler, ApprovalRecord, HarnessError,
-    InMemoryEventSink, ModelCapabilities, PolicyDecision, PolicyEngine, ProgrammaticConformance,
-    ProgrammaticHostConfig, ProviderCapabilityLimits, RunEvent, RunRequest, RunStatus, RunStrategy,
+    InMemoryEventSink, ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
+    PolicyDecision, PolicyEngine, ProgrammaticConformance, ProgrammaticHostConfig,
+    ProviderCapabilityLimits, ProviderHealth, RunEvent, RunRequest, RunStatus, RunStrategy,
     StrategyFallbackReason, Tool, ToolCallContext, ToolCaller, ToolDefinition, ToolRegistry,
     ToolResult, ToolRisk, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
     HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
@@ -16,6 +17,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
 };
+use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +32,77 @@ fn request(tool_ids: &[&str]) -> RunRequest {
     agent.tool_allowlist = tool_ids.iter().map(|id| (*id).into()).collect();
     agent.limits.max_model_calls = 4;
     RunRequest::new(agent, "complete the task").with_run_id("programmatic-test-run")
+}
+
+struct HostDeadlineFallbackProvider {
+    calls: AtomicU32,
+    fallback_started: Arc<Notify>,
+}
+
+struct ConcurrentProgramProvider {
+    program: String,
+}
+
+#[async_trait]
+impl ModelProvider for ConcurrentProgramProvider {
+    fn id(&self) -> &str {
+        "concurrent-program"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        capabilities()
+    }
+
+    async fn health(&self) -> Result<ProviderHealth, HarnessError> {
+        Ok(ProviderHealth::healthy())
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError> {
+        Ok(vec![
+            ModelInfo::new("mock-model").with_capabilities(capabilities())
+        ])
+    }
+
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError> {
+        Ok(if request.tools.is_empty() {
+            ModelResponse::new("mock-model").with_final_output("concurrent done")
+        } else {
+            ModelResponse::new("mock-model").with_final_output(self.program.clone())
+        })
+    }
+}
+
+#[async_trait]
+impl ModelProvider for HostDeadlineFallbackProvider {
+    fn id(&self) -> &str {
+        "host-deadline-fallback"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        capabilities()
+    }
+
+    async fn health(&self) -> Result<ProviderHealth, HarnessError> {
+        Ok(ProviderHealth::healthy())
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError> {
+        Ok(vec![
+            ModelInfo::new("mock-model").with_capabilities(capabilities())
+        ])
+    }
+
+    async fn complete(&self, _: ModelRequest) -> Result<ModelResponse, HarnessError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 | 1 => Ok(ModelResponse::new("mock-model").with_final_output("not a program")),
+            2 => {
+                self.fallback_started.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(ModelResponse::new("mock-model").with_final_output("late direct answer"))
+            }
+            _ => Err(HarnessError::Provider("unexpected model request".into())),
+        }
+    }
 }
 
 fn return_program_with_exact_serialized_bytes(bytes: usize) -> String {
@@ -545,10 +618,69 @@ async fn repeated_public_run_ids_still_receive_distinct_programmatic_effect_nonc
 
     assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
     assert_ne!(first.tool_calls[0].id, second.tool_calls[0].id);
+    let first_nonce = &first.tool_calls[0].id[15..51];
+    let second_nonce = &second.tool_calls[0].id[15..51];
+    assert!(uuid::Uuid::parse_str(first_nonce).is_ok());
+    assert!(uuid::Uuid::parse_str(second_nonce).is_ok());
+    assert_ne!(first_nonce, second_nonce);
     let contexts = tool.contexts.lock().unwrap();
     assert_eq!(contexts.len(), 2);
     assert_eq!(contexts[0].run_id, contexts[1].run_id);
     assert_ne!(contexts[0].effect_key, contexts[1].effect_key);
+}
+
+#[tokio::test]
+async fn concurrent_reused_public_run_ids_keep_full_execution_nonces_distinct() {
+    let program = json!({"version":1,"body":[
+        {"kind":"invoke","name":"write","tool_id":"write","arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"integer","value":7}}]}},
+        {"kind":"return","value":{"kind":"variable","name":"write"}}
+    ]})
+    .to_string();
+    let provider = Arc::new(ConcurrentProgramProvider { program });
+    let tool = Arc::new(RecordingTool::new(
+        "write",
+        ToolResult::success(json!({"value": 7})),
+        false,
+        false,
+        [ToolCaller::Programmatic],
+    ));
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let runner = Arc::new(
+        AgentRunner::builder(provider)
+            .tools(registry)
+            .policy(Arc::new(AllowAllPolicy))
+            .programmatic(ProgrammaticHostConfig::default())
+            .build(),
+    );
+    let first_runner = runner.clone();
+    let first = tokio::spawn(async move {
+        first_runner
+            .run_with_strategy(
+                request(&["write"]).with_run_id("concurrent-public-run-id"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+    let second = tokio::spawn(async move {
+        runner
+            .run_with_strategy(
+                request(&["write"]).with_run_id("concurrent-public-run-id"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    assert_ne!(first.tool_calls[0].id, second.tool_calls[0].id);
+    for call_id in [&first.tool_calls[0].id, &second.tool_calls[0].id] {
+        assert!(uuid::Uuid::parse_str(&call_id[15..51]).is_ok());
+    }
 }
 
 #[tokio::test]
@@ -925,6 +1057,39 @@ async fn programmatic_fanout_uses_the_minimum_of_host_agent_and_provider_caps() 
 }
 
 #[tokio::test]
+async fn transcript_envelope_rejects_a_fanout_before_policy_or_dispatch() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(two_read_fanout_program())]).with_capabilities(
+            capabilities().with_parallel_tool_calls(true).with_limits(
+                ProviderCapabilityLimits::new()
+                    .with_max_program_bytes(64 * 1024)
+                    .with_max_parallel_tool_calls(2),
+            ),
+        ),
+    );
+    let tool = Arc::new(CountingTool::new("read", true, true));
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let mut run_request = request(&["read"]);
+    // One potential 1 MiB program return fits, but reserving two possible
+    // 1 MiB canonical tool responses does not. This must stop before policy,
+    // approval, or a tool dispatch can begin.
+    run_request.agent.limits.max_transcript_bytes = 2 * 1024 * 1024;
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry)
+        .policy(Arc::new(AllowAllPolicy))
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(run_request, RunStrategy::Programmatic)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::LimitReached);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn programmatic_parallel_fanout_preserves_input_order_through_reverse_completion() {
     let program = read_fanout_program(&[1, 2, 3]);
     let provider = Arc::new(
@@ -944,6 +1109,10 @@ async fn programmatic_parallel_fanout_preserves_input_order_through_reverse_comp
     config.max_fanout_concurrency = 3;
     let mut run_request = request(&["read"]);
     run_request.agent.limits.max_programmatic_fanout_concurrency = 3;
+    // This test isolates ordering rather than the bounded final-synthesis
+    // envelope. Three possible 1 MiB responses plus a 1 MiB program return
+    // require more than the default 4 MiB transcript allowance.
+    run_request.agent.limits.max_transcript_bytes = 16 * 1024 * 1024;
     let runner = Arc::new(
         AgentRunner::builder(provider.clone())
             .tools(registry)
@@ -1222,6 +1391,10 @@ async fn immutable_fanout_cap_accepts_n_minus_one_and_n_but_rejects_n_plus_one_b
         let mut run_request = request(&["read"]);
         run_request.agent.limits.max_programmatic_fanout_concurrency =
             HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY;
+        // The effective fan-out cap is eight. Reserve eight potential 1 MiB
+        // tool responses plus a 1 MiB program return so this test remains a
+        // fan-out-cap boundary, not a transcript-cap boundary.
+        run_request.agent.limits.max_transcript_bytes = 16 * 1024 * 1024;
         let result = AgentRunner::builder(provider.clone())
             .tools(registry)
             .policy(Arc::new(AllowAllPolicy))
@@ -1560,6 +1733,39 @@ async fn invalid_repaired_program_falls_back_once_to_fresh_direct_scope_before_e
         .iter()
         .enumerate()
         .all(|(index, record)| record.sequence == (index + 1) as u64));
+}
+
+#[tokio::test(start_paused = true)]
+async fn direct_fallback_keeps_the_tighter_programmatic_host_deadline() {
+    let provider = Arc::new(HostDeadlineFallbackProvider {
+        calls: AtomicU32::new(0),
+        fallback_started: Arc::new(Notify::new()),
+    });
+    let mut config = ProgrammaticHostConfig::default();
+    config.max_duration_ms = 1;
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .programmatic(config)
+            .build(),
+    );
+    let mut run_request = request(&[]);
+    // The application deadline is intentionally looser than the host's
+    // programmatic deadline. The fallback must retain the latter.
+    run_request.agent.limits.max_run_duration_ms = Some(100);
+    let fallback_started = provider.fallback_started.clone();
+    let run = tokio::spawn(async move {
+        runner
+            .run_with_strategy(run_request, RunStrategy::Programmatic)
+            .await
+    });
+
+    fallback_started.notified().await;
+    tokio::time::advance(Duration::from_millis(2)).await;
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert!(result.errors.iter().any(|error| error.code == "timed_out"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
 }
 
 #[test]
