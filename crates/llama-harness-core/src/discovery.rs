@@ -864,6 +864,25 @@ mod tests {
         assert!(empty.is_empty());
         assert!(!stats.cache_hit);
         assert!(!empty_registry.catalog_index().1);
+
+        let mut full_fit_registry = ToolRegistry::default();
+        register(
+            &mut full_fit_registry,
+            "weather.current",
+            "weather",
+            ToolDiscoveryMetadata::hot(),
+        );
+        let (full, stats) = scope(
+            &full_fit_registry,
+            "weather.current",
+            &["weather.current".into()],
+            ToolDiscoveryLimits::new(),
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert_eq!(full.definitions().len(), 1);
+        assert!(!stats.cache_hit);
+        assert!(!full_fit_registry.catalog_index().1);
     }
 
     #[test]
@@ -915,6 +934,11 @@ mod tests {
             ToolDiscoveryMetadata::deferred(),
         );
         assert!(duplicate.is_err());
+        let invalid_metadata = first.register_with_discovery(
+            Arc::new(TestTool(definition("weather.invalid", "invalid"))),
+            ToolDiscoveryMetadata::deferred().with_namespace("not stable"),
+        );
+        assert!(invalid_metadata.is_err());
         assert_eq!(first_fingerprint, first.catalog_fingerprint());
         let (_, preserved_stats) = scope(
             &first,
