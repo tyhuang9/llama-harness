@@ -94,6 +94,8 @@ impl ToolBatch {
 /// let _ = ToolResponse { call_site: 0 };
 /// ```
 pub struct ToolResponse {
+    execution_id: ExecutionId,
+    program_attempt: u32,
     call_site: u32,
     dynamic_ordinal: u64,
     ok: bool,
@@ -126,6 +128,8 @@ impl ToolResponse {
             return Err(resource("response serialized byte limit exceeded"));
         }
         Ok(Self {
+            execution_id: request.execution_id,
+            program_attempt: request.program_attempt,
             call_site: request.call_site,
             dynamic_ordinal: request.dynamic_ordinal,
             ok: true,
@@ -136,6 +140,8 @@ impl ToolResponse {
     /// Creates an inert, checked failure response for a yielded request.
     pub fn failure(request: &ToolRequest) -> Self {
         Self {
+            execution_id: request.execution_id,
+            program_attempt: request.program_attempt,
             call_site: request.call_site,
             dynamic_ordinal: request.dynamic_ordinal,
             ok: false,
@@ -1327,6 +1333,13 @@ impl Execution {
             0
         };
         for (response, expected) in responses.iter().zip(&pending.requests) {
+            if response.execution_id != self.execution_id
+                || response.program_attempt != self.program_attempt
+            {
+                return Err(resume_error(
+                    "response provenance does not match the suspended execution",
+                ));
+            }
             if (response.call_site, response.dynamic_ordinal) != *expected {
                 return Err(resume_error(
                     "response identity does not match yielded request order",
@@ -2936,6 +2949,24 @@ mod tests {
                 .unwrap_err()
                 .code(),
             SandboxErrorCode::InvalidResume
+        );
+        assert!(second.step(1).is_err());
+    }
+
+    #[test]
+    fn cross_execution_response_terminalizes_even_when_request_ids_collide() {
+        let raw = r#"{"version":1,"body":[{"kind":"invoke","name":"r","tool_id":"read","arguments":{"kind":"object","entries":[]}},{"kind":"return","value":{"kind":"null"}}]}"#;
+        let limits = SandboxLimits::default();
+        let mut first = execution(raw, 49, limits);
+        let mut second = execution(raw, 50, limits);
+        let (first_batch, _first_token) = yield_once(&mut first);
+        let (_second_batch, second_token) = yield_once(&mut second);
+        let response = ToolResponse::failure(&first_batch.calls()[0]);
+        let error = second.resume(second_token, vec![response]).unwrap_err();
+        assert_eq!(error.code(), SandboxErrorCode::InvalidResume);
+        assert_eq!(
+            error.message(),
+            "response provenance does not match the suspended execution"
         );
         assert!(second.step(1).is_err());
     }
