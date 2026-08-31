@@ -21,7 +21,7 @@ pub(crate) fn parse_program(input: &[u8], limits: &SandboxLimits) -> Result<Prog
 }
 
 fn validate_json_nesting(input: &[u8], max_depth: usize) -> Result<(), SandboxError> {
-    let mut depth = 0usize;
+    let mut delimiters = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
     for byte in input.iter().copied() {
@@ -38,16 +38,26 @@ fn validate_json_nesting(input: &[u8], max_depth: usize) -> Result<(), SandboxEr
         match byte {
             b'"' => in_string = true,
             b'{' | b'[' => {
-                depth = depth
-                    .checked_add(1)
-                    .ok_or_else(|| resource("JSON nesting limit exceeded"))?;
-                if depth > max_depth {
+                delimiters
+                    .try_reserve(1)
+                    .map_err(|_| resource("JSON nesting validation allocation failed"))?;
+                delimiters.push(byte);
+                if delimiters.len() > max_depth {
                     return Err(resource("JSON nesting limit exceeded"));
                 }
             }
-            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'}' if delimiters.pop() != Some(b'{') => {
+                return Err(invalid("program JSON delimiters are unbalanced"));
+            }
+            b']' if delimiters.pop() != Some(b'[') => {
+                return Err(invalid("program JSON delimiters are unbalanced"));
+            }
+            b'}' | b']' => {}
             _ => {}
         }
+    }
+    if in_string || !delimiters.is_empty() {
+        return Err(invalid("program JSON is incomplete"));
     }
     Ok(())
 }
@@ -405,6 +415,8 @@ mod tests {
             br#"{"version":1,"body":[{"kind":"return","value":{"kind":"integer","value":1,"value":2}}]}"#.as_slice(),
             br#"{"version":1,"body":[]} true"#.as_slice(),
             br#"{"version":1,"body":[{"kind":"return","value":{"kind":"null"}}]"#.as_slice(),
+            br#"{"version":1,"body":[]]}"#.as_slice(),
+            br#"{"version":1,"body":[}"#.as_slice(),
         ] {
             assert_eq!(
                 Program::from_json(raw, &limits).unwrap_err().code(),

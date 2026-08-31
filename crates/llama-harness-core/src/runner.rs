@@ -347,6 +347,7 @@ impl AgentRunner {
                         ToolCaller::Direct,
                         false,
                         false,
+                        None,
                         deadline,
                     )
                     .await

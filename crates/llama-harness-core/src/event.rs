@@ -142,6 +142,41 @@ pub enum RunEvent {
         /// Number of validated plan nodes.
         node_count: u32,
     },
+    /// A metadata-only program generation or repair attempt changed lifecycle state.
+    ProgramLifecycle {
+        /// One-based program generation or repair attempt.
+        attempt: u32,
+        /// Stable value-free lifecycle outcome.
+        outcome: ProgramLifecycleOutcome,
+    },
+    /// A strict program AST and its private bytecode completed validation.
+    ProgramValidated {
+        /// One-based successfully validated program attempt.
+        attempt: u32,
+        /// Number of source AST statements admitted to compilation.
+        statement_count: u32,
+        /// Number of private verified bytecode instructions.
+        instruction_count: u32,
+    },
+    /// A program VM completed before final model synthesis.
+    ProgramExecutionCompleted {
+        /// One-based successfully executed program attempt.
+        attempt: u32,
+        /// Deterministic fuel charged by the VM.
+        fuel_used: u64,
+        /// Executed branch decisions.
+        branches: u64,
+        /// Entered bounded loop iterations.
+        loop_iterations: u64,
+        /// Read-only fan-out batches yielded.
+        fanout_batches: u32,
+        /// Failed or invalid broker results observed before this terminal execution state.
+        partial_failures: u32,
+        /// Peak conservatively accounted VM bytes.
+        peak_accounted_bytes: u64,
+        /// VM execution duration in milliseconds.
+        duration_ms: u64,
+    },
     /// A declarative plan node started execution.
     PlanNodeStarted {
         /// Runner-generated opaque node identifier; never model-provided text.
@@ -319,10 +354,37 @@ pub enum StrategyFallbackReason {
     UnsupportedCapability,
     /// A generated plan remained invalid after one repair attempt.
     InvalidPlan,
+    /// A generated program remained invalid after its single repair attempt.
+    InvalidProgram,
     /// Execution failed after some node results were safely recorded.
     ExecutionRecovery,
     /// Planner execution failed before any tool effect began.
     PlannerFailure,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Stable value-free lifecycle outcome for a program attempt.
+pub enum ProgramLifecycleOutcome {
+    /// Program generation or repair started.
+    Started,
+    /// Strict parsing, compilation, and private-bytecode verification succeeded.
+    Validated,
+    /// The provider output failed strict parsing or verification.
+    Invalid,
+    /// VM execution completed and returned an inert value.
+    Succeeded,
+    /// The attempt was abandoned for the approved direct fallback before an effect.
+    Fallback,
+    /// The attempt failed after validation.
+    Failed,
+    /// The attempt was cancelled.
+    Cancelled,
+    /// The attempt exceeded its deadline.
+    TimedOut,
+    /// The attempt exhausted a configured resource limit.
+    LimitReached,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

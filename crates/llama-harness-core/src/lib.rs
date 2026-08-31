@@ -37,8 +37,8 @@ pub use discovery::{
 pub use error::{HarnessError, ModelStreamFailureKind, RunError};
 pub use event::{
     EventRecord, EventSink, InMemoryEventSink, PlanLifecycleOutcome, PlanNodeOutcome, PlanPhase,
-    RunEvent, StrategyFallbackReason, StrategySelectionReason, ToolDiscoveryOutcome,
-    ToolDiscoverySelection,
+    ProgramLifecycleOutcome, RunEvent, StrategyFallbackReason, StrategySelectionReason,
+    ToolDiscoveryOutcome, ToolDiscoverySelection,
 };
 pub use limits::{AgentLimits, GenerationOptions};
 #[cfg(feature = "programmatic")]

@@ -1123,6 +1123,7 @@ impl<'a> StrategyRun<'a> {
                     ToolCaller::DeclarativePlan,
                     node.approval_barrier,
                     !node.result_bindings.is_empty(),
+                    None,
                     self.deadline,
                 )
                 .await;
@@ -1961,6 +1962,7 @@ impl<'a> StrategyRun<'a> {
                         ToolCaller::Direct,
                         false,
                         false,
+                        None,
                         self.deadline,
                     )
                     .await

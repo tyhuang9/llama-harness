@@ -64,6 +64,16 @@ pub struct ToolCallContext {
     pub call_id: String,
     /// Identifier of the registered tool.
     pub tool_id: String,
+    /// Caller class that owns this occurrence, when supplied by the broker.
+    pub caller: Option<ToolCaller>,
+    /// Program generation/repair attempt ordinal, when programmatic.
+    pub program_attempt: Option<u32>,
+    /// Static verified call-site ordinal, when programmatic.
+    pub static_call_site: Option<u32>,
+    /// Dynamic execution occurrence ordinal, when programmatic.
+    pub dynamic_ordinal: Option<u64>,
+    /// Stable occurrence-specific effect identity, when applicable.
+    pub effect_key: Option<String>,
 }
 
 impl ToolCallContext {
@@ -79,7 +89,28 @@ impl ToolCallContext {
             trace_id: trace_id.into(),
             call_id: call_id.into(),
             tool_id: tool_id.into(),
+            caller: None,
+            program_attempt: None,
+            static_call_site: None,
+            dynamic_ordinal: None,
+            effect_key: None,
         }
+    }
+
+    /// Binds explicit programmatic occurrence provenance to this context.
+    pub fn with_programmatic_occurrence(
+        mut self,
+        program_attempt: u32,
+        static_call_site: u32,
+        dynamic_ordinal: u64,
+        effect_key: impl Into<String>,
+    ) -> Self {
+        self.caller = Some(ToolCaller::Programmatic);
+        self.program_attempt = Some(program_attempt);
+        self.static_call_site = Some(static_call_site);
+        self.dynamic_ordinal = Some(dynamic_ordinal);
+        self.effect_key = Some(effect_key.into());
+        self
     }
 }
 

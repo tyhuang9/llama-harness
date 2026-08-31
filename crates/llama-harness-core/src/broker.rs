@@ -190,8 +190,10 @@ impl<'a> ToolBroker<'a> {
         caller: ToolCaller,
         approval_barrier: bool,
         defer_signature_checks: bool,
+        supplied_context: Option<ToolCallContext>,
         deadline: Option<Instant>,
     ) -> Result<PrepareOutcome, HarnessError> {
+        let mut call = call;
         check_stopped(
             &request.cancellation,
             deadline,
@@ -206,14 +208,6 @@ impl<'a> ToolBroker<'a> {
             return Ok(PrepareOutcome::Stop);
         }
         state.tool_calls += 1;
-
-        if !defer_signature_checks {
-            let mut recorded_call = self.call_for_transcript(request, &call, caller);
-            if caller == ToolCaller::Programmatic {
-                recorded_call.arguments_json = "{}".into();
-            }
-            result.tool_calls.push(recorded_call);
-        }
 
         if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
             self.reject(
@@ -255,6 +249,30 @@ impl<'a> ToolBroker<'a> {
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                 "tool arguments exceed JSON depth limit",
             )));
+        }
+        let canonical_arguments = serde_json::to_string(&arguments).map_err(|_| {
+            HarnessError::InvalidArguments("tool arguments could not be canonicalized".into())
+        })?;
+        if canonical_arguments.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
+            self.reject(
+                result,
+                events,
+                state,
+                &call,
+                "canonical tool arguments exceed byte limit".into(),
+            );
+            return Ok(PrepareOutcome::Rejected(ToolResult::failure(
+                "tool arguments exceed byte limit",
+            )));
+        }
+        call.arguments_json = canonical_arguments;
+
+        if !defer_signature_checks {
+            let mut recorded_call = self.call_for_transcript(request, &call, caller);
+            if caller == ToolCaller::Programmatic {
+                recorded_call.arguments_json = "{}".into();
+            }
+            result.tool_calls.push(recorded_call);
         }
 
         if !self.scope.contains(&call.tool_id) || self.scope.caller() != caller {
@@ -305,19 +323,60 @@ impl<'a> ToolBroker<'a> {
             )));
         }
 
-        let context = ToolCallContext::new(
-            result.id.clone(),
-            result.trace_id.clone(),
-            call.id.clone(),
-            call.tool_id.clone(),
-        );
+        let context = match supplied_context {
+            Some(context) => context,
+            None => {
+                let mut context = ToolCallContext::new(
+                    result.id.clone(),
+                    result.trace_id.clone(),
+                    call.id.clone(),
+                    call.tool_id.clone(),
+                );
+                context.caller = Some(caller);
+                context
+            }
+        };
+        if context.run_id != result.id
+            || context.trace_id != result.trace_id
+            || context.call_id != call.id
+            || context.tool_id != call.tool_id
+            || context.caller != Some(caller)
+        {
+            return Err(HarnessError::InvalidRequest(
+                "tool call context does not match the broker occurrence".into(),
+            ));
+        }
+        let has_programmatic_provenance = context.program_attempt.is_some()
+            || context.static_call_site.is_some()
+            || context.dynamic_ordinal.is_some()
+            || context.effect_key.is_some();
+        if caller == ToolCaller::Programmatic {
+            if context.program_attempt.is_none()
+                || context.static_call_site.is_none()
+                || context.dynamic_ordinal.is_none()
+                || context.effect_key.as_deref() != Some(call.id.as_str())
+            {
+                return Err(HarnessError::InvalidRequest(
+                    "programmatic tool context is missing occurrence provenance".into(),
+                ));
+            }
+        } else if has_programmatic_provenance {
+            return Err(HarnessError::InvalidRequest(
+                "non-programmatic tool context contains program occurrence provenance".into(),
+            ));
+        }
 
         let signature =
             (!defer_signature_checks).then(|| canonical_signature(&call.tool_id, &arguments));
         if let Some(signature) = &signature {
-            if let Some(recorded) =
-                self.reusable_effect(state, events, &call, tool.definition().read_only, signature)?
-            {
+            if let Some(recorded) = self.reusable_effect(
+                state,
+                events,
+                &call,
+                caller,
+                tool.definition().read_only,
+                signature,
+            )? {
                 return Ok(PrepareOutcome::Reused(recorded));
             }
             if !self.account_signature(request, result, state, signature) {
@@ -346,7 +405,7 @@ impl<'a> ToolBroker<'a> {
         let effect_key = if tool.definition().read_only {
             None
         } else if caller == ToolCaller::Programmatic {
-            Some(call.id.clone())
+            context.effect_key.clone()
         } else {
             signature.clone()
         };
@@ -421,6 +480,7 @@ impl<'a> ToolBroker<'a> {
             state,
             events,
             &prepared.call,
+            prepared.caller,
             prepared.tool.definition().read_only,
             &signature,
         )? {
@@ -494,10 +554,11 @@ impl<'a> ToolBroker<'a> {
         state: &mut BrokerState,
         events: &mut EventEmitter,
         call: &ToolCall,
+        caller: ToolCaller,
         read_only: bool,
         signature: &str,
     ) -> Result<Option<Arc<ToolResult>>, HarnessError> {
-        if !state.reuse_committed_effects || read_only {
+        if !state.reuse_committed_effects || read_only || caller == ToolCaller::Programmatic {
             return Ok(None);
         }
         match state.effects.get(signature) {
@@ -621,6 +682,27 @@ impl<'a> ToolBroker<'a> {
             deadline,
             "run deadline reached while waiting for tool concurrency",
         )?;
+        let current = self.tools.get(&prepared.call.tool_id).ok_or_else(|| {
+            HarnessError::InvalidTool("tool disappeared before invocation".into())
+        })?;
+        let canonical_arguments = serde_json::to_string(&prepared.arguments).map_err(|_| {
+            HarnessError::InvalidArguments(
+                "prepared tool arguments could not be canonicalized".into(),
+            )
+        })?;
+        let current_signature = canonical_signature(&prepared.call.tool_id, &prepared.arguments);
+        if !Arc::ptr_eq(&current, &prepared.tool)
+            || !self.scope.contains(&prepared.call.tool_id)
+            || self.scope.caller() != prepared.caller
+            || !prepared.tool.definition().allows_caller(prepared.caller)
+            || prepared.call.arguments_json != canonical_arguments
+            || prepared.signature.as_deref() != Some(current_signature.as_str())
+            || prepared.authorized_signature.as_deref() != Some(current_signature.as_str())
+        {
+            return Err(HarnessError::Policy(
+                "tool identity or bound authorization changed before invocation".into(),
+            ));
+        }
         let tool_cancellation = request.cancellation.child_token();
         let execution = prepared.tool.execute_with_context(
             &prepared.context,

@@ -25,5 +25,6 @@ pub use compiler::VerifiedProgram;
 pub use error::{SandboxError, SandboxErrorCode};
 pub use limits::{SandboxLimits, HARD_LIMITS};
 pub use vm::{
-    Execution, ExecutionId, ResumeToken, StepOutcome, ToolBatch, ToolRequest, ToolResponse,
+    Execution, ExecutionId, ExecutionMetrics, ResumeToken, StepOutcome, ToolBatch, ToolRequest,
+    ToolResponse,
 };

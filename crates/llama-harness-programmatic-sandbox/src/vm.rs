@@ -2,7 +2,11 @@ use crate::{
     compiler::{ExprCode, ExprInstruction, Instruction, VerifiedProgram},
     BinaryOperator, SandboxError, SandboxErrorCode, UnaryOperator,
 };
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use serde_json::{Map, Number, Value};
 
 /// Host-supplied identifier that scopes resume tokens to one live execution.
@@ -10,7 +14,7 @@ use serde_json::{Map, Number, Value};
 pub struct ExecutionId(pub u64);
 
 /// One inert, statically named tool request yielded by the sandbox.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ToolRequest {
     /// Host execution identity.
     pub execution_id: ExecutionId,
@@ -26,11 +30,35 @@ pub struct ToolRequest {
     pub arguments: Value,
 }
 
+impl core::fmt::Debug for ToolRequest {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ToolRequest")
+            .field("execution_id", &self.execution_id)
+            .field("program_attempt", &self.program_attempt)
+            .field("call_site", &self.call_site)
+            .field("dynamic_ordinal", &self.dynamic_ordinal)
+            .field("tool_id", &"<redacted>")
+            .field("arguments", &"<redacted>")
+            .finish()
+    }
+}
+
 /// One ordered batch of inert tool requests.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ToolBatch {
     calls: Vec<ToolRequest>,
     read_only_fan_out: bool,
+}
+
+impl core::fmt::Debug for ToolBatch {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ToolBatch")
+            .field("call_count", &self.calls.len())
+            .field("read_only_fan_out", &self.read_only_fan_out)
+            .finish()
+    }
 }
 
 impl ToolBatch {
@@ -49,7 +77,7 @@ impl ToolBatch {
 }
 
 /// One host-produced response corresponding to a yielded request occurrence.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ToolResponse {
     /// Static call-site ordinal copied from the request.
     pub call_site: u32,
@@ -59,6 +87,18 @@ pub struct ToolResponse {
     pub ok: bool,
     /// Owned JSON output. It remains inert data inside the VM.
     pub output: Value,
+}
+
+impl core::fmt::Debug for ToolResponse {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ToolResponse")
+            .field("call_site", &self.call_site)
+            .field("dynamic_ordinal", &self.dynamic_ordinal)
+            .field("ok", &self.ok)
+            .field("output", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ToolResponse {
@@ -91,7 +131,7 @@ pub struct ResumeToken {
 }
 
 /// Result of one bounded scheduling slice.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 #[non_exhaustive]
 pub enum StepOutcome {
     /// The slice budget was consumed without completing or yielding a tool batch.
@@ -107,11 +147,45 @@ pub enum StepOutcome {
     Complete(Value),
 }
 
+impl core::fmt::Debug for StepOutcome {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Sliced => formatter.write_str("Sliced"),
+            Self::Yielded { batch, resume } => formatter
+                .debug_struct("Yielded")
+                .field("batch", batch)
+                .field("resume", resume)
+                .finish(),
+            Self::Complete(_) => formatter.write_str("Complete(<redacted>)"),
+        }
+    }
+}
+
+/// Aggregate, value-free execution counters safe for host telemetry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionMetrics {
+    /// Fuel charged before deterministic work.
+    pub fuel_used: u64,
+    /// Number of suspended tool batches.
+    pub yields: u32,
+    /// Number of branch decisions executed.
+    pub branches: u64,
+    /// Number of bounded loop iterations entered.
+    pub loop_iterations: u64,
+    /// Number of read-only fan-out batches yielded.
+    pub fanout_batches: u32,
+    /// Conservatively retained value bytes.
+    pub retained_bytes: usize,
+    /// Cumulative value bytes charged.
+    pub cumulative_bytes: usize,
+}
+
 struct LoopFrame {
     items: Vec<Value>,
     index: usize,
     item_slot: usize,
     body_target: usize,
+    body_slots: Vec<usize>,
 }
 
 enum Work {
@@ -174,6 +248,9 @@ pub struct Execution {
     dynamic_ordinal: u64,
     live_bytes: usize,
     cumulative_bytes: usize,
+    branches: u64,
+    loop_iterations: u64,
+    fanout_batches: u32,
     terminal: bool,
 }
 
@@ -209,8 +286,24 @@ impl Execution {
             dynamic_ordinal: 0,
             live_bytes: 0,
             cumulative_bytes: 0,
+            branches: 0,
+            loop_iterations: 0,
+            fanout_batches: 0,
             terminal: false,
         })
+    }
+
+    /// Returns aggregate value-free counters for this live execution.
+    pub const fn metrics(&self) -> ExecutionMetrics {
+        ExecutionMetrics {
+            fuel_used: self.fuel_used,
+            yields: self.yields,
+            branches: self.branches,
+            loop_iterations: self.loop_iterations,
+            fanout_batches: self.fanout_batches,
+            retained_bytes: self.live_bytes,
+            cumulative_bytes: self.cumulative_bytes,
+        }
     }
 
     /// Advances execution by at most `slice_fuel` deterministic work units.
@@ -256,6 +349,7 @@ impl Execution {
                     condition,
                     false_target,
                 } => {
+                    self.branches = self.branches.saturating_add(1);
                     let condition = expect_bool(self.eval(&condition)?, "branch condition")?;
                     self.pc = if condition { self.pc + 1 } else { false_target };
                 }
@@ -274,37 +368,57 @@ impl Execution {
                         self.pc = end_target;
                         continue;
                     }
-                    self.precharge_value_slice(&items)?;
+                    self.precharge_bytes(serialized_array_len(&items)?)?;
+                    self.precharge_value(&items[0])?;
                     self.locals[item_slot] = Some(items[0].clone());
+                    self.loop_iterations = self.loop_iterations.saturating_add(1);
                     self.loops
                         .try_reserve(1)
                         .map_err(|_| resource("control stack allocation failed"))?;
                     if self.loops.len() >= self.program.limits.max_control_stack {
                         return Err(resource("control stack limit exceeded"));
                     }
+                    let body_slots = loop_body_slots(&self.program.code, self.pc + 1, end_target)?;
                     self.loops.push(LoopFrame {
                         items,
                         index: 0,
                         item_slot,
                         body_target: self.pc + 1,
+                        body_slots,
                     });
                     self.pc += 1;
                 }
                 Instruction::LoopNext { body_target } => {
-                    let frame = self
-                        .loops
-                        .last_mut()
-                        .ok_or_else(|| execution("loop stack underflow"))?;
-                    if frame.body_target != body_target {
-                        return Err(execution("loop frame target mismatch"));
-                    }
-                    frame.index += 1;
-                    if frame.index < frame.items.len() {
-                        self.locals[frame.item_slot] = Some(frame.items[frame.index].clone());
+                    let next = {
+                        let frame = self
+                            .loops
+                            .last_mut()
+                            .ok_or_else(|| execution("loop stack underflow"))?;
+                        if frame.body_target != body_target {
+                            return Err(execution("loop frame target mismatch"));
+                        }
+                        frame.index += 1;
+                        (frame.index < frame.items.len()).then(|| {
+                            (
+                                frame.item_slot,
+                                frame.items[frame.index].clone(),
+                                frame.body_slots.clone(),
+                            )
+                        })
+                    };
+                    if let Some((item_slot, item, body_slots)) = next {
+                        clear_loop_body_slots(&mut self.locals, &body_slots);
+                        self.loop_iterations = self.loop_iterations.saturating_add(1);
+                        self.precharge_value(&item)?;
+                        self.locals[item_slot] = Some(item);
                         self.pc = body_target;
                     } else {
+                        let frame = self
+                            .loops
+                            .pop()
+                            .ok_or_else(|| execution("loop stack underflow"))?;
+                        clear_loop_body_slots(&mut self.locals, &frame.body_slots);
                         self.locals[frame.item_slot] = None;
-                        self.loops.pop();
                         self.pc += 1;
                     }
                 }
@@ -321,6 +435,8 @@ impl Execution {
                         max_items,
                         self.program.limits.max_collection_items,
                     )?;
+                    self.precharge_bytes(serialized_array_syntax_len(items.len())?)?;
+                    self.precharge_bytes(serialized_array_len(&items)?)?;
                     let mut output = Vec::new();
                     output
                         .try_reserve(items.len())
@@ -347,6 +463,11 @@ impl Execution {
                         max_items,
                         self.program.limits.max_collection_items,
                     )?;
+                    // Reserve the worst-case serialized array framing before the
+                    // output vector grows. A filtered result may retain fewer
+                    // elements, so this is deliberately conservative.
+                    self.precharge_bytes(serialized_array_syntax_len(items.len())?)?;
+                    self.precharge_bytes(serialized_array_len(&items)?)?;
                     let mut output = Vec::new();
                     output
                         .try_reserve(items.len())
@@ -375,7 +496,9 @@ impl Execution {
                         max_items,
                         self.program.limits.max_collection_items,
                     )?;
+                    self.precharge_bytes(serialized_array_len(&items)?)?;
                     let accumulator = self.eval(&initial)?;
+                    self.precharge_value(&accumulator)?;
                     self.work = Some(Work::Reduce {
                         slot,
                         item_slot,
@@ -408,6 +531,7 @@ impl Execution {
                 } => {
                     let items = expect_array(self.eval(&collection)?, "fan-out collection")?;
                     validate_items(items.len(), max_calls, self.program.limits.max_fanout)?;
+                    self.precharge_bytes(serialized_array_len(&items)?)?;
                     let mut calls = Vec::new();
                     calls
                         .try_reserve(items.len())
@@ -425,9 +549,11 @@ impl Execution {
                 }
                 Instruction::Return { value } => {
                     let output = self.eval(&value)?;
-                    if value_size(&output)? > self.program.limits.max_output_bytes {
+                    let serialized_bytes = serialized_value_len(&output)?;
+                    if serialized_bytes > self.program.limits.max_output_bytes {
                         return Err(resource("output byte limit exceeded"));
                     }
+                    self.precharge_bytes(serialized_bytes)?;
                     self.terminal = true;
                     return Ok(StepOutcome::Complete(output));
                 }
@@ -457,31 +583,48 @@ impl Execution {
                 "response count does not match the yielded batch",
             ));
         }
+        if !pending.fan_out && responses.len() != 1 {
+            self.pending = Some(pending);
+            return Err(resume_error("single-call response is missing"));
+        }
+        if responses
+            .iter()
+            .zip(pending.requests.iter())
+            .any(|(response, expected)| (response.call_site, response.dynamic_ordinal) != *expected)
+        {
+            self.pending = Some(pending);
+            return Err(resume_error(
+                "response identity does not match yielded request order",
+            ));
+        }
+
         let mut values = Vec::new();
-        values
-            .try_reserve(responses.len())
-            .map_err(|_| resource("response allocation failed"))?;
+        if pending.fan_out {
+            self.precharge_bytes(serialized_array_syntax_len(responses.len())?)?;
+            values
+                .try_reserve(responses.len())
+                .map_err(|_| resource("response allocation failed"))?;
+        }
         for (response, expected) in responses.into_iter().zip(pending.requests.iter()) {
-            if (response.call_site, response.dynamic_ordinal) != *expected {
-                self.pending = Some(pending);
-                return Err(resume_error(
-                    "response identity does not match yielded request order",
-                ));
-            }
+            debug_assert_eq!(
+                (response.call_site, response.dynamic_ordinal),
+                *expected,
+                "response identity was prevalidated"
+            );
             self.precharge_value(&response.output)?;
+            self.precharge_bytes(response_object_syntax_len(response.ok)?)?;
             let mut object = Map::new();
             object.insert("ok".into(), Value::Bool(response.ok));
             object.insert("output".into(), response.output);
-            values.push(Value::Object(object));
+            if pending.fan_out {
+                values.push(Value::Object(object));
+            } else {
+                self.store_precharged(pending.slot, Value::Object(object))?;
+            }
         }
-        let stored = if pending.fan_out {
-            Value::Array(values)
-        } else {
-            values
-                .pop()
-                .ok_or_else(|| resume_error("single-call response is missing"))?
-        };
-        self.store(pending.slot, stored)?;
+        if pending.fan_out {
+            self.store_precharged(pending.slot, Value::Array(values))?;
+        }
         self.pc += 1;
         Ok(())
     }
@@ -502,7 +645,7 @@ impl Execution {
                 output,
             } => {
                 if *index == items.len() {
-                    self.store(*slot, Value::Array(core::mem::take(output)))?;
+                    self.store_precharged(*slot, Value::Array(core::mem::take(output)))?;
                     self.locals[*item_slot] = None;
                     self.pc += 1;
                     true
@@ -510,6 +653,7 @@ impl Execution {
                     advanced = false;
                     false
                 } else {
+                    self.precharge_value(&items[*index])?;
                     self.locals[*item_slot] = Some(items[*index].clone());
                     let mapped = self.eval(value)?;
                     self.precharge_value(&mapped)?;
@@ -527,7 +671,7 @@ impl Execution {
                 output,
             } => {
                 if *index == items.len() {
-                    self.store(*slot, Value::Array(core::mem::take(output)))?;
+                    self.store_precharged(*slot, Value::Array(core::mem::take(output)))?;
                     self.locals[*item_slot] = None;
                     self.pc += 1;
                     true
@@ -535,6 +679,7 @@ impl Execution {
                     advanced = false;
                     false
                 } else {
+                    self.precharge_value(&items[*index])?;
                     self.locals[*item_slot] = Some(items[*index].clone());
                     if expect_bool(self.eval(predicate)?, "filter predicate")? {
                         self.precharge_value(&items[*index])?;
@@ -563,9 +708,12 @@ impl Execution {
                     advanced = false;
                     false
                 } else {
+                    self.precharge_value(&items[*index])?;
+                    self.precharge_value(accumulator)?;
                     self.locals[*item_slot] = Some(items[*index].clone());
                     self.locals[*accumulator_slot] = Some(accumulator.clone());
                     *accumulator = self.eval(value)?;
+                    self.precharge_value(accumulator)?;
                     *index += 1;
                     false
                 }
@@ -587,6 +735,7 @@ impl Execution {
                     advanced = false;
                     false
                 } else {
+                    self.precharge_value(&items[*index])?;
                     self.locals[*item_slot] = Some(items[*index].clone());
                     let args = self.eval(arguments)?;
                     require_object(&args)?;
@@ -637,6 +786,9 @@ impl Execution {
         }
         let yield_ordinal = self.yields;
         self.yields += 1;
+        if fan_out {
+            self.fanout_batches = self.fanout_batches.saturating_add(1);
+        }
         let requests = calls
             .iter()
             .map(|call| (call.call_site, call.dynamic_ordinal))
@@ -666,6 +818,7 @@ impl Execution {
         arguments: Value,
     ) -> Result<ToolRequest, SandboxError> {
         self.precharge_value(&arguments)?;
+        self.precharge_bytes(tool_id.len())?;
         let dynamic_ordinal = self.dynamic_ordinal;
         self.dynamic_ordinal = self
             .dynamic_ordinal
@@ -769,29 +922,38 @@ impl Execution {
         Ok(())
     }
 
-    fn precharge_value(&mut self, value: &Value) -> Result<(), SandboxError> {
-        let bytes = value_size(value)?;
-        self.live_bytes = self
-            .live_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| resource("live byte limit exceeded"))?;
-        self.cumulative_bytes = self
-            .cumulative_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| resource("cumulative byte limit exceeded"))?;
-        if self.live_bytes > self.program.limits.max_live_bytes {
-            return Err(resource("live byte limit exceeded"));
+    /// Stores a composite whose values and JSON framing were charged before its
+    /// backing collection grew. This avoids charging host responses twice when
+    /// they are wrapped as inert VM results.
+    fn store_precharged(&mut self, slot: usize, value: Value) -> Result<(), SandboxError> {
+        if self.locals.get(slot).and_then(Option::as_ref).is_some() {
+            return Err(execution("immutable local was already initialized"));
         }
-        if self.cumulative_bytes > self.program.limits.max_cumulative_bytes {
-            return Err(resource("cumulative byte limit exceeded"));
-        }
+        self.locals[slot] = Some(value);
         Ok(())
     }
 
-    fn precharge_value_slice(&mut self, values: &[Value]) -> Result<(), SandboxError> {
-        for value in values {
-            self.precharge_value(value)?;
+    fn precharge_value(&mut self, value: &Value) -> Result<(), SandboxError> {
+        self.precharge_bytes(serialized_value_len(value)?)
+    }
+
+    fn precharge_bytes(&mut self, bytes: usize) -> Result<(), SandboxError> {
+        let live_bytes = self
+            .live_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| resource("live byte limit exceeded"))?;
+        let cumulative_bytes = self
+            .cumulative_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| resource("cumulative byte limit exceeded"))?;
+        if live_bytes > self.program.limits.max_live_bytes {
+            return Err(resource("live byte limit exceeded"));
         }
+        if cumulative_bytes > self.program.limits.max_cumulative_bytes {
+            return Err(resource("cumulative byte limit exceeded"));
+        }
+        self.live_bytes = live_bytes;
+        self.cumulative_bytes = cumulative_bytes;
         Ok(())
     }
 }
@@ -849,6 +1011,58 @@ fn validate_items(actual: usize, declared: usize, effective: usize) -> Result<()
         Err(resource("collection item limit exceeded"))
     } else {
         Ok(())
+    }
+}
+
+fn loop_body_slots(
+    code: &[Instruction],
+    body_target: usize,
+    end_target: usize,
+) -> Result<Vec<usize>, SandboxError> {
+    let end = end_target
+        .checked_sub(1)
+        .ok_or_else(|| execution("loop body target is invalid"))?;
+    let body = code
+        .get(body_target..end)
+        .ok_or_else(|| execution("loop body target is invalid"))?;
+    let mut slots = Vec::new();
+    slots
+        .try_reserve(body.len().saturating_mul(3))
+        .map_err(|_| resource("loop local tracking allocation failed"))?;
+    for instruction in body {
+        match instruction {
+            Instruction::Let { slot, .. }
+            | Instruction::Map { slot, .. }
+            | Instruction::Filter { slot, .. }
+            | Instruction::Invoke { slot, .. }
+            | Instruction::FanOut { slot, .. } => slots.push(*slot),
+            Instruction::LoopStart { item_slot, .. } => slots.push(*item_slot),
+            Instruction::Reduce {
+                slot,
+                item_slot,
+                accumulator_slot,
+                ..
+            } => {
+                slots.push(*slot);
+                slots.push(*item_slot);
+                slots.push(*accumulator_slot);
+            }
+            Instruction::Branch { .. }
+            | Instruction::Jump { .. }
+            | Instruction::LoopNext { .. }
+            | Instruction::Return { .. } => {}
+        }
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    Ok(slots)
+}
+
+fn clear_loop_body_slots(locals: &mut [Option<Value>], slots: &[usize]) {
+    for slot in slots {
+        if let Some(local) = locals.get_mut(*slot) {
+            *local = None;
+        }
     }
 }
 
@@ -944,41 +1158,72 @@ fn unary(operator: UnaryOperator, value: Value) -> Result<Value, SandboxError> {
     }
 }
 
-fn value_size(value: &Value) -> Result<usize, SandboxError> {
-    let mut total = 0usize;
-    let mut stack = Vec::from([value]);
-    while let Some(value) = stack.pop() {
-        let bytes = match value {
-            Value::Null => 4,
-            Value::Bool(_) => 5,
-            Value::Number(_) => 24,
-            Value::String(value) => value.len(),
-            Value::Array(values) => {
-                stack
-                    .try_reserve(values.len())
-                    .map_err(|_| resource("value sizing allocation failed"))?;
-                stack.extend(values);
-                values.len()
-            }
-            Value::Object(values) => {
-                stack
-                    .try_reserve(values.len())
-                    .map_err(|_| resource("value sizing allocation failed"))?;
-                let mut keys = 0usize;
-                for (key, value) in values {
-                    keys = keys
-                        .checked_add(key.len())
-                        .ok_or_else(|| resource("value byte limit exceeded"))?;
-                    stack.push(value);
+/// Exact compact JSON length without allocating a serialization buffer. This
+/// is the unit used for final output and value-retention accounting.
+fn serialized_value_len(value: &Value) -> Result<usize, SandboxError> {
+    match value {
+        Value::Null => Ok(4),
+        Value::Bool(true) => Ok(4),
+        Value::Bool(false) => Ok(5),
+        Value::Number(number) => Ok(number.to_string().len()),
+        Value::String(value) => serialized_string_len(value),
+        Value::Array(values) => serialized_array_len(values),
+        Value::Object(values) => {
+            let mut total = 2usize;
+            for (index, (key, value)) in values.iter().enumerate() {
+                if index > 0 {
+                    total = checked_bytes(total, 1)?;
                 }
-                keys
+                total = checked_bytes(total, serialized_string_len(key)?)?;
+                total = checked_bytes(total, 1)?;
+                total = checked_bytes(total, serialized_value_len(value)?)?;
             }
-        };
-        total = total
-            .checked_add(bytes)
-            .ok_or_else(|| resource("value byte limit exceeded"))?;
+            Ok(total)
+        }
+    }
+}
+
+fn serialized_array_len(values: &[Value]) -> Result<usize, SandboxError> {
+    let mut total = serialized_array_syntax_len(values.len())?;
+    for value in values {
+        total = checked_bytes(total, serialized_value_len(value)?)?;
     }
     Ok(total)
+}
+
+fn serialized_array_syntax_len(count: usize) -> Result<usize, SandboxError> {
+    checked_bytes(2, count.saturating_sub(1))
+}
+
+fn response_object_syntax_len(ok: bool) -> Result<usize, SandboxError> {
+    let mut total = 2usize;
+    total = checked_bytes(total, serialized_string_len("ok")?)?;
+    total = checked_bytes(total, 1)?;
+    total = checked_bytes(total, if ok { 4 } else { 5 })?;
+    total = checked_bytes(total, 1)?;
+    total = checked_bytes(total, serialized_string_len("output")?)?;
+    checked_bytes(total, 1)
+}
+
+fn serialized_string_len(value: &str) -> Result<usize, SandboxError> {
+    let mut total = 2usize;
+    for byte in value.bytes() {
+        total = checked_bytes(
+            total,
+            match byte {
+                b'"' | b'\\' => 2,
+                0x00..=0x1f => 6,
+                _ => 1,
+            },
+        )?;
+    }
+    Ok(total)
+}
+
+fn checked_bytes(total: usize, additional: usize) -> Result<usize, SandboxError> {
+    total
+        .checked_add(additional)
+        .ok_or_else(|| resource("value byte limit exceeded"))
 }
 
 fn resource(message: impl Into<String>) -> SandboxError {
@@ -1023,6 +1268,8 @@ mod tests {
             {"kind":"let","name":"xs","value":{"kind":"array","items":[
                 {"kind":"integer","value":1},{"kind":"integer","value":2},{"kind":"integer","value":3}
             ]}},
+            {"kind":"for_each","item":"loop_item","collection":{"kind":"variable","name":"xs"},"max_iterations":3,
+             "body":[{"kind":"let","name":"per_iteration","value":{"kind":"variable","name":"loop_item"}}]},
             {"kind":"map","name":"doubled","item":"i","collection":{"kind":"variable","name":"xs"},"max_items":3,
              "value":{"kind":"binary","operator":"multiply","left":{"kind":"variable","name":"i"},"right":{"kind":"integer","value":2}}},
             {"kind":"filter","name":"even","item":"i","collection":{"kind":"variable","name":"doubled"},"max_items":3,
@@ -1050,6 +1297,9 @@ mod tests {
             other => panic!("expected yield, got {other:?}"),
         };
         assert!(batch.requests_read_only_fan_out());
+        let debug = alloc::format!("{batch:?}");
+        assert!(!debug.contains("read.item"));
+        assert!(!debug.contains("safe"));
         assert_eq!(batch.calls().len(), 2);
         assert_eq!(batch.calls()[0].arguments, json!({"id":2}));
         assert_eq!(batch.calls()[1].arguments, json!({"id":1}));
@@ -1132,5 +1382,139 @@ mod tests {
             vm.step(100).unwrap_err().code(),
             SandboxErrorCode::Execution
         );
+    }
+
+    #[test]
+    fn output_and_value_accounting_are_exact_at_boundaries() {
+        fn compile_with(value: &str, max_output_bytes: usize) -> Execution {
+            let program = json!({"version":1,"body":[{"kind":"return","value":{"kind":"string","value":value}}]});
+            let limits = SandboxLimits {
+                max_output_bytes,
+                ..SandboxLimits::default()
+            };
+            let bytes = serde_json::to_vec(&program).unwrap();
+            let verified = Program::from_json(&bytes, &limits)
+                .unwrap()
+                .compile(&limits)
+                .unwrap();
+            Execution::new(verified, ExecutionId(22)).unwrap()
+        }
+
+        assert_eq!(
+            compile_with("1234", 7).step(100).unwrap(),
+            StepOutcome::Complete(json!("1234"))
+        );
+        assert_eq!(
+            compile_with("12345", 7).step(100).unwrap(),
+            StepOutcome::Complete(json!("12345"))
+        );
+        assert_eq!(
+            compile_with("123456", 7).step(100).unwrap_err().code(),
+            SandboxErrorCode::ResourceLimit
+        );
+
+        let response_program = json!({"version":1,"body":[
+            {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[]}},
+            {"kind":"return","value":{"kind":"variable","name":"result"}}
+        ]});
+        let response_output = json!({"ok":true,"output":"x"});
+        let expected = serialized_value_len(&json!({})).unwrap()
+            + "read".len()
+            + (serialized_value_len(&response_output).unwrap() * 2);
+        let build_response_vm = |limit| {
+            let limits = SandboxLimits {
+                max_live_bytes: limit,
+                max_cumulative_bytes: limit,
+                ..SandboxLimits::default()
+            };
+            let verified =
+                Program::from_json(&serde_json::to_vec(&response_program).unwrap(), &limits)
+                    .unwrap()
+                    .compile(&limits)
+                    .unwrap();
+            Execution::new(verified, ExecutionId(23)).unwrap()
+        };
+        let mut at_limit = build_response_vm(expected);
+        let (batch, token) = match at_limit.step(100).unwrap() {
+            StepOutcome::Yielded { batch, resume } => (batch, resume),
+            _ => unreachable!(),
+        };
+        at_limit
+            .resume(
+                token,
+                vec![ToolResponse::success(&batch.calls()[0], json!("x"))],
+            )
+            .unwrap();
+        assert!(matches!(
+            at_limit.step(100).unwrap(),
+            StepOutcome::Complete(_)
+        ));
+        assert_eq!(at_limit.metrics().cumulative_bytes, expected);
+
+        let mut below_limit = build_response_vm(expected - 1);
+        let (batch, token) = match below_limit.step(100).unwrap() {
+            StepOutcome::Yielded { batch, resume } => (batch, resume),
+            _ => unreachable!(),
+        };
+        below_limit
+            .resume(
+                token,
+                vec![ToolResponse::success(&batch.calls()[0], json!("x"))],
+            )
+            .unwrap();
+        assert_eq!(
+            below_limit.step(100).unwrap_err().code(),
+            SandboxErrorCode::ResourceLimit
+        );
+
+        let intermediate_program = json!({"version":1,"body":[
+            {"kind":"let","name":"xs","value":{"kind":"array","items":[{"kind":"string","value":"a"},{"kind":"string","value":"b"}]}},
+            {"kind":"map","name":"mapped","item":"item","collection":{"kind":"variable","name":"xs"},"max_items":2,"value":{"kind":"variable","name":"item"}},
+            {"kind":"return","value":{"kind":"variable","name":"mapped"}}
+        ]});
+        let build_intermediate_vm = |limit| {
+            let limits = SandboxLimits {
+                max_live_bytes: limit,
+                max_cumulative_bytes: limit,
+                ..SandboxLimits::default()
+            };
+            let verified =
+                Program::from_json(&serde_json::to_vec(&intermediate_program).unwrap(), &limits)
+                    .unwrap()
+                    .compile(&limits)
+                    .unwrap();
+            Execution::new(verified, ExecutionId(24)).unwrap()
+        };
+        let mut baseline = build_intermediate_vm(4 * 1024);
+        loop {
+            match baseline.step(1_024).unwrap() {
+                StepOutcome::Sliced => {}
+                StepOutcome::Complete(value) => {
+                    assert_eq!(value, json!(["a", "b"]));
+                    break;
+                }
+                StepOutcome::Yielded { .. } => unreachable!(),
+            }
+        }
+        let intermediate_limit = baseline.metrics().cumulative_bytes;
+        assert!(matches!(
+            run(build_intermediate_vm(intermediate_limit + 1)),
+            Value::Array(_)
+        ));
+        assert!(matches!(
+            run(build_intermediate_vm(intermediate_limit)),
+            Value::Array(_)
+        ));
+        let mut oversized = build_intermediate_vm(intermediate_limit - 1);
+        loop {
+            match oversized.step(1_024) {
+                Ok(StepOutcome::Sliced) => {}
+                Ok(_) => panic!("expected an intermediate resource limit"),
+                Err(error) => {
+                    assert_eq!(error.code(), SandboxErrorCode::ResourceLimit);
+                    break;
+                }
+            }
+        }
     }
 }

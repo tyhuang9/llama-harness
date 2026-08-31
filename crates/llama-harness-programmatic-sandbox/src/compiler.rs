@@ -2,15 +2,37 @@ use crate::{
     BinaryOperator, Expression, Program, SandboxError, SandboxErrorCode, SandboxLimits, Statement,
     UnaryOperator, PROGRAM_VERSION_V1,
 };
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    vec,
+    vec::Vec,
+};
 use serde_json::Value;
 
 /// An opaque, verified executable. Its bytecode is private and non-serializable.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VerifiedProgram {
     pub(crate) code: Vec<Instruction>,
     pub(crate) local_count: usize,
     pub(crate) limits: SandboxLimits,
+}
+
+impl core::fmt::Debug for VerifiedProgram {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("VerifiedProgram")
+            .field("instruction_count", &self.code.len())
+            .field("local_count", &self.local_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedProgram {
+    /// Returns the number of private verified top-level instructions.
+    pub fn instruction_count(&self) -> usize {
+        self.code.len()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -116,7 +138,10 @@ pub(crate) fn compile_program(
     if !matches!(compiler.code.last(), Some(Instruction::Return { .. })) {
         return Err(verify("program must end with a return statement"));
     }
-    compiler.verify()?;
+    // Deliberately verify the completed private bytecode rather than relying on
+    // the compiler's construction invariants. This is the last boundary before
+    // the VM receives an executable program.
+    verify_bytecode(&compiler.code, compiler.next_slot, limits)?;
     Ok(VerifiedProgram {
         code: compiler.code,
         local_count: compiler.next_slot,
@@ -456,61 +481,509 @@ impl Compiler {
             Ok(())
         }
     }
+}
 
-    fn verify(&self) -> Result<(), SandboxError> {
-        if self.code.len() + self.expression_instructions > self.limits.max_bytecode_instructions {
-            return Err(resource("bytecode instruction limit exceeded"));
-        }
-        for instruction in &self.code {
-            match instruction {
-                Instruction::Branch { false_target, .. }
-                | Instruction::Jump {
-                    target: false_target,
-                } if *false_target > self.code.len() => {
-                    return Err(verify("bytecode jump target is invalid"))
-                }
-                Instruction::LoopStart { end_target, .. } if *end_target > self.code.len() => {
-                    return Err(verify("bytecode loop target is invalid"))
-                }
-                Instruction::LoopNext { body_target } if *body_target >= self.code.len() => {
-                    return Err(verify("bytecode loop backedge is invalid"))
-                }
-                _ => {}
-            }
-        }
-        self.verify_all_paths_return()?;
-        Ok(())
+fn instruction_slots(instruction: &Instruction) -> Vec<usize> {
+    match instruction {
+        Instruction::Let { slot, .. }
+        | Instruction::Map { slot, .. }
+        | Instruction::Filter { slot, .. }
+        | Instruction::Invoke { slot, .. }
+        | Instruction::FanOut { slot, .. } => vec![*slot],
+        Instruction::LoopStart { item_slot, .. } => vec![*item_slot],
+        Instruction::Reduce {
+            slot,
+            item_slot,
+            accumulator_slot,
+            ..
+        } => vec![*slot, *item_slot, *accumulator_slot],
+        _ => Vec::new(),
+    }
+}
+
+/// Independently validates private compiler output before it is admitted to
+/// the VM. The verifier intentionally receives only bytecode, its local
+/// count, and immutable limits: it must not depend on compiler bookkeeping.
+fn verify_bytecode(
+    code: &[Instruction],
+    local_count: usize,
+    limits: &SandboxLimits,
+) -> Result<(), SandboxError> {
+    limits.validate()?;
+    if code.is_empty() {
+        return Err(verify("bytecode must not be empty"));
+    }
+    if local_count > limits.max_locals {
+        return Err(resource("local binding limit exceeded"));
     }
 
-    fn verify_all_paths_return(&self) -> Result<(), SandboxError> {
-        let mut pending = Vec::from([0usize]);
-        let mut visited = alloc::collections::BTreeSet::new();
-        while let Some(pc) = pending.pop() {
-            if pc == self.code.len() {
+    let mut call_sites = BTreeSet::new();
+    let mut loop_bodies = BTreeMap::new();
+    let mut expression_instructions = 0usize;
+    let mut constant_bytes = 0usize;
+
+    for (pc, instruction) in code.iter().enumerate() {
+        for slot in instruction_slots(instruction) {
+            if slot >= local_count {
+                return Err(verify("bytecode local slot is invalid"));
+            }
+        }
+        expression_instructions = expression_instructions
+            .checked_add(verify_instruction_expressions(
+                instruction,
+                limits,
+                &mut constant_bytes,
+            )?)
+            .ok_or_else(|| resource("bytecode instruction limit exceeded"))?;
+
+        match instruction {
+            Instruction::Branch { false_target, .. } => {
+                if *false_target <= pc || *false_target > code.len() {
+                    return Err(verify("bytecode branch target is invalid"));
+                }
+            }
+            Instruction::Jump { target } => {
+                if *target <= pc || *target > code.len() {
+                    return Err(verify("bytecode jump target is invalid"));
+                }
+            }
+            Instruction::LoopStart {
+                item_slot,
+                max_iterations,
+                end_target,
+                ..
+            } => {
+                if *max_iterations == 0 || *max_iterations > limits.max_loop_iterations {
+                    return Err(verify("bytecode loop bound is invalid"));
+                }
+                if *end_target <= pc + 1 || *end_target > code.len() {
+                    return Err(verify("bytecode loop target is invalid"));
+                }
+                let loop_next = code
+                    .get(end_target.saturating_sub(1))
+                    .ok_or_else(|| verify("bytecode loop target is invalid"))?;
+                if !matches!(loop_next, Instruction::LoopNext { body_target } if *body_target == pc + 1)
+                {
+                    return Err(verify("bytecode loop structure is invalid"));
+                }
+                if loop_bodies
+                    .insert(pc + 1, (*item_slot, *end_target))
+                    .is_some()
+                {
+                    return Err(verify("bytecode loop body is ambiguous"));
+                }
+            }
+            Instruction::LoopNext { body_target } => {
+                if *body_target >= pc || !loop_bodies.contains_key(body_target) {
+                    return Err(verify("bytecode loop backedge is invalid"));
+                }
+            }
+            Instruction::Map {
+                slot,
+                item_slot,
+                max_items,
+                ..
+            }
+            | Instruction::Filter {
+                slot,
+                item_slot,
+                max_items,
+                ..
+            } => {
+                if slot == item_slot {
+                    return Err(verify("bytecode collection local slots must differ"));
+                }
+                if *max_items == 0 || *max_items > limits.max_collection_items {
+                    return Err(verify("bytecode collection bound is invalid"));
+                }
+            }
+            Instruction::Reduce {
+                slot,
+                item_slot,
+                accumulator_slot,
+                max_items,
+                ..
+            } => {
+                if slot == item_slot || slot == accumulator_slot || item_slot == accumulator_slot {
+                    return Err(verify("bytecode reduce local slots must differ"));
+                }
+                if *max_items == 0 || *max_items > limits.max_collection_items {
+                    return Err(verify("bytecode collection bound is invalid"));
+                }
+            }
+            Instruction::Invoke {
+                tool_id, call_site, ..
+            }
+            | Instruction::FanOut {
+                tool_id, call_site, ..
+            } => {
+                verify_tool_id(tool_id)?;
+                if !call_sites.insert(*call_site) {
+                    return Err(verify("bytecode call sites must be unique"));
+                }
+                if let Instruction::FanOut {
+                    max_calls,
+                    slot,
+                    item_slot,
+                    ..
+                } = instruction
+                {
+                    if slot == item_slot {
+                        return Err(verify("bytecode fan-out local slots must differ"));
+                    }
+                    if *max_calls == 0 || *max_calls > limits.max_fanout {
+                        return Err(verify("bytecode fan-out bound is invalid"));
+                    }
+                }
+            }
+            Instruction::Let { .. } | Instruction::Return { .. } => {}
+        }
+    }
+    if code
+        .len()
+        .checked_add(expression_instructions)
+        .filter(|count| *count <= limits.max_bytecode_instructions)
+        .is_none()
+    {
+        return Err(resource("bytecode instruction limit exceeded"));
+    }
+
+    verify_definite_local_initialization(code, local_count, &loop_bodies)?;
+    Ok(())
+}
+
+fn verify_instruction_expressions(
+    instruction: &Instruction,
+    limits: &SandboxLimits,
+    constant_bytes: &mut usize,
+) -> Result<usize, SandboxError> {
+    let mut total = 0usize;
+    for expression in instruction_expressions(instruction) {
+        verify_expression(&expression.0, limits.max_operand_stack)?;
+        total = total
+            .checked_add(expression.0.len())
+            .ok_or_else(|| resource("bytecode instruction limit exceeded"))?;
+        for opcode in &expression.0 {
+            match opcode {
+                ExprInstruction::Constant(value) => {
+                    verify_constant(value, 1, limits, constant_bytes)?;
+                }
+                ExprInstruction::Path(pointer) => {
+                    verify_pointer(pointer)?;
+                    add_constant_bytes(constant_bytes, pointer.len(), limits)?;
+                }
+                ExprInstruction::Array(count) if *count > limits.max_collection_items => {
+                    return Err(resource("bytecode array size exceeds the effective limit"));
+                }
+                ExprInstruction::Object(keys) => {
+                    if keys.len() > limits.max_collection_items {
+                        return Err(resource("bytecode object size exceeds the effective limit"));
+                    }
+                    let mut unique = BTreeSet::new();
+                    for key in keys {
+                        if key.is_empty() || key.len() > 256 || !unique.insert(key.as_str()) {
+                            return Err(verify("bytecode object keys are invalid"));
+                        }
+                        add_constant_bytes(constant_bytes, key.len(), limits)?;
+                    }
+                }
+                ExprInstruction::Load(_)
+                | ExprInstruction::Array(_)
+                | ExprInstruction::Binary(_)
+                | ExprInstruction::Unary(_) => {}
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn verify_definite_local_initialization(
+    code: &[Instruction],
+    local_count: usize,
+    loop_bodies: &BTreeMap<usize, (usize, usize)>,
+) -> Result<(), SandboxError> {
+    let mut loop_locals = BTreeMap::new();
+    for (body_target, (_, end_target)) in loop_bodies {
+        let mut locals = BTreeSet::new();
+        for instruction in &code[*body_target..end_target.saturating_sub(1)] {
+            for slot in instruction_slots(instruction) {
+                locals.insert(slot);
+            }
+        }
+        loop_locals.insert(*body_target, locals);
+    }
+
+    let mut states: Vec<Option<BTreeSet<usize>>> = vec![None; code.len()];
+    states[0] = Some(BTreeSet::new());
+    let mut pending = vec![0usize];
+    while let Some(pc) = pending.pop() {
+        let available = states[pc]
+            .clone()
+            .ok_or_else(|| verify("bytecode verifier state is invalid"))?;
+        let instruction = &code[pc];
+        verify_instruction_loads(instruction, &available, local_count)?;
+
+        let mut propagate = |target: usize, state: BTreeSet<usize>| -> Result<(), SandboxError> {
+            if target >= code.len() {
                 return Err(verify("every reachable control path must return"));
             }
-            if pc > self.code.len() || !visited.insert(pc) {
-                continue;
+            match &mut states[target] {
+                Some(existing) => {
+                    let intersection = existing
+                        .intersection(&state)
+                        .copied()
+                        .collect::<BTreeSet<_>>();
+                    if *existing != intersection {
+                        *existing = intersection;
+                        pending.push(target);
+                    }
+                }
+                None => {
+                    states[target] = Some(state);
+                    pending.push(target);
+                }
             }
-            match &self.code[pc] {
-                Instruction::Return { .. } => {}
-                Instruction::Branch { false_target, .. } => {
-                    pending.push(pc + 1);
-                    pending.push(*false_target);
+            Ok(())
+        };
+
+        match instruction {
+            Instruction::Return { .. } => {}
+            Instruction::Branch { false_target, .. } => {
+                propagate(pc + 1, available.clone())?;
+                propagate(*false_target, available)?;
+            }
+            Instruction::Jump { target } => propagate(*target, available)?,
+            Instruction::LoopStart {
+                item_slot,
+                end_target,
+                ..
+            } => {
+                if available.contains(item_slot) {
+                    return Err(verify("bytecode loop local is already initialized"));
                 }
-                Instruction::Jump { target } => pending.push(*target),
-                Instruction::LoopStart { end_target, .. } => {
-                    pending.push(pc + 1);
-                    pending.push(*end_target);
+                let mut body = available.clone();
+                body.insert(*item_slot);
+                propagate(pc + 1, body)?;
+                propagate(*end_target, available)?;
+            }
+            Instruction::LoopNext { body_target } => {
+                let (item_slot, _) = loop_bodies
+                    .get(body_target)
+                    .ok_or_else(|| verify("bytecode loop backedge is invalid"))?;
+                let locals = loop_locals
+                    .get(body_target)
+                    .ok_or_else(|| verify("bytecode loop locals are invalid"))?;
+                let mut next_body = available.clone();
+                for slot in locals {
+                    next_body.remove(slot);
                 }
-                Instruction::LoopNext { body_target } => {
-                    pending.push(*body_target);
-                    pending.push(pc + 1);
+                next_body.insert(*item_slot);
+                let mut after_loop = next_body.clone();
+                after_loop.remove(item_slot);
+                propagate(*body_target, next_body)?;
+                propagate(pc + 1, after_loop)?;
+            }
+            Instruction::Let { slot, .. }
+            | Instruction::Map { slot, .. }
+            | Instruction::Filter { slot, .. }
+            | Instruction::Reduce { slot, .. }
+            | Instruction::Invoke { slot, .. }
+            | Instruction::FanOut { slot, .. } => {
+                if available.contains(slot) {
+                    return Err(verify("bytecode immutable local is rebound"));
                 }
-                _ => pending.push(pc + 1),
+                let mut next = available;
+                next.insert(*slot);
+                propagate(pc + 1, next)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_instruction_loads(
+    instruction: &Instruction,
+    available: &BTreeSet<usize>,
+    local_count: usize,
+) -> Result<(), SandboxError> {
+    let verify_loads = |expression: &ExprCode, scope: &BTreeSet<usize>| {
+        for opcode in &expression.0 {
+            if let ExprInstruction::Load(slot) = opcode {
+                if *slot >= local_count || !scope.contains(slot) {
+                    return Err(verify(
+                        "bytecode local load is unavailable on this control-flow path",
+                    ));
+                }
             }
         }
         Ok(())
+    };
+    match instruction {
+        Instruction::Map {
+            item_slot,
+            collection,
+            value,
+            ..
+        } => {
+            verify_loads(collection, available)?;
+            let mut scoped = available.clone();
+            scoped.insert(*item_slot);
+            verify_loads(value, &scoped)
+        }
+        Instruction::Filter {
+            item_slot,
+            collection,
+            predicate,
+            ..
+        } => {
+            verify_loads(collection, available)?;
+            let mut scoped = available.clone();
+            scoped.insert(*item_slot);
+            verify_loads(predicate, &scoped)
+        }
+        Instruction::Reduce {
+            item_slot,
+            accumulator_slot,
+            collection,
+            initial,
+            value,
+            ..
+        } => {
+            verify_loads(collection, available)?;
+            verify_loads(initial, available)?;
+            let mut scoped = available.clone();
+            scoped.insert(*item_slot);
+            scoped.insert(*accumulator_slot);
+            verify_loads(value, &scoped)
+        }
+        Instruction::FanOut {
+            item_slot,
+            collection,
+            arguments,
+            ..
+        } => {
+            verify_loads(collection, available)?;
+            let mut scoped = available.clone();
+            scoped.insert(*item_slot);
+            verify_loads(arguments, &scoped)
+        }
+        _ => {
+            for expression in instruction_expressions(instruction) {
+                verify_loads(expression, available)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn verify_constant(
+    value: &Value,
+    depth: usize,
+    limits: &SandboxLimits,
+    constant_bytes: &mut usize,
+) -> Result<(), SandboxError> {
+    if depth > limits.max_nesting {
+        return Err(resource("bytecode constant nesting limit exceeded"));
+    }
+    match value {
+        Value::Null | Value::Bool(_) => Ok(()),
+        Value::Number(number) if number.as_i64().is_some() => Ok(()),
+        Value::Number(_) => Err(verify("bytecode constants must be signed integers")),
+        Value::String(value) => add_constant_bytes(constant_bytes, value.len(), limits),
+        Value::Array(values) => {
+            if values.len() > limits.max_collection_items {
+                return Err(resource(
+                    "bytecode constant array exceeds the effective limit",
+                ));
+            }
+            for value in values {
+                verify_constant(value, depth + 1, limits, constant_bytes)?;
+            }
+            Ok(())
+        }
+        Value::Object(values) => {
+            if values.len() > limits.max_collection_items {
+                return Err(resource(
+                    "bytecode constant object exceeds the effective limit",
+                ));
+            }
+            for (key, value) in values {
+                if key.is_empty() || key.len() > 256 {
+                    return Err(verify("bytecode constant object key is invalid"));
+                }
+                add_constant_bytes(constant_bytes, key.len(), limits)?;
+                verify_constant(value, depth + 1, limits, constant_bytes)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn verify_pointer(pointer: &str) -> Result<(), SandboxError> {
+    if pointer.len() > 1024 || (!pointer.is_empty() && !pointer.starts_with('/')) {
+        return Err(verify("bytecode JSON pointer is invalid"));
+    }
+    let bytes = pointer.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'~' {
+            index += 1;
+            if index == bytes.len() || !matches!(bytes[index], b'0' | b'1') {
+                return Err(verify("bytecode JSON pointer escape is invalid"));
+            }
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn verify_tool_id(tool_id: &str) -> Result<(), SandboxError> {
+    if tool_id.is_empty() || tool_id.len() > 256 {
+        return Err(verify("bytecode tool identifier is invalid"));
+    }
+    Ok(())
+}
+
+fn add_constant_bytes(
+    total: &mut usize,
+    bytes: usize,
+    limits: &SandboxLimits,
+) -> Result<(), SandboxError> {
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| resource("constant byte limit exceeded"))?;
+    if *total > limits.max_constant_bytes {
+        return Err(resource("constant byte limit exceeded"));
+    }
+    Ok(())
+}
+
+fn instruction_expressions(instruction: &Instruction) -> Vec<&ExprCode> {
+    match instruction {
+        Instruction::Let { value, .. } | Instruction::Return { value } => vec![value],
+        Instruction::Branch { condition, .. } => vec![condition],
+        Instruction::LoopStart { collection, .. } => vec![collection],
+        Instruction::Map {
+            collection, value, ..
+        } => vec![collection, value],
+        Instruction::Filter {
+            collection,
+            predicate,
+            ..
+        } => vec![collection, predicate],
+        Instruction::Reduce {
+            collection,
+            initial,
+            value,
+            ..
+        } => vec![collection, initial, value],
+        Instruction::Invoke { arguments, .. } => vec![arguments],
+        Instruction::FanOut {
+            collection,
+            arguments,
+            ..
+        } => vec![collection, arguments],
+        Instruction::Jump { .. } | Instruction::LoopNext { .. } => Vec::new(),
     }
 }
 
@@ -604,5 +1077,73 @@ mod tests {
                 .code(),
             SandboxErrorCode::Verification
         );
+    }
+
+    #[test]
+    fn independent_verifier_rejects_private_tampering_without_public_bytecode() {
+        let limits = SandboxLimits::default();
+        let invalid_load = vec![Instruction::Return {
+            value: ExprCode(vec![ExprInstruction::Load(1)]),
+        }];
+        assert_eq!(
+            verify_bytecode(&invalid_load, 1, &limits)
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::Verification
+        );
+
+        let arguments = ExprCode(vec![ExprInstruction::Constant(Value::Object(
+            serde_json::Map::new(),
+        ))]);
+        let duplicate_sites = vec![
+            Instruction::Invoke {
+                slot: 0,
+                tool_id: "read".into(),
+                arguments: arguments.clone(),
+                call_site: 0,
+            },
+            Instruction::Invoke {
+                slot: 1,
+                tool_id: "read".into(),
+                arguments,
+                call_site: 0,
+            },
+            Instruction::Return {
+                value: ExprCode(vec![ExprInstruction::Load(1)]),
+            },
+        ];
+        assert_eq!(
+            verify_bytecode(&duplicate_sites, 2, &limits)
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::Verification
+        );
+
+        let invalid_destination = vec![Instruction::Let {
+            slot: 1,
+            value: ExprCode(vec![ExprInstruction::Constant(Value::Null)]),
+        }];
+        assert_eq!(
+            verify_bytecode(&invalid_destination, 1, &limits)
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::Verification
+        );
+
+        let invalid_jump = vec![Instruction::Jump { target: 0 }];
+        assert_eq!(
+            verify_bytecode(&invalid_jump, 0, &limits)
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::Verification
+        );
+    }
+
+    #[test]
+    fn verified_program_debug_output_never_contains_constants() {
+        let program = compile(br#"{"version":1,"body":[{"kind":"return","value":{"kind":"string","value":"CANARY_SECRET"}}]}"#).unwrap();
+        let debug = alloc::format!("{program:?}");
+        assert!(!debug.contains("CANARY_SECRET"));
+        assert!(debug.contains("instruction_count"));
     }
 }

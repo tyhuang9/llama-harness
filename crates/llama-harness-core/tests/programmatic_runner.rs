@@ -3,9 +3,10 @@
 use async_trait::async_trait;
 use llama_harness_core::{
     mock::{final_response, MockModelProvider},
-    AgentDefinition, AgentRunner, AllowAllPolicy, HarnessError, ModelCapabilities,
-    ProgrammaticConformance, ProgrammaticHostConfig, ProviderCapabilityLimits, RunRequest,
-    RunStatus, RunStrategy, Tool, ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    AgentDefinition, AgentRunner, AllowAllPolicy, HarnessError, InMemoryEventSink,
+    ModelCapabilities, ProgrammaticConformance, ProgrammaticHostConfig, ProviderCapabilityLimits,
+    RunEvent, RunRequest, RunStatus, RunStrategy, StrategyFallbackReason, Tool, ToolCaller,
+    ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
 };
 use serde_json::{json, Value};
 use std::sync::{
@@ -225,4 +226,38 @@ async fn invalid_program_gets_exactly_one_repair_before_dispatch() {
         .unwrap();
     assert!(matches!(result.status, RunStatus::Completed));
     assert_eq!(provider.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn invalid_repaired_program_falls_back_once_to_fresh_direct_scope_before_effects() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response("not json"),
+            final_response("still not json"),
+            final_response("direct fallback"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let events = Arc::new(InMemoryEventSink::default());
+    let runner = AgentRunner::builder(provider.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .event_sink(events.clone())
+        .build();
+
+    let result = runner
+        .run_with_strategy(request(&[]), RunStrategy::Programmatic)
+        .await
+        .unwrap();
+    assert!(matches!(result.status, RunStatus::Completed));
+    assert_eq!(result.final_output.as_deref(), Some("direct fallback"));
+    assert_eq!(provider.requests().len(), 3);
+    assert!(events.events().iter().any(|record| {
+        matches!(
+            record.event,
+            RunEvent::StrategyFallback {
+                reason: StrategyFallbackReason::InvalidProgram,
+                ..
+            }
+        )
+    }));
 }

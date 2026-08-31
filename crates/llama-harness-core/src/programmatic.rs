@@ -1,21 +1,27 @@
 use crate::{
     broker::{BrokerState, PrepareOutcome, PreparedCall, ToolBroker},
     discovery::{ToolScope, ToolScopeSelection},
-    event::{EventEmitter, RunEvent, StrategySelectionReason},
+    event::{EventEmitter, ProgramLifecycleOutcome, RunEvent, StrategySelectionReason},
     runner::{
         apply_terminal_error, await_guarded, check_stopped, emit_discovery, ensure_transcript,
         initial_messages, merge_generation, provider_deadline, validate_model_response,
-        validate_output, RunPreflight,
+        validate_output, DirectStrategyEvents, RunPreflight,
     },
     AgentRunner, HarnessError, Message, ModelRequest, ModelResponse, ProgrammaticConformance,
-    RunRequest, RunResult, RunStatus, RunStrategy, ToolCall, ToolCaller, ToolResult,
+    RunRequest, RunResult, RunStatus, RunStrategy, StrategyFallbackReason, ToolCall,
+    ToolCallContext, ToolCaller, ToolResult,
 };
 use futures_util::future::join_all;
 use llama_harness_programmatic_sandbox::{
     Execution, ExecutionId, Program, SandboxErrorCode, SandboxLimits, StepOutcome, ToolBatch,
     ToolResponse,
 };
-use std::{sync::Arc, time::Duration};
+use serde::Serialize;
+use serde_json::Value;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant as StdInstant},
+};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -28,6 +34,20 @@ const MAX_FANOUT_CONCURRENCY: usize = 8;
 const PROGRAM_PROMPT: &str = r#"Return only a strict llama-harness program JSON object. Use version 1 and a body array. Statements are let, branch, for_each, map, filter, reduce, invoke, fan_out, and return. Expressions are null, boolean, integer, string, variable, path, array, object, binary, and unary. Tool IDs in invoke/fan_out must be static IDs from the supplied catalog. All loops and collections require explicit bounded limits. Do not use markdown, floats, dynamic tool names, code strings, imports, functions, recursion, mutation, reflection, exceptions, regex, or prose."#;
 
 const REPAIR_PROMPT: &str = "The previous program failed strict structural verification. Return one corrected version-1 program JSON object only. Do not add markdown or prose.";
+
+#[derive(Serialize)]
+struct ProgrammaticTranscriptEntry {
+    tool_id: String,
+    arguments: Value,
+    ok: bool,
+    output: Value,
+}
+
+#[derive(Serialize)]
+struct ProgrammaticSynthesisInput<'a> {
+    program_return: &'a Value,
+    broker_calls: &'a [ProgrammaticTranscriptEntry],
+}
 
 /// Explicit host opt-in and resource bounds for programmatic execution.
 #[derive(Clone, Debug)]
@@ -206,6 +226,7 @@ impl AgentRunner {
         let mut repair_calls = 0u32;
         let mut synthesis_calls = 0u32;
         let mut broker_state = BrokerState::default();
+        let mut broker_transcript = Vec::new();
         let broker = ToolBroker::new(
             &self.tools,
             &scope,
@@ -214,6 +235,7 @@ impl AgentRunner {
             &self.concurrency,
         );
         let mut dispatched = false;
+        let mut invalid_program_exhausted = false;
         let terminal = async {
             let mut generation_messages = initial_messages(&request);
             generation_messages.push(Message::system(PROGRAM_PROMPT));
@@ -221,6 +243,10 @@ impl AgentRunner {
 
             let mut program_attempt = 0u32;
             let verified = loop {
+                events.emit(RunEvent::ProgramLifecycle {
+                    attempt: program_attempt.saturating_add(1),
+                    outcome: ProgramLifecycleOutcome::Started,
+                });
                 let response = self
                     .programmatic_completion(
                         &request,
@@ -240,26 +266,53 @@ impl AgentRunner {
                 let source = response.final_output.as_deref().ok_or_else(|| {
                     HarnessError::InvalidOutput("provider returned no program".into())
                 });
+                let mut statement_count = 0u32;
                 let compiled = source.and_then(|source| {
                     Program::from_json(source.as_bytes(), &limits)
-                        .and_then(|program| program.compile(&limits))
+                        .and_then(|program| {
+                            statement_count = program.body.len().min(u32::MAX as usize) as u32;
+                            program.compile(&limits)
+                        })
                         .map_err(sandbox_error)
                 });
                 match compiled {
-                    Ok(program) => break program,
-                    Err(_error) if program_attempt == 0 && model_calls + 1 < request.agent.limits.max_model_calls => {
+                    Ok(program) => {
+                        events.emit(RunEvent::ProgramLifecycle {
+                            attempt: program_attempt.saturating_add(1),
+                            outcome: ProgramLifecycleOutcome::Validated,
+                        });
+                        events.emit(RunEvent::ProgramValidated {
+                            attempt: program_attempt.saturating_add(1),
+                            statement_count,
+                            instruction_count: program.instruction_count().min(u32::MAX as usize)
+                                as u32,
+                        });
+                        break program;
+                    }
+                    Err(_error)
+                        if program_attempt == 0
+                            && model_calls < request.agent.limits.max_model_calls =>
+                    {
                         program_attempt = 1;
                         generation_messages.push(Message::assistant(response.final_output.unwrap_or_default()));
                         generation_messages.push(Message::system(REPAIR_PROMPT));
                         ensure_transcript(&generation_messages, &request.agent.limits)?;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        events.emit(RunEvent::ProgramLifecycle {
+                            attempt: program_attempt.saturating_add(1),
+                            outcome: ProgramLifecycleOutcome::Invalid,
+                        });
+                        invalid_program_exhausted = program_attempt == 1;
+                        return Err(error);
+                    }
                 }
             };
 
             let execution_number = execution_id(&run_id);
             let mut vm = Execution::with_attempt(verified, ExecutionId(execution_number), program_attempt)
                 .map_err(sandbox_error)?;
+            let vm_started = StdInstant::now();
             let program_output = loop {
                 check_stopped(&request.cancellation, deadline, "programmatic run deadline reached")?;
                 match vm.step(limits.max_slice_fuel).map_err(sandbox_error)? {
@@ -276,6 +329,7 @@ impl AgentRunner {
                                 &batch,
                                 deadline,
                                 &mut dispatched,
+                                &mut broker_transcript,
                             )
                             .await?;
                         vm.resume(resume, responses).map_err(sandbox_error)?;
@@ -287,13 +341,30 @@ impl AgentRunner {
                     }
                 }
             };
+            let metrics = vm.metrics();
+            events.emit(RunEvent::ProgramLifecycle {
+                attempt: program_attempt.saturating_add(1),
+                outcome: ProgramLifecycleOutcome::Succeeded,
+            });
+            events.emit(RunEvent::ProgramExecutionCompleted {
+                attempt: program_attempt.saturating_add(1),
+                fuel_used: metrics.fuel_used,
+                branches: metrics.branches,
+                loop_iterations: metrics.loop_iterations,
+                fanout_batches: metrics.fanout_batches,
+                partial_failures: broker_state.tool_failed.saturating_add(broker_state.tool_cancelled),
+                peak_accounted_bytes: metrics.retained_bytes as u64,
+                duration_ms: vm_started.elapsed().as_millis() as u64,
+            });
 
-            let output_json = serde_json::to_string(&program_output).map_err(|_| {
-                HarnessError::InvalidOutput("program output could not be serialized".into())
-            })?;
+            let output_json = serde_json::to_string(&ProgrammaticSynthesisInput {
+                program_return: &program_output,
+                broker_calls: &broker_transcript,
+            })
+            .map_err(|_| HarnessError::InvalidOutput("program synthesis input could not be serialized".into()))?;
             let mut synthesis_messages = initial_messages(&request);
             synthesis_messages.push(Message::system(
-                "A verified program completed. Produce the final answer using only the inert JSON result in the next user message.",
+                "A verified program completed. Produce the final answer using only the inert program return and broker-audited tool transcript in the next user message.",
             ));
             synthesis_messages.push(Message::user(output_json));
             ensure_transcript(&synthesis_messages, &request.agent.limits)?;
@@ -329,6 +400,24 @@ impl AgentRunner {
         .await;
 
         drop(admission);
+        if invalid_program_exhausted && !dispatched && broker_state.tool_issued == 0 {
+            events.emit(RunEvent::ProgramLifecycle {
+                attempt: repair_calls.saturating_add(1),
+                outcome: ProgramLifecycleOutcome::Fallback,
+            });
+            return self
+                .run_direct(
+                    request,
+                    Some(DirectStrategyEvents {
+                        requested: RunStrategy::Programmatic,
+                        reason: StrategySelectionReason::Forced,
+                        fallback: Some(StrategyFallbackReason::InvalidProgram),
+                        prior_discovery: None,
+                    }),
+                    preflight,
+                )
+                .await;
+        }
         if let Err(error) = terminal {
             if dispatched {
                 apply_terminal_error(
@@ -434,6 +523,7 @@ impl AgentRunner {
         batch: &ToolBatch,
         deadline: Option<Instant>,
         dispatched: &mut bool,
+        transcript: &mut Vec<ProgrammaticTranscriptEntry>,
     ) -> Result<Vec<ToolResponse>, HarnessError> {
         let mut prepared: Vec<(usize, Box<PreparedCall>)> = Vec::new();
         let mut responses: Vec<Option<ToolResponse>> = vec![None; batch.calls().len()];
@@ -458,6 +548,18 @@ impl AgentRunner {
                     )
                 })?,
             );
+            let context = ToolCallContext::new(
+                result.id.clone(),
+                result.trace_id.clone(),
+                call.id.clone(),
+                call.tool_id.clone(),
+            )
+            .with_programmatic_occurrence(
+                request_call.program_attempt,
+                request_call.call_site,
+                request_call.dynamic_ordinal,
+                call.id.clone(),
+            );
             match broker
                 .prepare(
                     request,
@@ -468,16 +570,34 @@ impl AgentRunner {
                     ToolCaller::Programmatic,
                     false,
                     false,
+                    Some(context),
                     deadline,
                 )
                 .await?
             {
                 PrepareOutcome::Ready(call) => prepared.push((index, call)),
-                PrepareOutcome::Rejected(_) | PrepareOutcome::Stop => {
+                PrepareOutcome::Rejected(_) => {
                     responses[index] = Some(ToolResponse::failure(request_call));
+                    transcript.push(ProgrammaticTranscriptEntry {
+                        tool_id: request_call.tool_id.clone(),
+                        arguments: request_call.arguments.clone(),
+                        ok: false,
+                        output: Value::Null,
+                    });
+                }
+                PrepareOutcome::Stop => {
+                    return Err(HarnessError::ResourceLimit(
+                        "programmatic batch exhausted the tool call budget before dispatch".into(),
+                    ));
                 }
                 PrepareOutcome::Reused(value) => {
                     responses[index] = Some(tool_response(request_call, value.as_ref()));
+                    transcript.push(ProgrammaticTranscriptEntry {
+                        tool_id: request_call.tool_id.clone(),
+                        arguments: request_call.arguments.clone(),
+                        ok: value.ok,
+                        output: value.output.clone(),
+                    });
                 }
             }
         }
@@ -491,16 +611,30 @@ impl AgentRunner {
                 "programmatic fan-out requires read-only, parallel-safe tools".into(),
             ));
         }
-        if batch.requests_read_only_fan_out()
-            && prepared.len()
-                > self
-                    .programmatic
-                    .as_ref()
-                    .map_or(0, |config| config.max_fanout_concurrency)
-        {
-            return Err(HarnessError::ResourceLimit(
-                "programmatic fan-out concurrency limit exceeded".into(),
-            ));
+        if batch.requests_read_only_fan_out() {
+            let capabilities = self.provider.capabilities();
+            let provider_parallel = capabilities
+                .supports_parallel_tool_calls
+                .then_some(capabilities.limits.max_parallel_tool_calls)
+                .flatten()
+                .filter(|limit| *limit > 0)
+                .ok_or_else(|| {
+                    HarnessError::UnsupportedCapability(
+                        "programmatic fan-out requires a nonzero provider parallel-call limit"
+                            .into(),
+                    )
+                })? as usize;
+            let effective = self
+                .programmatic
+                .as_ref()
+                .map_or(0, |config| config.max_fanout_concurrency)
+                .min(provider_parallel)
+                .min(batch.calls().len().min(MAX_FANOUT_CONCURRENCY));
+            if prepared.len() > effective {
+                return Err(HarnessError::ResourceLimit(
+                    "programmatic fan-out exceeds the effective concurrency limit".into(),
+                ));
+            }
         }
 
         for (_, call) in &prepared {
@@ -569,6 +703,12 @@ impl AgentRunner {
             });
             broker.record_execution(state, call, &execution);
             responses[*index] = Some(tool_response(request_call, execution.result.as_ref()));
+            transcript.push(ProgrammaticTranscriptEntry {
+                tool_id: call.call.tool_id.clone(),
+                arguments: call.arguments.clone(),
+                ok: true,
+                output: execution.result.output.clone(),
+            });
         }
         if let Some(error) = first_execution_error {
             return Err(error);

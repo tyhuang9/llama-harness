@@ -52,7 +52,11 @@ pub struct SandboxLimits {
     pub max_yields: usize,
     /// Maximum calls in one read-only fan-out batch.
     pub max_fanout: usize,
-    /// Maximum live VM-owned bytes.
+    /// Maximum conservatively retained VM-owned bytes.
+    ///
+    /// The VM may retain a charge until execution ends even after a scoped
+    /// value is no longer reachable. This fail-closed accounting makes the
+    /// bound deterministic and can reject earlier than exact heap liveness.
     pub max_live_bytes: usize,
     /// Maximum cumulatively allocated VM-owned bytes.
     pub max_cumulative_bytes: usize,
