@@ -85,6 +85,11 @@ select Programmatic.
 
 For every Programmatic case, assert the existing tool-sequence, exact canonical
 argument, policy/approval, cancellation, limit, and final-state expectations.
+The repository acceptance matrix executes those cases through a fresh real
+`AgentRunner` with deterministic provider, tool, policy, and approval fixtures;
+it never constructs a `RunResult` or safety metric by hand. Include repair,
+pre-dispatch fallback, capability downgrade, and an Adaptive-never-Programmatic
+case alongside Direct, declarative-plan, and Programmatic comparisons.
 Add privacy canaries that prove lifecycle events, SQLite export, errors, and
 debug formatting omit program source, AST, bytecode, constants, locals,
 arguments, and tool results. Evaluation artifacts retain only the explicit

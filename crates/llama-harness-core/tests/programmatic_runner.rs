@@ -10,6 +10,7 @@ use llama_harness_core::{
     ToolResult, ToolRisk, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
     HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
 };
+use llama_harness_programmatic_sandbox::HARD_LIMITS;
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
@@ -1084,6 +1085,19 @@ async fn each_programmatic_byte_cap_winner_enforces_n_minus_one_n_and_n_plus_one
                 } else {
                     HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES
                 };
+            if matches!(winner, Winner::Library) {
+                // At the immutable 256 KiB program ceiling, the deliberately
+                // rejected N+1 response must still fit in the repair
+                // transcript and literal-retention accounting. Raise only
+                // those unrelated limits so this test exercises the effective
+                // program-byte boundary.
+                let repair_transcript_cap = (cap as u64).saturating_mul(4);
+                run_request.agent.limits.max_input_bytes = repair_transcript_cap;
+                run_request.agent.limits.max_request_payload_bytes = repair_transcript_cap;
+                host.limits.max_constant_bytes = HARD_LIMITS.max_constant_bytes;
+                host.limits.max_fuel = HARD_LIMITS.max_fuel;
+                host.limits.max_slice_fuel = HARD_LIMITS.max_slice_fuel;
+            }
             let provider_cap = if matches!(winner, Winner::Provider) {
                 cap as u64
             } else {

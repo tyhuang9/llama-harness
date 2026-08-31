@@ -1946,6 +1946,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 

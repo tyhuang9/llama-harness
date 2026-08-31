@@ -23,5 +23,7 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+llama-harness-core = { version = "0.1.0", path = "../llama-harness-core", features = ["programmatic"] }
 llama-harness-observability = { version = "0.1.0", path = "../llama-harness-observability" }
 tokio = { version = "1", features = ["macros", "rt"] }
+tokio-util = "0.7"

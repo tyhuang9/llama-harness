@@ -32,11 +32,22 @@ cases:
     input: Read then approve a write.
     expected: {status: completed, required_tools: [read, write], required_approval_tools: [write], max_model_calls: 2, max_tool_calls: 2}
   - id: partial-failure
+    strategy: direct
     fixture: {id: partial-failure, data: {scenario: partial-failure, tools: [read, read], partial_failure: true}}
     input: Collect a bounded partial read failure.
     expected: {status: completed, required_tools: [read], max_model_calls: 2, max_tool_calls: 2}
+  - id: repair
+    strategy: programmatic
+    fixture: {id: repair, data: {scenario: repair, tools: []}}
+    input: Repair one invalid program before execution.
+    expected: {status: completed, max_model_calls: 3, max_tool_calls: 0}
+  - id: fallback
+    strategy: programmatic
+    fixture: {id: fallback, data: {scenario: fallback, tools: [read]}}
+    input: Fall back to Direct after invalid program repair fails.
+    expected: {status: completed, required_tools: [read], max_model_calls: 4, max_tool_calls: 1}
   - id: capability-downgrade
     strategy: direct
     fixture: {id: capability-downgrade, data: {scenario: capability-downgrade, tools: [read], programmatic_available: false}}
     input: Safely run after Programmatic capability downgrade.
-    expected: {status: completed, required_tools: [read], max_model_calls: 1, max_tool_calls: 1}
+    expected: {status: completed, required_tools: [read], max_model_calls: 2, max_tool_calls: 1}
