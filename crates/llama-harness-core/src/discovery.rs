@@ -37,6 +37,7 @@ pub(crate) const MAX_PREPARED_CATALOG_CACHE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_DEFERRED_LEXICAL_TERMS: usize = 256;
 pub(crate) const MAX_DEFERRED_LEXICAL_BYTES: usize = 1024;
 const TREE_NODE_OVERHEAD: usize = 4 * std::mem::size_of::<usize>();
+const ARC_ALLOCATION_OVERHEAD: usize = 2 * std::mem::size_of::<usize>();
 
 /// Whether a registered tool is always exposed or selected only when relevant.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -318,6 +319,7 @@ impl CatalogCacheKey {
 
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            .saturating_add(ARC_ALLOCATION_OVERHEAD)
             .saturating_add(
                 self.tools
                     .len()
@@ -442,6 +444,7 @@ impl PreparedCatalogKey {
 
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            .saturating_add(ARC_ALLOCATION_OVERHEAD)
             .saturating_add(
                 self.0
                     .len()
@@ -631,6 +634,7 @@ impl CatalogIndex {
                 )
         });
         std::mem::size_of::<Self>()
+            .saturating_add(ARC_ALLOCATION_OVERHEAD)
             .saturating_add(entries)
             .saturating_add(entry_allocations)
             .saturating_add(postings_retained_bytes(&self.postings))
@@ -659,6 +663,7 @@ fn prepared_catalog_retained_bytes(catalog: &PreparedToolCatalog) -> usize {
             total.saturating_add(tool_definition_retained_bytes(definition))
         });
     std::mem::size_of::<PreparedToolCatalog>()
+        .saturating_add(ARC_ALLOCATION_OVERHEAD.saturating_mul(3))
         .saturating_add(definitions)
         .saturating_add(catalog.serialized_definitions().len())
         .saturating_add(catalog.provider_tools_json().get().len())
