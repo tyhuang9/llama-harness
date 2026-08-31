@@ -279,7 +279,7 @@ pub enum ToolDiscoverySelection {
     FullCatalog,
     /// Only mandatory hot tools were selected.
     HotOnly,
-    /// A unique exact identifier, name, namespace, or alias selected tools.
+    /// An exact identifier, name, namespace, or alias selected tools.
     Exact,
     /// A high-margin lexical match selected one deferred tool.
     LexicalConfident,

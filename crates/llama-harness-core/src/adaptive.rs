@@ -366,7 +366,7 @@ impl AgentRunner {
             }
             Err(error) => return Err(error),
         };
-        let mut run = match StrategyRun::new(
+        let mut run = StrategyRun::new(
             self,
             &request,
             requested,
@@ -374,19 +374,7 @@ impl AgentRunner {
             direct_scope,
             direct_discovery,
             preflight,
-        ) {
-            Ok(run) => run,
-            Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
-                return Ok(pre_event_terminal_result(
-                    &request,
-                    error,
-                    &self.events,
-                    requested,
-                    started,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
+        );
         if requested == RunStrategy::DeclarativePlan {
             run.events.emit(RunEvent::StrategySelected {
                 requested,
@@ -730,7 +718,7 @@ impl<'a> StrategyRun<'a> {
         direct_scope: ToolScope,
         direct_discovery: ToolDiscoveryStats,
         preflight: RunPreflight,
-    ) -> Result<Self, HarnessError> {
+    ) -> Self {
         let started = preflight.started;
         let run_id = request
             .run_id
@@ -757,7 +745,7 @@ impl<'a> StrategyRun<'a> {
             prepared_plan.discovery,
         );
         emit_discovery(&mut events, ToolCaller::Direct, direct_discovery);
-        Ok(Self {
+        Self {
             runner,
             request,
             output_validator: preflight.output_validator,
@@ -780,7 +768,7 @@ impl<'a> StrategyRun<'a> {
             plan_attempt: 0,
             direct_scope,
             plan_scope: prepared_plan.scope,
-        })
+        }
     }
 
     fn terminate(&mut self, error: HarnessError) {
