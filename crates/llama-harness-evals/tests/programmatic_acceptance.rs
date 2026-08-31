@@ -430,7 +430,8 @@ impl EvalExecutor for AcceptanceExecutor {
             } else {
                 json!({"value": index as i64 + 1})
             };
-            if call.arguments_json != expected_arguments.to_string() {
+            let expected_arguments_json = expected_arguments.to_string();
+            if call.arguments_json != expected_arguments_json {
                 return Err(EvalError::Executor(
                     "runner did not retain canonical tool arguments".into(),
                 ));

@@ -1105,8 +1105,10 @@ async fn programmatic_parallel_fanout_preserves_input_order_through_reverse_comp
     let tool = Arc::new(ControlledFanoutTool::new(3));
     let mut registry = ToolRegistry::default();
     registry.register(tool.clone()).unwrap();
-    let mut config = ProgrammaticHostConfig::default();
-    config.max_fanout_concurrency = 3;
+    let config = ProgrammaticHostConfig {
+        max_fanout_concurrency: 3,
+        ..ProgrammaticHostConfig::default()
+    };
     let mut run_request = request(&["read"]);
     run_request.agent.limits.max_programmatic_fanout_concurrency = 3;
     // This test isolates ordering rather than the bounded final-synthesis
@@ -1552,8 +1554,10 @@ async fn active_programmatic_mutation_deadline_drains_cooperatively_then_stays_t
     let tool = Arc::new(CancellationBarrierTool::mutation("write"));
     let mut registry = ToolRegistry::default();
     registry.register(tool.clone()).unwrap();
-    let mut config = ProgrammaticHostConfig::default();
-    config.max_duration_ms = 1;
+    let config = ProgrammaticHostConfig {
+        max_duration_ms: 1,
+        ..ProgrammaticHostConfig::default()
+    };
     let runner = Arc::new(
         AgentRunner::builder(provider.clone())
             .tools(registry)
@@ -1741,8 +1745,10 @@ async fn direct_fallback_keeps_the_tighter_programmatic_host_deadline() {
         calls: AtomicU32::new(0),
         fallback_started: Arc::new(Notify::new()),
     });
-    let mut config = ProgrammaticHostConfig::default();
-    config.max_duration_ms = 1;
+    let config = ProgrammaticHostConfig {
+        max_duration_ms: 1,
+        ..ProgrammaticHostConfig::default()
+    };
     let runner = Arc::new(
         AgentRunner::builder(provider.clone())
             .programmatic(config)
@@ -1771,8 +1777,10 @@ async fn direct_fallback_keeps_the_tighter_programmatic_host_deadline() {
 #[test]
 fn invalid_vm_admission_configuration_never_panics_while_building() {
     for max_active_vms in [0, 17, usize::MAX] {
-        let mut config = ProgrammaticHostConfig::default();
-        config.max_active_vms = max_active_vms;
+        let config = ProgrammaticHostConfig {
+            max_active_vms,
+            ..ProgrammaticHostConfig::default()
+        };
         let provider = Arc::new(MockModelProvider::scripted([]).with_capabilities(capabilities()));
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             AgentRunner::builder(provider).programmatic(config).build()
@@ -1784,8 +1792,10 @@ fn invalid_vm_admission_configuration_never_panics_while_building() {
 #[tokio::test]
 async fn invalid_vm_admission_configuration_fails_closed_when_run() {
     for max_active_vms in [0, 17, usize::MAX] {
-        let mut config = ProgrammaticHostConfig::default();
-        config.max_active_vms = max_active_vms;
+        let config = ProgrammaticHostConfig {
+            max_active_vms,
+            ..ProgrammaticHostConfig::default()
+        };
         let provider = Arc::new(MockModelProvider::scripted([]).with_capabilities(capabilities()));
         let result = AgentRunner::builder(provider)
             .programmatic(config)
