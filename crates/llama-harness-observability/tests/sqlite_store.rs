@@ -4,14 +4,15 @@ use llama_harness_core::{
     RunRequest, RunStatus, RunStrategy, ToolCaller, ToolDiscoveryOutcome, ToolDiscoverySelection,
 };
 use llama_harness_observability::{
-    AppendOutcome, RedactionConfig, RetentionPolicy, RunListQuery, SqliteEventSink,
-    TraceStoreConfig, TraceStoreError, REDACTED_VALUE,
+    AppendOutcome, PersistenceFailure, PersistenceFailureCategory, PersistenceFailureHandler,
+    RedactionConfig, RetentionPolicy, RunListQuery, SqliteEventSink, TraceStoreConfig,
+    TraceStoreError, REDACTED_VALUE,
 };
 use serde_json::json;
 use std::{
     fs,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -22,11 +23,14 @@ fn record(
     timestamp_ms: u64,
     event: RunEvent,
 ) -> EventRecord {
-    let mut record = EventRecord::new(run_id, trace_id, sequence, timestamp_ms, event);
-    // Test records model one EventEmitter execution unless a test deliberately
-    // overrides this identity to model reuse of a public run ID.
-    record.execution_id = format!("test-execution:{run_id}:{trace_id}");
-    record
+    EventRecord::new(
+        run_id,
+        format!("test-execution:{run_id}:{trace_id}"),
+        trace_id,
+        sequence,
+        timestamp_ms,
+        event,
+    )
 }
 
 #[test]
@@ -321,6 +325,8 @@ fn programmatic_event_kinds_are_ordered_additive_and_redacted_on_reopen() {
                 RunEvent::ProgramExecutionCompleted {
                     attempt: 1,
                     fuel_used: 9,
+                    scheduling_slices: 3,
+                    tool_yields: 1,
                     branches: 1,
                     loop_iterations: 2,
                     fanout_batches: 1,
@@ -385,6 +391,8 @@ fn programmatic_event_kinds_are_ordered_additive_and_redacted_on_reopen() {
         events[2].record.event,
         RunEvent::ProgramExecutionCompleted {
             fuel_used: 9,
+            scheduling_slices: 3,
+            tool_yields: 1,
             fanout_batches: 1,
             ..
         }
@@ -539,6 +547,61 @@ fn legacy_migration_uses_collision_free_execution_ids_and_stable_roundtrips() {
         );
     }
     drop(store);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn v2_migration_rewrites_execution_groups_and_read_only_requires_writer_migration() {
+    let path = temporary_database("v2-migration");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL);
+             INSERT INTO schema_migrations(version) VALUES (2);
+             CREATE TABLE trace_events (
+                 run_id TEXT NOT NULL,
+                 execution_id TEXT NOT NULL,
+                 trace_id TEXT NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 timestamp_ms INTEGER NOT NULL,
+                 event_kind TEXT NOT NULL,
+                 status TEXT,
+                 event_json TEXT NOT NULL,
+                 raw_payload_json TEXT,
+                 PRIMARY KEY (execution_id, sequence)
+             );",
+        )
+        .unwrap();
+    let legacy = json!({
+        "run_id": "v2-run",
+        "trace_id": "v2-trace",
+        "sequence": 1,
+        "timestamp_ms": 1,
+        "event": {"type": "model_responded", "call_number": 1}
+    })
+    .to_string();
+    connection
+        .execute(
+            "INSERT INTO trace_events
+             (run_id, execution_id, trace_id, sequence, timestamp_ms, event_kind, event_json)
+             VALUES (?1, ?2, ?3, 1, 1, 'model.responded', ?4)",
+            rusqlite::params!["v2-run", "v2-run:v2-trace", "v2-trace", legacy],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        SqliteEventSink::open_read_only(&path),
+        Err(TraceStoreError::InvalidConfiguration(message)) if message.contains("writable open")
+    ));
+    let store = SqliteEventSink::open(&path, TraceStoreConfig::default()).unwrap();
+    let runs = store.list_runs(RunListQuery::default()).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].execution_id, "legacy-v3:6:v2-run:8:v2-trace");
+    drop(store);
+    let read_only = SqliteEventSink::open_read_only(&path).unwrap();
+    assert_eq!(read_only.events_for_run("v2-run", 10, 0).unwrap().len(), 1);
+    drop(read_only);
     fs::remove_file(path).unwrap();
 }
 
@@ -993,6 +1056,9 @@ fn sink_supports_concurrent_event_emission_and_exposes_write_errors() {
         );
     }
     assert_eq!(sink.last_emit_error(), None);
+    let healthy = sink.persistence_health();
+    assert_eq!(healthy.persist_failures_total, 0);
+    assert!(healthy.healthy);
 
     sink.emit(record(
         "",
@@ -1002,6 +1068,13 @@ fn sink_supports_concurrent_event_emission_and_exposes_write_errors() {
         RunEvent::ModelResponded { call_number: 1 },
     ));
     assert!(sink.last_emit_error().unwrap().contains("run ID"));
+    let failed = sink.persistence_health();
+    assert_eq!(failed.persist_failures_total, 1);
+    assert_eq!(
+        failed.last_failure_category,
+        Some(PersistenceFailureCategory::InvalidRecord)
+    );
+    assert!(!failed.healthy);
 }
 
 #[test]
@@ -1027,4 +1100,156 @@ fn export_refuses_a_trace_that_cannot_be_complete_within_the_export_bound() {
         store.export_run("run-large"),
         Err(TraceStoreError::ResourceLimit(message)) if message.contains("limited to 1000")
     ));
+}
+
+#[test]
+fn public_records_share_one_explicit_execution_and_order_roundtrips() {
+    let store = SqliteEventSink::open_in_memory(TraceStoreConfig::default()).unwrap();
+    let first = EventRecord::new(
+        "public-run",
+        "public-execution",
+        "public-trace",
+        1,
+        10,
+        RunEvent::Started {
+            run_id: "public-run".into(),
+            trace_id: "public-trace".into(),
+        },
+    );
+    let second = EventRecord::new(
+        "public-run",
+        "public-execution",
+        "public-trace",
+        2,
+        20,
+        RunEvent::Completed {
+            status: RunStatus::Completed,
+        },
+    );
+    store.append_batch([(first, None), (second, None)]).unwrap();
+
+    let runs = store.list_runs(RunListQuery::default()).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].execution_id, "public-execution");
+    assert_eq!(runs[0].event_count, 2);
+    assert_eq!(
+        store
+            .events_for_execution("public-execution", 10, 0)
+            .unwrap()
+            .iter()
+            .map(|event| event.record.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+struct CapturingFailureHandler(Arc<Mutex<Vec<PersistenceFailure>>>);
+
+impl PersistenceFailureHandler for CapturingFailureHandler {
+    fn on_persistence_failure(&self, failure: PersistenceFailure) {
+        self.0.lock().unwrap().push(failure);
+    }
+}
+
+struct PanickingFailureHandler;
+
+impl PersistenceFailureHandler for PanickingFailureHandler {
+    fn on_persistence_failure(&self, _: PersistenceFailure) {
+        panic!("host callback must be contained");
+    }
+}
+
+#[test]
+fn persistence_health_tracks_single_batch_callback_and_recovery() {
+    let store = SqliteEventSink::open_in_memory(TraceStoreConfig::default()).unwrap();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    store
+        .set_persistence_failure_handler(Some(Arc::new(CapturingFailureHandler(observed.clone()))));
+
+    store.append(&started("health", "trace-health", 1)).unwrap();
+    let healthy = store.persistence_health();
+    assert_eq!(healthy.persist_failures_total, 0);
+    assert!(healthy.healthy);
+    assert!(healthy.last_success_timestamp_ms.is_some());
+
+    let invalid = record(
+        "",
+        "trace-health",
+        2,
+        2,
+        RunEvent::ModelResponded { call_number: 1 },
+    );
+    assert!(matches!(
+        store.append(&invalid),
+        Err(TraceStoreError::InvalidRecord(_))
+    ));
+    let mut batch_invalid = started("health", "trace-health", 2);
+    batch_invalid.execution_id = " ".into();
+    assert!(matches!(
+        store.append_batch([(batch_invalid, None)]),
+        Err(TraceStoreError::InvalidRecord(_))
+    ));
+    let failed = store.persistence_health();
+    assert_eq!(failed.persist_failures_total, 2);
+    assert!(!failed.healthy);
+    assert_eq!(
+        failed.last_failure_category,
+        Some(PersistenceFailureCategory::InvalidRecord)
+    );
+    assert!(failed.last_failure_timestamp_ms.is_some());
+    let callback_failures = observed.lock().unwrap().clone();
+    assert_eq!(callback_failures.len(), 2);
+    assert!(callback_failures
+        .iter()
+        .all(|failure| matches!(failure.category, PersistenceFailureCategory::InvalidRecord)));
+
+    store.set_persistence_failure_handler(Some(Arc::new(PanickingFailureHandler)));
+    store.emit(invalid);
+    assert_eq!(store.persistence_health().persist_failures_total, 3);
+    assert!(store.last_emit_error().is_some());
+
+    store
+        .append(&completed(
+            "health",
+            "trace-health",
+            2,
+            3,
+            RunStatus::Completed,
+        ))
+        .unwrap();
+    let recovered = store.persistence_health();
+    assert_eq!(recovered.persist_failures_total, 3);
+    assert!(recovered.healthy);
+    assert!(recovered.last_success_timestamp_ms.is_some());
+}
+
+#[test]
+fn age_retention_deletes_only_complete_execution_groups() {
+    let store = SqliteEventSink::open_in_memory(TraceStoreConfig::default()).unwrap();
+    store
+        .append_batch([
+            (started("old", "trace", 10), None),
+            (completed("old", "trace", 2, 20, RunStatus::Completed), None),
+            (started("straddling", "trace", 10), None),
+            (
+                completed("straddling", "trace", 2, 110, RunStatus::Completed),
+                None,
+            ),
+            (started("incomplete", "trace", 10), None),
+        ])
+        .unwrap();
+    let retention = store
+        .apply_retention(
+            &RetentionPolicy {
+                max_age_ms: Some(50),
+                max_runs: None,
+            },
+            100,
+        )
+        .unwrap();
+    assert_eq!(retention.runs_deleted, 1);
+    assert_eq!(retention.events_deleted, 2);
+    assert!(store.events_for_run("old", 10, 0).unwrap().is_empty());
+    assert_eq!(store.events_for_run("straddling", 10, 0).unwrap().len(), 2);
+    assert_eq!(store.events_for_run("incomplete", 10, 0).unwrap().len(), 1);
 }

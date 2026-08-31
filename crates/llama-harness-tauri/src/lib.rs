@@ -770,6 +770,7 @@ mod tests {
         ]);
         let record = EventRecord::new(
             "run",
+            "execution",
             "trace",
             1,
             1,

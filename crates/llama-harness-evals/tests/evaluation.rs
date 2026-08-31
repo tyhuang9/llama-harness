@@ -568,6 +568,7 @@ async fn regression_export_and_replay_use_explicit_fixture_data_not_trace_payloa
         .append_with_raw(
             &EventRecord::new(
                 "run-1",
+                "execution-1",
                 "trace-1",
                 1,
                 1,

@@ -8,9 +8,13 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    panic::{catch_unwind, AssertUnwindSafe},
     path::Path,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 
@@ -54,6 +58,78 @@ pub enum AppendOutcome {
     Inserted,
     /// An identical event was already present.
     Duplicate,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Stable, value-free category for a failed trace-store persistence attempt.
+pub enum PersistenceFailureCategory {
+    /// SQLite reported a busy or locked database.
+    SqliteBusy,
+    /// SQLite reported another database error.
+    Sqlite,
+    /// Event or payload serialization failed.
+    Serialization,
+    /// The caller supplied an invalid record or configuration.
+    InvalidRecord,
+    /// A bounded event or payload exceeded its configured limit.
+    ResourceLimit,
+    /// The `(execution_id, sequence)` identity conflicts with persisted data.
+    Conflict,
+    /// A public run ID could not select a unique execution.
+    AmbiguousRun,
+    /// The local store mutex was poisoned.
+    Poisoned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+/// Value-free failure notification delivered to an optional host callback.
+pub struct PersistenceFailure {
+    /// Monotonic total after this failure is recorded.
+    pub persist_failures_total: u64,
+    /// Local timestamp when the failure was observed.
+    pub timestamp_ms: u64,
+    /// Stable failure category without an error message, SQL text, or payload.
+    pub category: PersistenceFailureCategory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+/// Thread-safe snapshot of SQLite persistence health.
+pub struct PersistenceHealth {
+    /// Monotonic total persistence failures observed by this sink.
+    pub persist_failures_total: u64,
+    /// Most recently observed persistence-failure timestamp.
+    pub last_failure_timestamp_ms: Option<u64>,
+    /// Stable category of the most recent failure.
+    pub last_failure_category: Option<PersistenceFailureCategory>,
+    /// Whether the most recent persistence attempt succeeded.
+    pub healthy: bool,
+    /// Most recently observed successful persistence timestamp.
+    pub last_success_timestamp_ms: Option<u64>,
+}
+
+impl Default for PersistenceHealth {
+    fn default() -> Self {
+        Self {
+            persist_failures_total: 0,
+            last_failure_timestamp_ms: None,
+            last_failure_category: None,
+            healthy: true,
+            last_success_timestamp_ms: None,
+        }
+    }
+}
+
+/// Receives value-free SQLite persistence-failure notifications.
+///
+/// Notifications run synchronously after a failed persistence attempt. Panics
+/// from an implementation are contained so they cannot poison event emission.
+pub trait PersistenceFailureHandler: Send + Sync {
+    /// Records one value-free persistence failure.
+    fn on_persistence_failure(&self, failure: PersistenceFailure);
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,7 +183,9 @@ pub struct RunListQuery {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 /// Age and count limits for deleting old trace data.
 pub struct RetentionPolicy {
-    /// Delete events older than this age relative to the supplied current time.
+    /// Delete complete executions whose latest event is older than this age
+    /// relative to the supplied current time. Incomplete executions are kept
+    /// intact until explicitly deleted or removed by `max_runs`.
     pub max_age_ms: Option<u64>,
     /// Keep at most this many most-recent runs.
     pub max_runs: Option<u32>,
@@ -198,6 +276,9 @@ struct StoreInner {
     connection: Mutex<Connection>,
     config: TraceStoreConfig,
     last_emit_error: Mutex<Option<String>>,
+    persist_failures_total: AtomicU64,
+    persistence_health: Mutex<PersistenceHealth>,
+    persistence_failure_handler: Mutex<Option<Arc<dyn PersistenceFailureHandler>>>,
 }
 
 impl SqliteEventSink {
@@ -217,6 +298,28 @@ impl SqliteEventSink {
         let config = TraceStoreConfig::default();
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(config.busy_timeout)?;
+        let version = connection
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| {
+                TraceStoreError::InvalidConfiguration(
+                    "trace database requires a writable open to initialize or migrate to schema v3"
+                        .into(),
+                )
+            })?;
+        if version < CURRENT_SCHEMA_VERSION {
+            return Err(TraceStoreError::InvalidConfiguration(format!(
+                "trace database schema v{version} requires a writable open to migrate to v{CURRENT_SCHEMA_VERSION}"
+            )));
+        }
+        if version > CURRENT_SCHEMA_VERSION {
+            return Err(TraceStoreError::InvalidConfiguration(format!(
+                "database schema version {version} is newer than supported version {CURRENT_SCHEMA_VERSION}"
+            )));
+        }
         Ok(Self::from_connection(connection, config))
     }
 
@@ -234,6 +337,9 @@ impl SqliteEventSink {
                 connection: Mutex::new(connection),
                 config,
                 last_emit_error: Mutex::new(None),
+                persist_failures_total: AtomicU64::new(0),
+                persistence_health: Mutex::new(PersistenceHealth::default()),
+                persistence_failure_handler: Mutex::new(None),
             }),
         }
     }
@@ -250,12 +356,16 @@ impl SqliteEventSink {
         record: &EventRecord,
         raw_payload: Option<&Value>,
     ) -> Result<AppendOutcome, TraceStoreError> {
-        let prepared = self.prepare(record, raw_payload)?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        let outcome = append_prepared(&transaction, &prepared)?;
-        transaction.commit()?;
-        Ok(outcome)
+        let result = (|| {
+            let prepared = self.prepare(record, raw_payload)?;
+            let mut connection = self.connection()?;
+            let transaction = connection.transaction()?;
+            let outcome = append_prepared(&transaction, &prepared)?;
+            transaction.commit()?;
+            Ok(outcome)
+        })();
+        self.observe_persistence_result(&result);
+        result
     }
 
     /// Appends a group of events in one transaction. Existing identical events remain
@@ -264,18 +374,22 @@ impl SqliteEventSink {
         &self,
         events: impl IntoIterator<Item = (EventRecord, Option<Value>)>,
     ) -> Result<Vec<AppendOutcome>, TraceStoreError> {
-        let prepared = events
-            .into_iter()
-            .map(|(record, raw)| self.prepare(&record, raw.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        let outcomes = prepared
-            .iter()
-            .map(|event| append_prepared(&transaction, event))
-            .collect::<Result<Vec<_>, _>>()?;
-        transaction.commit()?;
-        Ok(outcomes)
+        let result = (|| {
+            let prepared = events
+                .into_iter()
+                .map(|(record, raw)| self.prepare(&record, raw.as_ref()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut connection = self.connection()?;
+            let transaction = connection.transaction()?;
+            let outcomes = prepared
+                .iter()
+                .map(|event| append_prepared(&transaction, event))
+                .collect::<Result<Vec<_>, _>>()?;
+            transaction.commit()?;
+            Ok(outcomes)
+        })();
+        self.observe_persistence_result(&result);
+        result
     }
 
     /// Returns persisted events for one execution in sequence order.
@@ -447,10 +561,22 @@ impl SqliteEventSink {
         let mut result = RetentionResult::default();
         if let Some(max_age_ms) = policy.max_age_ms {
             let cutoff = now_ms.saturating_sub(max_age_ms);
-            result.events_deleted += transaction.execute(
-                "DELETE FROM trace_events WHERE timestamp_ms < ?1",
-                params![to_sql_integer(cutoff)?],
-            )? as u64;
+            let execution_ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT execution_id
+                     FROM trace_events
+                     GROUP BY execution_id
+                     HAVING MAX(timestamp_ms) < ?1
+                        AND MAX(CASE WHEN status IS NOT NULL THEN 1 ELSE 0 END) = 1",
+                )?;
+                let execution_ids = statement
+                    .query_map(params![to_sql_integer(cutoff)?], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                execution_ids
+            };
+            delete_execution_groups(&transaction, execution_ids, &mut result)?;
         }
         if let Some(max_runs) = policy.max_runs {
             let run_ids = {
@@ -466,13 +592,7 @@ impl SqliteEventSink {
                     .collect::<Result<Vec<_>, _>>()?;
                 run_ids
             };
-            for execution_id in run_ids {
-                result.events_deleted += transaction.execute(
-                    "DELETE FROM trace_events WHERE execution_id = ?1",
-                    params![execution_id],
-                )? as u64;
-                result.runs_deleted += 1;
-            }
+            delete_execution_groups(&transaction, run_ids, &mut result)?;
         }
         transaction.commit()?;
         Ok(result)
@@ -537,6 +657,86 @@ impl SqliteEventSink {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Returns value-free health counters for successful and failed persistence.
+    pub fn persistence_health(&self) -> PersistenceHealth {
+        let mut health = self
+            .inner
+            .persistence_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        health.persist_failures_total = self.inner.persist_failures_total.load(Ordering::Relaxed);
+        health
+    }
+
+    /// Installs or removes the optional value-free persistence-failure callback.
+    ///
+    /// The callback runs without a store mutex held. Panics are contained so
+    /// `EventSink::emit` remains non-panicking and usable after a bad handler.
+    pub fn set_persistence_failure_handler(
+        &self,
+        handler: Option<Arc<dyn PersistenceFailureHandler>>,
+    ) {
+        *self
+            .inner
+            .persistence_failure_handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = handler;
+    }
+
+    fn observe_persistence_result<T>(&self, result: &Result<T, TraceStoreError>) {
+        match result {
+            Ok(_) => self.record_persistence_success(),
+            Err(error) => self.record_persistence_failure(persistence_failure_category(error)),
+        }
+    }
+
+    fn record_persistence_success(&self) {
+        let mut health = self
+            .inner
+            .persistence_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        health.healthy = true;
+        health.last_success_timestamp_ms = Some(observed_timestamp_ms());
+        health.persist_failures_total = self.inner.persist_failures_total.load(Ordering::Relaxed);
+    }
+
+    fn record_persistence_failure(&self, category: PersistenceFailureCategory) {
+        let total = self
+            .inner
+            .persist_failures_total
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                Some(total.saturating_add(1))
+            })
+            .map_or(u64::MAX, |total| total.saturating_add(1));
+        let failure = PersistenceFailure {
+            persist_failures_total: total,
+            timestamp_ms: observed_timestamp_ms(),
+            category,
+        };
+        {
+            let mut health = self
+                .inner
+                .persistence_health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            health.persist_failures_total = total;
+            health.last_failure_timestamp_ms = Some(failure.timestamp_ms);
+            health.last_failure_category = Some(category);
+            health.healthy = false;
+        }
+        let handler = self
+            .inner
+            .persistence_failure_handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(handler) = handler {
+            let _ = catch_unwind(AssertUnwindSafe(|| handler.on_persistence_failure(failure)));
+        }
     }
 
     fn prepare(
@@ -679,6 +879,21 @@ fn append_prepared(
     }
 }
 
+fn delete_execution_groups(
+    transaction: &Transaction<'_>,
+    execution_ids: impl IntoIterator<Item = String>,
+    result: &mut RetentionResult,
+) -> Result<(), TraceStoreError> {
+    for execution_id in execution_ids {
+        result.events_deleted += transaction.execute(
+            "DELETE FROM trace_events WHERE execution_id = ?1",
+            params![execution_id],
+        )? as u64;
+        result.runs_deleted += 1;
+    }
+    Ok(())
+}
+
 fn configure_and_migrate(
     connection: &mut Connection,
     config: &TraceStoreConfig,
@@ -707,7 +922,7 @@ fn configure_and_migrate(
          CREATE INDEX IF NOT EXISTS trace_events_status_idx
              ON trace_events(status);",
     )?;
-    let version = connection.query_row(
+    let mut version = connection.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
         [],
         |row| row.get::<_, i64>(0),
@@ -718,9 +933,44 @@ fn configure_and_migrate(
         )));
     }
     if version < 2 {
-        connection.execute_batch(
-            "BEGIN;
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "
              CREATE TABLE trace_events_v2 (
+                 run_id TEXT NOT NULL,
+                 execution_id TEXT NOT NULL,
+                 trace_id TEXT NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 timestamp_ms INTEGER NOT NULL,
+                 event_kind TEXT NOT NULL,
+                 status TEXT,
+                 event_json TEXT NOT NULL,
+                 raw_payload_json TEXT,
+                 PRIMARY KEY (run_id, sequence)
+             );
+             INSERT INTO trace_events_v2
+                 (run_id, execution_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json)
+             SELECT run_id,
+                    run_id || ':' || trace_id,
+                    trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json
+             FROM trace_events;
+             DROP TABLE trace_events;
+             ALTER TABLE trace_events_v2 RENAME TO trace_events;
+             CREATE INDEX trace_events_trace_timestamp_idx
+                 ON trace_events(trace_id, timestamp_ms DESC);
+             CREATE INDEX trace_events_timestamp_idx
+                 ON trace_events(timestamp_ms DESC);
+             CREATE INDEX trace_events_status_idx
+                 ON trace_events(status);",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations(version) VALUES (2)", [])?;
+        transaction.commit()?;
+        version = 2;
+    }
+    if version < 3 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE trace_events_v3 (
                  run_id TEXT NOT NULL,
                  execution_id TEXT NOT NULL,
                  trace_id TEXT NOT NULL,
@@ -732,31 +982,27 @@ fn configure_and_migrate(
                  raw_payload_json TEXT,
                  PRIMARY KEY (execution_id, sequence)
              );
-             INSERT INTO trace_events_v2
+             INSERT INTO trace_events_v3
                  (run_id, execution_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json)
              SELECT run_id,
-                    'legacy-v3:' || length(run_id) || ':' || run_id || ':' || length(trace_id) || ':' || trace_id,
+                    CASE WHEN execution_id = run_id || ':' || trace_id
+                         THEN 'legacy-v3:' || length(run_id) || ':' || run_id || ':' || length(trace_id) || ':' || trace_id
+                         ELSE execution_id
+                    END,
                     trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json
              FROM trace_events;
              DROP TABLE trace_events;
-             ALTER TABLE trace_events_v2 RENAME TO trace_events;
+             ALTER TABLE trace_events_v3 RENAME TO trace_events;
              CREATE INDEX trace_events_trace_timestamp_idx
                  ON trace_events(trace_id, timestamp_ms DESC);
              CREATE INDEX trace_events_timestamp_idx
                  ON trace_events(timestamp_ms DESC);
              CREATE INDEX trace_events_status_idx
-                 ON trace_events(status);
-             COMMIT;",
+                 ON trace_events(status);",
         )?;
-    }
-    if version < 3 {
-        connection.execute_batch(
-            "BEGIN;
-             UPDATE trace_events
-             SET execution_id = 'legacy-v3:' || length(run_id) || ':' || run_id || ':' || length(trace_id) || ':' || trace_id
-             WHERE execution_id = run_id || ':' || trace_id;
-             COMMIT;",
-        )?;
+        transaction.execute("INSERT INTO schema_migrations(version) VALUES (3)", [])?;
+        transaction.commit()?;
+        version = 3;
     }
     connection.execute_batch(
         "CREATE INDEX IF NOT EXISTS trace_events_trace_timestamp_idx
@@ -768,12 +1014,7 @@ fn configure_and_migrate(
          CREATE INDEX IF NOT EXISTS trace_events_status_idx
              ON trace_events(status);",
     )?;
-    if version < CURRENT_SCHEMA_VERSION {
-        connection.execute(
-            "INSERT INTO schema_migrations(version) VALUES (?1)",
-            params![CURRENT_SCHEMA_VERSION],
-        )?;
-    }
+    debug_assert_eq!(version, CURRENT_SCHEMA_VERSION);
     Ok(())
 }
 
@@ -789,6 +1030,34 @@ fn validate_config(config: &TraceStoreConfig) -> Result<(), TraceStoreError> {
         ));
     }
     Ok(())
+}
+
+fn observed_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
+fn persistence_failure_category(error: &TraceStoreError) -> PersistenceFailureCategory {
+    match error {
+        TraceStoreError::Sqlite(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            PersistenceFailureCategory::SqliteBusy
+        }
+        TraceStoreError::Sqlite(_) => PersistenceFailureCategory::Sqlite,
+        TraceStoreError::Serialization(_) => PersistenceFailureCategory::Serialization,
+        TraceStoreError::InvalidConfiguration(_) | TraceStoreError::InvalidRecord(_) => {
+            PersistenceFailureCategory::InvalidRecord
+        }
+        TraceStoreError::ResourceLimit(_) => PersistenceFailureCategory::ResourceLimit,
+        TraceStoreError::Conflict { .. } => PersistenceFailureCategory::Conflict,
+        TraceStoreError::AmbiguousRun { .. } => PersistenceFailureCategory::AmbiguousRun,
+        TraceStoreError::Poisoned => PersistenceFailureCategory::Poisoned,
+    }
 }
 
 fn decode_persisted_event(

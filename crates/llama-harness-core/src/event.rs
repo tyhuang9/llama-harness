@@ -27,9 +27,15 @@ pub struct EventRecord {
 }
 
 impl EventRecord {
-    /// Creates one ordered event record for a run and trace.
+    /// Creates one ordered event record for an explicit logical execution.
+    ///
+    /// Callers emitting more than one record for a run must reuse the same
+    /// `execution_id` and advance `sequence` contiguously. The runner's
+    /// internal event emitter
+    /// manages that identity and ordering for runner-produced events.
     pub fn new(
         run_id: impl Into<String>,
+        execution_id: impl Into<String>,
         trace_id: impl Into<String>,
         sequence: u64,
         timestamp_ms: u64,
@@ -37,7 +43,7 @@ impl EventRecord {
     ) -> Self {
         Self {
             run_id: run_id.into(),
-            execution_id: new_execution_id(),
+            execution_id: execution_id.into(),
             trace_id: trace_id.into(),
             sequence,
             timestamp_ms,
@@ -171,6 +177,12 @@ pub enum RunEvent {
         attempt: u32,
         /// Deterministic fuel charged by the VM.
         fuel_used: u64,
+        /// Number of host scheduling slices entered for the VM.
+        #[serde(default)]
+        scheduling_slices: u64,
+        /// Number of tool-yield batches produced by the VM.
+        #[serde(default)]
+        tool_yields: u32,
         /// Executed branch decisions.
         branches: u64,
         /// Entered bounded loop iterations.

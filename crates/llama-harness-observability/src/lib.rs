@@ -9,6 +9,7 @@ mod sqlite;
 
 pub use redaction::{RedactionConfig, REDACTED_VALUE};
 pub use sqlite::{
-    AppendOutcome, ExportedRun, PersistedEvent, RetentionPolicy, RetentionResult, RunListQuery,
+    AppendOutcome, ExportedRun, PersistedEvent, PersistenceFailure, PersistenceFailureCategory,
+    PersistenceFailureHandler, PersistenceHealth, RetentionPolicy, RetentionResult, RunListQuery,
     RunSummary, SqliteEventSink, TraceStoreConfig, TraceStoreError,
 };

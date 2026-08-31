@@ -88,6 +88,13 @@ its only terminal lifecycle outcome only after final synthesis and output
 validation succeed; synthesis errors instead emit one final `failed`,
 `cancelled`, `timed_out`, or `limit_reached` outcome.
 
+`ProgramExecutionCompleted` also reports value-free VM telemetry: fuel,
+scheduling slices entered by the host loop, tool-yield batches, branches,
+bounded loop iterations, fan-out batches, partial failures, peak accounted
+bytes, and VM duration. These counters are persisted as local metadata and
+available to trace-store filtering/export only; the runtime wire contract does
+not project this Programmatic-only event yet.
+
 ## Broker safety boundary
 
 Every concrete invocation, including a declarative-plan node, passes through

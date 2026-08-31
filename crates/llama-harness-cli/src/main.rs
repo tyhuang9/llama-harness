@@ -688,6 +688,7 @@ mod tests {
             .append_with_raw(
                 &EventRecord::new(
                     "run-1",
+                    "execution-1",
                     "trace-1",
                     1,
                     1,

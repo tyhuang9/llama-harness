@@ -592,12 +592,14 @@ impl AgentRunner {
             )
             .map_err(sandbox_error)?;
             let vm_started = StdInstant::now();
+            let mut scheduling_slices = 0u64;
             let program_output = loop {
                 check_stopped(
                     &request.cancellation,
                     deadline,
                     "programmatic run deadline reached",
                 )?;
+                scheduling_slices = scheduling_slices.saturating_add(1);
                 let step = vm.step(limits.max_slice_fuel).map_err(sandbox_error)?;
                 match step {
                     StepOutcome::Sliced => {
@@ -639,6 +641,8 @@ impl AgentRunner {
             events.emit(RunEvent::ProgramExecutionCompleted {
                 attempt: program_attempt.saturating_add(1),
                 fuel_used: metrics.fuel_used,
+                scheduling_slices,
+                tool_yields: metrics.yields,
                 branches: metrics.branches,
                 loop_iterations: metrics.loop_iterations,
                 fanout_batches: metrics.fanout_batches,

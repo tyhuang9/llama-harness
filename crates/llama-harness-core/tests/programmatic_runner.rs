@@ -2589,6 +2589,15 @@ async fn program_lifecycle_succeeds_only_after_final_synthesis() {
         .iter()
         .position(|record| matches!(record.event, RunEvent::ProgramExecutionCompleted { .. }))
         .unwrap();
+    let vm_metrics = records.iter().find_map(|record| match record.event {
+        RunEvent::ProgramExecutionCompleted {
+            scheduling_slices,
+            tool_yields,
+            ..
+        } => Some((scheduling_slices, tool_yields)),
+        _ => None,
+    });
+    assert!(matches!(vm_metrics, Some((slices, 0)) if slices > 0));
     let succeeded = records
         .iter()
         .position(|record| {
