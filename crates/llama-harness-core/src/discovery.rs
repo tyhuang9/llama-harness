@@ -296,7 +296,7 @@ pub(crate) struct AllowedCatalogEntry<'a> {
 
 pub(crate) struct CatalogIndex {
     entries: Vec<CatalogEntry>,
-    document_frequency: BTreeMap<String, u32>,
+    postings: BTreeMap<String, Vec<(usize, u128)>>,
     total_document_len: u128,
 }
 
@@ -564,22 +564,36 @@ impl CatalogIndex {
                 .copied()
                 .fold(0u32, u32::saturating_add);
         }
-        let mut document_frequency = BTreeMap::<String, u32>::new();
         let mut total_document_len = 0u128;
         for (position, entry) in entries.iter().enumerate() {
             if position % DISCOVERY_GUARD_INTERVAL == 0 {
                 guard()?;
             }
             total_document_len = total_document_len.saturating_add(u128::from(entry.document_len));
-            for term in entry.terms.keys() {
-                let frequency = document_frequency.entry(term.clone()).or_default();
-                *frequency = frequency.saturating_add(1);
+        }
+        let documents = entries.len() as u128;
+        let mut postings = BTreeMap::<String, Vec<(usize, u128)>>::new();
+        for (position, entry) in entries.iter_mut().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            let length_normalization = bm25_length_normalization(
+                documents,
+                u128::from(entry.document_len),
+                total_document_len,
+            );
+            for (term, frequency) in std::mem::take(&mut entry.terms) {
+                let term_weight = bm25_term_weight(u128::from(frequency), length_normalization);
+                postings
+                    .entry(term)
+                    .or_default()
+                    .push((position, term_weight));
             }
         }
         guard()?;
         Ok(Self {
             entries,
-            document_frequency,
+            postings,
             total_document_len,
         })
     }
@@ -615,21 +629,25 @@ impl CatalogIndex {
                         .map(String::capacity)
                         .fold(0usize, usize::saturating_add),
                 )
-                .saturating_add(string_u32_map_retained_bytes(&entry.terms))
         });
         std::mem::size_of::<Self>()
             .saturating_add(entries)
             .saturating_add(entry_allocations)
-            .saturating_add(string_u32_map_retained_bytes(&self.document_frequency))
+            .saturating_add(postings_retained_bytes(&self.postings))
     }
 }
 
-fn string_u32_map_retained_bytes(map: &BTreeMap<String, u32>) -> usize {
-    map.iter().fold(0usize, |total, (term, _)| {
+fn postings_retained_bytes(map: &BTreeMap<String, Vec<(usize, u128)>>) -> usize {
+    map.iter().fold(0usize, |total, (term, postings)| {
         total
-            .saturating_add(std::mem::size_of::<(String, u32)>())
+            .saturating_add(std::mem::size_of::<(String, Vec<(usize, u128)>)>())
             .saturating_add(TREE_NODE_OVERHEAD)
             .saturating_add(term.capacity())
+            .saturating_add(
+                postings
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(usize, u128)>()),
+            )
     })
 }
 
@@ -1257,37 +1275,33 @@ fn rank_with_counts(
         guard()?;
         return Ok(RankedSelection::Lexical(Vec::new()));
     }
-    let mut query_idf = BTreeMap::<&str, u128>::new();
-    for term in &query_terms {
-        let Some(document_frequency) = index.document_frequency.get(term).copied() else {
+    let mut document_scores = vec![0u64; entries.len()];
+    let mut matching_postings = 0usize;
+    for term in query_terms {
+        let Some(postings) = index.postings.get(&term) else {
             continue;
         };
-        query_idf.insert(
-            term,
-            bm25_inverse_document_frequency(documents, u128::from(document_frequency)),
+        let inverse_document_frequency = bm25_inverse_document_frequency(
+            documents,
+            u128::try_from(postings.len()).unwrap_or(u128::MAX),
         );
         counts.logarithm_evaluations = counts.logarithm_evaluations.saturating_add(1);
+        for (document, term_weight) in postings {
+            if matching_postings.is_multiple_of(DISCOVERY_GUARD_INTERVAL) {
+                guard()?;
+            }
+            matching_postings = matching_postings.saturating_add(1);
+            let score = bm25_score_with_idf(inverse_document_frequency, *term_weight);
+            document_scores[*document] = document_scores[*document].saturating_add(score);
+        }
     }
     guard()?;
     let retained_limit = max_expansion.max(2).min(entries.len());
     let mut scored: Vec<(u64, String)> = Vec::with_capacity(retained_limit);
-    for (position, entry) in entries.iter().enumerate() {
+    for (position, (entry, score)) in entries.iter().zip(document_scores).enumerate() {
         if position % DISCOVERY_GUARD_INTERVAL == 0 {
             guard()?;
         }
-        let score = query_terms.iter().fold(0u64, |total, term| {
-            let Some(frequency) = entry.terms.get(term).copied().map(u128::from) else {
-                return total;
-            };
-            let inverse_document_frequency = query_idf.get(term.as_str()).copied().unwrap_or(0);
-            total.saturating_add(bm25_term_score_with_idf(
-                documents,
-                inverse_document_frequency,
-                frequency,
-                u128::from(entry.document_len),
-                index.total_document_len,
-            ))
-        });
         if score > 0 {
             counts.scored_documents = counts.scored_documents.saturating_add(1);
             let candidate = (score, entry.id.clone());
@@ -1353,13 +1367,10 @@ fn bm25_term_score(
         return 0;
     }
     let inverse_document_frequency = bm25_inverse_document_frequency(documents, document_frequency);
-    bm25_term_score_with_idf(
-        documents,
-        inverse_document_frequency,
-        term_frequency,
-        document_len,
-        total_document_len,
-    )
+    let length_normalization =
+        bm25_length_normalization(documents, document_len, total_document_len);
+    let term_weight = bm25_term_weight(term_frequency, length_normalization);
+    bm25_score_with_idf(inverse_document_frequency, term_weight)
 }
 
 fn bm25_inverse_document_frequency(documents: u128, document_frequency: u128) -> u128 {
@@ -1372,40 +1383,46 @@ fn bm25_inverse_document_frequency(documents: u128, document_frequency: u128) ->
     scaled_natural_log_ratio(idf_numerator, idf_denominator)
 }
 
-fn bm25_term_score_with_idf(
+fn bm25_length_normalization(
     documents: u128,
-    inverse_document_frequency: u128,
-    term_frequency: u128,
     document_len: u128,
     total_document_len: u128,
-) -> u64 {
-    if documents == 0
-        || inverse_document_frequency == 0
-        || term_frequency == 0
-        || total_document_len == 0
-    {
+) -> u128 {
+    if documents == 0 || total_document_len == 0 {
         return 0;
     }
-    let length_normalization = BM25_SCALE
+    BM25_SCALE
         .saturating_sub(BM25_B)
         .saturating_add(rounded_divide(
             BM25_B
                 .saturating_mul(document_len)
                 .saturating_mul(documents),
             total_document_len,
-        ));
+        ))
+}
+
+fn bm25_term_weight(term_frequency: u128, length_normalization: u128) -> u128 {
+    if term_frequency == 0 || length_normalization == 0 {
+        return 0;
+    }
     let denominator = term_frequency
         .saturating_mul(BM25_SCALE)
         .saturating_add(rounded_divide(
             BM25_K1.saturating_mul(length_normalization),
             BM25_SCALE,
         ));
-    let term_weight = rounded_divide(
+    rounded_divide(
         term_frequency
             .saturating_mul(BM25_K1.saturating_add(BM25_SCALE))
             .saturating_mul(BM25_SCALE),
         denominator,
-    );
+    )
+}
+
+fn bm25_score_with_idf(inverse_document_frequency: u128, term_weight: u128) -> u64 {
+    if inverse_document_frequency == 0 || term_weight == 0 {
+        return 0;
+    }
     let score = rounded_divide(
         inverse_document_frequency.saturating_mul(term_weight),
         BM25_SCALE,
@@ -2852,7 +2869,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_cache_entries_are_uncached_without_publishing_build_counters() {
+    fn max_shape_indexes_are_bounded_and_oversized_prepared_entries_are_uncached() {
         let alias_tokens = (0..249)
             .map(|index| format!("{index:02x}"))
             .collect::<Vec<_>>();
@@ -2891,9 +2908,12 @@ mod tests {
         )
         .unwrap();
         assert!(first.is_empty() && second.is_empty());
-        assert!(!first_stats.cache_hit && !second_stats.cache_hit);
-        assert_eq!(registry.catalog_build_count(), 0);
-        assert_eq!(registry.catalog_cache_metrics(), (0, 0, 0));
+        assert!(!first_stats.cache_hit && second_stats.cache_hit);
+        assert_eq!(registry.catalog_build_count(), 1);
+        let (entries, bytes, evictions) = registry.catalog_cache_metrics();
+        assert_eq!(entries, 1);
+        assert!(bytes <= MAX_SCOPE_CATALOG_CACHE_BYTES);
+        assert_eq!(evictions, 0);
 
         let mut prepared_registry = ToolRegistry::default();
         let description = "x".repeat(3 * 1024 * 1024);
@@ -3162,5 +3182,127 @@ mod tests {
         )
         .unwrap();
         assert!(selected.contains("weather.current"));
+    }
+
+    #[test]
+    #[ignore = "non-gating release discovery latency evaluation"]
+    fn discovery_release_microbenchmark() {
+        use std::{hint::black_box, time::Duration};
+
+        fn percentile(samples: &mut [Duration], percentile: usize) -> Duration {
+            samples.sort_unstable();
+            let position = samples
+                .len()
+                .saturating_mul(percentile)
+                .div_ceil(100)
+                .saturating_sub(1);
+            samples[position.min(samples.len().saturating_sub(1))]
+        }
+
+        fn evaluate(label: &str, count: usize, adversarial: bool) {
+            let mut registry = ToolRegistry::default();
+            let adversarial_name = (0..MAX_QUERY_TERMS)
+                .map(|term| format!("t{term:02}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut allowlist = Vec::with_capacity(count);
+            for index in 0..count {
+                let id = format!("benchmark.tool.{index:04}");
+                let name = if adversarial {
+                    adversarial_name.clone()
+                } else {
+                    format!("Benchmark tool {index:04}")
+                };
+                let metadata = if adversarial {
+                    ToolDiscoveryMetadata::deferred()
+                } else {
+                    ToolDiscoveryMetadata::deferred()
+                        .with_aliases([format!("category-{:02}", index % 10)])
+                };
+                let definition = ToolDefinition::new(
+                    &id,
+                    name,
+                    "description excluded from discovery",
+                    json!({"type": "object"}),
+                )
+                .with_allowed_callers([ToolCaller::Direct]);
+                registry
+                    .register_with_discovery(Arc::new(TestTool(definition)), metadata)
+                    .unwrap();
+                allowlist.push(id);
+            }
+            let query = if adversarial {
+                format!("{adversarial_name} request")
+            } else {
+                "category request".to_owned()
+            };
+            let limits = ToolDiscoveryLimits::new()
+                .with_max_tools(4)
+                .with_max_expansion_tools(4);
+            let provider = ProviderCapabilityLimits::new();
+
+            let mut cold = Vec::with_capacity(25);
+            for _ in 0..25 {
+                *registry
+                    .catalog_cache
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = CatalogCache::default();
+                *registry
+                    .prepared_catalog_cache
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    PreparedCatalogCache::default();
+                let provider_limits = provider.clone();
+                let started = std::time::Instant::now();
+                let (selected, stats) =
+                    scope(&registry, &query, &allowlist, limits, provider_limits)
+                        .expect("benchmark scope selection");
+                cold.push(started.elapsed());
+                assert!(!stats.cache_hit);
+                black_box(selected.serialized_definitions());
+            }
+
+            let (selected, _) = scope(&registry, &query, &allowlist, limits, provider.clone())
+                .expect("benchmark warmup");
+            black_box(selected.serialized_definitions());
+            let mut warm = Vec::with_capacity(200);
+            for _ in 0..200 {
+                let provider_limits = provider.clone();
+                let started = std::time::Instant::now();
+                let (selected, stats) =
+                    scope(&registry, &query, &allowlist, limits, provider_limits)
+                        .expect("benchmark warm scope selection");
+                warm.push(started.elapsed());
+                assert!(stats.cache_hit);
+                black_box(selected.serialized_definitions());
+            }
+
+            let cold_median = percentile(&mut cold, 50);
+            let cold_p95 = percentile(&mut cold, 95);
+            let warm_median = percentile(&mut warm, 50);
+            let warm_p95 = percentile(&mut warm, 95);
+            println!(
+                "discovery-benchmark scenario={label} tools={count} cold_median_us={} cold_p95_us={} warm_median_us={} warm_p95_us={} cold_target={} warm_target={}",
+                cold_median.as_micros(),
+                cold_p95.as_micros(),
+                warm_median.as_micros(),
+                warm_p95.as_micros(),
+                if cold_p95 < Duration::from_millis(50) { "pass" } else { "miss" },
+                if warm_p95 < Duration::from_millis(5) { "pass" } else { "miss" },
+            );
+        }
+
+        println!(
+            "discovery-benchmark profile={}",
+            if cfg!(debug_assertions) {
+                "debug (results are informational; rerun with --release)"
+            } else {
+                "release"
+            }
+        );
+        for count in [30, 100, 1_000] {
+            evaluate("normal", count, false);
+        }
+        evaluate("adversarial-64-term", 1_000, true);
     }
 }
