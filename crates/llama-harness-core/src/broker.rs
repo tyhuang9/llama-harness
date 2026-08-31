@@ -124,6 +124,7 @@ pub(crate) struct PreparedCall {
     pub(crate) tool: Arc<dyn Tool>,
     pub(crate) context: ToolCallContext,
     signature: Option<String>,
+    effect_key: Option<String>,
     caller: ToolCaller,
     authorized_signature: Option<String>,
     signature_accounted: bool,
@@ -207,7 +208,10 @@ impl<'a> ToolBroker<'a> {
         state.tool_calls += 1;
 
         if !defer_signature_checks {
-            let recorded_call = self.call_for_transcript(request, &call, caller);
+            let mut recorded_call = self.call_for_transcript(request, &call, caller);
+            if caller == ToolCaller::Programmatic {
+                recorded_call.arguments_json = "{}".into();
+            }
             result.tool_calls.push(recorded_call);
         }
 
@@ -339,12 +343,20 @@ impl<'a> ToolBroker<'a> {
         }
 
         let authorized_signature = signature.clone();
+        let effect_key = if tool.definition().read_only {
+            None
+        } else if caller == ToolCaller::Programmatic {
+            Some(call.id.clone())
+        } else {
+            signature.clone()
+        };
         Ok(PrepareOutcome::Ready(Box::new(PreparedCall {
             call,
             arguments,
             tool,
             context,
             signature,
+            effect_key,
             caller,
             authorized_signature,
             signature_accounted: !defer_signature_checks,
@@ -447,6 +459,7 @@ impl<'a> ToolBroker<'a> {
 
         prepared.arguments = arguments;
         prepared.call.arguments_json = arguments_json;
+        prepared.effect_key = (!prepared.tool.definition().read_only).then(|| signature.clone());
         prepared.signature = Some(signature);
         Ok(FinalizeOutcome::Ready)
     }
@@ -659,7 +672,7 @@ impl<'a> ToolBroker<'a> {
         if prepared.tool.definition().read_only {
             return;
         }
-        if let Some(signature) = &prepared.signature {
+        if let Some(signature) = &prepared.effect_key {
             state
                 .effects
                 .insert(signature.clone(), EffectRecord::Dispatched);
@@ -670,7 +683,7 @@ impl<'a> ToolBroker<'a> {
         if prepared.tool.definition().read_only {
             return;
         }
-        if let Some(signature) = &prepared.signature {
+        if let Some(signature) = &prepared.effect_key {
             state
                 .effects
                 .insert(signature.clone(), EffectRecord::Uncertain);
@@ -691,7 +704,7 @@ impl<'a> ToolBroker<'a> {
         if prepared.tool.definition().read_only {
             return;
         }
-        if let Some(signature) = &prepared.signature {
+        if let Some(signature) = &prepared.effect_key {
             let record = if execution.result.ok && execution.validation_error.is_none() {
                 EffectRecord::Completed(Arc::clone(&execution.result))
             } else {

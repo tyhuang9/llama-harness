@@ -127,13 +127,14 @@ impl AgentRunner {
     /// Executes one run with an explicit strategy override.
     ///
     /// Forced direct execution preserves the reactive safety-boundary behavior.
-    /// Programmatic execution remains unavailable until the optional sandbox is
-    /// installed by a later release.
+    /// Forced programmatic execution fails closed unless the crate feature,
+    /// host opt-in, provider conformance, and resource limits are all present.
     pub async fn run_with_strategy(
         &self,
         request: RunRequest,
         strategy: RunStrategy,
     ) -> Result<RunResult, HarnessError> {
+        #[cfg(not(feature = "programmatic"))]
         if strategy == RunStrategy::Programmatic {
             return Err(HarnessError::UnsupportedCapability(
                 "programmatic execution requires the optional sandbox runtime".into(),
@@ -160,6 +161,9 @@ impl AgentRunner {
                 )
                 .await
             }
+            #[cfg(feature = "programmatic")]
+            RunStrategy::Programmatic => self.run_programmatic(request, preflight).await,
+            #[cfg(not(feature = "programmatic"))]
             RunStrategy::Programmatic => unreachable!("programmatic strategy returned above"),
             RunStrategy::DeclarativePlan => {
                 let readiness = match self.prepare_plan_scope(&request, preflight.deadline) {

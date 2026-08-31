@@ -17,6 +17,8 @@ mod model;
 /// Declarative execution plan contracts and validation.
 pub mod plan;
 mod policy;
+#[cfg(feature = "programmatic")]
+mod programmatic;
 mod runner;
 mod streaming;
 mod tool;
@@ -39,10 +41,12 @@ pub use event::{
     ToolDiscoverySelection,
 };
 pub use limits::{AgentLimits, GenerationOptions};
+#[cfg(feature = "programmatic")]
+pub use llama_harness_programmatic_sandbox as programmatic_sandbox;
 pub use message::{Message, MessageRole};
 pub use model::{
     ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, PreparedToolCatalog,
-    ProviderCapabilityLimits, ProviderHealth, Usage,
+    ProgrammaticConformance, ProviderCapabilityLimits, ProviderHealth, Usage,
 };
 pub use plan::{
     ExecutionPlan, PlanConcurrency, PlanNode, ResultBinding, ResultRef,
@@ -54,6 +58,8 @@ pub use policy::{
     AllowAllPolicy, ApprovalHandler, ApprovalRecord, DenyApproval, PolicyDecision, PolicyEngine,
     SafeDefaultPolicy,
 };
+#[cfg(feature = "programmatic")]
+pub use programmatic::ProgrammaticHostConfig;
 pub use runner::{AgentRunner, AgentRunnerBuilder};
 pub use streaming::{
     ModelEventStream, ModelStreamController, ModelStreamEvent, PartialToolCall, ToolCallAssembler,

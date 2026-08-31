@@ -19,6 +19,7 @@ ollama = ["dep:llama-harness-ollama"]
 observability = ["dep:llama-harness-observability"]
 evals = ["dep:llama-harness-evals"]
 tauri = ["dep:llama-harness-tauri"]
+programmatic = ["llama-harness-core/programmatic"]
 
 [dependencies]
 async-trait = "0.1"

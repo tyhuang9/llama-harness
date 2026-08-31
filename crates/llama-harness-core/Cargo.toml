@@ -13,12 +13,17 @@ keywords = ["agents", "llm", "tools"]
 categories = ["development-tools", "asynchronous"]
 publish = ["crates-io"]
 
+[features]
+default = []
+programmatic = ["dep:llama-harness-programmatic-sandbox"]
+
 [dependencies]
 async-trait = "0.1"
 blake3 = "1"
 futures-core = "0.3"
 futures-util = "0.3"
 jsonschema = { version = "0.37", default-features = false }
+llama-harness-programmatic-sandbox = { version = "0.1.0", path = "../llama-harness-programmatic-sandbox", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9"

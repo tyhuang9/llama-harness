@@ -30,6 +30,10 @@ pub struct AgentRunner {
     pub(crate) events: Arc<dyn EventSink>,
     pub(crate) concurrency: Arc<ToolConcurrencyLimiter>,
     pub(crate) discovery_limits: ToolDiscoveryLimits,
+    #[cfg(feature = "programmatic")]
+    pub(crate) programmatic: Option<crate::ProgrammaticHostConfig>,
+    #[cfg(feature = "programmatic")]
+    pub(crate) programmatic_admission: Arc<tokio::sync::Semaphore>,
 }
 
 /// Configures an [`AgentRunner`] and its policy, approval, tool, and event integrations.
@@ -41,6 +45,8 @@ pub struct AgentRunnerBuilder {
     events: Arc<dyn EventSink>,
     concurrency: Arc<ToolConcurrencyLimiter>,
     discovery_limits: ToolDiscoveryLimits,
+    #[cfg(feature = "programmatic")]
+    programmatic: Option<crate::ProgrammaticHostConfig>,
 }
 
 pub(crate) struct RunPreflight {
@@ -60,6 +66,8 @@ impl AgentRunner {
             events: Arc::new(InMemoryEventSink::default()),
             concurrency: Arc::new(ToolConcurrencyLimiter::default()),
             discovery_limits: ToolDiscoveryLimits::default(),
+            #[cfg(feature = "programmatic")]
+            programmatic: None,
         }
     }
 
@@ -602,6 +610,12 @@ pub(crate) struct DirectStrategyEvents {
 }
 
 impl AgentRunnerBuilder {
+    #[cfg(feature = "programmatic")]
+    /// Explicitly opts this host into bounded programmatic execution.
+    pub fn programmatic(mut self, config: crate::ProgrammaticHostConfig) -> Self {
+        self.programmatic = Some(config);
+        self
+    }
     /// Replaces the tool registry used by the runner.
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = tools;
@@ -634,6 +648,12 @@ impl AgentRunnerBuilder {
 
     /// Builds the configured runner.
     pub fn build(self) -> AgentRunner {
+        #[cfg(feature = "programmatic")]
+        let admission = Arc::new(tokio::sync::Semaphore::new(
+            self.programmatic
+                .as_ref()
+                .map_or(1, |config| config.max_active_vms),
+        ));
         AgentRunner {
             provider: self.provider,
             tools: self.tools,
@@ -642,6 +662,10 @@ impl AgentRunnerBuilder {
             events: self.events,
             concurrency: self.concurrency,
             discovery_limits: self.discovery_limits,
+            #[cfg(feature = "programmatic")]
+            programmatic: self.programmatic,
+            #[cfg(feature = "programmatic")]
+            programmatic_admission: admission,
         }
     }
 }

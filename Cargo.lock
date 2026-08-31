@@ -1924,6 +1924,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "jsonschema",
+ "llama-harness-programmatic-sandbox",
  "serde",
  "serde_json",
  "serde_yaml",
