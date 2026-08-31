@@ -1319,7 +1319,7 @@ async fn direct_runner_hides_and_rejects_tools_without_direct_permission() {
     assert!(result
         .errors
         .iter()
-        .any(|error| error.message.contains("does not allow direct calls")));
+        .any(|error| error.message.contains("tool unavailable")));
     let feedback: ToolResult = serde_json::from_str(
         &provider.requests()[1]
             .messages

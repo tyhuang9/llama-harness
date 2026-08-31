@@ -7,7 +7,7 @@ use crate::{
     model::{ModelProvider, ModelRequest, ModelResponse},
     policy::{ApprovalHandler, DenyApproval, PolicyEngine, SafeDefaultPolicy},
     tool::{ToolCall, ToolCaller, ToolRegistry, ToolResult},
-    GenerationOptions, HarnessError, RunError,
+    GenerationOptions, HarnessError, RunError, ToolDiscoveryLimits, ToolScope,
 };
 use jsonschema::Validator;
 use serde_json::Value;
@@ -28,6 +28,7 @@ pub struct AgentRunner {
     pub(crate) approvals: Arc<dyn ApprovalHandler>,
     pub(crate) events: Arc<dyn EventSink>,
     pub(crate) concurrency: Arc<ToolConcurrencyLimiter>,
+    pub(crate) discovery_limits: ToolDiscoveryLimits,
 }
 
 /// Configures an [`AgentRunner`] and its policy, approval, tool, and event integrations.
@@ -38,6 +39,7 @@ pub struct AgentRunnerBuilder {
     approvals: Arc<dyn ApprovalHandler>,
     events: Arc<dyn EventSink>,
     concurrency: Arc<ToolConcurrencyLimiter>,
+    discovery_limits: ToolDiscoveryLimits,
 }
 
 impl AgentRunner {
@@ -50,6 +52,7 @@ impl AgentRunner {
             approvals: Arc::new(DenyApproval),
             events: Arc::new(InMemoryEventSink::default()),
             concurrency: Arc::new(ToolConcurrencyLimiter::default()),
+            discovery_limits: ToolDiscoveryLimits::default(),
         }
     }
 
@@ -59,6 +62,13 @@ impl AgentRunner {
         strategy_events: Option<DirectStrategyEvents>,
     ) -> Result<RunResult, HarnessError> {
         let output_validator = validate_request(&request)?;
+        let (tool_scope, discovery) = self.tools.select_scope(
+            &request.input,
+            &request.agent.tool_allowlist,
+            ToolCaller::Direct,
+            self.discovery_limits,
+            &self.provider.capabilities().limits,
+        )?;
         let started = StdInstant::now();
         let deadline = absolute_deadline(request.agent.limits.max_run_duration_ms)?;
         let run_id = request
@@ -93,6 +103,7 @@ impl AgentRunner {
         let mut events =
             EventEmitter::new(run_id.clone(), trace_id.clone(), Arc::clone(&self.events));
         events.emit(RunEvent::Started { run_id, trace_id });
+        emit_discovery(&mut events, ToolCaller::Direct, discovery);
         if let Some(strategy_events) = strategy_events {
             if let Some(reason) = strategy_events.fallback {
                 events.emit(RunEvent::StrategyFallback {
@@ -114,6 +125,7 @@ impl AgentRunner {
         let mut output_repairs = 0;
         let broker = ToolBroker::new(
             &self.tools,
+            &tool_scope,
             &self.policy,
             &self.approvals,
             &self.concurrency,
@@ -164,9 +176,7 @@ impl AgentRunner {
                 let completion = self.provider.complete(ModelRequest {
                     model: model.clone(),
                     messages: messages.clone(),
-                    tools: self
-                        .tools
-                        .allowed_definitions(&request.agent.tool_allowlist),
+                    tools: tool_scope.definitions().to_vec(),
                     generation: merge_generation(
                         &request.agent.generation,
                         &request.overrides.generation,
@@ -260,7 +270,8 @@ impl AgentRunner {
                 break;
             }
 
-            let recorded_calls = self.tool_calls_for_transcript(&request, &response.tool_calls);
+            let recorded_calls =
+                self.tool_calls_for_transcript(&request, &tool_scope, &response.tool_calls);
             messages.push(Message::assistant_tool_calls(recorded_calls.clone()));
             if let Err(error) = ensure_transcript(&messages, &request.agent.limits) {
                 apply_terminal_error(&mut result, error);
@@ -392,13 +403,14 @@ impl AgentRunner {
     pub(crate) fn tool_calls_for_transcript(
         &self,
         request: &RunRequest,
+        scope: &ToolScope,
         calls: &[ToolCall],
     ) -> Vec<ToolCall> {
         calls
             .iter()
             .map(|call| {
                 let mut transcript_call = call.clone();
-                if !self.tool_arguments_are_valid(request, call) {
+                if !self.tool_arguments_are_valid(request, scope, call) {
                     transcript_call.arguments_json = "{}".into();
                 }
                 transcript_call
@@ -406,7 +418,12 @@ impl AgentRunner {
             .collect()
     }
 
-    fn tool_arguments_are_valid(&self, request: &RunRequest, call: &ToolCall) -> bool {
+    fn tool_arguments_are_valid(
+        &self,
+        request: &RunRequest,
+        scope: &ToolScope,
+        call: &ToolCall,
+    ) -> bool {
         if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
             return false;
         }
@@ -420,6 +437,9 @@ impl AgentRunner {
         )
         .is_err()
         {
+            return false;
+        }
+        if !scope.contains(&call.tool_id) {
             return false;
         }
         let Some(tool) = self.tools.get(&call.tool_id) else {
@@ -446,6 +466,12 @@ impl AgentRunnerBuilder {
     /// Replaces the tool registry used by the runner.
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Replaces the bounded host limits used for model-facing tool discovery.
+    pub fn discovery_limits(mut self, limits: ToolDiscoveryLimits) -> Self {
+        self.discovery_limits = limits;
         self
     }
 
@@ -476,8 +502,27 @@ impl AgentRunnerBuilder {
             approvals: self.approvals,
             events: self.events,
             concurrency: self.concurrency,
+            discovery_limits: self.discovery_limits,
         }
     }
+}
+
+pub(crate) fn emit_discovery(
+    events: &mut EventEmitter,
+    caller: ToolCaller,
+    stats: crate::discovery::ToolDiscoveryStats,
+) {
+    if stats.deferred_candidate_count == 0 && !stats.catalog_exceeded_budget {
+        return;
+    }
+    events.emit(RunEvent::ToolDiscoveryCompleted {
+        caller,
+        candidate_count: stats.candidate_count,
+        selected_count: stats.selected_count,
+        deferred_candidate_count: stats.deferred_candidate_count,
+        catalog_exceeded_budget: stats.catalog_exceeded_budget,
+        cache_hit: stats.cache_hit,
+    });
 }
 
 pub(crate) fn validate_request(request: &RunRequest) -> Result<Option<Validator>, HarnessError> {

@@ -3,6 +3,7 @@ use crate::{
     runner::{await_guarded, check_stopped},
     ApprovalHandler, HarnessError, PolicyDecision, PolicyEngine, RunError, RunEvent, RunRequest,
     RunResult, RunStatus, Tool, ToolCall, ToolCallContext, ToolCaller, ToolRegistry, ToolResult,
+    ToolScope,
 };
 use serde_json::Value;
 use std::{
@@ -154,6 +155,7 @@ pub(crate) struct BrokerExecution {
 /// Provider-neutral safety boundary used by direct and orchestrated calls.
 pub(crate) struct ToolBroker<'a> {
     tools: &'a ToolRegistry,
+    scope: &'a ToolScope,
     policy: &'a Arc<dyn PolicyEngine>,
     approvals: &'a Arc<dyn ApprovalHandler>,
     concurrency: &'a Arc<ToolConcurrencyLimiter>,
@@ -162,12 +164,14 @@ pub(crate) struct ToolBroker<'a> {
 impl<'a> ToolBroker<'a> {
     pub(crate) fn new(
         tools: &'a ToolRegistry,
+        scope: &'a ToolScope,
         policy: &'a Arc<dyn PolicyEngine>,
         approvals: &'a Arc<dyn ApprovalHandler>,
         concurrency: &'a Arc<ToolConcurrencyLimiter>,
     ) -> Self {
         Self {
             tools,
+            scope,
             policy,
             approvals,
             concurrency,
@@ -249,10 +253,16 @@ impl<'a> ToolBroker<'a> {
             )));
         }
 
-        let Some(tool) = self.tools.get(&call.tool_id) else {
-            self.reject(result, events, state, &call, "unknown tool".into());
+        if !self.scope.contains(&call.tool_id) || self.scope.caller() != caller {
+            self.reject(result, events, state, &call, "tool unavailable".into());
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
-                "unknown tool",
+                "tool unavailable",
+            )));
+        }
+        let Some(tool) = self.tools.get(&call.tool_id) else {
+            self.reject(result, events, state, &call, "tool unavailable".into());
+            return Ok(PrepareOutcome::Rejected(ToolResult::failure(
+                "tool unavailable",
             )));
         };
         if !request
@@ -376,6 +386,8 @@ impl<'a> ToolBroker<'a> {
             request.agent.limits.max_json_depth,
         )?;
         if !prepared.tool.definition().allows_caller(prepared.caller)
+            || !self.scope.contains(&prepared.call.tool_id)
+            || self.scope.caller() != prepared.caller
             || !request
                 .agent
                 .tool_allowlist

@@ -4,14 +4,14 @@ use crate::{
     limits::serialized_len,
     plan::{MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES},
     runner::{
-        absolute_deadline, apply_terminal_error, ensure_transcript, initial_messages,
-        merge_generation, provider_deadline, push_tool_message, validate_model_response,
-        validate_output, validate_request, DirectStrategyEvents,
+        absolute_deadline, apply_terminal_error, emit_discovery, ensure_transcript,
+        initial_messages, merge_generation, provider_deadline, push_tool_message,
+        validate_model_response, validate_output, validate_request, DirectStrategyEvents,
     },
     AgentRunner, ExecutionPlan, HarnessError, Message, ModelRequest, ModelResponse,
     PlanConcurrency, PlanLifecycleOutcome, PlanNode, PlanNodeOutcome, PlanPhase, RunError,
     RunEvent, RunRequest, RunResult, RunStatus, RunStrategy, StrategyFallbackReason,
-    StrategySelectionReason, ToolCall, ToolCaller, ToolDefinition, ToolResult,
+    StrategySelectionReason, ToolCall, ToolCaller, ToolDefinition, ToolResult, ToolScope,
 };
 use futures_util::future::join_all;
 use jsonschema::Validator;
@@ -64,6 +64,8 @@ struct StrategyRun<'a> {
     selected: RunStrategy,
     terminal: bool,
     plan_attempt: u32,
+    direct_scope: ToolScope,
+    plan_scope: ToolScope,
 }
 
 struct PreparedNode {
@@ -137,7 +139,7 @@ impl AgentRunner {
                     .await
             }
             RunStrategy::Adaptive => {
-                if self.planning_downgrade_reason(&request).is_some() {
+                if self.planning_downgrade_reason(&request)?.is_some() {
                     self.run_direct(
                         request,
                         Some(DirectStrategyEvents {
@@ -155,51 +157,41 @@ impl AgentRunner {
     }
 
     fn ensure_planning_capability(&self, request: &RunRequest) -> Result<(), HarnessError> {
-        if let Some(reason) = self.planning_downgrade_reason(request) {
+        if let Some(reason) = self.planning_downgrade_reason(request)? {
             return Err(HarnessError::UnsupportedCapability(reason.into()));
         }
         Ok(())
     }
 
-    fn planning_downgrade_reason(&self, request: &RunRequest) -> Option<&'static str> {
+    fn planning_downgrade_reason(
+        &self,
+        request: &RunRequest,
+    ) -> Result<Option<&'static str>, HarnessError> {
         let capabilities = self.provider.capabilities();
         if request.agent.limits.max_model_calls < 2 {
-            return Some("run model-call budget cannot support planning and finalization");
+            return Ok(Some(
+                "run model-call budget cannot support planning and finalization",
+            ));
         }
         if !capabilities.supports_tools || !capabilities.supports_structured_plans {
-            return Some("provider does not support structured plans");
+            return Ok(Some("provider does not support structured plans"));
         }
         if capabilities.limits.max_plan_nodes == Some(0)
             || capabilities.limits.max_plan_bytes == Some(0)
         {
-            return Some("provider advertises no structured-plan capacity");
+            return Ok(Some("provider advertises no structured-plan capacity"));
         }
-        let tools = self
-            .tools
-            .allowed_definitions_for(&request.agent.tool_allowlist, ToolCaller::DeclarativePlan);
-        if tools.is_empty() {
-            return Some("no allowed tools permit declarative plan calls");
+        let (scope, _) = self.tools.select_scope(
+            &request.input,
+            &request.agent.tool_allowlist,
+            ToolCaller::DeclarativePlan,
+            self.discovery_limits,
+            &capabilities.limits,
+        )?;
+        if scope.is_empty() {
+            return Ok(Some("no allowed tools permit declarative plan calls"));
         }
-        if capabilities
-            .limits
-            .max_tools
-            .is_some_and(|limit| tools.len() > limit as usize)
-        {
-            return Some("tool catalog exceeds provider tool-count capacity");
-        }
-        let schema_bytes = tools.iter().fold(0u64, |total, tool| {
-            total.saturating_add(
-                serde_json::to_vec(tool).map_or(u64::MAX, |bytes| bytes.len() as u64),
-            )
-        });
-        if capabilities
-            .limits
-            .max_tool_schema_bytes
-            .is_some_and(|limit| schema_bytes > limit)
-        {
-            return Some("tool catalog exceeds provider schema capacity");
-        }
-        None
+        Ok(None)
     }
 
     async fn run_planned(
@@ -216,9 +208,7 @@ impl AgentRunner {
             });
         }
 
-        let plan_tools = self
-            .tools
-            .allowed_definitions_for(&request.agent.tool_allowlist, ToolCaller::DeclarativePlan);
+        let plan_tools = run.plan_scope.definitions().to_vec();
         let mut planner_messages = run.messages.clone();
         planner_messages.insert(0, Message::system(PLANNER_PROMPT));
         let mut invalid_repair_used = false;
@@ -551,6 +541,21 @@ impl<'a> StrategyRun<'a> {
         requested: RunStrategy,
     ) -> Result<Self, HarnessError> {
         let output_validator = validate_request(request)?;
+        let capabilities = runner.provider.capabilities();
+        let (direct_scope, direct_discovery) = runner.tools.select_scope(
+            &request.input,
+            &request.agent.tool_allowlist,
+            ToolCaller::Direct,
+            runner.discovery_limits,
+            &capabilities.limits,
+        )?;
+        let (plan_scope, plan_discovery) = runner.tools.select_scope(
+            &request.input,
+            &request.agent.tool_allowlist,
+            ToolCaller::DeclarativePlan,
+            runner.discovery_limits,
+            &capabilities.limits,
+        )?;
         let started = StdInstant::now();
         let deadline = absolute_deadline(request.agent.limits.max_run_duration_ms)?;
         let run_id = request
@@ -572,6 +577,8 @@ impl<'a> StrategyRun<'a> {
             run_id: run_id.clone(),
             trace_id: trace_id.clone(),
         });
+        emit_discovery(&mut events, ToolCaller::Direct, direct_discovery);
+        emit_discovery(&mut events, ToolCaller::DeclarativePlan, plan_discovery);
         Ok(Self {
             runner,
             request,
@@ -593,6 +600,8 @@ impl<'a> StrategyRun<'a> {
             selected: requested,
             terminal: false,
             plan_attempt: 0,
+            direct_scope,
+            plan_scope,
         })
     }
 
@@ -829,6 +838,12 @@ impl<'a> StrategyRun<'a> {
                     node.id
                 )));
             };
+            if !self.plan_scope.contains(&node.tool_id) {
+                return Err(HarnessError::InvalidTool(format!(
+                    "plan node '{}' selects an unavailable tool",
+                    node.id
+                )));
+            }
             if !self
                 .request
                 .agent
@@ -901,8 +916,10 @@ impl<'a> StrategyRun<'a> {
         plan_attempt: u32,
     ) -> Result<Option<Vec<PreparedNode>>, HarnessError> {
         self.static_plan_preflight(plan)?;
+        let scope = self.plan_scope.clone();
         let broker = ToolBroker::new(
             &self.runner.tools,
+            &scope,
             &self.runner.policy,
             &self.runner.approvals,
             &self.runner.concurrency,
@@ -1005,8 +1022,10 @@ impl<'a> StrategyRun<'a> {
         completed: &BTreeMap<String, Arc<ToolResult>>,
         done: &HashSet<String>,
     ) -> Result<bool, HarnessError> {
+        let scope = self.plan_scope.clone();
         let broker = ToolBroker::new(
             &self.runner.tools,
+            &scope,
             &self.runner.policy,
             &self.runner.approvals,
             &self.runner.concurrency,
@@ -1261,8 +1280,10 @@ impl<'a> StrategyRun<'a> {
             let wave = build_wave(&prepared, &ready, max_parallel);
             wave_number += 1;
 
+            let scope = self.plan_scope.clone();
             let broker = ToolBroker::new(
                 &self.runner.tools,
+                &scope,
                 &self.runner.policy,
                 &self.runner.approvals,
                 &self.runner.concurrency,
@@ -1656,8 +1677,10 @@ impl<'a> StrategyRun<'a> {
     }
 
     async fn run_reactive(&mut self, initial_phase: ModelCallPhase) {
+        let scope = self.direct_scope.clone();
         let broker = ToolBroker::new(
             &self.runner.tools,
+            &scope,
             &self.runner.policy,
             &self.runner.approvals,
             &self.runner.concurrency,
@@ -1670,9 +1693,7 @@ impl<'a> StrategyRun<'a> {
             let response = match self
                 .complete(
                     self.messages.clone(),
-                    self.runner
-                        .tools
-                        .allowed_definitions(&self.request.agent.tool_allowlist),
+                    self.direct_scope.definitions().to_vec(),
                     phase,
                     false,
                 )
@@ -1739,9 +1760,11 @@ impl<'a> StrategyRun<'a> {
                 ));
                 return;
             }
-            let recorded_calls = self
-                .runner
-                .tool_calls_for_transcript(self.request, &response.tool_calls);
+            let recorded_calls = self.runner.tool_calls_for_transcript(
+                self.request,
+                &self.direct_scope,
+                &response.tool_calls,
+            );
             self.messages
                 .push(Message::assistant_tool_calls(recorded_calls));
             if let Err(error) = ensure_transcript(&self.messages, &self.request.agent.limits) {
