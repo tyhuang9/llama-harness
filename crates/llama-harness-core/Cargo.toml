@@ -15,6 +15,7 @@ publish = ["crates-io"]
 
 [dependencies]
 async-trait = "0.1"
+blake3 = "1"
 futures-core = "0.3"
 futures-util = "0.3"
 jsonschema = { version = "0.37", default-features = false }

@@ -6,6 +6,7 @@ mod adaptive;
 mod agent;
 mod agent_manifest;
 mod broker;
+mod discovery;
 mod error;
 mod event;
 mod limits;
@@ -26,6 +27,10 @@ pub use agent::{
 pub use agent_manifest::{
     load_agent_manifest, load_agent_manifest_path, AgentManifest, AgentManifestError,
     AGENT_MANIFEST_VERSION,
+};
+pub use discovery::{
+    CatalogFingerprint, ToolDiscoveryLimits, ToolDiscoveryMetadata, ToolExposure, ToolScope,
+    CATALOG_FINGERPRINT_VERSION,
 };
 pub use error::{HarnessError, ModelStreamFailureKind, RunError};
 pub use event::{

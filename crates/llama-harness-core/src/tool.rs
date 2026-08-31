@@ -1,4 +1,5 @@
 use crate::{
+    discovery::{CatalogEntry, CatalogIndex, ToolDiscoveryMetadata},
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len},
     AgentLimits, HarnessError,
 };
@@ -8,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -400,21 +401,40 @@ pub trait Tool: Send + Sync {
     }
 }
 
-struct RegisteredTool {
-    tool: Arc<dyn Tool>,
+pub(crate) struct RegisteredTool {
+    pub(crate) tool: Arc<dyn Tool>,
     validator: Arc<Validator>,
     output_validator: Option<Arc<Validator>>,
+    pub(crate) discovery: ToolDiscoveryMetadata,
 }
 
-#[derive(Default)]
 /// Registry of tools and their compiled argument validators.
 pub struct ToolRegistry {
-    tools: HashMap<String, RegisteredTool>,
+    pub(crate) tools: HashMap<String, RegisteredTool>,
+    pub(crate) catalog_cache: RwLock<Option<Arc<CatalogIndex>>>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self {
+            tools: HashMap::new(),
+            catalog_cache: RwLock::new(None),
+        }
+    }
 }
 
 impl ToolRegistry {
     /// Validates and registers a tool, rejecting duplicate IDs and invalid schemas.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), HarnessError> {
+        self.register_with_discovery(tool, ToolDiscoveryMetadata::default())
+    }
+
+    /// Registers a tool with validated, privacy-safe discovery metadata.
+    pub fn register_with_discovery(
+        &mut self,
+        tool: Arc<dyn Tool>,
+        mut discovery: ToolDiscoveryMetadata,
+    ) -> Result<(), HarnessError> {
         let id = tool.definition().id.trim().to_owned();
         if id.is_empty() {
             return Err(HarnessError::InvalidTool("tool id is required".into()));
@@ -452,14 +472,21 @@ impl ToolRegistry {
             None
         };
         validate_scheduling_metadata(tool.definition(), &id)?;
+        discovery.validate(&id)?;
+        discovery.aliases.sort();
         self.tools.insert(
             id,
             RegisteredTool {
                 tool,
                 validator: Arc::new(validator),
                 output_validator,
+                discovery,
             },
         );
+        *self
+            .catalog_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         Ok(())
     }
 
@@ -468,24 +495,57 @@ impl ToolRegistry {
         self.tools.get(id).map(|entry| Arc::clone(&entry.tool))
     }
 
-    pub(crate) fn allowed_definitions(&self, allowlist: &[String]) -> Vec<ToolDefinition> {
-        self.allowed_definitions_for(allowlist, ToolCaller::Direct)
-    }
-
-    pub(crate) fn allowed_definitions_for(
+    pub(crate) fn allowed_catalog(
         &self,
         allowlist: &[String],
         caller: ToolCaller,
-    ) -> Vec<ToolDefinition> {
+    ) -> Vec<(&ToolDefinition, &ToolDiscoveryMetadata)> {
+        let mut seen = BTreeSet::new();
         allowlist
             .iter()
+            .filter(|id| seen.insert((*id).as_str()))
             .filter_map(|id| {
-                self.tools
-                    .get(id)
-                    .filter(|entry| entry.tool.definition().allows_caller(caller))
-                    .map(|entry| entry.tool.definition().clone())
+                self.tools.get(id).and_then(|entry| {
+                    entry
+                        .tool
+                        .definition()
+                        .allows_caller(caller)
+                        .then_some((entry.tool.definition(), &entry.discovery))
+                })
             })
             .collect()
+    }
+
+    pub(crate) fn catalog_index(&self) -> (Arc<CatalogIndex>, bool) {
+        if let Some(index) = self
+            .catalog_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+        {
+            return (index, true);
+        }
+        let index = Arc::new(CatalogIndex::build(
+            self.tools
+                .values()
+                .map(|entry| CatalogEntry {
+                    id: entry.tool.definition().id.clone(),
+                    name: entry.tool.definition().name.clone(),
+                    metadata: entry.discovery.clone(),
+                    terms: Default::default(),
+                })
+                .collect(),
+        ));
+        let mut cache = self
+            .catalog_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = cache.as_ref() {
+            return (Arc::clone(existing), true);
+        }
+        *cache = Some(Arc::clone(&index));
+        (index, false)
     }
 
     pub(crate) fn validate(&self, tool_id: &str, arguments: &Value) -> Result<(), HarnessError> {
