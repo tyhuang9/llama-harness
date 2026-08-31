@@ -2435,25 +2435,37 @@ mod discovery_terminal_tests {
         records: &[crate::EventRecord],
         result: &RunResult,
         usage_strategy: RunStrategy,
+        completed_callers: &[ToolCaller],
     ) {
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 3 + completed_callers.len());
         assert_eq!(
             records
                 .iter()
                 .map(|record| record.sequence)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            (1..=records.len() as u64).collect::<Vec<_>>()
         );
         assert!(matches!(records[0].event, RunEvent::Started { .. }));
-        assert_zero_usage(&records[1].event, usage_strategy, result.duration_ms);
+        let actual_callers = records[1..=completed_callers.len()]
+            .iter()
+            .filter_map(|record| match record.event {
+                RunEvent::ToolDiscoveryCompleted { caller, .. } => Some(caller),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_callers, completed_callers);
+        assert_zero_usage(
+            &records[1 + completed_callers.len()].event,
+            usage_strategy,
+            result.duration_ms,
+        );
         assert!(matches!(
-            records[2].event,
+            records[2 + completed_callers.len()].event,
             RunEvent::Completed { ref status } if status == &result.status
         ));
         assert!(!records.iter().any(|record| matches!(
             record.event,
-            RunEvent::ToolDiscoveryCompleted { .. }
-                | RunEvent::ModelRequested { .. }
+            RunEvent::ModelRequested { .. }
                 | RunEvent::PolicyDecided { .. }
                 | RunEvent::ApprovalRequested { .. }
                 | RunEvent::ToolEffectReused { .. }
@@ -2468,6 +2480,14 @@ mod discovery_terminal_tests {
         capabilities: ModelCapabilities,
         usage_strategy: RunStrategy,
     ) {
+        let completed_callers = if paused_caller == ToolCaller::Direct
+            && strategy != RunStrategy::Direct
+            && capabilities.supports_structured_plans
+        {
+            vec![ToolCaller::DeclarativePlan]
+        } else {
+            Vec::new()
+        };
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let (registry, tools) =
@@ -2538,7 +2558,7 @@ mod discovery_terminal_tests {
         );
 
         let records = events.events();
-        assert_pre_event_terminal_records(&records, &result, usage_strategy);
+        assert_pre_event_terminal_records(&records, &result, usage_strategy, &completed_callers);
     }
 
     #[test]
@@ -2777,7 +2797,7 @@ mod discovery_terminal_tests {
                 .sum::<u32>(),
             0
         );
-        assert_pre_event_terminal_records(&events.events(), &result, strategy);
+        assert_pre_event_terminal_records(&events.events(), &result, strategy, &[]);
     }
 
     #[test]
@@ -2861,7 +2881,7 @@ mod discovery_terminal_tests {
         );
         assert!(runner.tools.catalog_cache_is_empty());
         assert_eq!(runner.tools.catalog_build_count(), 0);
-        assert_pre_event_terminal_records(&events.events(), &cancelled, RunStrategy::Direct);
+        assert_pre_event_terminal_records(&events.events(), &cancelled, RunStrategy::Direct, &[]);
 
         let mut retry_agent = crate::AgentDefinition::new("discovery", "Discovery", "1", "mock");
         retry_agent.tool_allowlist = allowlist;
