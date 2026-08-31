@@ -76,10 +76,11 @@ fn runner_discovery_events_reopen_with_additive_legacy_compatibility() {
     connection
         .execute(
             "INSERT INTO trace_events
-             (run_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json)
-             VALUES (?1, ?2, 1, 1, ?3, NULL, ?4)",
+             (run_id, execution_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json)
+             VALUES (?1, ?2, ?3, 1, 1, ?4, NULL, ?5)",
             rusqlite::params![
                 "legacy-discovery",
+                "legacy-discovery-execution",
                 "legacy-discovery-trace",
                 "tool.discovery.completed",
                 legacy
@@ -408,12 +409,20 @@ fn migration_append_query_reopen_and_conflict_are_deterministic() {
     assert_eq!(store.append(&first).unwrap(), AppendOutcome::Inserted);
     assert_eq!(store.append(&second).unwrap(), AppendOutcome::Inserted);
     assert_eq!(store.append(&first).unwrap(), AppendOutcome::Duplicate);
+    let mut conflicting = first.clone();
+    conflicting.timestamp_ms = 11;
+    conflicting.event = RunEvent::ModelResponded { call_number: 1 };
     assert!(matches!(
-        store.append(&record("run-a", "trace-a", 1, 11, RunEvent::ModelResponded { call_number: 1 })),
+        store.append(&conflicting),
         Err(TraceStoreError::Conflict { run_id, sequence }) if run_id == "run-a" && sequence == 1
     ));
+    let mut wrong_trace = first.clone();
+    wrong_trace.trace_id = "trace-other".into();
+    wrong_trace.sequence = 3;
+    wrong_trace.timestamp_ms = 30;
+    wrong_trace.event = RunEvent::ModelResponded { call_number: 2 };
     assert!(matches!(
-        store.append(&record("run-a", "trace-other", 3, 30, RunEvent::ModelResponded { call_number: 2 })),
+        store.append(&wrong_trace),
         Err(TraceStoreError::InvalidRecord(message)) if message.contains("already belongs")
     ));
     let events = store.events_for_run("run-a", 10, 0).unwrap();
@@ -522,6 +531,86 @@ fn raw_payloads_are_opt_in_bounded_and_redacted_before_write_and_export() {
 }
 
 #[test]
+fn repeated_public_run_ids_use_distinct_execution_keys_without_sequence_conflicts() {
+    let store = SqliteEventSink::open_in_memory(TraceStoreConfig::default()).unwrap();
+    let explicit_first = record(
+        "public-run-id",
+        "public-trace-id",
+        1,
+        1,
+        RunEvent::ModelResponded { call_number: 1 },
+    );
+    let explicit_second = record(
+        "public-run-id",
+        "public-trace-id",
+        1,
+        2,
+        RunEvent::ModelResponded { call_number: 1 },
+    );
+    assert_ne!(explicit_first.execution_id, explicit_second.execution_id);
+    assert_eq!(
+        store.append(&explicit_first).unwrap(),
+        AppendOutcome::Inserted
+    );
+    assert_eq!(
+        store.append(&explicit_second).unwrap(),
+        AppendOutcome::Inserted
+    );
+
+    let generated_first = record(
+        "generated-run-id",
+        "generated-trace-id",
+        1,
+        3,
+        RunEvent::ModelResponded { call_number: 1 },
+    );
+    let generated_second = record(
+        "generated-run-id",
+        "generated-trace-id",
+        1,
+        4,
+        RunEvent::ModelResponded { call_number: 1 },
+    );
+    assert_eq!(
+        store.append(&generated_first).unwrap(),
+        AppendOutcome::Inserted
+    );
+    assert_eq!(
+        store.append(&generated_second).unwrap(),
+        AppendOutcome::Inserted
+    );
+    assert_eq!(
+        store.events_for_run("public-run-id", 10, 0).unwrap().len(),
+        2
+    );
+    assert_eq!(
+        store
+            .events_for_run("generated-run-id", 10, 0)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn default_redaction_matches_artifact_key_tokens_without_hiding_capabilities() {
+    let redacted = RedactionConfig::default().redact(&json!({
+        "program": "program-source",
+        "program_source": "program-source",
+        "vm-locals": "program-source",
+        "programmatic_conformance": "strict_json_ast_v1",
+        "locale": "en-US",
+        "resource": "programmatic-resource"
+    }));
+    assert_eq!(redacted["program"], REDACTED_VALUE);
+    assert_eq!(redacted["program_source"], REDACTED_VALUE);
+    assert_eq!(redacted["vm-locals"], REDACTED_VALUE);
+    assert_eq!(redacted["programmatic_conformance"], "strict_json_ast_v1");
+    assert_eq!(redacted["locale"], "en-US");
+    assert_eq!(redacted["resource"], "programmatic-resource");
+}
+
+#[test]
 fn raw_payload_capture_never_persists_program_artifacts_by_default() {
     const PROGRAM_CANARY: &str = "program-artifact-canary";
     let store = SqliteEventSink::open_in_memory(TraceStoreConfig {
@@ -574,20 +663,12 @@ fn batch_writes_are_transactional_and_run_queries_filter_paginate_export_and_ret
         ])
         .unwrap();
     assert_eq!(inserted, vec![AppendOutcome::Inserted; 4]);
+    let atomic_first = started("run-atomic", "trace-c", 1);
+    let mut atomic_conflict = atomic_first.clone();
+    atomic_conflict.timestamp_ms = 2;
+    atomic_conflict.event = RunEvent::ModelResponded { call_number: 1 };
     assert!(matches!(
-        store.append_batch(vec![
-            (started("run-atomic", "trace-c", 1), None),
-            (
-                record(
-                    "run-atomic",
-                    "trace-c",
-                    1,
-                    2,
-                    RunEvent::ModelResponded { call_number: 1 }
-                ),
-                None
-            ),
-        ]),
+        store.append_batch(vec![(atomic_first, None), (atomic_conflict, None),]),
         Err(TraceStoreError::Conflict { .. })
     ));
     assert!(store

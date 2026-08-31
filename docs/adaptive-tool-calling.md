@@ -33,15 +33,21 @@ and tool scope, canonical arguments, schema validation, policy, approval,
 effect ledger, deadlines, cancellation, transcript limits, and audited events.
 The effective bound for each resource is the minimum applicable library hard
 cap, host sandbox setting, Agent limit, and provider capability. Program runs
-require a finite deadline and VM admission; read-only, parallel-safe fan-out is
+require a finite deadline and VM admission. Admission applies only to bounded
+ VM compute slices and is released before any provider, policy, approval, or
+ tool wait; read-only, parallel-safe fan-out is
 bounded at eight and additionally limited by the host, provider, Agent, and
 broker caps. Mutations are always serialized.
 
 One correction prompt is permitted only before an effect is dispatched. If the
-corrected program is still invalid and no effect was issued, the runner starts
-a fresh Direct-scope sequential fallback and records the `invalid_program`
-fallback metadata; a forced run therefore never claims that Programmatic
-succeeded. Cancellation, deadline, resource, invalid-output, tool, resume, or
+corrected program is still invalid and no effect was issued, the runner enters
+a fresh Direct scope as a continuation of the same logical run: it preserves
+the public run and trace IDs, event sequence, deadline, cumulative budgets,
+and broker state while recording `invalid_program` fallback metadata. A forced
+run therefore never claims that Programmatic succeeded. Program generation,
+repair, and final synthesis deliberately use the bounded completion path even
+when a provider advertises streaming; streaming is not a programmatic runtime
+contract yet. Cancellation, deadline, resource, invalid-output, tool, resume, or
 result failures after dispatch leave the effect uncertain and terminal. They
 never repair, restart, replay, speculate, or fall back.
 

@@ -1,6 +1,6 @@
 # Local trace observability
 
-Every `AgentRunner` run has a generated `run_id`, `trace_id`, monotonically increasing event sequence, and timestamp. Enable the facade's `observability` feature and attach `SqliteEventSink` from `llama_harness::observability` as the core runner's `EventSink` to persist that causal event stream locally. The sink uses a project-selected SQLite database; it does not start a service or require the developer console to remain open.
+Every `AgentRunner` run has a generated internal execution identity, a public `run_id`/`trace_id` correlation pair, monotonically increasing event sequence, and timestamp. The internal identity remains distinct even when an application deliberately reuses a public run ID, so local SQLite persistence cannot collide on sequence numbers. Enable the facade's `observability` feature and attach `SqliteEventSink` from `llama_harness::observability` as the core runner's `EventSink` to persist that causal event stream locally. The sink uses a project-selected SQLite database; it does not start a service or require the developer console to remain open.
 
 ## Stored events
 

@@ -14,7 +14,7 @@ use std::{
 };
 use thiserror::Error;
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 const DEFAULT_MAX_EVENT_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_RAW_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_QUERY_LIMIT: u32 = 1_000;
@@ -544,25 +544,26 @@ fn append_prepared(
 ) -> Result<AppendOutcome, TraceStoreError> {
     let existing_trace_id = transaction
         .query_row(
-            "SELECT trace_id FROM trace_events WHERE run_id = ?1 LIMIT 1",
-            params![event.record.run_id],
+            "SELECT trace_id FROM trace_events WHERE execution_id = ?1 LIMIT 1",
+            params![event.record.execution_id],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
     if let Some(existing_trace_id) = existing_trace_id {
         if existing_trace_id != event.record.trace_id {
             return Err(TraceStoreError::InvalidRecord(format!(
-                "run {} already belongs to trace {existing_trace_id}",
-                event.record.run_id
+                "execution {} already belongs to trace {existing_trace_id}",
+                event.record.execution_id
             )));
         }
     }
     let inserted = transaction.execute(
         "INSERT OR IGNORE INTO trace_events
-         (run_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (run_id, execution_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             event.record.run_id,
+            event.record.execution_id,
             event.record.trace_id,
             to_sql_integer(event.record.sequence)?,
             to_sql_integer(event.record.timestamp_ms)?,
@@ -577,8 +578,8 @@ fn append_prepared(
     }
     let existing = transaction
         .query_row(
-            "SELECT event_json, raw_payload_json FROM trace_events WHERE run_id = ?1 AND sequence = ?2",
-            params![event.record.run_id, to_sql_integer(event.record.sequence)?],
+            "SELECT event_json, raw_payload_json FROM trace_events WHERE execution_id = ?1 AND sequence = ?2",
+            params![event.record.execution_id, to_sql_integer(event.record.sequence)?],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
         )
         .optional()?;
@@ -606,6 +607,7 @@ fn configure_and_migrate(
         "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY NOT NULL);
          CREATE TABLE IF NOT EXISTS trace_events (
              run_id TEXT NOT NULL,
+             execution_id TEXT NOT NULL,
              trace_id TEXT NOT NULL,
              sequence INTEGER NOT NULL,
              timestamp_ms INTEGER NOT NULL,
@@ -613,7 +615,7 @@ fn configure_and_migrate(
              status TEXT,
              event_json TEXT NOT NULL,
              raw_payload_json TEXT,
-             PRIMARY KEY (run_id, sequence)
+             PRIMARY KEY (execution_id, sequence)
          );
          CREATE INDEX IF NOT EXISTS trace_events_trace_timestamp_idx
              ON trace_events(trace_id, timestamp_ms DESC);
@@ -631,6 +633,36 @@ fn configure_and_migrate(
         return Err(TraceStoreError::InvalidConfiguration(format!(
             "database schema version {version} is newer than supported version {CURRENT_SCHEMA_VERSION}"
         )));
+    }
+    if version < 2 {
+        connection.execute_batch(
+            "BEGIN;
+             CREATE TABLE trace_events_v2 (
+                 run_id TEXT NOT NULL,
+                 execution_id TEXT NOT NULL,
+                 trace_id TEXT NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 timestamp_ms INTEGER NOT NULL,
+                 event_kind TEXT NOT NULL,
+                 status TEXT,
+                 event_json TEXT NOT NULL,
+                 raw_payload_json TEXT,
+                 PRIMARY KEY (execution_id, sequence)
+             );
+             INSERT INTO trace_events_v2
+                 (run_id, execution_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json)
+             SELECT run_id, run_id || ':' || trace_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json
+             FROM trace_events;
+             DROP TABLE trace_events;
+             ALTER TABLE trace_events_v2 RENAME TO trace_events;
+             CREATE INDEX trace_events_trace_timestamp_idx
+                 ON trace_events(trace_id, timestamp_ms DESC);
+             CREATE INDEX trace_events_timestamp_idx
+                 ON trace_events(timestamp_ms DESC);
+             CREATE INDEX trace_events_status_idx
+                 ON trace_events(status);
+             COMMIT;",
+        )?;
     }
     if version < CURRENT_SCHEMA_VERSION {
         connection.execute(

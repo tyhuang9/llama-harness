@@ -78,7 +78,7 @@ select Programmatic.
 | Programmatic, conforming provider | Records forced Programmatic selection, bounded lifecycle metadata, broker-audited calls, and a final result. |
 | Missing host feature/configuration or false/zero provider capability | Fails closed before a program tool call; it is not a Direct fallback. |
 | First invalid program, corrected program valid | Uses at most one pre-dispatch repair and records the repair lifecycle. |
-| Invalid program after the one repair, no dispatched effect | Starts a fresh Direct-scope sequential fallback and records `invalid_program`; do not count it as Programmatic success. |
+| Invalid program after the one repair, no dispatched effect | Continues the same run through a fresh Direct scope and records `invalid_program`; IDs, event sequence, deadline, budgets, and broker state remain continuous. Do not count it as Programmatic success. |
 | Any failure after dispatch, including cancellation, deadline, invalid output, or resource limit | Ends terminally with the effect uncertain; no repair, restart, replay, fallback, or speculation. |
 | Read-only parallel-safe fan-out | Preserves source order, validates and reserves the entire bounded batch before dispatch, and respects the effective cap of eight. |
 | Mutation in fan-out or mixed read/write batch | Rejects the batch before dispatch; state-changing calls remain serial. |
