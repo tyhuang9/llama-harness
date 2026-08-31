@@ -694,19 +694,24 @@ impl McpCatalogManager {
             stale_until_ms,
             tools: managed,
         });
-        let previous = {
+        let previous = match (|| {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| McpError::CatalogUnavailable)?;
             if state.closed {
-                return self
-                    .fail_refresh_context(snapshot.context.clone(), McpError::CatalogUnavailable)
-                    .await;
+                return Err(McpError::CatalogUnavailable);
             }
             let previous = state.active.replace(Arc::clone(&snapshot));
             state.invalidated = false;
-            previous
+            Ok(previous)
+        })() {
+            Ok(previous) => previous,
+            Err(error) => {
+                return self
+                    .fail_refresh_context(snapshot.context.clone(), error)
+                    .await
+            }
         };
         if let Some(previous) = previous {
             self.schedule_close_after_drain(previous.context.clone());
