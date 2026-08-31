@@ -268,12 +268,14 @@ pub enum ToolDiscoveryOutcome {
 #[non_exhaustive]
 /// Stable, value-free category for a completed tool-discovery selection.
 pub enum ToolDiscoverySelection {
+    /// An event written by an earlier release did not record a selection category.
+    #[default]
+    LegacyUnclassified,
     /// The authorized caller catalog was empty.
     EmptyCatalog,
     /// The provider advertised insufficient capacity for any tool scope.
     NoCapacity,
     /// The complete authorized catalog fit the effective budget.
-    #[default]
     FullCatalog,
     /// Only mandatory hot tools were selected.
     HotOnly,

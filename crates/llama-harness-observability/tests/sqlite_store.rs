@@ -139,7 +139,7 @@ fn runner_discovery_events_reopen_with_additive_legacy_compatibility() {
         legacy[0].record.event,
         RunEvent::ToolDiscoveryCompleted {
             outcome: ToolDiscoveryOutcome::Selected,
-            selection: ToolDiscoverySelection::FullCatalog,
+            selection: ToolDiscoverySelection::LegacyUnclassified,
             effective_tool_count_budget: 0,
             effective_schema_byte_budget: 0,
             selected_schema_bytes: 0,

@@ -571,7 +571,10 @@ async fn known_unselected_and_unknown_calls_have_the_same_external_rejection() {
             .into_iter()
             .map(|record| {
                 let mut value = serde_json::to_value(record.event).unwrap();
-                if value.get("type") == Some(&Value::String("strategy_usage".into())) {
+                if matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("strategy_usage" | "tool_discovery_completed")
+                ) {
                     value["duration_ms"] = json!(0);
                 }
                 value
@@ -1237,7 +1240,11 @@ async fn direct_and_adaptive_preflight_rejects_before_large_catalog_discovery() 
         .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
         .build();
 
-    for strategy in [RunStrategy::Direct, RunStrategy::Adaptive] {
+    for strategy in [
+        RunStrategy::Direct,
+        RunStrategy::Adaptive,
+        RunStrategy::DeclarativePlan,
+    ] {
         let empty = request(count, "");
         assert!(matches!(
             runner.run_with_strategy(empty, strategy).await,
