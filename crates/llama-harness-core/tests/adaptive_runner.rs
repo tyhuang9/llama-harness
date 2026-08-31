@@ -9,11 +9,11 @@ use llama_harness_core::{
 };
 use serde_json::{json, Value};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
-use tokio::sync::{Barrier, Semaphore};
+use tokio::sync::{Barrier, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 fn planning_capabilities(parallel: u32) -> ModelCapabilities {
@@ -225,6 +225,43 @@ struct DelayedOutcomeTool {
     delay: Duration,
     outcome: Result<ToolResult, HarnessError>,
     calls: AtomicU32,
+}
+
+struct CooperativeCancellationTool {
+    definition: ToolDefinition,
+    calls: AtomicU32,
+    entered: Arc<Notify>,
+    observed_cancellation: AtomicBool,
+}
+
+impl CooperativeCancellationTool {
+    fn mutation(id: &str) -> Self {
+        Self {
+            definition: definition(id, false, false),
+            calls: AtomicU32::new(0),
+            entered: Arc::new(Notify::new()),
+            observed_cancellation: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CooperativeCancellationTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(
+        &self,
+        _: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, HarnessError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_waiters();
+        cancellation.cancelled().await;
+        self.observed_cancellation.store(true, Ordering::SeqCst);
+        Ok(ToolResult::success(json!({"cancelled": true})))
+    }
 }
 
 #[async_trait]
@@ -1501,6 +1538,53 @@ async fn post_dispatch_cancellation_is_terminal_and_never_replayed() {
             ..
         }
     )));
+    assert_strategy_usage_reconciles(&events);
+}
+
+#[tokio::test]
+async fn declarative_active_mutation_cancellation_drains_the_shared_broker_child_token() {
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "write", "tool_id": "write", "arguments": {}}]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(envelope.to_string()),
+            final_response("must not recover"),
+        ])
+        .with_capabilities(planning_capabilities(1)),
+    );
+    let tool = Arc::new(CooperativeCancellationTool::mutation("write"));
+    let events = Arc::new(InMemoryEventSink::default());
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry([tool.clone() as Arc<dyn Tool>]))
+            .policy(Arc::new(AllowAllPolicy))
+            .event_sink(events.clone())
+            .build(),
+    );
+    let run_request = request(&["write"]);
+    let cancellation = run_request.cancellation.clone();
+    let entered = tool.entered.clone();
+    let entered_wait = entered.notified();
+    let run = tokio::spawn(async move {
+        runner
+            .run_with_strategy(run_request, RunStrategy::DeclarativePlan)
+            .await
+    });
+
+    entered_wait.await;
+    cancellation.cancel();
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Cancelled);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(tool.observed_cancellation.load(Ordering::SeqCst));
+    assert_eq!(provider.requests().len(), 1);
+    assert!(!events
+        .events()
+        .iter()
+        .any(|record| matches!(record.event, RunEvent::StrategyFallback { .. })));
     assert_strategy_usage_reconciles(&events);
 }
 

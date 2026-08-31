@@ -7,14 +7,15 @@ use llama_harness_core::{
     InMemoryEventSink, ModelCapabilities, PolicyDecision, PolicyEngine, ProgrammaticConformance,
     ProgrammaticHostConfig, ProviderCapabilityLimits, RunEvent, RunRequest, RunStatus, RunStrategy,
     StrategyFallbackReason, Tool, ToolCallContext, ToolCaller, ToolDefinition, ToolRegistry,
-    ToolResult, ToolRisk,
+    ToolResult, ToolRisk, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
+    HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
 };
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 fn capabilities() -> ModelCapabilities {
@@ -47,10 +48,14 @@ fn return_program_with_exact_serialized_bytes(bytes: usize) -> String {
 }
 
 fn two_read_fanout_program() -> String {
+    read_fanout_program(&[1, 2])
+}
+
+fn read_fanout_program(values: &[u64]) -> String {
     json!({"version":1,"body":[
         {"kind":"fan_out","name":"results","tool_id":"read","item":"i",
-         "collection":{"kind":"array","items":[{"kind":"integer","value":1},{"kind":"integer","value":2}]},
-         "max_calls":2,
+         "collection":{"kind":"array","items":values.iter().map(|value| json!({"kind":"integer","value":value})).collect::<Vec<_>>()},
+         "max_calls":values.len(),
          "arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"variable","name":"i"}}]}},
         {"kind":"return","value":{"kind":"variable","name":"results"}}
     ]})
@@ -200,6 +205,155 @@ impl Tool for CancellationBarrierTool {
     }
 }
 
+struct ControlledFanoutTool {
+    definition: ToolDefinition,
+    calls: AtomicU32,
+    entered: Arc<Semaphore>,
+    releases: Vec<Arc<Semaphore>>,
+    finished: Arc<Semaphore>,
+    active: AtomicU32,
+    maximum: AtomicU32,
+    completed: Mutex<Vec<u64>>,
+}
+
+impl ControlledFanoutTool {
+    fn new(call_count: usize) -> Self {
+        Self {
+            definition: ToolDefinition::new(
+                "read",
+                "read",
+                "controlled parallel read",
+                json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}),
+            )
+            .with_risk(ToolRisk::Low)
+            .with_read_only(true)
+            .with_parallel_safe(true)
+            .with_allowed_callers([ToolCaller::Programmatic]),
+            calls: AtomicU32::new(0),
+            entered: Arc::new(Semaphore::new(0)),
+            releases: (0..call_count)
+                .map(|_| Arc::new(Semaphore::new(0)))
+                .collect(),
+            finished: Arc::new(Semaphore::new(0)),
+            active: AtomicU32::new(0),
+            maximum: AtomicU32::new(0),
+            completed: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ControlledFanoutTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(
+        &self,
+        arguments: Value,
+        _: CancellationToken,
+    ) -> Result<ToolResult, HarnessError> {
+        let value = arguments["value"]
+            .as_u64()
+            .expect("test fanout argument must be an integer");
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.maximum.fetch_max(active, Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.add_permits(1);
+        let permit = self.releases[value as usize - 1]
+            .acquire()
+            .await
+            .expect("test fanout release semaphore remains open");
+        permit.forget();
+        self.completed.lock().unwrap().push(value);
+        self.finished.add_permits(1);
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolResult::success(arguments))
+    }
+}
+
+struct CancellationFanoutTool {
+    definition: ToolDefinition,
+    calls: AtomicU32,
+    entered: Arc<Semaphore>,
+    observed_cancellation: AtomicU32,
+}
+
+struct NonCooperativeMutationTool {
+    definition: ToolDefinition,
+    calls: AtomicU32,
+    entered: Arc<Notify>,
+}
+
+impl NonCooperativeMutationTool {
+    fn new() -> Self {
+        Self {
+            definition: ToolDefinition::new(
+                "write",
+                "write",
+                "non-cooperative mutation",
+                json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}),
+            )
+            .with_risk(ToolRisk::High)
+            .with_allowed_callers([ToolCaller::Programmatic]),
+            calls: AtomicU32::new(0),
+            entered: Arc::new(Notify::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for NonCooperativeMutationTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(&self, _: Value, _: CancellationToken) -> Result<ToolResult, HarnessError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_waiters();
+        std::future::pending().await
+    }
+}
+
+impl CancellationFanoutTool {
+    fn new() -> Self {
+        Self {
+            definition: ToolDefinition::new(
+                "read",
+                "read",
+                "cooperatively cancellable fanout read",
+                json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}),
+            )
+            .with_risk(ToolRisk::Low)
+            .with_read_only(true)
+            .with_parallel_safe(true)
+            .with_allowed_callers([ToolCaller::Programmatic]),
+            calls: AtomicU32::new(0),
+            entered: Arc::new(Semaphore::new(0)),
+            observed_cancellation: AtomicU32::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CancellationFanoutTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(
+        &self,
+        _: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, HarnessError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.add_permits(1);
+        cancellation.cancelled().await;
+        self.observed_cancellation.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolResult::success(json!({"cancelled": true})))
+    }
+}
+
 struct ApprovalOnWrite {
     seen_arguments: Mutex<Vec<Value>>,
     granted: bool,
@@ -279,6 +433,36 @@ async fn forced_programmatic_runs_model_program_broker_and_final_synthesis() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].tools.len(), 1);
     assert!(requests[1].tools.is_empty());
+}
+
+#[tokio::test]
+async fn programmatic_generation_uses_bounded_completion_even_when_streaming_is_advertised() {
+    let program = json!({"version":1,"body":[
+        {"kind":"return","value":{"kind":"string","value":"safe"}}
+    ]});
+    // `MockModelProvider` only implements `complete`; its trait-default `stream` fails.
+    // A successful run with streaming advertised therefore proves this path remains bounded
+    // completion-based until a distinct provider streaming contract is introduced.
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(serde_json::to_string(&program).unwrap()),
+            final_response("done"),
+        ])
+        .with_capabilities(
+            ModelCapabilities::new(true, true, true)
+                .with_programmatic_conformance(ProgrammaticConformance::StrictJsonAstV1)
+                .with_limits(ProviderCapabilityLimits::new().with_max_program_bytes(64 * 1024)),
+        ),
+    );
+    let result = AgentRunner::builder(provider.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(request(&[]), RunStrategy::Programmatic)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(provider.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -680,6 +864,264 @@ async fn programmatic_fanout_uses_the_minimum_of_host_agent_and_provider_caps() 
 }
 
 #[tokio::test]
+async fn programmatic_parallel_fanout_preserves_input_order_through_reverse_completion() {
+    let program = read_fanout_program(&[1, 2, 3]);
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(program), final_response("done")])
+            .with_capabilities(
+                capabilities().with_parallel_tool_calls(true).with_limits(
+                    ProviderCapabilityLimits::new()
+                        .with_max_program_bytes(64 * 1024)
+                        .with_max_parallel_tool_calls(3),
+                ),
+            ),
+    );
+    let tool = Arc::new(ControlledFanoutTool::new(3));
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let mut config = ProgrammaticHostConfig::default();
+    config.max_fanout_concurrency = 3;
+    let mut run_request = request(&["read"]);
+    run_request.agent.limits.max_programmatic_fanout_concurrency = 3;
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .policy(Arc::new(AllowAllPolicy))
+            .programmatic(config)
+            .build(),
+    );
+    let entered = tool.entered.clone();
+    let finished = tool.finished.clone();
+    let run = tokio::spawn(async move {
+        runner
+            .run_with_strategy(run_request, RunStrategy::Programmatic)
+            .await
+    });
+
+    for _ in 0..3 {
+        entered.acquire().await.unwrap().forget();
+    }
+    for value in [3usize, 2, 1] {
+        tool.releases[value - 1].add_permits(1);
+        finished.acquire().await.unwrap().forget();
+    }
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(tool.maximum.load(Ordering::SeqCst), 3);
+    assert_eq!(*tool.completed.lock().unwrap(), vec![3, 2, 1]);
+    assert_eq!(result.tool_calls.len(), 3);
+    let requests = provider.requests();
+    let synthesis = requests[1]
+        .messages
+        .last()
+        .expect("final synthesis receives the canonical broker transcript");
+    let canonical: Value = serde_json::from_str(&synthesis.content).unwrap();
+    assert_eq!(
+        canonical["broker_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| call["arguments"]["value"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        canonical["program_return"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value["output"]["value"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+#[tokio::test]
+async fn cancelled_programmatic_fanout_drains_each_active_read_without_synthesis_or_replay() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(two_read_fanout_program()),
+            final_response("must not synthesize"),
+            final_response("must not fall back"),
+        ])
+        .with_capabilities(
+            capabilities().with_parallel_tool_calls(true).with_limits(
+                ProviderCapabilityLimits::new()
+                    .with_max_program_bytes(64 * 1024)
+                    .with_max_parallel_tool_calls(2),
+            ),
+        ),
+    );
+    let tool = Arc::new(CancellationFanoutTool::new());
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .policy(Arc::new(AllowAllPolicy))
+            .programmatic(ProgrammaticHostConfig::default())
+            .build(),
+    );
+    let run_request = request(&["read"]);
+    let cancellation = run_request.cancellation.clone();
+    let entered = tool.entered.clone();
+    let run = tokio::spawn(async move {
+        runner
+            .run_with_strategy(run_request, RunStrategy::Programmatic)
+            .await
+    });
+
+    for _ in 0..2 {
+        entered.acquire().await.unwrap().forget();
+    }
+    cancellation.cancel();
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(tool.observed_cancellation.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn each_programmatic_byte_cap_winner_enforces_n_minus_one_n_and_n_plus_one() {
+    enum Winner {
+        Host,
+        Agent,
+        Provider,
+        Library,
+    }
+
+    for winner in [
+        Winner::Host,
+        Winner::Agent,
+        Winner::Provider,
+        Winner::Library,
+    ] {
+        let cap = if matches!(winner, Winner::Library) {
+            HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES as usize
+        } else {
+            160
+        };
+        let sources = [
+            return_program_with_exact_serialized_bytes(cap - 1),
+            return_program_with_exact_serialized_bytes(cap),
+            return_program_with_exact_serialized_bytes(cap + 1),
+        ];
+        for (index, source) in sources.iter().enumerate() {
+            let mut host = ProgrammaticHostConfig::default();
+            host.limits.max_program_bytes = if matches!(winner, Winner::Host) {
+                cap
+            } else {
+                HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES as usize
+            };
+            let mut run_request = request(&[]);
+            run_request.agent.limits.max_programmatic_program_bytes =
+                if matches!(winner, Winner::Agent) {
+                    cap as u64
+                } else {
+                    HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES
+                };
+            let provider_cap = if matches!(winner, Winner::Provider) {
+                cap as u64
+            } else {
+                HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES
+            };
+            let provider = Arc::new(
+                MockModelProvider::scripted([
+                    final_response(source.clone()),
+                    final_response(return_program_with_exact_serialized_bytes(cap - 1)),
+                    final_response("done"),
+                ])
+                .with_capabilities(capabilities().with_limits(
+                    ProviderCapabilityLimits::new().with_max_program_bytes(provider_cap),
+                )),
+            );
+            let result = AgentRunner::builder(provider.clone())
+                .programmatic(host)
+                .build()
+                .run_with_strategy(run_request, RunStrategy::Programmatic)
+                .await
+                .unwrap();
+            assert_eq!(result.status, RunStatus::Completed);
+            assert_eq!(provider.requests().len(), if index < 2 { 2 } else { 3 });
+        }
+    }
+}
+
+#[tokio::test]
+async fn each_configurable_fanout_cap_winner_enforces_n_minus_one_n_and_n_plus_one() {
+    enum Winner {
+        Host,
+        Agent,
+        Provider,
+    }
+
+    for winner in [Winner::Host, Winner::Agent, Winner::Provider] {
+        for call_count in 1..=3usize {
+            let host_cap = if matches!(winner, Winner::Host) { 2 } else { 3 };
+            let agent_cap = if matches!(winner, Winner::Agent) {
+                2
+            } else {
+                3
+            };
+            let provider_cap = if matches!(winner, Winner::Provider) {
+                2
+            } else {
+                3
+            };
+            let provider = Arc::new(
+                MockModelProvider::scripted([
+                    final_response(read_fanout_program(
+                        &(1..=call_count as u64).collect::<Vec<_>>(),
+                    )),
+                    final_response("done"),
+                ])
+                .with_capabilities(
+                    capabilities().with_parallel_tool_calls(true).with_limits(
+                        ProviderCapabilityLimits::new()
+                            .with_max_program_bytes(64 * 1024)
+                            .with_max_parallel_tool_calls(provider_cap),
+                    ),
+                ),
+            );
+            let tool = Arc::new(CountingTool::new("read", true, true));
+            let mut registry = ToolRegistry::default();
+            registry.register(tool.clone()).unwrap();
+            let config = ProgrammaticHostConfig {
+                max_fanout_concurrency: host_cap,
+                ..ProgrammaticHostConfig::default()
+            };
+            let mut run_request = request(&["read"]);
+            run_request.agent.limits.max_programmatic_fanout_concurrency = agent_cap as u32;
+            let result = AgentRunner::builder(provider.clone())
+                .tools(registry)
+                .policy(Arc::new(AllowAllPolicy))
+                .programmatic(config)
+                .build()
+                .run_with_strategy(run_request, RunStrategy::Programmatic)
+                .await
+                .unwrap();
+            if call_count <= 2 {
+                assert_eq!(result.status, RunStatus::Completed);
+                assert_eq!(tool.calls.load(Ordering::SeqCst), call_count as u32);
+                assert_eq!(provider.requests().len(), 2);
+            } else {
+                assert!(matches!(
+                    result.status,
+                    RunStatus::Failed | RunStatus::LimitReached
+                ));
+                assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(provider.requests().len(), 1);
+            }
+        }
+    }
+    assert_eq!(HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY, 8);
+}
+
+#[tokio::test]
 async fn post_dispatch_mutation_failure_is_terminal_and_never_replayed_or_fallen_back() {
     let program = json!({"version":1,"body":[
         {"kind":"invoke","name":"result","tool_id":"write","arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"integer","value":7}}]}},
@@ -759,11 +1201,7 @@ async fn cancellation_during_an_active_mutation_is_terminal_uncertain_without_re
 
     entered_wait.await;
     cancellation.cancel();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), run)
-        .await
-        .expect("cooperative tool cancellation must drain")
-        .unwrap()
-        .unwrap();
+    let result = run.await.unwrap().unwrap();
 
     assert_eq!(result.status, RunStatus::Failed);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
@@ -775,6 +1213,93 @@ async fn cancellation_during_an_active_mutation_is_terminal_uncertain_without_re
             RunEvent::StrategyFallback { .. } | RunEvent::ProgramExecutionCompleted { .. }
         )
     }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn active_programmatic_mutation_deadline_drains_cooperatively_then_stays_terminal() {
+    let program = json!({"version":1,"body":[
+        {"kind":"invoke","name":"result","tool_id":"write","arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"integer","value":7}}]}},
+        {"kind":"return","value":{"kind":"variable","name":"result"}}
+    ]});
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(serde_json::to_string(&program).unwrap()),
+            final_response("must not synthesize"),
+            final_response("must not fall back"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let tool = Arc::new(CancellationBarrierTool::mutation("write"));
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let mut config = ProgrammaticHostConfig::default();
+    config.max_duration_ms = 1;
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .policy(Arc::new(AllowAllPolicy))
+            .programmatic(config)
+            .build(),
+    );
+    let entered = tool.entered.clone();
+    let entered_wait = entered.notified();
+    let run = tokio::spawn(async move {
+        runner
+            .run_with_strategy(request(&["write"]), RunStrategy::Programmatic)
+            .await
+    });
+
+    entered_wait.await;
+    tokio::time::advance(std::time::Duration::from_millis(2)).await;
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert!(tool.observed_cancellation.load(Ordering::SeqCst));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn non_cooperative_programmatic_mutation_cleanup_grace_is_terminal_uncertain() {
+    let program = json!({"version":1,"body":[
+        {"kind":"invoke","name":"result","tool_id":"write","arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"integer","value":7}}]}},
+        {"kind":"return","value":{"kind":"variable","name":"result"}}
+    ]});
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(serde_json::to_string(&program).unwrap()),
+            final_response("must not synthesize"),
+            final_response("must not fall back"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let tool = Arc::new(NonCooperativeMutationTool::new());
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .policy(Arc::new(AllowAllPolicy))
+            .programmatic(ProgrammaticHostConfig::default())
+            .build(),
+    );
+    let run_request = request(&["write"]);
+    let cancellation = run_request.cancellation.clone();
+    let entered = tool.entered.clone();
+    let entered_wait = entered.notified();
+    let run = tokio::spawn(async move {
+        runner
+            .run_with_strategy(run_request, RunStrategy::Programmatic)
+            .await
+    });
+
+    entered_wait.await;
+    cancellation.cancel();
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.requests().len(), 1);
 }
 
 #[tokio::test]

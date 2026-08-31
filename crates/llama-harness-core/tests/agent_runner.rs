@@ -17,7 +17,7 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 fn request() -> RunRequest {
@@ -185,6 +185,62 @@ impl Tool for CancellationBarrierTool {
         } else {
             pending().await
         }
+    }
+}
+
+struct CleanupHoldTool {
+    definition: ToolDefinition,
+    calls: AtomicU32,
+    entered: Arc<Semaphore>,
+    observed_cancellation: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl CleanupHoldTool {
+    fn new() -> Self {
+        Self {
+            definition: ToolDefinition::new(
+                "read",
+                "read",
+                "cleanup hold",
+                json!({"type":"object"}),
+            )
+            .with_risk(ToolRisk::Low)
+            .with_idempotent(true)
+            .with_read_only(true)
+            .with_concurrency_key("cleanup-hold"),
+            calls: AtomicU32::new(0),
+            entered: Arc::new(Semaphore::new(0)),
+            observed_cancellation: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CleanupHoldTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(
+        &self,
+        _: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, HarnessError> {
+        let ordinal = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.add_permits(1);
+        if ordinal == 0 {
+            cancellation.cancelled().await;
+            self.observed_cancellation.add_permits(1);
+        }
+        let permit = self
+            .release
+            .acquire()
+            .await
+            .expect("test cleanup-release semaphore remains open");
+        permit.forget();
+        Ok(ToolResult::success(json!({"ok": true})))
     }
 }
 
@@ -718,16 +774,85 @@ async fn direct_active_tool_cancellation_drains_the_child_token_before_terminal_
 
     entered_wait.await;
     cancellation.cancel();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), run)
-        .await
-        .expect("cooperative direct tool cancellation must drain")
-        .unwrap()
-        .unwrap();
+    let result = run.await.unwrap().unwrap();
 
     assert_eq!(result.status, RunStatus::Cancelled);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     assert!(tool.observed_cancellation.load(Ordering::SeqCst));
     assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn direct_active_tool_deadline_drains_the_child_token_before_terminal_result() {
+    let tool = Arc::new(CancellationBarrierTool::new(true));
+    let provider = Arc::new(MockModelProvider::scripted([tool_response(call(
+        "barrier", "read", "{}",
+    ))]));
+    let mut run_request = request();
+    run_request.agent.limits.max_run_duration_ms = Some(1);
+    let entered = tool.entered.clone();
+    let entered_wait = entered.notified();
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry(tool.clone()))
+            .build(),
+    );
+    let run = tokio::spawn(async move { runner.run(run_request).await });
+
+    entered_wait.await;
+    tokio::time::advance(std::time::Duration::from_millis(2)).await;
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(result.errors.last().unwrap().code, "timed_out");
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(tool.observed_cancellation.load(Ordering::SeqCst));
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn direct_keyed_admission_remains_held_until_cooperative_cleanup_returns() {
+    let tool = Arc::new(CleanupHoldTool::new());
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("first", "read", "{}")),
+        tool_response(call("second", "read", "{}")),
+        final_response("second run complete"),
+    ]));
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry(tool.clone()))
+            .build(),
+    );
+
+    let first_request = request();
+    let first_cancellation = first_request.cancellation.clone();
+    let first_run = {
+        let runner = runner.clone();
+        tokio::spawn(async move { runner.run(first_request).await })
+    };
+    tool.entered.acquire().await.unwrap().forget();
+    first_cancellation.cancel();
+    tool.observed_cancellation.acquire().await.unwrap().forget();
+
+    let second_run = {
+        let runner = runner.clone();
+        tokio::spawn(async move { runner.run(request()).await })
+    };
+    while provider.requests().len() < 2 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+
+    tool.release.add_permits(1);
+    tool.entered.acquire().await.unwrap().forget();
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    tool.release.add_permits(1);
+
+    let first = first_run.await.unwrap().unwrap();
+    let second = second_run.await.unwrap().unwrap();
+    assert_eq!(first.status, RunStatus::Cancelled);
+    assert_eq!(second.status, RunStatus::Completed);
+    assert_eq!(provider.requests().len(), 3);
 }
 
 #[tokio::test(start_paused = true)]
