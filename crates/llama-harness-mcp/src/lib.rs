@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashSet},
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, Weak,
@@ -79,6 +80,11 @@ pub enum McpOperation {
 /// Semantic transport boundary; implementations own JSON-RPC and credentials.
 #[async_trait]
 pub trait McpTransport: Send + Sync {
+    /// Implementations MUST enforce their host-controlled [`McpWireLimits`]
+    /// before and while reading and parsing wire frames. This semantic
+    /// boundary receives values that have already been allocated by the host;
+    /// the catalog manager separately performs bounded, non-recursive
+    /// admission before retaining or cloning any server values.
     /// Negotiates one supported MCP context.
     async fn connect(
         &self,
@@ -104,6 +110,28 @@ pub trait McpTransport: Send + Sync {
         context: McpContext,
         cancellation: CancellationToken,
     ) -> Result<(), McpTransportError>;
+}
+
+/// Host-side limits for raw MCP wire frames.
+///
+/// These limits are intentionally not passed through [`McpTransport`]: the
+/// transport owns framing and parsing. Implementers must apply equivalent
+/// limits before semantic values cross that boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct McpWireLimits {
+    /// Maximum encoded frame size accepted by the transport.
+    pub max_frame_bytes: usize,
+    /// Maximum JSON nesting accepted while parsing a frame.
+    pub max_json_depth: usize,
+}
+
+impl Default for McpWireLimits {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: 512 * 1024,
+            max_json_depth: 32,
+        }
+    }
 }
 
 /// Closes a negotiated context with a bounded deadline. Hosts should call this
@@ -180,6 +208,16 @@ pub struct McpLimits {
     pub max_response_bytes: usize,
     /// Max unstructured MCP content blocks accepted from one response.
     pub max_content_blocks: usize,
+    /// Maximum JSON nodes admitted from any one server value.
+    pub max_json_nodes: usize,
+    /// Maximum object properties admitted from any one server value.
+    pub max_schema_properties: usize,
+    /// Maximum UTF-8 bytes in any admitted string.
+    pub max_string_bytes: usize,
+    /// Maximum negotiated capability names admitted from one context.
+    pub max_context_capabilities: usize,
+    /// Maximum retired generations retained while shutdown drains.
+    pub max_retired_generations: usize,
 }
 
 /// Bounded lifecycle deadlines. Calls are never retried after a timeout.
@@ -214,6 +252,11 @@ impl Default for McpLimits {
             max_json_depth: 32,
             max_response_bytes: 512 * 1024,
             max_content_blocks: 128,
+            max_json_nodes: 16 * 1024,
+            max_schema_properties: 8 * 1024,
+            max_string_bytes: 64 * 1024,
+            max_context_capabilities: 128,
+            max_retired_generations: 8,
         }
     }
 }
@@ -420,7 +463,9 @@ impl ObserverHub {
     fn emit(&self, event: McpLifecycleEvent) {
         if let Some(observer) = &self.observer {
             self.attempted.fetch_add(1, Ordering::Relaxed);
-            if observer.observe(&event).is_err() {
+            if catch_unwind(AssertUnwindSafe(|| observer.observe(&event)))
+                .map_or(true, |result| result.is_err())
+            {
                 self.failures.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -449,7 +494,8 @@ pub struct McpCatalogSnapshot {
 
 struct ActiveCatalog {
     summary: McpCatalogSnapshot,
-    context: McpContext,
+    context: Arc<McpContext>,
+    in_flight: Arc<InFlightCalls>,
     expires_at_ms: u64,
     stale_until_ms: u64,
     tools: Vec<Arc<ManagedMcpToolAdapter>>,
@@ -484,13 +530,19 @@ async fn wait_for_drain(calls: &InFlightCalls) {
     }
 }
 
+struct RetiredContext {
+    context: Arc<McpContext>,
+    in_flight: Arc<InFlightCalls>,
+}
+
 struct CatalogState {
     active: Option<Arc<ActiveCatalog>>,
     closed: bool,
     invalidated: bool,
     last_now_ms: u64,
     next_generation: u64,
-    retired_contexts: Vec<McpContext>,
+    pending_refresh_contexts: Vec<McpContext>,
+    retired_contexts: Vec<RetiredContext>,
     close_failures: u64,
     draining_contexts: u64,
 }
@@ -505,6 +557,7 @@ impl Default for CatalogState {
             invalidated: false,
             last_now_ms: 0,
             next_generation: 1,
+            pending_refresh_contexts: Vec::new(),
             retired_contexts: Vec::new(),
             close_failures: 0,
             draining_contexts: 0,
@@ -529,7 +582,6 @@ pub struct McpCatalogManager {
     close_lock: tokio::sync::Mutex<()>,
     observer: Arc<ObserverHub>,
     registration_group: ToolRegistrationGroup,
-    in_flight: Arc<InFlightCalls>,
     id_deriver: Arc<McpIdDeriver>,
 }
 
@@ -582,7 +634,6 @@ impl McpCatalogManager {
             }),
             registration_group: ToolRegistrationGroup::new(format!("mcp:{server_id}"))
                 .map_err(McpError::Core)?,
-            in_flight: Arc::new(InFlightCalls::default()),
             id_deriver: Arc::new(generated_id),
         })
     }
@@ -594,6 +645,13 @@ impl McpCatalogManager {
     ) -> Result<McpCatalogSnapshot, McpError> {
         let _refresh = self.refresh_lock.lock().await;
         if self.is_closed() {
+            return Err(McpError::CatalogUnavailable);
+        }
+        if self.state.lock().map_or(true, |state| {
+            state.retired_contexts.len() >= self.limits.max_retired_generations
+                || usize::try_from(state.draining_contexts)
+                    .map_or(true, |count| count >= self.limits.max_retired_generations)
+        }) {
             return Err(McpError::CatalogUnavailable);
         }
         let started = Instant::now();
@@ -701,6 +759,8 @@ impl McpCatalogManager {
                     .await
             }
         };
+        let context = Arc::new(context);
+        let in_flight = Arc::new(InFlightCalls::default());
         let managed = tools
             .items
             .into_iter()
@@ -710,7 +770,7 @@ impl McpCatalogManager {
                         (self.id_deriver)(&self.server_id, &tool.name),
                         self.server_id.clone(),
                         tool,
-                        context.clone(),
+                        Arc::clone(&context),
                         Arc::clone(&self.transport),
                         self.timeouts.call,
                         self.limits.clone(),
@@ -719,7 +779,7 @@ impl McpCatalogManager {
                     generation,
                     Arc::downgrade(&self.state),
                     Arc::clone(&self.clock),
-                    Arc::clone(&self.in_flight),
+                    Arc::clone(&in_flight),
                 ))
             })
             .collect::<Vec<_>>();
@@ -730,7 +790,7 @@ impl McpCatalogManager {
         {
             return self
                 .fail_refresh_context(
-                    context,
+                    (*context).clone(),
                     McpError::InvalidCatalog("generated ID collision".into()),
                     started,
                     bytes,
@@ -745,7 +805,8 @@ impl McpCatalogManager {
                 cache_scope: scope,
                 tool_count: managed.len(),
             },
-            context,
+            context: Arc::clone(&context),
+            in_flight,
             expires_at_ms,
             stale_until_ms,
             tools: managed,
@@ -758,6 +819,15 @@ impl McpCatalogManager {
             if state.closed {
                 return Err(McpError::CatalogUnavailable);
             }
+            if let Some(index) = state
+                .pending_refresh_contexts
+                .iter()
+                .rposition(|candidate| candidate == context.as_ref())
+            {
+                state.pending_refresh_contexts.remove(index);
+            } else {
+                return Err(McpError::CatalogUnavailable);
+            }
             let previous = state.active.replace(Arc::clone(&snapshot));
             state.invalidated = false;
             Ok(previous)
@@ -765,12 +835,15 @@ impl McpCatalogManager {
             Ok(previous) => previous,
             Err(error) => {
                 return self
-                    .fail_refresh_context(snapshot.context.clone(), error, started, bytes, pages)
+                    .fail_refresh_context((*snapshot.context).clone(), error, started, bytes, pages)
                     .await
             }
         };
         if let Some(previous) = previous {
-            self.schedule_close_after_drain(previous.context.clone());
+            self.schedule_close_after_drain(
+                Arc::clone(&previous.context),
+                Arc::clone(&previous.in_flight),
+            );
         }
         self.observer.emit(event(
             McpLifecycleOperation::Refresh,
@@ -850,11 +923,27 @@ impl McpCatalogManager {
                 state.closed = true;
                 state.invalidated = true;
                 if let Some(snapshot) = state.active.take() {
-                    state.retired_contexts.push(snapshot.context.clone());
+                    state.retired_contexts.push(RetiredContext {
+                        context: Arc::clone(&snapshot.context),
+                        in_flight: Arc::clone(&snapshot.in_flight),
+                    });
+                }
+                for context in std::mem::take(&mut state.pending_refresh_contexts) {
+                    state.retired_contexts.push(RetiredContext {
+                        context: Arc::new(context),
+                        in_flight: Arc::new(InFlightCalls::default()),
+                    });
                 }
             }
             (
-                std::mem::take(&mut state.retired_contexts),
+                state
+                    .retired_contexts
+                    .iter()
+                    .map(|entry| RetiredContext {
+                        context: Arc::clone(&entry.context),
+                        in_flight: Arc::clone(&entry.in_flight),
+                    })
+                    .collect::<Vec<_>>(),
                 state.draining_contexts,
             )
         };
@@ -862,15 +951,15 @@ impl McpCatalogManager {
         let had_no_retryable_contexts = contexts.is_empty();
         let mut failed = false;
         for context in contexts {
-            if tokio::time::timeout(self.timeouts.close, wait_for_drain(&self.in_flight))
+            if tokio::time::timeout(self.timeouts.close, wait_for_drain(&context.in_flight))
                 .await
                 .is_err()
             {
-                self.schedule_close_after_drain(context);
+                self.schedule_close_after_drain(context.context, context.in_flight);
                 failed = true;
                 continue;
             }
-            if !self.try_close_or_retain(context).await {
+            if !self.try_close_retained(&context).await {
                 failed = true;
             }
         }
@@ -916,7 +1005,13 @@ impl McpCatalogManager {
                 close_failures: u64::MAX,
             },
             |state| McpShutdownHealth {
-                pending_contexts: u64::try_from(state.retired_contexts.len()).unwrap_or(u64::MAX),
+                pending_contexts: u64::try_from(
+                    state
+                        .retired_contexts
+                        .len()
+                        .saturating_add(state.pending_refresh_contexts.len()),
+                )
+                .unwrap_or(u64::MAX),
                 in_progress_contexts: state.draining_contexts,
                 close_failures: state.close_failures,
             },
@@ -927,18 +1022,27 @@ impl McpCatalogManager {
         self.state.lock().map(|state| state.closed).unwrap_or(true)
     }
 
-    async fn try_close_or_retain(&self, context: McpContext) -> bool {
+    /// Attempts a context already retained in manager ownership. Keeping the
+    /// original entry in state until transport close succeeds makes a dropped
+    /// caller future unable to lose a connected context.
+    async fn try_close_retained(&self, context: &RetiredContext) -> bool {
         let closed = close_context(
             self.transport.as_ref(),
-            context.clone(),
+            (*context.context).clone(),
             CancellationToken::new(),
             self.timeouts.close,
         )
         .await
         .is_ok();
-        if !closed {
-            if let Ok(mut state) = self.state.lock() {
-                state.retired_contexts.push(context);
+        if let Ok(mut state) = self.state.lock() {
+            if closed {
+                if let Some(index) = state.retired_contexts.iter().position(|entry| {
+                    Arc::ptr_eq(&entry.context, &context.context)
+                        && Arc::ptr_eq(&entry.in_flight, &context.in_flight)
+                }) {
+                    state.retired_contexts.remove(index);
+                }
+            } else {
                 state.close_failures = state.close_failures.saturating_add(1);
             }
         }
@@ -953,7 +1057,7 @@ impl McpCatalogManager {
         bytes: u64,
         pages: u64,
     ) -> Result<T, McpError> {
-        self.try_close_or_retain(context).await;
+        self.cleanup_pending_context(context).await;
         self.observer.emit(event(
             McpLifecycleOperation::Refresh,
             outcome_for_error(&error),
@@ -969,13 +1073,47 @@ impl McpCatalogManager {
         Err(error)
     }
 
-    fn schedule_close_after_drain(&self, context: McpContext) {
+    fn retain_pending_context(&self, context: McpContext) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pending_refresh_contexts.push(context);
+        }
+    }
+
+    fn take_pending_context(&self, context: &McpContext) -> Option<McpContext> {
+        self.state.lock().ok().and_then(|mut state| {
+            state
+                .pending_refresh_contexts
+                .iter()
+                .rposition(|candidate| candidate == context)
+                .map(|index| state.pending_refresh_contexts.remove(index))
+        })
+    }
+
+    async fn cleanup_pending_context(&self, context: McpContext) {
+        let retained = RetiredContext {
+            context: Arc::new(self.take_pending_context(&context).unwrap_or(context)),
+            in_flight: Arc::new(InFlightCalls::default()),
+        };
+        if let Ok(mut state) = self.state.lock() {
+            state.retired_contexts.push(RetiredContext {
+                context: Arc::clone(&retained.context),
+                in_flight: Arc::clone(&retained.in_flight),
+            });
+        }
+        self.try_close_retained(&retained).await;
+    }
+
+    fn schedule_close_after_drain(&self, context: Arc<McpContext>, calls: Arc<InFlightCalls>) {
         let transport = Arc::clone(&self.transport);
-        let calls = Arc::clone(&self.in_flight);
         let timeout = self.timeouts.close;
         let observer = Arc::clone(&self.observer);
         let state = Arc::clone(&self.state);
         if let Ok(mut state) = state.lock() {
+            if let Some(index) = state.retired_contexts.iter().position(|entry| {
+                Arc::ptr_eq(&entry.context, &context) && Arc::ptr_eq(&entry.in_flight, &calls)
+            }) {
+                state.retired_contexts.remove(index);
+            }
             state.draining_contexts = state.draining_contexts.saturating_add(1);
         }
         tokio::spawn(async move {
@@ -983,7 +1121,7 @@ impl McpCatalogManager {
             let started = Instant::now();
             let result = close_context(
                 transport.as_ref(),
-                context.clone(),
+                (*context).clone(),
                 CancellationToken::new(),
                 timeout,
             )
@@ -991,7 +1129,10 @@ impl McpCatalogManager {
             if let Ok(mut state) = state.lock() {
                 state.draining_contexts = state.draining_contexts.saturating_sub(1);
                 if result.is_err() {
-                    state.retired_contexts.push(context);
+                    state.retired_contexts.push(RetiredContext {
+                        context,
+                        in_flight: calls,
+                    });
                     state.close_failures = state.close_failures.saturating_add(1);
                 }
             }
@@ -1036,10 +1177,18 @@ impl McpCatalogManager {
             _ = cancellation.cancelled() => return Err(McpError::Transport(McpTransportError { operation: McpOperation::Connect, dispatch: McpDispatchState::NotDispatched })),
             result = tokio::time::timeout(self.timeouts.connect, self.transport.connect(cancellation.child_token())) => result.map_err(|_| McpTransportError { operation: McpOperation::Connect, dispatch: McpDispatchState::PossiblyDispatched })??,
         };
+        // Record ownership before the first post-connect await. If the
+        // refresh future is abandoned during validation/listing, close() can
+        // still reclaim this handle.
+        self.retain_pending_context(context.clone());
+        if let Err(error) = validate_context(&context, &self.limits) {
+            self.cleanup_pending_context(context).await;
+            return Err(error);
+        }
         if !supported_context(&context) {
             // Once connected, this function owns the context until it is
             // transferred in its successful return value.
-            self.try_close_or_retain(context).await;
+            self.cleanup_pending_context(context).await;
             return Err(McpError::InvalidCatalog(
                 "unsupported version or missing tools capability".into(),
             ));
@@ -1067,7 +1216,7 @@ impl McpCatalogManager {
         let fetched = match fetched {
             Ok(fetched) => fetched,
             Err(error) => {
-                self.try_close_or_retain(context).await;
+                self.cleanup_pending_context(context).await;
                 return Err(error);
             }
         };
@@ -1206,9 +1355,7 @@ async fn fetch_tools(
             result = tokio::time::timeout(timeout, transport.list_tools(context, cursor.as_deref(), cancellation.child_token())) => result.map_err(|_| McpTransportError { operation: McpOperation::ListTools, dispatch: McpDispatchState::PossiblyDispatched })??,
         };
         pages = pages.checked_add(1).ok_or(McpError::Clock)?;
-        let page_bytes = serde_json::to_vec(&page)
-            .map_err(|_| McpError::InvalidCatalog("unserializable page".into()))?
-            .len();
+        let page_bytes = admit_page(&page, limits)?;
         bytes = bytes
             .checked_add(page_bytes)
             .ok_or(McpError::InvalidCatalog(
@@ -1337,7 +1484,7 @@ fn event(
 struct McpToolAdapter {
     definition: ToolDefinition,
     transport: Arc<dyn McpTransport>,
-    context: McpContext,
+    context: Arc<McpContext>,
     native_name: String,
     call_timeout: Duration,
     limits: McpLimits,
@@ -1349,7 +1496,7 @@ impl McpToolAdapter {
         id: String,
         server_id: String,
         tool: McpTool,
-        context: McpContext,
+        context: Arc<McpContext>,
         transport: Arc<dyn McpTransport>,
         call_timeout: Duration,
         limits: McpLimits,
@@ -1468,16 +1615,12 @@ impl McpToolAdapter {
         match result {
             Ok(result) => {
                 let normalized = normalize_result(
-                    &result,
+                    result,
                     &self.limits,
                     self.definition.output_schema.is_some(),
                 );
                 let (outcome, count, bytes) = match &normalized {
-                    Ok(_) => (
-                        McpLifecycleOutcome::Succeeded,
-                        content_block_count(&result),
-                        result_bytes(&result).unwrap_or(0),
-                    ),
+                    Ok((_, bytes, count)) => (McpLifecycleOutcome::Succeeded, *count, *bytes),
                     Err(_) => (McpLifecycleOutcome::Rejected, 0, 0),
                 };
                 self.observer.emit(event(
@@ -1492,7 +1635,7 @@ impl McpToolAdapter {
                     McpDispatchState::Responded,
                     correlation,
                 ));
-                normalized
+                normalized.map(|(result, _, _)| result)
             }
             Err(error) => {
                 let (outcome, cancelled, dispatch, returned) = match error {
@@ -1534,33 +1677,11 @@ impl McpToolAdapter {
 }
 
 fn normalize_result(
-    result: &McpCallResult,
+    result: McpCallResult,
     limits: &McpLimits,
     has_output_schema: bool,
-) -> Result<ToolResult, HarnessError> {
-    let bytes = result_bytes(result)?;
-    if usize::try_from(bytes).unwrap_or(usize::MAX) > limits.max_response_bytes {
-        return Err(HarnessError::ResourceLimit(
-            "MCP response exceeds byte limit".into(),
-        ));
-    }
-    let values = [result.structured_content.as_ref(), result.content.as_ref()];
-    if values
-        .iter()
-        .flatten()
-        .any(|value| json_depth(value) > limits.max_json_depth)
-    {
-        return Err(HarnessError::ResourceLimit(
-            "MCP response exceeds depth limit".into(),
-        ));
-    }
-    if usize::try_from(content_block_count(result)).unwrap_or(usize::MAX)
-        > limits.max_content_blocks
-    {
-        return Err(HarnessError::ResourceLimit(
-            "MCP response exceeds content block limit".into(),
-        ));
-    }
+) -> Result<(ToolResult, u64, u64), HarnessError> {
+    let (bytes, blocks) = admit_call_result(&result, limits)?;
     if !result.is_error && has_output_schema && result.structured_content.is_none() {
         return Err(HarnessError::Tool(
             "MCP structured content is required".into(),
@@ -1568,49 +1689,59 @@ fn normalize_result(
     }
     let output = result
         .structured_content
-        .clone()
-        .or_else(|| result.content.clone())
+        .or(result.content)
         .unwrap_or(Value::Null);
     if result.is_error {
-        Ok(ToolResult::new(
-            false,
-            output,
-            Some("MCP tool reported failure".into()),
+        Ok((
+            ToolResult::new(false, output, Some("MCP tool reported failure".into())),
+            bytes,
+            blocks,
         ))
     } else {
-        Ok(ToolResult::success(output))
+        Ok((ToolResult::success(output), bytes, blocks))
     }
 }
 
-fn result_bytes(result: &McpCallResult) -> Result<u64, HarnessError> {
-    let structured = result
-        .structured_content
-        .as_ref()
-        .map(serde_json::to_vec)
-        .transpose()
-        .map_err(|_| HarnessError::Tool("MCP result normalization failed".into()))?
-        .map_or(0usize, |bytes| bytes.len());
-    let content = result
-        .content
-        .as_ref()
-        .map(serde_json::to_vec)
-        .transpose()
-        .map_err(|_| HarnessError::Tool("MCP result normalization failed".into()))?
-        .map_or(0usize, |bytes| bytes.len());
-    u64::try_from(
-        structured
-            .checked_add(content)
-            .ok_or_else(|| HarnessError::ResourceLimit("MCP response exceeds byte limit".into()))?,
-    )
-    .map_err(|_| HarnessError::ResourceLimit("MCP response exceeds byte limit".into()))
-}
-
-fn content_block_count(result: &McpCallResult) -> u64 {
-    result
+fn admit_call_result(
+    result: &McpCallResult,
+    limits: &McpLimits,
+) -> Result<(u64, u64), HarnessError> {
+    let blocks = result
         .content
         .as_ref()
         .and_then(Value::as_array)
-        .map_or(0, |blocks| u64::try_from(blocks.len()).unwrap_or(u64::MAX))
+        .map_or(0, Vec::len);
+    if blocks > limits.max_content_blocks {
+        return Err(HarnessError::ResourceLimit(
+            "MCP response exceeds content block limit".into(),
+        ));
+    }
+    let mut bytes = 0usize;
+    for value in [result.structured_content.as_ref(), result.content.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        bytes = bytes
+            .checked_add(
+                admit_json_value(value, limits, limits.max_response_bytes, false).map_err(
+                    |_| {
+                        HarnessError::ResourceLimit(
+                            "MCP response exceeds configured structural limit".into(),
+                        )
+                    },
+                )?,
+            )
+            .ok_or_else(|| HarnessError::ResourceLimit("MCP response exceeds byte limit".into()))?;
+        if bytes > limits.max_response_bytes {
+            return Err(HarnessError::ResourceLimit(
+                "MCP response exceeds byte limit".into(),
+            ));
+        }
+    }
+    Ok((
+        u64::try_from(bytes).unwrap_or(u64::MAX),
+        u64::try_from(blocks).unwrap_or(u64::MAX),
+    ))
 }
 fn generated_id(server: &str, native: &str) -> String {
     let slug: String = native
@@ -1660,12 +1791,7 @@ fn validate_tool(tool: &McpTool, limits: &McpLimits) -> Result<(), McpError> {
         .into_iter()
         .chain(tool.output_schema.iter())
     {
-        let encoded = serde_json::to_vec(schema)
-            .map_err(|_| McpError::InvalidCatalog("invalid schema".into()))?;
-        if encoded.len() > limits.max_catalog_bytes
-            || json_depth(schema) > limits.max_json_depth
-            || has_external_reference(schema)
-        {
+        if admit_json_value(schema, limits, limits.max_catalog_bytes, true).is_err() {
             return Err(McpError::InvalidCatalog(
                 "unsafe or oversized schema".into(),
             ));
@@ -1673,23 +1799,197 @@ fn validate_tool(tool: &McpTool, limits: &McpLimits) -> Result<(), McpError> {
     }
     Ok(())
 }
-fn json_depth(v: &Value) -> usize {
-    match v {
-        Value::Array(a) => 1 + a.iter().map(json_depth).max().unwrap_or(0),
-        Value::Object(o) => 1 + o.values().map(json_depth).max().unwrap_or(0),
-        _ => 1,
+
+fn admit_page(page: &McpToolPage, limits: &McpLimits) -> Result<usize, McpError> {
+    let mut bytes = 2usize; // object braces
+    let mut add = |value: usize| -> Result<(), McpError> {
+        bytes = bytes
+            .checked_add(value)
+            .ok_or_else(|| McpError::InvalidCatalog("catalog exceeds byte limit".into()))?;
+        if bytes > limits.max_catalog_bytes {
+            return Err(McpError::InvalidCatalog(
+                "catalog exceeds byte limit".into(),
+            ));
+        }
+        Ok(())
+    };
+    for tool in &page.tools {
+        if tool.name.len() > limits.max_string_bytes
+            || tool.description.len() > limits.max_string_bytes
+        {
+            return Err(McpError::InvalidCatalog(
+                "catalog string exceeds limit".into(),
+            ));
+        }
+        add(json_string_len(&tool.name)
+            .map_err(|_| McpError::InvalidCatalog("catalog exceeds byte limit".into()))?)?;
+        add(json_string_len(&tool.description)
+            .map_err(|_| McpError::InvalidCatalog("catalog exceeds byte limit".into()))?)?;
+        add(
+            admit_json_value(&tool.input_schema, limits, limits.max_catalog_bytes, true)
+                .map_err(|_| McpError::InvalidCatalog("unsafe or oversized schema".into()))?,
+        )?;
+        if let Some(schema) = &tool.output_schema {
+            add(
+                admit_json_value(schema, limits, limits.max_catalog_bytes, true)
+                    .map_err(|_| McpError::InvalidCatalog("unsafe or oversized schema".into()))?,
+            )?;
+        }
     }
+    for string in [page.next_cursor.as_deref(), page.cache_scope.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if string.len() > limits.max_string_bytes {
+            return Err(McpError::InvalidCatalog(
+                "catalog string exceeds limit".into(),
+            ));
+        }
+        add(json_string_len(string)
+            .map_err(|_| McpError::InvalidCatalog("catalog exceeds byte limit".into()))?)?;
+    }
+    Ok(bytes)
 }
-fn has_external_reference(v: &Value) -> bool {
-    match v {
-        Value::Object(o) => o.iter().any(|(k, v)| {
-            matches!(k.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef")
-                && v.as_str().is_some_and(|s| !s.starts_with('#'))
-                || has_external_reference(v)
-        }),
-        Value::Array(a) => a.iter().any(has_external_reference),
-        _ => false,
+
+fn validate_context(context: &McpContext, limits: &McpLimits) -> Result<(), McpError> {
+    if context.capabilities.len() > limits.max_context_capabilities
+        || context.version.len() > limits.max_string_bytes
+        || context
+            .request_context
+            .as_ref()
+            .is_some_and(|value| value.len() > limits.max_string_bytes)
+    {
+        return Err(McpError::InvalidCatalog(
+            "negotiated context exceeds limit".into(),
+        ));
     }
+    let mut bytes = json_string_len(&context.version)
+        .map_err(|_| McpError::InvalidCatalog("negotiated context exceeds limit".into()))?;
+    let mut nodes = 1usize;
+    for capability in &context.capabilities {
+        if capability.len() > limits.max_string_bytes {
+            return Err(McpError::InvalidCatalog(
+                "negotiated context exceeds limit".into(),
+            ));
+        }
+        bytes = bytes
+            .checked_add(
+                json_string_len(capability).map_err(|_| {
+                    McpError::InvalidCatalog("negotiated context exceeds limit".into())
+                })?,
+            )
+            .ok_or_else(|| McpError::InvalidCatalog("negotiated context exceeds limit".into()))?;
+        nodes = nodes
+            .checked_add(1)
+            .ok_or_else(|| McpError::InvalidCatalog("negotiated context exceeds limit".into()))?;
+    }
+    if let Some(request_context) = &context.request_context {
+        bytes = bytes
+            .checked_add(
+                json_string_len(request_context).map_err(|_| {
+                    McpError::InvalidCatalog("negotiated context exceeds limit".into())
+                })?,
+            )
+            .ok_or_else(|| McpError::InvalidCatalog("negotiated context exceeds limit".into()))?;
+        nodes = nodes
+            .checked_add(1)
+            .ok_or_else(|| McpError::InvalidCatalog("negotiated context exceeds limit".into()))?;
+    }
+    if bytes > limits.max_catalog_bytes
+        || nodes > limits.max_json_nodes
+        || limits.max_json_depth < 2
+    {
+        return Err(McpError::InvalidCatalog(
+            "negotiated context exceeds limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Estimates JSON's encoded size while enforcing structural limits without
+/// serialization, recursion, or cloning of untrusted server values.
+fn admit_json_value(
+    root: &Value,
+    limits: &McpLimits,
+    max_bytes: usize,
+    reject_external_refs: bool,
+) -> Result<usize, ()> {
+    let mut bytes = 0usize;
+    let mut nodes = 0usize;
+    let mut properties = 0usize;
+    let mut stack = vec![(root, 1usize)];
+    while let Some((value, depth)) = stack.pop() {
+        if depth > limits.max_json_depth {
+            return Err(());
+        }
+        nodes = nodes.checked_add(1).ok_or(())?;
+        if nodes > limits.max_json_nodes {
+            return Err(());
+        }
+        let mut add = |count: usize| -> Result<(), ()> {
+            bytes = bytes.checked_add(count).ok_or(())?;
+            (bytes <= max_bytes).then_some(()).ok_or(())
+        };
+        match value {
+            Value::Null => add(4)?,
+            Value::Bool(true) => add(4)?,
+            Value::Bool(false) => add(5)?,
+            Value::Number(number) => add(number.to_string().len())?,
+            Value::String(string) => {
+                if string.len() > limits.max_string_bytes {
+                    return Err(());
+                }
+                add(json_string_len(string)?)?;
+            }
+            Value::Array(values) => {
+                add(2usize
+                    .checked_add(values.len().saturating_sub(1))
+                    .ok_or(())?)?;
+                for child in values.iter().rev() {
+                    stack.push((child, depth.checked_add(1).ok_or(())?));
+                }
+            }
+            Value::Object(values) => {
+                properties = properties.checked_add(values.len()).ok_or(())?;
+                if properties > limits.max_schema_properties {
+                    return Err(());
+                }
+                add(2usize
+                    .checked_add(values.len().saturating_sub(1))
+                    .ok_or(())?)?;
+                for (key, child) in values.iter().rev() {
+                    if key.len() > limits.max_string_bytes {
+                        return Err(());
+                    }
+                    add(json_string_len(key)?.checked_add(1).ok_or(())?)?;
+                    if reject_external_refs
+                        && matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef")
+                        && child
+                            .as_str()
+                            .is_some_and(|reference| !reference.starts_with('#'))
+                    {
+                        return Err(());
+                    }
+                    stack.push((child, depth.checked_add(1).ok_or(())?));
+                }
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn json_string_len(value: &str) -> Result<usize, ()> {
+    let mut bytes = 2usize;
+    for byte in value.bytes() {
+        bytes = bytes
+            .checked_add(match byte {
+                b'"' | b'\\' | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' => 2,
+                0x00..=0x1f => 6,
+                _ => 1,
+            })
+            .ok_or(())?;
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -1852,6 +2152,14 @@ mod tests {
         }
     }
 
+    struct PanicObserver;
+
+    impl McpObserver for PanicObserver {
+        fn observe(&self, _: &McpLifecycleEvent) -> Result<(), McpObserverError> {
+            panic!("observer panic must not escape")
+        }
+    }
+
     fn tool(name: &str) -> McpTool {
         McpTool {
             name: name.into(),
@@ -1895,9 +2203,136 @@ mod tests {
     }
     #[test]
     fn external_schema_reference_is_rejected() {
-        assert!(has_external_reference(
-            &serde_json::json!({"$ref":"https://invalid/schema"})
+        assert!(admit_json_value(
+            &serde_json::json!({"$ref":"https://invalid/schema"}),
+            &McpLimits::default(),
+            McpLimits::default().max_catalog_bytes,
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn iterative_admission_rejects_adversarial_schema_without_serializing() {
+        let limits = McpLimits::default();
+        let mut deep = Value::Null;
+        for _ in 0..(limits.max_json_depth + 2) {
+            deep = Value::Array(vec![deep]);
+        }
+        assert!(admit_json_value(&deep, &limits, limits.max_catalog_bytes, true).is_err());
+
+        let wide = Value::Array(
+            (0..(limits.max_json_nodes + 1))
+                .map(|_| Value::Null)
+                .collect(),
+        );
+        assert!(admit_json_value(&wide, &limits, limits.max_catalog_bytes, true).is_err());
+
+        let large = Value::String("x".repeat(limits.max_string_bytes + 1));
+        assert!(admit_json_value(&large, &limits, limits.max_catalog_bytes, true).is_err());
+    }
+
+    #[test]
+    fn iterative_result_admission_rejects_deep_wide_and_large_values() {
+        let limits = McpLimits::default();
+        let mut deep = Value::Null;
+        for _ in 0..(limits.max_json_depth + 2) {
+            deep = Value::Array(vec![deep]);
+        }
+        assert!(normalize_result(
+            McpCallResult {
+                structured_content: Some(deep),
+                content: None,
+                is_error: false
+            },
+            &limits,
+            false
+        )
+        .is_err());
+        let wide = Value::Array(
+            (0..(limits.max_json_nodes + 1))
+                .map(|_| Value::Null)
+                .collect(),
+        );
+        assert!(normalize_result(
+            McpCallResult {
+                structured_content: Some(wide),
+                content: None,
+                is_error: false
+            },
+            &limits,
+            false
+        )
+        .is_err());
+        let large = Value::String("x".repeat(limits.max_string_bytes + 1));
+        assert!(normalize_result(
+            McpCallResult {
+                structured_content: Some(large),
+                content: None,
+                is_error: false
+            },
+            &limits,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn negotiation_context_limits_are_bounded() {
+        let mut limits = McpLimits {
+            max_context_capabilities: 1,
+            ..McpLimits::default()
+        };
+        let context = McpContext {
+            era: McpProtocolEra::Modern20260728,
+            version: "2026-07-28".into(),
+            capabilities: BTreeSet::from(["tools".into(), "large".into()]),
+            request_context: None,
+        };
+        assert!(validate_context(&context, &limits).is_err());
+        limits.max_context_capabilities = 2;
+        limits.max_string_bytes = 2;
+        assert!(validate_context(&context, &limits).is_err());
+    }
+
+    #[tokio::test]
+    async fn adapters_share_the_snapshot_context_arc() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one"), tool("two")]));
+        let manager = manager(transport, clock, None, None);
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        let state = manager.state.lock().expect("test mutex");
+        let active = state.active.as_ref().expect("active snapshot");
+        assert!(Arc::ptr_eq(&active.context, &active.tools[0].inner.context));
+        assert!(Arc::ptr_eq(&active.context, &active.tools[1].inner.context));
+    }
+
+    #[tokio::test]
+    async fn retired_generation_bound_fails_before_connect() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let limits = McpLimits {
+            max_retired_generations: 0,
+            ..McpLimits::default()
+        };
+        let manager = McpCatalogManager::with_configuration(
+            transport.clone(),
+            "server",
+            limits,
+            McpTimeouts::default(),
+            McpCachePolicy::default(),
+            clock,
+            None,
+        )
+        .expect("manager");
+        assert!(matches!(
+            manager.refresh(CancellationToken::new()).await,
+            Err(McpError::CatalogUnavailable)
         ));
+        assert!(!transport.connect_started.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -2368,6 +2803,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observer_panics_are_contained_and_counted() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let manager = manager(transport, clock, None, Some(Arc::new(PanicObserver)));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("observer panic is isolated");
+        assert!(manager.observer_health().failures > 0);
+    }
+
+    #[tokio::test]
     async fn observer_preserves_pre_dispatch_refresh_failure_state() {
         let clock = Arc::new(FakeClock::default());
         let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
@@ -2506,7 +2953,7 @@ mod tests {
         };
         assert!(matches!(
             normalize_result(
-                &McpCallResult {
+                McpCallResult {
                     structured_content: Some(serde_json::json!("toolong")),
                     content: None,
                     is_error: false
@@ -2520,7 +2967,7 @@ mod tests {
         limits.max_json_depth = 1;
         assert!(matches!(
             normalize_result(
-                &McpCallResult {
+                McpCallResult {
                     structured_content: Some(serde_json::json!({"nested": true})),
                     content: None,
                     is_error: false
@@ -2534,7 +2981,7 @@ mod tests {
         limits.max_content_blocks = 1;
         assert!(matches!(
             normalize_result(
-                &McpCallResult {
+                McpCallResult {
                     structured_content: None,
                     content: Some(serde_json::json!([1, 2])),
                     is_error: false
@@ -2547,7 +2994,7 @@ mod tests {
         limits.max_content_blocks = 2;
         assert!(matches!(
             normalize_result(
-                &McpCallResult {
+                McpCallResult {
                     structured_content: None,
                     content: Some(serde_json::json!("x")),
                     is_error: false
@@ -2562,7 +3009,7 @@ mod tests {
     #[test]
     fn error_results_use_static_error_with_bounded_normalized_content() {
         let result = normalize_result(
-            &McpCallResult {
+            McpCallResult {
                 structured_content: None,
                 content: Some(serde_json::json!([{"text":"server controlled"}])),
                 is_error: true,
@@ -2571,8 +3018,8 @@ mod tests {
             true,
         )
         .expect("normalizes failure");
-        assert!(!result.ok);
-        assert_eq!(result.error.as_deref(), Some("MCP tool reported failure"));
-        assert_ne!(result.output, Value::Null);
+        assert!(!result.0.ok);
+        assert_eq!(result.0.error.as_deref(), Some("MCP tool reported failure"));
+        assert_ne!(result.0.output, Value::Null);
     }
 }
