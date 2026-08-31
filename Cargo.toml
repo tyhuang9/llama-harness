@@ -12,6 +12,7 @@ members = [
   "crates/llama-harness-evals",
   "crates/llama-harness-promptfoo",
   "crates/llama-harness-cli",
+  "crates/llama-harness-mcp",
   "examples/local-task-agent",
   "examples/tauri-agent-host",
   "xtask",

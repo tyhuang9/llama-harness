@@ -83,6 +83,12 @@ pub mod evals {
     pub use llama_harness_evals::*;
 }
 
+#[cfg(feature = "mcp")]
+/// Transport-neutral Model Context Protocol tool adapter.
+pub mod mcp {
+    pub use llama_harness_mcp::*;
+}
+
 #[cfg(feature = "tauri")]
 /// Embedded Tauri event, approval, cancellation, and path helpers.
 pub mod tauri {
