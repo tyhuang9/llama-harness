@@ -240,6 +240,7 @@ pub(crate) struct AllowedCatalogEntry<'a> {
     pub(crate) definition: &'a ToolDefinition,
     pub(crate) metadata: &'a ToolDiscoveryMetadata,
     pub(crate) serialized_definition: &'a Arc<[u8]>,
+    pub(crate) version: u64,
 }
 
 pub(crate) struct CatalogIndex {
@@ -248,19 +249,17 @@ pub(crate) struct CatalogIndex {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CatalogCacheKey {
-    generation: u64,
     caller: ToolCaller,
-    tool_ids: Arc<[String]>,
+    tools: Arc<[(String, u64)]>,
 }
 
 impl CatalogCacheKey {
-    pub(crate) fn new(generation: u64, caller: ToolCaller, mut tool_ids: Vec<String>) -> Self {
-        tool_ids.sort();
-        tool_ids.dedup();
+    pub(crate) fn new(caller: ToolCaller, mut tools: Vec<(String, u64)>) -> Self {
+        tools.sort();
+        tools.dedup();
         Self {
-            generation,
             caller,
-            tool_ids: Arc::from(tool_ids),
+            tools: Arc::from(tools),
         }
     }
 }
@@ -283,10 +282,6 @@ impl CatalogCache {
             self.entries.pop_front();
         }
         self.entries.push_back((key, index));
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.entries.clear();
     }
 
     #[cfg(test)]
@@ -1194,6 +1189,92 @@ mod tests {
             .unwrap();
         assert!(direct_again.cache_hit);
         assert_eq!(registry.catalog_build_count(), 2);
+    }
+
+    #[test]
+    fn unrelated_registration_cannot_make_an_authorized_scope_cold() {
+        let mut registry = ToolRegistry::default();
+        for id in ["permitted.alpha", "permitted.beta"] {
+            register(
+                &mut registry,
+                id,
+                "description",
+                ToolDiscoveryMetadata::deferred(),
+            );
+        }
+        let allowed = vec!["permitted.alpha".into(), "permitted.beta".into()];
+        let limits = ToolDiscoveryLimits::new().with_max_tools(1);
+        let select = |registry: &ToolRegistry, caller, allowlist: &[String]| {
+            registry
+                .select_scope(
+                    "permitted request",
+                    allowlist,
+                    caller,
+                    limits,
+                    &ProviderCapabilityLimits::new(),
+                )
+                .unwrap()
+        };
+
+        let (direct, direct_cold) = select(&registry, ToolCaller::Direct, &allowed);
+        let (declarative, declarative_cold) =
+            select(&registry, ToolCaller::DeclarativePlan, &allowed);
+        assert!(!direct_cold.cache_hit);
+        assert!(!declarative_cold.cache_hit);
+        assert_eq!(registry.catalog_build_count(), 2);
+
+        register(
+            &mut registry,
+            "hidden.unallowlisted",
+            "description",
+            ToolDiscoveryMetadata::deferred(),
+        );
+        let (direct_after_hidden, direct_warm) = select(&registry, ToolCaller::Direct, &allowed);
+        let (declarative_after_hidden, declarative_warm) =
+            select(&registry, ToolCaller::DeclarativePlan, &allowed);
+        assert!(direct_warm.cache_hit);
+        assert!(declarative_warm.cache_hit);
+        assert_eq!(direct.definitions(), direct_after_hidden.definitions());
+        assert_eq!(
+            declarative.definitions(),
+            declarative_after_hidden.definitions()
+        );
+        assert_eq!(registry.catalog_build_count(), 2);
+
+        let incompatible = ToolDefinition::new(
+            "hidden.incompatible",
+            "Hidden incompatible",
+            "description",
+            json!({"type": "object"}),
+        )
+        .with_allowed_callers([ToolCaller::Programmatic]);
+        registry
+            .register_with_discovery(
+                Arc::new(TestTool(incompatible)),
+                ToolDiscoveryMetadata::deferred(),
+            )
+            .unwrap();
+        let mut with_incompatible = allowed.clone();
+        with_incompatible.push("hidden.incompatible".into());
+        for caller in [ToolCaller::Direct, ToolCaller::DeclarativePlan] {
+            let (_, stats) = select(&registry, caller, &with_incompatible);
+            assert!(stats.cache_hit);
+        }
+        assert_eq!(registry.catalog_build_count(), 2);
+
+        register(
+            &mut registry,
+            "permitted.new",
+            "description",
+            ToolDiscoveryMetadata::deferred(),
+        );
+        let mut expanded = allowed;
+        expanded.push("permitted.new".into());
+        for caller in [ToolCaller::Direct, ToolCaller::DeclarativePlan] {
+            let (_, stats) = select(&registry, caller, &expanded);
+            assert!(!stats.cache_hit);
+        }
+        assert_eq!(registry.catalog_build_count(), 4);
     }
 
     #[test]

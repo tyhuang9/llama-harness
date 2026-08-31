@@ -419,6 +419,7 @@ pub(crate) struct RegisteredTool {
     output_validator: Option<Arc<Validator>>,
     pub(crate) discovery: ToolDiscoveryMetadata,
     pub(crate) serialized_definition: Arc<[u8]>,
+    pub(crate) catalog_version: u64,
 }
 
 /// Registry of tools and their compiled argument validators.
@@ -560,13 +561,10 @@ impl ToolRegistry {
                 output_validator,
                 discovery,
                 serialized_definition,
+                catalog_version: next_generation,
             },
         );
         self.catalog_generation = next_generation;
-        self.catalog_cache
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
         *self
             .fingerprint_cache
             .write()
@@ -612,6 +610,7 @@ impl ToolRegistry {
                     definition: &entry.definition,
                     metadata: &entry.discovery,
                     serialized_definition: &entry.serialized_definition,
+                    version: entry.catalog_version,
                 });
             }
         }
@@ -627,11 +626,10 @@ impl ToolRegistry {
     ) -> Result<(Arc<CatalogIndex>, bool), HarnessError> {
         guard()?;
         let key = CatalogCacheKey::new(
-            self.catalog_generation,
             caller,
             allowed
                 .iter()
-                .map(|entry| entry.definition.id.clone())
+                .map(|entry| (entry.definition.id.clone(), entry.version))
                 .collect(),
         );
         if let Some(index) = self
