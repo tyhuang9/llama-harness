@@ -387,17 +387,9 @@ fn generated_id(server: &str, native: &str) -> String {
         .take(48)
         .collect();
     format!(
-        "mcp-{}-{}",
-        server,
+        "mcp-{server}-{}-{}",
+        if slug.is_empty() { "tool" } else { &slug },
         &blake3::hash(native.as_bytes()).to_hex()[..12]
-    )
-    .replace("--", "-")
-    .replace(
-        &format!("mcp-{server}-"),
-        &format!(
-            "mcp-{server}-{}-",
-            if slug.is_empty() { "tool" } else { &slug }
-        ),
     )
 }
 fn validate_server_id(id: String) -> Result<String, McpError> {
