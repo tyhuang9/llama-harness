@@ -2650,6 +2650,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_context_bound_counts_pending_retired_and_draining_before_connect() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let manager = McpCatalogManager::with_configuration(
+            transport.clone(),
+            "server",
+            McpLimits {
+                max_retired_generations: 3,
+                ..McpLimits::default()
+            },
+            McpTimeouts::default(),
+            McpCachePolicy::default(),
+            clock,
+            None,
+        )
+        .expect("manager");
+        let context = transport.context.clone();
+        {
+            let mut state = manager.state.lock().expect("test mutex");
+            state.pending_refresh_contexts.push(context.clone());
+            state.retired_contexts.push(RetiredContext {
+                context: Arc::new(context),
+                in_flight: Arc::new(InFlightCalls::default()),
+            });
+            state.draining_contexts = 1;
+        }
+        assert!(matches!(
+            manager.refresh(CancellationToken::new()).await,
+            Err(McpError::CatalogUnavailable)
+        ));
+        assert_eq!(transport.connects.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn close_reports_pending_until_another_generation_drains() {
         let clock = Arc::new(FakeClock::default());
         let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
