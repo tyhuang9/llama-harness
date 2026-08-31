@@ -7,7 +7,7 @@ All notable changes to this project are documented here.
 - Add the public Rust facade and release package metadata.
 - Stabilize named `ollama`, `observability`, `evals`, `tauri`, and `programmatic`
   facade modules with Rust 1.88 as the verified minimum supported version.
-- Define the seven-crate Rust publication set, including the separately
+- Define the eight-crate Rust publication set, including the separately
   publishable deterministic programmatic sandbox, and defer protocol/runtime SDK
   distribution from the Cargo 0.1 release.
 - Define JSONL protocol v1 and the managed child-sidecar runtime.

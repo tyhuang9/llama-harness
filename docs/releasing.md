@@ -4,14 +4,14 @@ No package or release artifact is published by this repository's normal CI check
 
 ## Rust crates.io runbook
 
-This section is the manual runbook for the seven Rust crates. It is independent
+This section is the manual runbook for the eight Rust crates. It is independent
 of the deferred sidecar/SDK artifact workflow below. Do not combine their
 authorizations or assume that a successful SDK validation publishes a crate.
 
 The initial Rust release uses the unified `0.1.0` version:
 `llama-harness-programmatic-sandbox`, `llama-harness-core`,
 `llama-harness-ollama`, `llama-harness-observability`, `llama-harness-tauri`,
-`llama-harness-evals`, and the `llama-harness` facade.
+`llama-harness-evals`, `llama-harness-mcp`, and the `llama-harness` facade.
 Protocol/runtime, SDKs, Promptfoo integration, scripted runtime, examples,
 developer console, CLI, and release helper are not published in this milestone.
 
@@ -20,7 +20,7 @@ developer console, CLI, and release helper are not published in this milestone.
 Before publishing, record the exact reviewed commit on clean `main` as
 `SOURCE_COMMIT`. The worktree must have no unreviewed or uncommitted changes,
 and the requested version must match the workspace/package metadata and the
-changelog or prepared release notes. For `0.1.0`, recheck all seven crate names
+changelog or prepared release notes. For `0.1.0`, recheck all eight crate names
 on crates.io immediately before the first publish; a name conflict or an
 existing `0.1.0` means stop and choose a forward version rather than trying to
 overwrite it.
@@ -40,9 +40,9 @@ pwsh -File scripts/release/check-rust-release.ps1 -Version 0.1.0 -SourceCommit $
 cargo run --locked -p xtask -- release-check
 ```
 
-The preflight validates the exact seven-crate set, unified version, Rust 1.88
+The preflight validates the exact eight-crate set, unified version, Rust 1.88
 MSRV, nonempty changelog entry, clean worktree, and source commit. The helper
-runs formatting, linting, tests, and Rust documentation, creates all seven
+runs formatting, linting, tests, and Rust documentation, creates all eight
 `.crate` archives, rejects unexpected, unsafe, or oversized archive contents,
 and checks extracted packages with the supported facade feature configurations.
 
@@ -142,9 +142,11 @@ dry-run and publish each direct integration:
 cargo publish --locked --dry-run --package llama-harness-ollama
 cargo publish --locked --dry-run --package llama-harness-observability
 cargo publish --locked --dry-run --package llama-harness-tauri
+cargo publish --locked --dry-run --package llama-harness-mcp
 cargo publish --locked --package llama-harness-ollama
 cargo publish --locked --package llama-harness-observability
 cargo publish --locked --package llama-harness-tauri
+cargo publish --locked --package llama-harness-mcp
 ```
 
 #### 4. Evaluations
@@ -184,9 +186,9 @@ Create a fresh, outside-workspace consumer for every final profile. Its manifest
 must contain only `llama-harness = "=0.1.0"`; it must not contain path, Git, or
 patch overrides. Generate a new lockfile and build the default configuration,
 `--no-default-features`, each individual supported feature (`ollama`,
-`observability`, `evals`, `tauri`, and `programmatic`), and `--all-features`.
+`observability`, `evals`, `tauri`, `programmatic`, and `mcp`), and `--all-features`.
 
-Verify the published `0.1.0` documentation pages for all seven crates:
+Verify the published `0.1.0` documentation pages for all eight crates:
 
 1. `https://docs.rs/llama-harness-programmatic-sandbox/0.1.0`
 2. `https://docs.rs/llama-harness-core/0.1.0`
@@ -194,9 +196,10 @@ Verify the published `0.1.0` documentation pages for all seven crates:
 4. `https://docs.rs/llama-harness-observability/0.1.0`
 5. `https://docs.rs/llama-harness-tauri/0.1.0`
 6. `https://docs.rs/llama-harness-evals/0.1.0`
-7. `https://docs.rs/llama-harness/0.1.0`
+7. `https://docs.rs/llama-harness-mcp/0.1.0`
+8. `https://docs.rs/llama-harness/0.1.0`
 
-Add the approved backup crates.io login to all seven crates, then verify each
+Add the approved backup crates.io login to all eight crates, then verify each
 owner list. Repeat these two commands for every crate name:
 
 ```powershell
@@ -204,7 +207,7 @@ cargo owner --add <backup-login> llama-harness-core
 cargo owner --list llama-harness-core
 ```
 
-Only after all seven pages render, all seven owner lists are confirmed, and the
+Only after all eight pages render, all eight owner lists are confirmed, and the
 final facade consumer passes, create the annotated `v0.1.0` tag pointing
 exactly to `SOURCE_COMMIT`, push that tag, and create the GitHub release from
 the checked-in notes:
@@ -227,7 +230,7 @@ If a layer partially releases, stop before its dependents, record which exact
 packages are visible, and diagnose from fresh consumers. Recover by publishing
 the remaining safe packages only when their exact dependency graph is still
 correct; otherwise publish a coordinated forward version. Do not tag or create
-a GitHub release until the entire seven-crate set has passed the final checks.
+a GitHub release until the entire eight-crate set has passed the final checks.
 
 The rollback boundary is the registry publish: source changes, tags, and a
 GitHub release can be reverted or corrected, but a published crate cannot be

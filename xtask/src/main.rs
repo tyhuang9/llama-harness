@@ -542,7 +542,7 @@ fn manifest_with_patches(
         );
     }
     if extracted_packages.len() != PUBLISHABLE_CRATES.len() {
-        return Err("cannot generate patches without all seven extracted crates".into());
+        return Err("cannot generate patches without all eight extracted crates".into());
     }
 
     let mut patched = manifest.trim_end().to_owned();
@@ -767,12 +767,12 @@ mod tests {
 
     #[test]
     fn publishable_set_is_exact_and_unique() {
-        assert_eq!(PUBLISHABLE_CRATES.len(), 7);
+        assert_eq!(PUBLISHABLE_CRATES.len(), 8);
         let names = PUBLISHABLE_CRATES
             .iter()
             .map(|package| package.name)
             .collect::<HashSet<_>>();
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
         assert!(names.contains("llama-harness"));
         assert!(names.contains("llama-harness-core"));
         assert!(names.contains("llama-harness-programmatic-sandbox"));
@@ -783,7 +783,8 @@ mod tests {
         assert_eq!(PUBLISHABLE_CRATES[1].name, "llama-harness-core");
         assert_eq!(PUBLISHABLE_CRATES[4].name, "llama-harness-tauri");
         assert_eq!(PUBLISHABLE_CRATES[5].name, "llama-harness-evals");
-        assert_eq!(PUBLISHABLE_CRATES[6].name, "llama-harness");
+        assert_eq!(PUBLISHABLE_CRATES[6].name, "llama-harness-mcp");
+        assert_eq!(PUBLISHABLE_CRATES[7].name, "llama-harness");
     }
 
     #[test]
@@ -797,7 +798,7 @@ mod tests {
                 .iter()
                 .filter(|argument| *argument == "--package")
                 .count(),
-            7
+            8
         );
         assert!(!arguments.iter().any(|argument| argument == "--workspace"));
         assert!(!arguments.iter().any(|argument| argument == "--all"));
@@ -836,7 +837,7 @@ mod tests {
             .collect::<Vec<_>>();
         let manifest = manifest_with_patches("[package]\nname = \"consumer\"\n", &packages)
             .expect("patch generation should succeed");
-        assert_eq!(manifest.matches(" = { path = ").count(), 7);
+        assert_eq!(manifest.matches(" = { path = ").count(), 8);
         assert!(manifest.contains("[patch.crates-io]"));
         assert!(manifest.contains("llama-harness = { path = \"/tmp/llama-harness\" }"));
     }

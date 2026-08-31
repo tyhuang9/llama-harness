@@ -299,6 +299,7 @@ class InputAndAbiTests(unittest.TestCase):
             "llama-harness-ollama",
             "llama-harness-programmatic-sandbox",
             "llama-harness-tauri",
+            "llama-harness-mcp",
         ):
             self.assertIn(f'"{crate}"', preflight)
 
@@ -389,6 +390,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                 "llama-harness-evals",
                 "llama-harness-programmatic-sandbox",
                 "llama-harness-tauri",
+                "llama-harness-mcp",
                 "llama-harness",
             },
         )
@@ -432,6 +434,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                 "llama-harness-evals",
                 "llama-harness-programmatic-sandbox",
                 "llama-harness-tauri",
+                "llama-harness-mcp",
                 "llama-harness",
             },
         )
@@ -463,7 +466,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                     .replace("publish = false\n", ""),
                     encoding="utf-8",
                 ),
-                "Expected exactly the seven supported crates.io packages",
+                "Expected exactly the eight supported crates.io packages",
             ),
             (
                 "MSRV mismatch",

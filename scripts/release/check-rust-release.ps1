@@ -17,7 +17,8 @@ $expectedCrates = @(
     "llama-harness-observability",
     "llama-harness-ollama",
     "llama-harness-programmatic-sandbox",
-    "llama-harness-tauri"
+    "llama-harness-tauri",
+    "llama-harness-mcp"
 ) | Sort-Object
 $stableVersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
@@ -39,13 +40,13 @@ try {
     )
     $actualCrates = @($publishable | ForEach-Object { [string]$_.name } | Sort-Object)
     $differences = @(Compare-Object $expectedCrates $actualCrates)
-    if ($publishable.Count -ne 7 -or $differences.Count -ne 0) {
-        throw "Expected exactly the seven supported crates.io packages. Actual: $($actualCrates -join ', ')"
+    if ($publishable.Count -ne 8 -or $differences.Count -ne 0) {
+        throw "Expected exactly the eight supported crates.io packages. Actual: $($actualCrates -join ', ')"
     }
 
     $metadataVersions = @($publishable | ForEach-Object { [string]$_.version } | Sort-Object -Unique)
     if ($metadataVersions.Count -ne 1 -or $metadataVersions[0] -notmatch $stableVersionPattern) {
-        throw "The seven crates.io packages must share one stable SemVer version. Actual: $($metadataVersions -join ', ')"
+        throw "The eight crates.io packages must share one stable SemVer version. Actual: $($metadataVersions -join ', ')"
     }
     if (-not $Version) {
         $Version = $metadataVersions[0]

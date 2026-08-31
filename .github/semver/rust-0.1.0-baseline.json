@@ -8,6 +8,7 @@
     "llama-harness-observability",
     "llama-harness-evals",
     "llama-harness-tauri",
+    "llama-harness-mcp",
     "llama-harness"
   ]
 }

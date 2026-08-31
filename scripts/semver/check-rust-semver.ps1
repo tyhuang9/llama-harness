@@ -23,8 +23,8 @@ if ($baseline.baseline_version -ne $expectedVersion -or $baseline.baseline_tag -
 }
 
 $recordedCrates = @($baseline.crates | ForEach-Object { [string]$_ })
-if ($recordedCrates.Count -ne 7 -or @($recordedCrates | Sort-Object -Unique).Count -ne 7) {
-    throw "SemVer baseline must contain exactly seven unique crate names."
+if ($recordedCrates.Count -ne 8 -or @($recordedCrates | Sort-Object -Unique).Count -ne 8) {
+    throw "SemVer baseline must contain exactly eight unique crate names."
 }
 
 $metadataJson = & cargo metadata --locked --format-version 1 --no-deps
@@ -39,9 +39,9 @@ $publishableCrates = @(
 )
 
 $differences = @(Compare-Object ($recordedCrates | Sort-Object) ($publishableCrates | Sort-Object))
-if ($publishableCrates.Count -ne 7 -or $differences.Count -ne 0) {
+if ($publishableCrates.Count -ne 8 -or $differences.Count -ne 0) {
     $actual = ($publishableCrates | Sort-Object) -join ", "
-    throw "Recorded SemVer crates do not match the seven publishable workspace crates. Actual: $actual"
+    throw "Recorded SemVer crates do not match the eight publishable workspace crates. Actual: $actual"
 }
 
 function Record-InitialBaseline {

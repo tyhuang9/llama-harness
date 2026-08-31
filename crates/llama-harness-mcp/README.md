@@ -5,6 +5,36 @@ Optional, transport-neutral MCP catalog adapter for `llama-harness`.
 The crate deliberately does not implement JSON-RPC or select a network client. Hosts supply an
 `McpTransport`; validated remote tools are registered as normal deferred core tools.
 
+## Compatibility and host boundary
+
+The adapter explicitly accepts only the modern `2026-07-28` discovery era and
+the legacy `2025-11-25` initialize era, and requires the negotiated `tools`
+capability. A host owns endpoint selection, authentication, credentials,
+connection lifetime, and the transport implementation. It must never treat
+server descriptions, annotations, schemas, cache hints, errors, or request
+context as trusted authority.
+
+Imported tools are high-risk, state-changing, non-idempotent, non-parallel,
+unknown-cancellation, Direct-only tools. They are deferred for normal core
+discovery, remain subject to the application allowlist, argument validation,
+policy, approval, call limits, cancellation, output validation, and the
+existing `ToolBroker`; there is no supported MCP execution bypass. Calls are
+never retried after dispatch because a remote effect may be uncertain.
+
+`McpCatalogManager` installs only a fully validated immutable snapshot. A
+modern snapshot requires consistent TTL and cache scope; a legacy snapshot uses
+the host-selected age. List-change invalidation and expiry fail closed unless a
+host deliberately configures a bounded stale allowance. Refresh never mutates
+an active runner, and old, invalidated, expired, or closed snapshots reject
+before dispatch.
+
+Lifecycle observation is metadata-only. It deliberately redacts endpoints,
+credentials, native names, arguments, results, schemas, raw frames, request
+contexts, and server-controlled error text. The crate is intended for
+same-process hosts or host-provided remote transports; it does not supply a
+reference network transport, task/resource/prompt import, speculative calls,
+an OAuth UI, or a real MCP client.
+
 For long-lived integrations, use `McpCatalogManager`. It builds a complete
 validated immutable snapshot before replacing the active catalog, rejects tools
 from invalidated, expired, replaced, or closed generations before native
