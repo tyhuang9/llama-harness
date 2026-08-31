@@ -1,7 +1,7 @@
 use crate::{
     discovery::{
-        AllowedCatalogEntry, CatalogEntry, CatalogIndex, ToolDiscoveryMetadata,
-        DISCOVERY_GUARD_INTERVAL,
+        fingerprint_catalog, AllowedCatalogEntry, CatalogCache, CatalogCacheKey, CatalogEntry,
+        CatalogFingerprint, CatalogIndex, ToolDiscoveryMetadata, DISCOVERY_GUARD_INTERVAL,
     },
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len},
     AgentLimits, HarnessError,
@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
 };
 use tokio_util::sync::CancellationToken;
 
@@ -420,7 +423,10 @@ pub(crate) struct RegisteredTool {
 /// Registry of tools and their compiled argument validators.
 pub struct ToolRegistry {
     pub(crate) tools: HashMap<String, RegisteredTool>,
-    pub(crate) catalog_cache: RwLock<Option<Arc<CatalogIndex>>>,
+    pub(crate) catalog_generation: u64,
+    pub(crate) catalog_cache: RwLock<CatalogCache>,
+    pub(crate) fingerprint_cache: RwLock<Option<CatalogFingerprint>>,
+    catalog_build_count: AtomicU64,
 }
 
 #[derive(Serialize)]
@@ -434,13 +440,20 @@ impl Default for ToolRegistry {
     fn default() -> Self {
         Self {
             tools: HashMap::new(),
-            catalog_cache: RwLock::new(None),
+            catalog_generation: 0,
+            catalog_cache: RwLock::new(CatalogCache::default()),
+            fingerprint_cache: RwLock::new(None),
+            catalog_build_count: AtomicU64::new(0),
         }
     }
 }
 
 impl ToolRegistry {
-    /// Validates and registers a tool, rejecting duplicate IDs and invalid schemas.
+    /// Validates and registers a legacy-compatible hot tool.
+    ///
+    /// IDs must contain a non-whitespace character, but otherwise retain the
+    /// base API's mixed-case, Unicode, punctuation, spacing, and name behavior.
+    /// Use [`Self::register_with_discovery`] for strict indexable metadata.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), HarnessError> {
         self.register_inner(tool, ToolDiscoveryMetadata::default(), false)
     }
@@ -531,6 +544,9 @@ impl ToolRegistry {
             .map_err(|error| {
                 HarnessError::InvalidTool(format!("tool is not serializable: {error}"))
             })?;
+        let next_generation = self.catalog_generation.checked_add(1).ok_or_else(|| {
+            HarnessError::InvalidTool("tool catalog generation is exhausted".into())
+        })?;
         self.tools.insert(
             id,
             RegisteredTool {
@@ -542,8 +558,13 @@ impl ToolRegistry {
                 serialized_definition,
             },
         );
+        self.catalog_generation = next_generation;
+        self.catalog_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         *self
-            .catalog_cache
+            .fingerprint_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         Ok(())
@@ -594,35 +615,40 @@ impl ToolRegistry {
         Ok(allowed)
     }
 
-    pub(crate) fn catalog_index(&self) -> (Arc<CatalogIndex>, bool) {
-        self.catalog_index_guarded(&mut || Ok(()))
-            .expect("the unguarded catalog index build cannot fail")
-    }
-
-    pub(crate) fn catalog_index_guarded(
+    pub(crate) fn catalog_index_for_scope(
         &self,
+        allowed: &[AllowedCatalogEntry<'_>],
+        caller: ToolCaller,
         guard: &mut impl FnMut() -> Result<(), HarnessError>,
     ) -> Result<(Arc<CatalogIndex>, bool), HarnessError> {
         guard()?;
+        let key = CatalogCacheKey::new(
+            self.catalog_generation,
+            caller,
+            allowed
+                .iter()
+                .map(|entry| entry.definition.id.clone())
+                .collect(),
+        );
         if let Some(index) = self
             .catalog_cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .cloned()
+            .get(&key)
         {
             return Ok((index, true));
         }
-        let mut entries = Vec::with_capacity(self.tools.len());
-        for (position, entry) in self.tools.values().enumerate() {
+        let mut entries = Vec::with_capacity(allowed.len());
+        for (position, entry) in allowed.iter().enumerate() {
             if position % DISCOVERY_GUARD_INTERVAL == 0 {
                 guard()?;
             }
             entries.push(CatalogEntry {
                 id: entry.definition.id.clone(),
                 name: entry.definition.name.clone(),
-                metadata: entry.discovery.clone(),
+                metadata: entry.metadata.clone(),
                 terms: Default::default(),
+                document_len: 0,
             });
         }
         let index = Arc::new(CatalogIndex::build(entries, guard)?);
@@ -631,11 +657,58 @@ impl ToolRegistry {
             .catalog_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = cache.as_ref() {
-            return Ok((Arc::clone(existing), true));
+        if let Some(existing) = cache.get(&key) {
+            return Ok((existing, true));
         }
-        *cache = Some(Arc::clone(&index));
+        cache.insert(key, Arc::clone(&index));
+        self.catalog_build_count.fetch_add(1, Ordering::Relaxed);
         Ok((index, false))
+    }
+
+    pub(crate) fn catalog_fingerprint_cached(&self) -> CatalogFingerprint {
+        if let Some(fingerprint) = self
+            .fingerprint_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+        {
+            return fingerprint;
+        }
+        let fingerprint = fingerprint_catalog(
+            self.tools
+                .values()
+                .map(|entry| CatalogEntry {
+                    id: entry.definition.id.clone(),
+                    name: entry.definition.name.clone(),
+                    metadata: entry.discovery.clone(),
+                    terms: Default::default(),
+                    document_len: 0,
+                })
+                .collect(),
+        );
+        let mut cache = self
+            .fingerprint_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = cache.as_ref() {
+            return existing.clone();
+        }
+        *cache = Some(fingerprint.clone());
+        fingerprint
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_build_count(&self) -> u64 {
+        self.catalog_build_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_cache_is_empty(&self) -> bool {
+        self.catalog_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 
     pub(crate) fn validate(&self, tool_id: &str, arguments: &Value) -> Result<(), HarnessError> {

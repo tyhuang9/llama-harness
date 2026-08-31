@@ -4,7 +4,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
 };
 use tokio::time::Instant;
@@ -14,8 +14,13 @@ use tokio_util::sync::CancellationToken;
 pub const CATALOG_FINGERPRINT_VERSION: u32 = 1;
 const MAX_DISCOVERY_QUERY_BYTES: usize = 4096;
 const MAX_QUERY_TERMS: usize = 64;
+const BM25_SCALE: u128 = 1_000;
+const BM25_K1: u128 = 1_200;
+const BM25_B: u128 = 750;
+const MIN_CONFIDENCE_MARGIN: u64 = 500;
 pub(crate) const MAX_DISCOVERY_IDENTIFIER_BYTES: usize = 128;
 pub(crate) const DISCOVERY_GUARD_INTERVAL: usize = 64;
+pub(crate) const MAX_SCOPE_CATALOG_CACHE_ENTRIES: usize = 16;
 
 /// Whether a registered tool is always exposed or selected only when relevant.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,6 +181,7 @@ pub(crate) struct ToolScope {
     caller: ToolCaller,
     tool_ids: BTreeSet<String>,
     definitions: Arc<[ToolDefinition]>,
+    serialized_definitions: Arc<[u8]>,
 }
 
 impl ToolScope {
@@ -188,6 +194,8 @@ impl ToolScope {
     }
 
     pub(crate) fn definitions(&self) -> &[ToolDefinition] {
+        debug_assert_eq!(self.serialized_definitions.first(), Some(&b'['));
+        debug_assert_eq!(self.serialized_definitions.last(), Some(&b']'));
         &self.definitions
     }
 
@@ -195,11 +203,17 @@ impl ToolScope {
         self.definitions.is_empty()
     }
 
+    #[cfg(test)]
+    pub(crate) fn serialized_definitions(&self) -> &[u8] {
+        &self.serialized_definitions
+    }
+
     fn empty(caller: ToolCaller) -> Self {
         Self {
             caller,
             tool_ids: BTreeSet::new(),
             definitions: Arc::from([]),
+            serialized_definitions: Arc::from(&b"[]"[..]),
         }
     }
 }
@@ -219,6 +233,7 @@ pub(crate) struct CatalogEntry {
     pub(crate) name: String,
     pub(crate) metadata: ToolDiscoveryMetadata,
     pub(crate) terms: BTreeMap<String, u32>,
+    pub(crate) document_len: u32,
 }
 
 pub(crate) struct AllowedCatalogEntry<'a> {
@@ -229,8 +244,55 @@ pub(crate) struct AllowedCatalogEntry<'a> {
 
 pub(crate) struct CatalogIndex {
     entries: Vec<CatalogEntry>,
-    positions: HashMap<String, usize>,
-    fingerprint: CatalogFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogCacheKey {
+    generation: u64,
+    caller: ToolCaller,
+    tool_ids: Arc<[String]>,
+}
+
+impl CatalogCacheKey {
+    pub(crate) fn new(generation: u64, caller: ToolCaller, mut tool_ids: Vec<String>) -> Self {
+        tool_ids.sort();
+        tool_ids.dedup();
+        Self {
+            generation,
+            caller,
+            tool_ids: Arc::from(tool_ids),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CatalogCache {
+    entries: VecDeque<(CatalogCacheKey, Arc<CatalogIndex>)>,
+}
+
+impl CatalogCache {
+    pub(crate) fn get(&self, key: &CatalogCacheKey) -> Option<Arc<CatalogIndex>> {
+        self.entries
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, index)| Arc::clone(index))
+    }
+
+    pub(crate) fn insert(&mut self, key: CatalogCacheKey, index: Arc<CatalogIndex>) {
+        if self.entries.len() == MAX_SCOPE_CATALOG_CACHE_ENTRIES {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, index));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 impl CatalogIndex {
@@ -245,60 +307,47 @@ impl CatalogIndex {
                 guard()?;
             }
             entry.terms = indexed_terms(entry);
+            entry.document_len = entry
+                .terms
+                .values()
+                .copied()
+                .fold(0u32, u32::saturating_add);
         }
-        let mut positions = HashMap::with_capacity(entries.len());
-        for (position, entry) in entries.iter().enumerate() {
-            if position % DISCOVERY_GUARD_INTERVAL == 0 {
-                guard()?;
-            }
-            positions.insert(entry.id.clone(), position);
-        }
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"llama-harness-tool-catalog\0v1\0");
-        for (position, entry) in entries.iter().enumerate() {
-            if position % DISCOVERY_GUARD_INTERVAL == 0 {
-                guard()?;
-            }
-            fingerprint_field(&mut hasher, &entry.id);
-            fingerprint_field(&mut hasher, &entry.name);
-            fingerprint_field(
-                &mut hasher,
-                entry.metadata.namespace.as_deref().unwrap_or_default(),
-            );
-            hasher.update(&[match entry.metadata.exposure {
-                ToolExposure::Hot => 0,
-                ToolExposure::Deferred => 1,
-            }]);
-            for alias in &entry.metadata.aliases {
-                fingerprint_field(&mut hasher, alias);
-            }
-            hasher.update(&[0xff]);
-        }
-        Ok(Self {
-            entries,
-            positions,
-            fingerprint: CatalogFingerprint {
-                version: CATALOG_FINGERPRINT_VERSION,
-                digest: hasher.finalize().to_hex().to_string(),
-            },
-        })
+        guard()?;
+        Ok(Self { entries })
     }
+}
 
-    pub(crate) fn fingerprint(&self) -> CatalogFingerprint {
-        self.fingerprint.clone()
+pub(crate) fn fingerprint_catalog(mut entries: Vec<CatalogEntry>) -> CatalogFingerprint {
+    entries.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"llama-harness-tool-catalog\0v1\0");
+    for entry in &entries {
+        fingerprint_field(&mut hasher, &entry.id);
+        fingerprint_field(&mut hasher, &entry.name);
+        fingerprint_field(
+            &mut hasher,
+            entry.metadata.namespace.as_deref().unwrap_or_default(),
+        );
+        hasher.update(&[match entry.metadata.exposure {
+            ToolExposure::Hot => 0,
+            ToolExposure::Deferred => 1,
+        }]);
+        for alias in &entry.metadata.aliases {
+            fingerprint_field(&mut hasher, alias);
+        }
+        hasher.update(&[0xff]);
     }
-
-    fn entry(&self, tool_id: &str) -> Option<&CatalogEntry> {
-        self.positions
-            .get(tool_id)
-            .and_then(|position| self.entries.get(*position))
+    CatalogFingerprint {
+        version: CATALOG_FINGERPRINT_VERSION,
+        digest: hasher.finalize().to_hex().to_string(),
     }
 }
 
 impl ToolRegistry {
     /// Returns the versioned fingerprint for the cached safe-metadata catalog.
     pub fn catalog_fingerprint(&self) -> CatalogFingerprint {
-        self.catalog_index().0.fingerprint()
+        self.catalog_fingerprint_cached()
     }
 
     #[cfg(test)]
@@ -371,34 +420,20 @@ impl ToolRegistry {
         if limits.max_tools == 0 || limits.max_bytes < 2 || allowed.is_empty() {
             return Ok((ToolScope::empty(caller), base_stats));
         }
-        let all_definitions = allowed
-            .iter()
-            .map(|entry| entry.definition.clone())
-            .collect::<Vec<_>>();
         if fits(&allowed, limits)? {
-            return Ok(scope_with_stats(caller, all_definitions, base_stats, false));
+            return Ok(scope_with_stats(
+                caller,
+                allowed.iter().collect(),
+                base_stats,
+                false,
+            ));
         }
 
-        let (index, cache_hit) = self.catalog_index_guarded(guard)?;
-        base_stats.cache_hit = cache_hit;
-
-        let mut scope_entries = Vec::with_capacity(allowed.len());
-        for (position, entry) in allowed.iter().enumerate() {
-            if position % DISCOVERY_GUARD_INTERVAL == 0 {
-                guard()?;
-            }
-            if let Some(indexed) = index.entry(&entry.definition.id) {
-                scope_entries.push(indexed);
-            }
-        }
-        scope_entries.sort_by(|left, right| left.id.cmp(&right.id));
         let mut required = allowed
             .iter()
             .filter(|entry| entry.metadata.exposure == ToolExposure::Hot)
             .map(|entry| entry.definition.id.clone())
             .collect::<BTreeSet<_>>();
-        let ranked = rank(&scope_entries, query, limits.max_expansion as usize, guard)?;
-        let exact = matches!(ranked, RankedSelection::Exact(_));
         let hot = allowed
             .iter()
             .filter(|entry| required.contains(&entry.definition.id))
@@ -408,6 +443,11 @@ impl ToolRegistry {
                 "mandatory hot tool scope exceeds discovery budget".into(),
             ));
         }
+        let (index, cache_hit) = self.catalog_index_for_scope(&allowed, caller, guard)?;
+        base_stats.cache_hit = cache_hit;
+        let scope_entries = index.entries.iter().collect::<Vec<_>>();
+        let ranked = rank(&scope_entries, query, limits.max_expansion as usize, guard)?;
+        let exact = matches!(ranked, RankedSelection::Exact(_));
         if exact {
             required.extend(ranked.ids().iter().cloned());
             let exact_entries = allowed
@@ -438,7 +478,6 @@ impl ToolRegistry {
         let selected = allowed
             .iter()
             .filter(|entry| required.contains(&entry.definition.id))
-            .map(|entry| entry.definition.clone())
             .collect::<Vec<_>>();
         Ok(scope_with_stats(caller, selected, base_stats, true))
     }
@@ -446,10 +485,15 @@ impl ToolRegistry {
 
 fn scope_with_stats(
     caller: ToolCaller,
-    definitions: Vec<ToolDefinition>,
+    entries: Vec<&AllowedCatalogEntry<'_>>,
     mut stats: ToolDiscoveryStats,
     exceeded: bool,
 ) -> (ToolScope, ToolDiscoveryStats) {
+    let definitions = entries
+        .iter()
+        .map(|entry| entry.definition.clone())
+        .collect::<Vec<_>>();
+    let serialized_definitions = serialize_definition_array(&entries);
     stats.selected_count = definitions.len() as u32;
     stats.catalog_exceeded_budget = exceeded;
     let tool_ids = definitions.iter().map(|tool| tool.id.clone()).collect();
@@ -458,9 +502,29 @@ fn scope_with_stats(
             caller,
             tool_ids,
             definitions: Arc::from(definitions),
+            serialized_definitions,
         },
         stats,
     )
+}
+
+fn serialize_definition_array(entries: &[&AllowedCatalogEntry<'_>]) -> Arc<[u8]> {
+    let capacity = entries
+        .iter()
+        .map(|entry| entry.serialized_definition.len())
+        .sum::<usize>()
+        .saturating_add(entries.len().saturating_sub(1))
+        .saturating_add(2);
+    let mut serialized = Vec::with_capacity(capacity);
+    serialized.push(b'[');
+    for (position, entry) in entries.iter().enumerate() {
+        if position > 0 {
+            serialized.push(b',');
+        }
+        serialized.extend_from_slice(entry.serialized_definition);
+    }
+    serialized.push(b']');
+    Arc::from(serialized)
 }
 
 fn fits(
@@ -527,7 +591,7 @@ fn rank(
     guard: &mut impl FnMut() -> Result<(), HarnessError>,
 ) -> Result<RankedSelection, HarnessError> {
     let normalized = normalize_phrase(query);
-    let query_terms = tokenize(query);
+    let query_terms = tokenize(query).into_iter().collect::<BTreeSet<_>>();
     guard()?;
     let exact_id = entries
         .iter()
@@ -582,8 +646,14 @@ fn rank(
     if query_terms.is_empty() {
         return Ok(RankedSelection::Lexical(Vec::new()));
     }
-    let documents = entries.len() as u64;
-    let mut document_frequency = BTreeMap::<&str, u64>::new();
+    let documents = entries.len() as u128;
+    let total_document_len = entries.iter().fold(0u128, |total, entry| {
+        total.saturating_add(u128::from(entry.document_len))
+    });
+    if total_document_len == 0 {
+        return Ok(RankedSelection::Lexical(Vec::new()));
+    }
+    let mut document_frequency = BTreeMap::<&str, u128>::new();
     for (position, entry) in entries.iter().enumerate() {
         if position % DISCOVERY_GUARD_INTERVAL == 0 {
             guard()?;
@@ -597,19 +667,19 @@ fn rank(
         if position % DISCOVERY_GUARD_INTERVAL == 0 {
             guard()?;
         }
-        let Some(score) = query_terms.iter().try_fold(0u64, |total, term| {
-            let Some(frequency) = entry.terms.get(term).copied().map(u64::from) else {
-                return Some(total);
+        let score = query_terms.iter().fold(0u64, |total, term| {
+            let Some(frequency) = entry.terms.get(term).copied().map(u128::from) else {
+                return total;
             };
-            let document_frequency = *document_frequency.get(term.as_str())?;
-            let idf = documents
-                .checked_add(1)?
-                .checked_mul(1_000)?
-                .checked_div(document_frequency.checked_add(1)?)?;
-            total.checked_add(idf.checked_mul(frequency.min(8))?)
-        }) else {
-            continue;
-        };
+            let document_frequency = document_frequency.get(term.as_str()).copied().unwrap_or(0);
+            total.saturating_add(bm25_term_score(
+                documents,
+                document_frequency,
+                frequency,
+                u128::from(entry.document_len),
+                total_document_len,
+            ))
+        });
         if score > 0 {
             scored.push((score, entry.id.clone()));
         }
@@ -620,11 +690,53 @@ fn rank(
     };
     let confident = scored
         .get(1)
-        .is_none_or(|(second, _)| best.saturating_sub(*second) >= 500);
+        .is_none_or(|(second, _)| best.saturating_sub(*second) >= MIN_CONFIDENCE_MARGIN);
     let take = if confident { 1 } else { max_expansion };
     Ok(RankedSelection::Lexical(
         scored.into_iter().take(take).map(|(_, id)| id).collect(),
     ))
+}
+
+fn bm25_term_score(
+    documents: u128,
+    document_frequency: u128,
+    term_frequency: u128,
+    document_len: u128,
+    total_document_len: u128,
+) -> u64 {
+    if documents == 0 || document_frequency == 0 || term_frequency == 0 || total_document_len == 0 {
+        return 0;
+    }
+    let inverse_document_frequency = documents
+        .saturating_sub(document_frequency)
+        .saturating_add(1)
+        .saturating_mul(BM25_SCALE)
+        .checked_div(document_frequency.saturating_add(1))
+        .unwrap_or(0)
+        .saturating_add(BM25_SCALE);
+    let length_normalization = BM25_SCALE.saturating_sub(BM25_B).saturating_add(
+        BM25_B
+            .saturating_mul(document_len)
+            .saturating_mul(documents)
+            .checked_div(total_document_len)
+            .unwrap_or(u128::MAX),
+    );
+    let denominator = term_frequency.saturating_mul(BM25_SCALE).saturating_add(
+        BM25_K1
+            .saturating_mul(length_normalization)
+            .checked_div(BM25_SCALE)
+            .unwrap_or(u128::MAX),
+    );
+    let term_weight = term_frequency
+        .saturating_mul(BM25_K1.saturating_add(BM25_SCALE))
+        .saturating_mul(BM25_SCALE)
+        .checked_div(denominator)
+        .unwrap_or(0);
+    let score = inverse_document_frequency
+        .saturating_mul(term_weight)
+        .checked_div(BM25_SCALE)
+        .unwrap_or(u128::MAX);
+    u64::try_from(score).unwrap_or(u64::MAX)
 }
 
 fn indexed_terms(entry: &CatalogEntry) -> BTreeMap<String, u32> {
@@ -812,7 +924,8 @@ mod tests {
         );
         assert!(matches!(result, Err(HarnessError::Cancelled)));
         assert_eq!(checkpoints, 20);
-        assert!(!registry.catalog_index().1);
+        assert!(registry.catalog_cache_is_empty());
+        assert_eq!(registry.catalog_build_count(), 0);
     }
 
     #[test]
@@ -899,6 +1012,148 @@ mod tests {
         assert!(expanded.contains("weather.tool.00"));
         assert!(expanded.contains("weather.tool.01"));
         assert!(expanded.contains("weather.tool.02"));
+    }
+
+    #[test]
+    fn fixed_point_bm25_saturates_tf_and_normalizes_document_length() {
+        let tf_one = bm25_term_score(4, 2, 1, 10, 40);
+        let tf_two = bm25_term_score(4, 2, 2, 10, 40);
+        let tf_four = bm25_term_score(4, 2, 4, 10, 40);
+        let tf_eight = bm25_term_score(4, 2, 8, 10, 40);
+        assert!(tf_one < tf_two && tf_two < tf_four && tf_four < tf_eight);
+        assert!(tf_two - tf_one > tf_eight - tf_four);
+
+        let short = bm25_term_score(4, 2, 2, 4, 40);
+        let long = bm25_term_score(4, 2, 2, 20, 40);
+        assert!(short > long);
+        assert!(bm25_term_score(u128::MAX, 1, u128::MAX, 1, u128::MAX) > 0);
+    }
+
+    #[test]
+    fn bm25_ranking_is_length_sensitive_and_permutation_stable() {
+        fn entry(id: &str, name: &str) -> CatalogEntry {
+            CatalogEntry {
+                id: id.into(),
+                name: name.into(),
+                metadata: ToolDiscoveryMetadata::deferred(),
+                terms: BTreeMap::new(),
+                document_len: 0,
+            }
+        }
+
+        let entries = vec![
+            entry("rank.a", "needle"),
+            entry(
+                "rank.b",
+                "needle filler filler filler filler filler filler filler",
+            ),
+            entry("rank.c", "unrelated"),
+        ];
+        let mut reversed = entries.clone();
+        reversed.reverse();
+        for candidate in [entries, reversed] {
+            let index = CatalogIndex::build(candidate, &mut || Ok(())).unwrap();
+            let references = index.entries.iter().collect::<Vec<_>>();
+            let ranked = rank(&references, "needle request", 1, &mut || Ok(())).unwrap();
+            assert_eq!(ranked.ids(), &["rank.a"]);
+        }
+
+        let tied = CatalogIndex::build(
+            vec![entry("tie.b", "needle"), entry("tie.a", "needle")],
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let references = tied.entries.iter().collect::<Vec<_>>();
+        let ranked = rank(&references, "needle request", 1, &mut || Ok(())).unwrap();
+        assert_eq!(ranked.ids(), &["tie.a"]);
+    }
+
+    #[test]
+    fn serialized_fragments_and_scope_cache_are_exact_and_caller_isolated() {
+        let mut registry = ToolRegistry::default();
+        for (id, name, alias) in [
+            ("fragment.one", r#"One, [quoted] "name""#, "needle-one"),
+            ("fragment.two", r#"Two }{ backslash \"#, "needle-two"),
+            ("fragment.three", "Three: delimiter", "needle-three"),
+        ] {
+            let definition = ToolDefinition::new(
+                id,
+                name,
+                "description with ],[{ delimiters",
+                json!({"type": "object", "properties": {"value": {"type": "string"}}}),
+            )
+            .with_allowed_callers([ToolCaller::Direct, ToolCaller::DeclarativePlan]);
+            registry
+                .register_with_discovery(
+                    Arc::new(TestTool(definition)),
+                    ToolDiscoveryMetadata::deferred().with_aliases([alias]),
+                )
+                .unwrap();
+        }
+        let ids = vec![
+            "fragment.one".into(),
+            "fragment.two".into(),
+            "fragment.three".into(),
+        ];
+        let limits = ToolDiscoveryLimits::new()
+            .with_max_tools(2)
+            .with_max_expansion_tools(2);
+        let (cold, cold_stats) = registry
+            .select_scope(
+                "needle request",
+                &ids,
+                ToolCaller::Direct,
+                limits,
+                &ProviderCapabilityLimits::new(),
+            )
+            .unwrap();
+        assert!(!cold_stats.cache_hit);
+        assert_eq!(registry.catalog_build_count(), 1);
+        assert_eq!(
+            cold.serialized_definitions(),
+            serde_json::to_vec(cold.definitions()).unwrap()
+        );
+
+        let mut permuted = ids.clone();
+        permuted.reverse();
+        let (warm, warm_stats) = registry
+            .select_scope(
+                "needle request",
+                &permuted,
+                ToolCaller::Direct,
+                limits,
+                &ProviderCapabilityLimits::new(),
+            )
+            .unwrap();
+        assert!(warm_stats.cache_hit);
+        assert_eq!(registry.catalog_build_count(), 1);
+        assert_eq!(
+            warm.serialized_definitions(),
+            serde_json::to_vec(warm.definitions()).unwrap()
+        );
+
+        let (_, declarative_stats) = registry
+            .select_scope(
+                "needle request",
+                &ids,
+                ToolCaller::DeclarativePlan,
+                limits,
+                &ProviderCapabilityLimits::new(),
+            )
+            .unwrap();
+        assert!(!declarative_stats.cache_hit);
+        assert_eq!(registry.catalog_build_count(), 2);
+        let (_, direct_again) = registry
+            .select_scope(
+                "needle request",
+                &ids,
+                ToolCaller::Direct,
+                limits,
+                &ProviderCapabilityLimits::new(),
+            )
+            .unwrap();
+        assert!(direct_again.cache_hit);
+        assert_eq!(registry.catalog_build_count(), 2);
     }
 
     #[test]
@@ -1012,6 +1267,66 @@ mod tests {
     }
 
     #[test]
+    fn scope_cache_build_work_does_not_traverse_unallowlisted_tools() {
+        fn registry_with_hidden(hidden: usize) -> ToolRegistry {
+            let mut registry = ToolRegistry::default();
+            for index in 0..3 {
+                register(
+                    &mut registry,
+                    &format!("allowed.tool.{index}"),
+                    "description",
+                    ToolDiscoveryMetadata::deferred()
+                        .with_aliases([format!("allowed-alias-{index}")]),
+                );
+            }
+            for index in 0..hidden {
+                register(
+                    &mut registry,
+                    &format!("hidden.tool.{index:04}"),
+                    "description",
+                    ToolDiscoveryMetadata::deferred()
+                        .with_aliases([format!("hidden-alias-{index:04}")]),
+                );
+            }
+            registry
+        }
+
+        let ids = vec![
+            "allowed.tool.0".into(),
+            "allowed.tool.1".into(),
+            "allowed.tool.2".into(),
+        ];
+        let limits = ToolDiscoveryLimits::new().with_max_tools(1);
+        let baseline = registry_with_hidden(0);
+        let polluted = registry_with_hidden(1_000);
+        let guarded_select = |registry: &ToolRegistry| {
+            let mut checkpoints = 0u32;
+            let result = registry.select_scope_guarded(
+                "allowed request",
+                &ids,
+                ToolCaller::Direct,
+                limits,
+                &ProviderCapabilityLimits::new(),
+                &mut || {
+                    checkpoints = checkpoints.saturating_add(1);
+                    Ok(())
+                },
+            );
+            (result.unwrap(), checkpoints)
+        };
+        let ((baseline_scope, baseline_stats), baseline_checkpoints) = guarded_select(&baseline);
+        let ((polluted_scope, polluted_stats), polluted_checkpoints) = guarded_select(&polluted);
+        assert_eq!(baseline_scope.definitions(), polluted_scope.definitions());
+        assert_eq!(
+            baseline_stats.candidate_count,
+            polluted_stats.candidate_count
+        );
+        assert_eq!(baseline_checkpoints, polluted_checkpoints);
+        assert_eq!(baseline.catalog_build_count(), 1);
+        assert_eq!(polluted.catalog_build_count(), 1);
+    }
+
+    #[test]
     fn budgets_are_exact_and_zero_provider_capacity_is_a_no_tool_scope() {
         let mut registry = ToolRegistry::default();
         register(
@@ -1090,7 +1405,8 @@ mod tests {
         .unwrap();
         assert!(empty.is_empty());
         assert!(!stats.cache_hit);
-        assert!(!empty_registry.catalog_index().1);
+        assert!(empty_registry.catalog_cache_is_empty());
+        assert_eq!(empty_registry.catalog_build_count(), 0);
 
         let mut full_fit_registry = ToolRegistry::default();
         register(
@@ -1109,7 +1425,8 @@ mod tests {
         .unwrap();
         assert_eq!(full.definitions().len(), 1);
         assert!(!stats.cache_hit);
-        assert!(!full_fit_registry.catalog_index().1);
+        assert!(full_fit_registry.catalog_cache_is_empty());
+        assert_eq!(full_fit_registry.catalog_build_count(), 0);
     }
 
     #[test]
@@ -1283,6 +1600,15 @@ mod tests {
         let fingerprint_after_valid = registry.catalog_fingerprint();
         assert_ne!(fingerprint, fingerprint_after_valid);
         let all_ids = vec!["weather.current".into(), exact_id];
+        let (_, cold_after_registration) = scope(
+            &registry,
+            "no match",
+            &all_ids,
+            ToolDiscoveryLimits::new().with_max_tools(1),
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert!(!cold_after_registration.cache_hit);
         let (_, warmed) = scope(
             &registry,
             "no match",
@@ -1292,6 +1618,8 @@ mod tests {
         )
         .unwrap();
         assert!(warmed.cache_hit);
+        assert_eq!(registry.catalog_build_count(), 1);
+        assert!(!registry.catalog_cache_is_empty());
 
         let invalid_definitions = [
             ToolDefinition::new(
@@ -1390,6 +1718,8 @@ mod tests {
         ));
 
         assert_eq!(fingerprint_after_valid, registry.catalog_fingerprint());
+        assert_eq!(registry.catalog_build_count(), 1);
+        assert!(!registry.catalog_cache_is_empty());
         let (_, preserved) = scope(
             &registry,
             "no match",
@@ -1399,6 +1729,7 @@ mod tests {
         )
         .unwrap();
         assert!(preserved.cache_hit);
+        assert_eq!(registry.catalog_build_count(), 1);
     }
 
     #[test]
