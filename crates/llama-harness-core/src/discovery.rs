@@ -14,10 +14,17 @@ use tokio_util::sync::CancellationToken;
 pub const CATALOG_FINGERPRINT_VERSION: u32 = 1;
 const MAX_DISCOVERY_QUERY_BYTES: usize = 4096;
 const MAX_QUERY_TERMS: usize = 64;
-const BM25_SCALE: u128 = 1_000;
-const BM25_K1: u128 = 1_200;
-const BM25_B: u128 = 750;
-const MIN_CONFIDENCE_MARGIN: u64 = 500;
+// BM25 scores use nine decimal fixed-point digits. IDF is the standard
+// ln(1 + (N - df + 0.5) / (df + 0.5)); its rational form is reduced to [1, 2)
+// and evaluated with 20 atanh-series terms. On that interval the omitted
+// series tail is below 2e-19 before fixed-point rounding. Every division rounds
+// half up; saturation is reserved for unreachable integer-capacity limits.
+const BM25_SCALE: u128 = 1_000_000_000;
+const BM25_K1: u128 = 1_200_000_000;
+const BM25_B: u128 = 750_000_000;
+const LN_2_SCALED: u128 = 693_147_181;
+const LN_SERIES_TERMS: u32 = 20;
+const MIN_CONFIDENCE_MARGIN: u64 = 500_000_000;
 pub(crate) const MAX_DISCOVERY_IDENTIFIER_BYTES: usize = 128;
 pub(crate) const DISCOVERY_GUARD_INTERVAL: usize = 64;
 pub(crate) const MAX_SCOPE_CATALOG_CACHE_ENTRIES: usize = 16;
@@ -827,36 +834,74 @@ fn bm25_term_score(
     if documents == 0 || document_frequency == 0 || term_frequency == 0 || total_document_len == 0 {
         return 0;
     }
-    let inverse_document_frequency = documents
-        .saturating_sub(document_frequency)
-        .saturating_add(1)
+    let document_frequency = document_frequency.min(documents);
+    let idf_numerator = documents.saturating_add(1).saturating_mul(2);
+    let idf_denominator = document_frequency.saturating_mul(2).saturating_add(1);
+    let inverse_document_frequency = scaled_natural_log_ratio(idf_numerator, idf_denominator);
+    let length_normalization = BM25_SCALE
+        .saturating_sub(BM25_B)
+        .saturating_add(rounded_divide(
+            BM25_B
+                .saturating_mul(document_len)
+                .saturating_mul(documents),
+            total_document_len,
+        ));
+    let denominator = term_frequency
         .saturating_mul(BM25_SCALE)
-        .checked_div(document_frequency.saturating_add(1))
-        .unwrap_or(0)
-        .saturating_add(BM25_SCALE);
-    let length_normalization = BM25_SCALE.saturating_sub(BM25_B).saturating_add(
-        BM25_B
-            .saturating_mul(document_len)
-            .saturating_mul(documents)
-            .checked_div(total_document_len)
-            .unwrap_or(u128::MAX),
+        .saturating_add(rounded_divide(
+            BM25_K1.saturating_mul(length_normalization),
+            BM25_SCALE,
+        ));
+    let term_weight = rounded_divide(
+        term_frequency
+            .saturating_mul(BM25_K1.saturating_add(BM25_SCALE))
+            .saturating_mul(BM25_SCALE),
+        denominator,
     );
-    let denominator = term_frequency.saturating_mul(BM25_SCALE).saturating_add(
-        BM25_K1
-            .saturating_mul(length_normalization)
-            .checked_div(BM25_SCALE)
-            .unwrap_or(u128::MAX),
+    let score = rounded_divide(
+        inverse_document_frequency.saturating_mul(term_weight),
+        BM25_SCALE,
     );
-    let term_weight = term_frequency
-        .saturating_mul(BM25_K1.saturating_add(BM25_SCALE))
-        .saturating_mul(BM25_SCALE)
-        .checked_div(denominator)
-        .unwrap_or(0);
-    let score = inverse_document_frequency
-        .saturating_mul(term_weight)
-        .checked_div(BM25_SCALE)
-        .unwrap_or(u128::MAX);
     u64::try_from(score).unwrap_or(u64::MAX)
+}
+
+fn scaled_natural_log_ratio(numerator: u128, denominator: u128) -> u128 {
+    if denominator == 0 || numerator <= denominator {
+        return 0;
+    }
+    let mut reduced_denominator = denominator;
+    let mut powers_of_two = 0u32;
+    while reduced_denominator <= numerator / 2 {
+        reduced_denominator = reduced_denominator.saturating_mul(2);
+        powers_of_two = powers_of_two.saturating_add(1);
+    }
+
+    // z = (x - 1) / (x + 1), with x in [1, 2), so z is in [0, 1/3).
+    let z = rounded_divide(
+        numerator
+            .saturating_sub(reduced_denominator)
+            .saturating_mul(BM25_SCALE),
+        numerator.saturating_add(reduced_denominator),
+    );
+    let z_squared = rounded_divide(z.saturating_mul(z), BM25_SCALE);
+    let mut power = z;
+    let mut series = 0u128;
+    for index in 0..LN_SERIES_TERMS {
+        series = series.saturating_add(rounded_divide(power, u128::from(index * 2 + 1)));
+        power = rounded_divide(power.saturating_mul(z_squared), BM25_SCALE);
+    }
+    u128::from(powers_of_two)
+        .saturating_mul(LN_2_SCALED)
+        .saturating_add(series.saturating_mul(2))
+}
+
+fn rounded_divide(numerator: u128, denominator: u128) -> u128 {
+    if denominator == 0 {
+        return u128::MAX;
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    quotient.saturating_add(u128::from(remainder >= denominator / 2 + denominator % 2))
 }
 
 fn indexed_terms(entry: &CatalogEntry) -> BTreeMap<String, u32> {
@@ -1186,6 +1231,60 @@ mod tests {
         let long = bm25_term_score(4, 2, 2, 20, 40);
         assert!(short > long);
         assert!(bm25_term_score(u128::MAX, 1, u128::MAX, 1, u128::MAX) > 0);
+    }
+
+    #[test]
+    fn fixed_point_bm25_matches_standard_f64_golden_references() {
+        fn reference(
+            documents: u128,
+            document_frequency: u128,
+            term_frequency: u128,
+            document_len: u128,
+            total_document_len: u128,
+        ) -> f64 {
+            let documents = documents as f64;
+            let document_frequency = document_frequency as f64;
+            let term_frequency = term_frequency as f64;
+            let document_len = document_len as f64;
+            let average_document_len = total_document_len as f64 / documents;
+            let idf =
+                (1.0 + (documents - document_frequency + 0.5) / (document_frequency + 0.5)).ln();
+            idf * term_frequency * (1.2 + 1.0)
+                / (term_frequency + 1.2 * (1.0 - 0.75 + 0.75 * document_len / average_document_len))
+        }
+
+        let cases = [
+            (1, 1, 1, 1, 1),
+            (4, 2, 1, 10, 40),
+            (10, 1, 3, 4, 80),
+            (100, 90, 2, 40, 2_500),
+            (1_000, 1, 32, 250, 100_000),
+        ];
+        for (documents, df, tf, document_len, total_document_len) in cases {
+            let fixed = bm25_term_score(documents, df, tf, document_len, total_document_len);
+            let actual = fixed as f64 / BM25_SCALE as f64;
+            let expected = reference(documents, df, tf, document_len, total_document_len);
+            assert!(
+                (actual - expected).abs() <= 5e-8,
+                "N={documents} df={df} tf={tf} dl={document_len}: {actual} != {expected}"
+            );
+        }
+
+        assert_eq!(scaled_natural_log_ratio(10, 5), LN_2_SCALED);
+        assert_eq!(scaled_natural_log_ratio(4, 3), 287_682_072);
+        let multi_term =
+            bm25_term_score(10, 1, 1, 4, 80).saturating_add(bm25_term_score(10, 5, 2, 4, 80));
+        let reversed =
+            bm25_term_score(10, 5, 2, 4, 80).saturating_add(bm25_term_score(10, 1, 1, 4, 80));
+        assert_eq!(multi_term, reversed);
+        assert!(multi_term > bm25_term_score(10, 1, 1, 4, 80));
+
+        let saturated = bm25_term_score(u128::MAX, 1, u128::MAX, 1, u128::MAX);
+        assert_eq!(
+            saturated,
+            bm25_term_score(u128::MAX, 1, u128::MAX, 1, u128::MAX)
+        );
+        assert!(saturated > 0);
     }
 
     #[test]
