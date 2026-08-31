@@ -93,7 +93,24 @@ scheduling slices entered by the host loop, tool-yield batches, branches,
 bounded loop iterations, fan-out batches, partial failures, peak accounted
 bytes, and VM duration. These counters are persisted as local metadata and
 available to trace-store filtering/export only; the runtime wire contract does
-not project this Programmatic-only event yet.
+not project this Programmatic-only event yet. Projecting it is deferred to the
+compatibility/protocol milestone; the current runtime filters core-only events,
+so its wire sequence can have intentional filtering gaps without losing or
+reordering projected events.
+
+### Programmatic event-contract matrix
+
+| Case | Terminal result | `ProgramExecutionCompleted` |
+| --- | --- | --- |
+| Verified program and final synthesis succeed | Program lifecycle `succeeded`; one run `completed` event | Present before final synthesis |
+| First program is repaired, then verified and synthesized | Repair is counted; successful attempt is `succeeded` | Present for the verified attempt |
+| Invalid program falls back before effects | Same-run Direct continuation, never Programmatic success | Absent |
+| Provider failure before VM completion | Failed terminal result | Absent |
+| Final synthesis failure after VM completion | Failed terminal lifecycle, no second success | Present |
+| Policy or approval rejection | Broker rejection; terminal result follows the program outcome | Present only if the VM subsequently completes |
+| Partial tool failure returned to the VM | Recorded as partial failure; terminal result follows the program outcome | Present if the VM completes |
+| Cancellation or deadline | Cancelled/timed-out terminal result | Present only when VM completion occurred first |
+| VM fuel, admission, or transcript limit | Limit-reached terminal result | Absent unless completion preceded a later transcript/synthesis limit |
 
 ## Broker safety boundary
 
@@ -231,8 +248,9 @@ behavior.
 
 Provider raw deltas are not persisted by this execution path. The local SQLite
 store records `PlanLifecycle` as `plan.lifecycle`; existing event kinds remain
-unchanged. Protocol runtimes intentionally filter additive core-only strategy
-and plan events when projecting the current wire protocol. Because the core
-event emitter allocates sequence numbers before that projection, wire consumers
-may observe sequence gaps; gaps are filtering artifacts, not lost or reordered
-wire events. Protocol and SDK contracts remain unchanged.
+unchanged. Protocol runtimes intentionally filter additive core-only strategy,
+plan, and Programmatic events until the compatibility/protocol milestone
+projects them. Because the core event emitter allocates sequence numbers before
+that projection, wire consumers may observe sequence gaps; gaps are filtering
+artifacts, not lost or reordered wire events. Protocol and SDK contracts remain
+unchanged.

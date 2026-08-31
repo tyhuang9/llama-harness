@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use llama_harness_core::{load_agent_manifest_path, AgentDefinition, ModelProvider};
 use llama_harness_evals::{load_suite_path, EvaluationReport, RegressionCase};
-use llama_harness_observability::{ExportedRun, SqliteEventSink, TraceStoreConfig};
+use llama_harness_observability::{ExportedRun, SqliteEventSink};
 use llama_harness_ollama::{OllamaProvider, DEFAULT_OLLAMA_BASE_URL};
 use llama_harness_promptfoo::{generate_workspace, normalize_observations, PromptfooError};
 use std::{
@@ -474,7 +474,7 @@ fn run_replay(arguments: ReplayArgs) -> Result<(), CliError> {
 fn run_inspect(command: InspectCommand) -> Result<(), CliError> {
     match command {
         InspectCommand::Run(arguments) => {
-            let store = SqliteEventSink::open(arguments.db, TraceStoreConfig::default())?;
+            let store = SqliteEventSink::open_read_only(arguments.db)?;
             let selected = arguments.execution_id.as_deref();
             let export = match selected {
                 Some(execution_id) => store.export_execution(execution_id)?,
@@ -604,7 +604,20 @@ mod tests {
     use super::*;
     use llama_harness_core::{EventRecord, RunEvent, RunStatus};
     use llama_harness_evals::{AssertionFailure, EvaluationCaseResult};
+    use llama_harness_observability::TraceStoreConfig;
     use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_trace_database(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "llama-harness-cli-{name}-{}-{stamp}.sqlite",
+            std::process::id()
+        ))
+    }
 
     fn report() -> EvaluationReport {
         let mut passing = EvaluationCaseResult::new("suite", "passing", "ollama:model", 1);
@@ -707,6 +720,60 @@ mod tests {
         assert!(!human.contains("private credential"));
         assert!(human.contains("run run-1 execution"));
         assert!(human.contains("trace trace-1: 1 event(s)"));
+    }
+
+    #[test]
+    fn inspect_run_never_creates_a_missing_trace_database() {
+        let path = temporary_trace_database("missing-trace");
+        let error = run_inspect(InspectCommand::Run(InspectRunArgs {
+            run_id: Some("missing".into()),
+            execution_id: None,
+            db: path.clone(),
+            export_json: false,
+        }))
+        .unwrap_err();
+        assert!(matches!(error, CliError::Trace(_)));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn inspect_run_refuses_legacy_schema_until_a_writer_migrates_it() {
+        let path = temporary_trace_database("legacy-trace");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL);
+                 INSERT INTO schema_migrations(version) VALUES (2);
+                 CREATE TABLE trace_events (
+                     run_id TEXT NOT NULL,
+                     execution_id TEXT NOT NULL,
+                     trace_id TEXT NOT NULL,
+                     sequence INTEGER NOT NULL,
+                     timestamp_ms INTEGER NOT NULL,
+                     event_kind TEXT NOT NULL,
+                     status TEXT,
+                     event_json TEXT NOT NULL,
+                     raw_payload_json TEXT,
+                     PRIMARY KEY (execution_id, sequence)
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = run_inspect(InspectCommand::Run(InspectRunArgs {
+            run_id: Some("legacy".into()),
+            execution_id: None,
+            db: path.clone(),
+            export_json: false,
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::Trace(llama_harness_observability::TraceStoreError::InvalidConfiguration(message))
+                if message.contains("writable open") && message.contains("migrate to v3")
+        ));
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

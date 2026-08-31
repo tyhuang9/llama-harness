@@ -14,7 +14,6 @@ pub struct EventRecord {
     pub run_id: String,
     /// Core-generated unique execution identity, independent of an optional
     /// application-visible run ID.
-    #[serde(default = "new_execution_id")]
     pub execution_id: String,
     /// Trace identifier associated with the run.
     pub trace_id: String,
@@ -540,5 +539,28 @@ impl EventEmitter {
             timestamp_ms,
             event,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EventRecord;
+
+    #[test]
+    fn public_event_record_deserialization_requires_execution_id() {
+        let record = serde_json::json!({
+            "run_id": "run",
+            "trace_id": "trace",
+            "sequence": 1,
+            "timestamp_ms": 1,
+            "event": {
+                "type": "started",
+                "run_id": "run",
+                "trace_id": "trace"
+            }
+        });
+
+        let error = serde_json::from_value::<EventRecord>(record).unwrap_err();
+        assert!(error.to_string().contains("execution_id"));
     }
 }

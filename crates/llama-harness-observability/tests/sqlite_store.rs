@@ -12,7 +12,7 @@ use serde_json::json;
 use std::{
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Barrier, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -68,6 +68,7 @@ fn runner_discovery_events_reopen_with_additive_legacy_compatibility() {
     assert_eq!(kind, "tool.discovery.completed");
     let legacy = json!({
         "run_id": "legacy-discovery",
+        "execution_id": "legacy-discovery-execution",
         "trace_id": "legacy-discovery-trace",
         "sequence": 1,
         "timestamp_ms": 1,
@@ -474,6 +475,101 @@ fn empty_execution_ids_are_rejected_before_single_and_batch_writes() {
         Err(TraceStoreError::InvalidRecord(message)) if message == "execution ID must not be empty"
     ));
     assert!(store.list_runs(RunListQuery::default()).unwrap().is_empty());
+}
+
+#[test]
+fn append_requires_contiguous_sequences_and_allows_exact_concurrent_retries() {
+    let store = SqliteEventSink::open_in_memory(TraceStoreConfig::default()).unwrap();
+    let gap = record(
+        "gap",
+        "trace-gap",
+        2,
+        2,
+        RunEvent::ModelResponded { call_number: 1 },
+    );
+    assert!(matches!(
+        store.append(&gap),
+        Err(TraceStoreError::InvalidRecord(message))
+            if message.contains("contiguous sequence 1, got 2")
+    ));
+    assert!(store.events_for_run("gap", 10, 0).unwrap().is_empty());
+
+    let first = started("batch-order", "trace-batch-order", 1);
+    let third = record(
+        "batch-order",
+        "trace-batch-order",
+        3,
+        3,
+        RunEvent::ModelResponded { call_number: 2 },
+    );
+    assert!(matches!(
+        store.append_batch([(first.clone(), None), (third, None)]),
+        Err(TraceStoreError::InvalidRecord(message))
+            if message.contains("contiguous sequence 2, got 3")
+    ));
+    assert!(store
+        .events_for_run("batch-order", 10, 0)
+        .unwrap()
+        .is_empty());
+    let second = record(
+        "batch-order",
+        "trace-batch-order",
+        2,
+        2,
+        RunEvent::ModelResponded { call_number: 1 },
+    );
+    assert!(matches!(
+        store.append_batch([(second, None), (first, None)]),
+        Err(TraceStoreError::InvalidRecord(message))
+            if message.contains("contiguous sequence 1, got 2")
+    ));
+    assert!(store
+        .events_for_run("batch-order", 10, 0)
+        .unwrap()
+        .is_empty());
+
+    let retry = started("retry", "trace-retry", 1);
+    let barrier = Arc::new(Barrier::new(2));
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let outcomes = outcomes.clone();
+            let retry = retry.clone();
+            scope.spawn(move || {
+                barrier.wait();
+                outcomes.lock().unwrap().push(store.append(&retry).unwrap());
+            });
+        }
+    });
+    let outcomes = outcomes.lock().unwrap();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == AppendOutcome::Inserted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == AppendOutcome::Duplicate)
+            .count(),
+        1
+    );
+    assert_eq!(
+        store
+            .append(&completed(
+                "retry",
+                "trace-retry",
+                2,
+                2,
+                RunStatus::Completed
+            ))
+            .unwrap(),
+        AppendOutcome::Inserted
+    );
 }
 
 #[test]

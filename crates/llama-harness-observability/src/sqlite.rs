@@ -839,6 +839,31 @@ fn append_prepared(
             )));
         }
     }
+    let existing = transaction
+        .query_row(
+            "SELECT event_json, raw_payload_json FROM trace_events WHERE execution_id = ?1 AND sequence = ?2",
+            params![event.record.execution_id, to_sql_integer(event.record.sequence)?],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    if let Some((event_json, raw_payload_json)) = existing {
+        return if event_json == event.event_json && raw_payload_json == event.raw_payload_json {
+            Ok(AppendOutcome::Duplicate)
+        } else {
+            Err(TraceStoreError::Conflict {
+                execution_id: event.record.execution_id.clone(),
+                run_id: event.record.run_id.clone(),
+                sequence: event.record.sequence,
+            })
+        };
+    }
+    let expected_sequence = expected_next_sequence(transaction, &event.record.execution_id)?;
+    if event.record.sequence != expected_sequence {
+        return Err(TraceStoreError::InvalidRecord(format!(
+            "execution {} requires contiguous sequence {expected_sequence}, got {}",
+            event.record.execution_id, event.record.sequence
+        )));
+    }
     let inserted = transaction.execute(
         "INSERT OR IGNORE INTO trace_events
          (run_id, execution_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json)
@@ -879,6 +904,28 @@ fn append_prepared(
     }
 }
 
+fn expected_next_sequence(
+    transaction: &Transaction<'_>,
+    execution_id: &str,
+) -> Result<u64, TraceStoreError> {
+    let latest_sequence = transaction.query_row(
+        "SELECT MAX(sequence) FROM trace_events WHERE execution_id = ?1",
+        params![execution_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    match latest_sequence {
+        None => Ok(1),
+        Some(sequence) => u64::try_from(sequence)
+            .ok()
+            .and_then(|sequence| sequence.checked_add(1))
+            .ok_or_else(|| {
+                TraceStoreError::InvalidRecord(format!(
+                    "execution {execution_id} has an invalid terminal sequence"
+                ))
+            }),
+    }
+}
+
 fn delete_execution_groups(
     transaction: &Transaction<'_>,
     execution_ids: impl IntoIterator<Item = String>,
@@ -892,6 +939,27 @@ fn delete_execution_groups(
         result.runs_deleted += 1;
     }
     Ok(())
+}
+
+struct LegacyMigrationRow {
+    run_id: String,
+    execution_id: String,
+    trace_id: String,
+    sequence: u64,
+    timestamp_ms: u64,
+    event_kind: String,
+    status: Option<String>,
+    event_json: String,
+    raw_payload_json: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LegacyEventRecord {
+    run_id: String,
+    trace_id: String,
+    sequence: u64,
+    timestamp_ms: u64,
+    event: RunEvent,
 }
 
 fn configure_and_migrate(
@@ -981,17 +1049,62 @@ fn configure_and_migrate(
                  event_json TEXT NOT NULL,
                  raw_payload_json TEXT,
                  PRIMARY KEY (execution_id, sequence)
-             );
-             INSERT INTO trace_events_v3
+             );",
+        )?;
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT run_id, execution_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json
+                 FROM trace_events",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(LegacyMigrationRow {
+                        run_id: row.get(0)?,
+                        execution_id: row.get(1)?,
+                        trace_id: row.get(2)?,
+                        sequence: row.get(3)?,
+                        timestamp_ms: row.get(4)?,
+                        event_kind: row.get(5)?,
+                        status: row.get(6)?,
+                        event_json: row.get(7)?,
+                        raw_payload_json: row.get(8)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for row in rows {
+            let execution_id = if row.execution_id == format!("{}:{}", row.run_id, row.trace_id) {
+                format!(
+                    "legacy-v3:{}:{}:{}:{}",
+                    row.run_id.len(),
+                    row.run_id,
+                    row.trace_id.len(),
+                    row.trace_id
+                )
+            } else {
+                row.execution_id.clone()
+            };
+            let event_json = decode_legacy_event_for_migration(&row, &execution_id)?;
+            transaction.execute(
+                "INSERT INTO trace_events_v3
                  (run_id, execution_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json)
-             SELECT run_id,
-                    CASE WHEN execution_id = run_id || ':' || trace_id
-                         THEN 'legacy-v3:' || length(run_id) || ':' || run_id || ':' || length(trace_id) || ':' || trace_id
-                         ELSE execution_id
-                    END,
-                    trace_id, sequence, timestamp_ms, event_kind, status, event_json, raw_payload_json
-             FROM trace_events;
-             DROP TABLE trace_events;
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    row.run_id,
+                    execution_id,
+                    row.trace_id,
+                    to_sql_integer(row.sequence)?,
+                    to_sql_integer(row.timestamp_ms)?,
+                    row.event_kind,
+                    row.status,
+                    event_json,
+                    row.raw_payload_json,
+                ],
+            )?;
+        }
+        transaction.execute_batch(
+            "DROP TABLE trace_events;
              ALTER TABLE trace_events_v3 RENAME TO trace_events;
              CREATE INDEX trace_events_trace_timestamp_idx
                  ON trace_events(trace_id, timestamp_ms DESC);
@@ -1063,16 +1176,43 @@ fn persistence_failure_category(error: &TraceStoreError) -> PersistenceFailureCa
 fn decode_persisted_event(
     (execution_id, event_json, raw_payload_json): (String, String, Option<String>),
 ) -> Result<PersistedEvent, TraceStoreError> {
-    let mut record: EventRecord = serde_json::from_str(&event_json)?;
-    // Legacy JSON records predate execution IDs. The selected database column
-    // is authoritative and keeps repeated reads deterministic.
-    record.execution_id = execution_id;
+    let record: EventRecord = serde_json::from_str(&event_json)?;
+    if record.execution_id != execution_id {
+        return Err(TraceStoreError::InvalidRecord(format!(
+            "stored event execution ID {} does not match its row identity {execution_id}",
+            record.execution_id
+        )));
+    }
     Ok(PersistedEvent {
         record,
         raw_payload: raw_payload_json
             .map(|payload| serde_json::from_str(&payload))
             .transpose()?,
     })
+}
+
+fn decode_legacy_event_for_migration(
+    row: &LegacyMigrationRow,
+    execution_id: &str,
+) -> Result<String, TraceStoreError> {
+    let legacy: LegacyEventRecord = serde_json::from_str(&row.event_json)?;
+    if legacy.run_id != row.run_id
+        || legacy.trace_id != row.trace_id
+        || legacy.sequence != row.sequence
+        || legacy.timestamp_ms != row.timestamp_ms
+    {
+        return Err(TraceStoreError::InvalidRecord(
+            "legacy event JSON does not match its stored row identity".into(),
+        ));
+    }
+    Ok(serde_json::to_string(&EventRecord::new(
+        row.run_id.clone(),
+        execution_id,
+        row.trace_id.clone(),
+        row.sequence,
+        row.timestamp_ms,
+        legacy.event,
+    ))?)
 }
 
 fn checked_limit(limit: u32) -> Result<u32, TraceStoreError> {

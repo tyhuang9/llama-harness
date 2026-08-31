@@ -1909,6 +1909,7 @@ dependencies = [
  "llama-harness-observability",
  "llama-harness-ollama",
  "llama-harness-promptfoo",
+ "rusqlite",
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.19",
