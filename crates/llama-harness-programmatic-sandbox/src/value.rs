@@ -6,12 +6,12 @@ use crate::{
     },
     SandboxError, SandboxErrorCode, SandboxLimits,
 };
-use alloc::{rc::Rc, string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use serde_json::Value;
 
 #[derive(Clone)]
 pub(crate) struct RuntimeValue {
-    node: Rc<RuntimeNode>,
+    node: Arc<RuntimeNode>,
     measurement: ValueMeasurement,
 }
 
@@ -142,7 +142,7 @@ impl RuntimeValue {
             max_depth: 1,
         };
         Ok(Self {
-            node: Rc::new(RuntimeNode::String(value)),
+            node: Arc::new(RuntimeNode::String(value)),
             measurement,
         })
     }
@@ -163,7 +163,7 @@ impl RuntimeValue {
 
     pub(crate) fn array_measured(values: Vec<Self>, measurement: ValueMeasurement) -> Self {
         Self {
-            node: Rc::new(RuntimeNode::Array(values)),
+            node: Arc::new(RuntimeNode::Array(values)),
             measurement,
         }
     }
@@ -193,7 +193,7 @@ impl RuntimeValue {
         measurement: ValueMeasurement,
     ) -> Self {
         Self {
-            node: Rc::new(RuntimeNode::Object(values)),
+            node: Arc::new(RuntimeNode::Object(values)),
             measurement,
         }
     }
@@ -246,7 +246,7 @@ impl RuntimeValue {
 
     fn scalar(node: RuntimeNode, serialized: usize) -> Self {
         Self {
-            node: Rc::new(node),
+            node: Arc::new(node),
             measurement: ValueMeasurement {
                 retained: primitive_retained_bytes(),
                 serialized,

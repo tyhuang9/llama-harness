@@ -2705,6 +2705,13 @@ mod tests {
         Execution::new(program, ExecutionId(id)).unwrap()
     }
 
+    #[test]
+    fn execution_is_send_for_async_runner_handoffs() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<Execution>();
+    }
+
     fn complete(vm: &mut Execution, slice: u64) -> Value {
         loop {
             match vm.step(slice).unwrap() {

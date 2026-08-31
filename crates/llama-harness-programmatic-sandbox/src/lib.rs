@@ -8,6 +8,14 @@
 //! instructions remain private and are never accepted from or persisted by a
 //! caller. The crate owns no external capabilities: tool requests are inert data
 //! that an embedding host may independently authorize and execute.
+//!
+//! The cached runtime graph uses [`alloc::sync::Arc`], so supported targets
+//! must provide pointer-width atomic operations. This keeps suspended
+//! [`Execution`] values safe to move across async task boundaries without
+//! introducing a `std` dependency.
+
+#[cfg(not(target_has_atomic = "ptr"))]
+compile_error!("llama-harness-programmatic-sandbox requires pointer-width atomics for Arc");
 
 extern crate alloc;
 #[cfg(test)]
