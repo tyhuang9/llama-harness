@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 pub const CATALOG_FINGERPRINT_VERSION: u32 = 1;
 const MAX_DISCOVERY_QUERY_BYTES: usize = 4096;
 const MAX_QUERY_TERMS: usize = 64;
+pub(crate) const MAX_DISCOVERY_IDENTIFIER_BYTES: usize = 128;
 pub(crate) const DISCOVERY_GUARD_INTERVAL: usize = 64;
 
 /// Whether a registered tool is always exposed or selected only when relevant.
@@ -666,7 +667,7 @@ fn normalize_phrase(value: &str) -> String {
 
 fn validate_stable_identifier(label: &str, value: &str, tool_id: &str) -> Result<(), HarnessError> {
     let valid = !value.is_empty()
-        && value.len() <= 128
+        && value.len() <= MAX_DISCOVERY_IDENTIFIER_BYTES
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase()
                 || byte.is_ascii_digit()
@@ -1218,6 +1219,175 @@ mod tests {
                 ToolDiscoveryMetadata::deferred().with_aliases(["same", "same"]),
             )
             .is_err());
+    }
+
+    #[test]
+    fn registration_bounds_are_canonical_and_failures_preserve_warm_catalog() {
+        use crate::tool::{MAX_TOOL_ID_BYTES, MAX_TOOL_NAME_BYTES, MAX_TOOL_SAFE_METADATA_BYTES};
+
+        let mut registry = ToolRegistry::default();
+        register(
+            &mut registry,
+            "weather.current",
+            "description",
+            ToolDiscoveryMetadata::deferred(),
+        );
+        let allowlist = vec!["weather.current".into()];
+        let limits = ToolDiscoveryLimits::new().with_max_tools(0);
+        let (_, cold) = scope(
+            &registry,
+            "weather",
+            &allowlist,
+            limits,
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert!(!cold.cache_hit);
+        let fingerprint = registry.catalog_fingerprint();
+        let (_, warm) = scope(
+            &registry,
+            "weather",
+            &allowlist,
+            ToolDiscoveryLimits::new().with_max_tools(1),
+            ProviderCapabilityLimits::new().with_max_tools(0),
+        )
+        .unwrap();
+        assert!(!warm.cache_hit);
+
+        let exact_id = format!("a{}", "x".repeat(MAX_TOOL_ID_BYTES - 1));
+        let exact_name = "N".repeat(MAX_TOOL_NAME_BYTES);
+        registry
+            .register_with_discovery(
+                Arc::new(TestTool(ToolDefinition::new(
+                    &exact_id,
+                    &exact_name,
+                    "description",
+                    json!({"type": "object"}),
+                ))),
+                ToolDiscoveryMetadata::deferred()
+                    .with_namespace("n".repeat(MAX_DISCOVERY_IDENTIFIER_BYTES))
+                    .with_aliases(["a".repeat(MAX_DISCOVERY_IDENTIFIER_BYTES)]),
+            )
+            .unwrap();
+        let fingerprint_after_valid = registry.catalog_fingerprint();
+        assert_ne!(fingerprint, fingerprint_after_valid);
+        let all_ids = vec!["weather.current".into(), exact_id];
+        let (_, warmed) = scope(
+            &registry,
+            "no match",
+            &all_ids,
+            ToolDiscoveryLimits::new().with_max_tools(1),
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert!(warmed.cache_hit);
+
+        let invalid_definitions = [
+            ToolDefinition::new(
+                format!("a{}", "x".repeat(MAX_TOOL_ID_BYTES)),
+                "Overlong id",
+                "description",
+                json!({"type": "object"}),
+            ),
+            ToolDefinition::new(
+                "invalid.name.length",
+                "N".repeat(MAX_TOOL_NAME_BYTES + 1),
+                "description",
+                json!({"type": "object"}),
+            ),
+            ToolDefinition::new(
+                " leading",
+                "Leading id whitespace",
+                "description",
+                json!({"type": "object"}),
+            ),
+            ToolDefinition::new(
+                "unicode.\u{e9}",
+                "Unicode id",
+                "description",
+                json!({"type": "object"}),
+            ),
+            ToolDefinition::new(
+                "unicode.decomposed",
+                "Cafe\u{301}",
+                "description",
+                json!({"type": "object"}),
+            ),
+            ToolDefinition::new(
+                "unicode.composed",
+                "Caf\u{e9}",
+                "description",
+                json!({"type": "object"}),
+            ),
+            ToolDefinition::new(
+                "control.name",
+                "Control\nName",
+                "description",
+                json!({"type": "object"}),
+            ),
+            ToolDefinition::new(
+                "bidi.name",
+                "Bidi \u{202e}Name",
+                "description",
+                json!({"type": "object"}),
+            ),
+        ];
+        for definition in invalid_definitions {
+            assert!(registry
+                .register_with_discovery(
+                    Arc::new(TestTool(definition)),
+                    ToolDiscoveryMetadata::deferred(),
+                )
+                .is_err());
+        }
+
+        for metadata in [
+            ToolDiscoveryMetadata::deferred()
+                .with_namespace(format!("n{}", "x".repeat(MAX_DISCOVERY_IDENTIFIER_BYTES))),
+            ToolDiscoveryMetadata::deferred()
+                .with_aliases([format!("a{}", "x".repeat(MAX_DISCOVERY_IDENTIFIER_BYTES))]),
+            ToolDiscoveryMetadata::deferred().with_namespace("unicode.\u{e9}"),
+            ToolDiscoveryMetadata::deferred().with_aliases(["control\u{0000}"]),
+        ] {
+            assert!(registry
+                .register_with_discovery(
+                    Arc::new(TestTool(definition("invalid.metadata", "description"))),
+                    metadata,
+                )
+                .is_err());
+        }
+
+        let stuffed_aliases = (0..32)
+            .map(|index| {
+                format!(
+                    "a{index:02}{}",
+                    "x".repeat(MAX_DISCOVERY_IDENTIFIER_BYTES - 3)
+                )
+            })
+            .collect::<Vec<_>>();
+        let stuffed = registry
+            .register_with_discovery(
+                Arc::new(TestTool(definition("stuffed.metadata", "description"))),
+                ToolDiscoveryMetadata::deferred().with_aliases(stuffed_aliases),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            stuffed,
+            HarnessError::InvalidTool(message)
+                if message.contains("safe discovery metadata")
+                    && message.contains(&MAX_TOOL_SAFE_METADATA_BYTES.to_string())
+        ));
+
+        assert_eq!(fingerprint_after_valid, registry.catalog_fingerprint());
+        let (_, preserved) = scope(
+            &registry,
+            "no match",
+            &all_ids,
+            ToolDiscoveryLimits::new().with_max_tools(1),
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert!(preserved.cache_hit);
     }
 
     #[test]

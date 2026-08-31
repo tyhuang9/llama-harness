@@ -16,6 +16,10 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub(crate) const MAX_TOOL_ID_BYTES: usize = 256;
+pub(crate) const MAX_TOOL_NAME_BYTES: usize = 256;
+pub(crate) const MAX_TOOL_SAFE_METADATA_BYTES: u64 = 4 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 /// A tool invocation requested by a model.
@@ -418,6 +422,13 @@ pub struct ToolRegistry {
     pub(crate) catalog_cache: RwLock<Option<Arc<CatalogIndex>>>,
 }
 
+#[derive(Serialize)]
+struct ToolSafeMetadata<'a> {
+    id: &'a str,
+    name: &'a str,
+    discovery: &'a ToolDiscoveryMetadata,
+}
+
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self {
@@ -439,12 +450,25 @@ impl ToolRegistry {
         tool: Arc<dyn Tool>,
         mut discovery: ToolDiscoveryMetadata,
     ) -> Result<(), HarnessError> {
-        let id = tool.definition().id.trim().to_owned();
-        if id.is_empty() {
-            return Err(HarnessError::InvalidTool("tool id is required".into()));
-        }
+        let id = tool.definition().id.clone();
+        validate_tool_identifier(&id)?;
+        validate_tool_name(&id, &tool.definition().name)?;
         if self.tools.contains_key(&id) {
             return Err(HarnessError::InvalidTool(format!("duplicate tool: {id}")));
+        }
+
+        discovery.validate(&id)?;
+        discovery.aliases.sort();
+        let safe_metadata_bytes = serialized_len(&ToolSafeMetadata {
+            id: &id,
+            name: &tool.definition().name,
+            discovery: &discovery,
+        })
+        .map_err(|error| HarnessError::InvalidTool(error.to_string()))?;
+        if safe_metadata_bytes > MAX_TOOL_SAFE_METADATA_BYTES {
+            return Err(HarnessError::InvalidTool(format!(
+                "tool {id} safe discovery metadata exceeds {MAX_TOOL_SAFE_METADATA_BYTES} bytes"
+            )));
         }
 
         let schema = &tool.definition().arguments_schema;
@@ -476,9 +500,8 @@ impl ToolRegistry {
             None
         };
         validate_scheduling_metadata(tool.definition(), &id)?;
-        discovery.validate(&id)?;
-        discovery.aliases.sort();
-        let definition_serialized_bytes = serialized_len(tool.definition())?;
+        let definition_serialized_bytes = serialized_len(tool.definition())
+            .map_err(|error| HarnessError::InvalidTool(error.to_string()))?;
         self.tools.insert(
             id,
             RegisteredTool {
@@ -611,6 +634,38 @@ impl ToolRegistry {
         }
         Ok(())
     }
+}
+
+fn validate_tool_identifier(id: &str) -> Result<(), HarnessError> {
+    let valid = !id.is_empty()
+        && id.len() <= MAX_TOOL_ID_BYTES
+        && id.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'-' | b'/')
+        })
+        && id.as_bytes()[0].is_ascii_alphanumeric();
+    if !valid {
+        return Err(HarnessError::InvalidTool(format!(
+            "tool id must be a stable lowercase ASCII identifier of at most {MAX_TOOL_ID_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tool_name(id: &str, name: &str) -> Result<(), HarnessError> {
+    let valid = !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME_BYTES
+        && name.trim() == name
+        && name
+            .bytes()
+            .all(|byte| byte == b' ' || byte.is_ascii_graphic());
+    if !valid {
+        return Err(HarnessError::InvalidTool(format!(
+            "tool {id} name must contain 1 to {MAX_TOOL_NAME_BYTES} bytes of canonical printable ASCII"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_scheduling_metadata(definition: &ToolDefinition, id: &str) -> Result<(), HarnessError> {
