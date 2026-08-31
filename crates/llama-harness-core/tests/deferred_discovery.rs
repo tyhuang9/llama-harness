@@ -134,6 +134,72 @@ fn request(count: usize, input: &str) -> RunRequest {
 }
 
 #[tokio::test]
+async fn legacy_hot_registration_preserves_unrestricted_small_catalog_definitions() {
+    let definitions = vec![
+        ToolDefinition::new(
+            "Mixed Case/工具 !?.",
+            "Unicode display 名称",
+            "legacy hot definition",
+            json!({"type": "object"}),
+        )
+        .with_read_only(true)
+        .with_allowed_callers([ToolCaller::Direct]),
+        ToolDefinition::new(
+            "punctuation:@#$%^&*()[]{}",
+            " punctuation\nand spaces ",
+            "legacy hot definition",
+            json!({"type": "object"}),
+        )
+        .with_read_only(true)
+        .with_allowed_callers([ToolCaller::Direct]),
+        ToolDefinition::new(
+            format!("long-{}", "x".repeat(300)),
+            "",
+            "legacy hot definition",
+            json!({"type": "object"}),
+        )
+        .with_read_only(true)
+        .with_allowed_callers([ToolCaller::Direct]),
+    ];
+    let mut registry = ToolRegistry::default();
+    for definition in &definitions {
+        registry
+            .register(Arc::new(CountingTool {
+                definition: definition.clone(),
+                calls: AtomicU32::new(0),
+                result: ToolResult::success(json!({"ok": true})),
+            }))
+            .unwrap();
+    }
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response("done")])
+            .with_capabilities(capabilities(10, false)),
+    );
+    let mut agent = AgentDefinition::new("legacy", "Legacy", "1", "mock-model");
+    agent.tool_allowlist = definitions
+        .iter()
+        .map(|definition| definition.id.clone())
+        .collect();
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry)
+        .build()
+        .run_with_strategy(
+            RunRequest::new(agent, "use legacy tools"),
+            RunStrategy::Direct,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, RunStatus::Completed);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].tools, definitions);
+    assert_eq!(
+        serde_json::to_vec(&requests[0].tools).unwrap(),
+        serde_json::to_vec(&definitions).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn direct_e2e_reuses_one_immutable_selected_scope_and_emits_private_counters() {
     let count = 1_000;
     let target = "catalog.tool.733";

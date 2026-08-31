@@ -410,10 +410,11 @@ pub trait Tool: Send + Sync {
 
 pub(crate) struct RegisteredTool {
     pub(crate) tool: Arc<dyn Tool>,
+    pub(crate) definition: ToolDefinition,
     validator: Arc<Validator>,
     output_validator: Option<Arc<Validator>>,
     pub(crate) discovery: ToolDiscoveryMetadata,
-    definition_serialized_bytes: u64,
+    pub(crate) serialized_definition: Arc<[u8]>,
 }
 
 /// Registry of tools and their compiled argument validators.
@@ -441,7 +442,7 @@ impl Default for ToolRegistry {
 impl ToolRegistry {
     /// Validates and registers a tool, rejecting duplicate IDs and invalid schemas.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), HarnessError> {
-        self.register_with_discovery(tool, ToolDiscoveryMetadata::default())
+        self.register_inner(tool, ToolDiscoveryMetadata::default(), false)
     }
 
     /// Registers a tool with validated, privacy-safe discovery metadata.
@@ -452,30 +453,51 @@ impl ToolRegistry {
     pub fn register_with_discovery(
         &mut self,
         tool: Arc<dyn Tool>,
-        mut discovery: ToolDiscoveryMetadata,
+        discovery: ToolDiscoveryMetadata,
     ) -> Result<(), HarnessError> {
-        let id = tool.definition().id.clone();
-        validate_tool_identifier(&id)?;
-        validate_tool_name(&id, &tool.definition().name)?;
+        self.register_inner(tool, discovery, true)
+    }
+
+    fn register_inner(
+        &mut self,
+        tool: Arc<dyn Tool>,
+        mut discovery: ToolDiscoveryMetadata,
+        strict_discovery_metadata: bool,
+    ) -> Result<(), HarnessError> {
+        let mut definition = tool.definition().clone();
+        let id = if strict_discovery_metadata {
+            validate_tool_identifier(&definition.id)?;
+            validate_tool_name(&definition.id, &definition.name)?;
+            definition.id.clone()
+        } else {
+            let id = definition.id.trim().to_owned();
+            if id.is_empty() {
+                return Err(HarnessError::InvalidTool("tool id is required".into()));
+            }
+            definition.id = id.clone();
+            id
+        };
         if self.tools.contains_key(&id) {
             return Err(HarnessError::InvalidTool(format!("duplicate tool: {id}")));
         }
 
-        discovery.validate(&id)?;
-        discovery.aliases.sort();
-        let safe_metadata_bytes = serialized_len(&ToolSafeMetadata {
-            id: &id,
-            name: &tool.definition().name,
-            discovery: &discovery,
-        })
-        .map_err(|error| HarnessError::InvalidTool(error.to_string()))?;
-        if safe_metadata_bytes > MAX_TOOL_SAFE_METADATA_BYTES {
-            return Err(HarnessError::InvalidTool(format!(
-                "tool {id} safe discovery metadata exceeds {MAX_TOOL_SAFE_METADATA_BYTES} bytes"
-            )));
+        if strict_discovery_metadata {
+            discovery.validate(&id)?;
+            discovery.aliases.sort();
+            let safe_metadata_bytes = serialized_len(&ToolSafeMetadata {
+                id: &id,
+                name: &definition.name,
+                discovery: &discovery,
+            })
+            .map_err(|error| HarnessError::InvalidTool(error.to_string()))?;
+            if safe_metadata_bytes > MAX_TOOL_SAFE_METADATA_BYTES {
+                return Err(HarnessError::InvalidTool(format!(
+                    "tool {id} safe discovery metadata exceeds {MAX_TOOL_SAFE_METADATA_BYTES} bytes"
+                )));
+            }
         }
 
-        let schema = &tool.definition().arguments_schema;
+        let schema = &definition.arguments_schema;
         let defaults = AgentLimits::default();
         if serialized_len(schema)? > defaults.max_request_payload_bytes {
             return Err(HarnessError::InvalidTool(format!(
@@ -488,7 +510,7 @@ impl ToolRegistry {
         let validator = compile_trusted_schema(schema, |error| {
             HarnessError::InvalidTool(format!("invalid schema for {id}: {error}"))
         })?;
-        let output_validator = if let Some(output_schema) = &tool.definition().output_schema {
+        let output_validator = if let Some(output_schema) = &definition.output_schema {
             if serialized_len(output_schema)? > defaults.max_request_payload_bytes {
                 return Err(HarnessError::InvalidTool(format!(
                     "output schema for {id} exceeds {} bytes",
@@ -503,17 +525,21 @@ impl ToolRegistry {
         } else {
             None
         };
-        validate_scheduling_metadata(tool.definition(), &id)?;
-        let definition_serialized_bytes = serialized_len(tool.definition())
-            .map_err(|error| HarnessError::InvalidTool(error.to_string()))?;
+        validate_scheduling_metadata(&definition, &id)?;
+        let serialized_definition = serde_json::to_vec(&definition)
+            .map(Arc::<[u8]>::from)
+            .map_err(|error| {
+                HarnessError::InvalidTool(format!("tool is not serializable: {error}"))
+            })?;
         self.tools.insert(
             id,
             RegisteredTool {
                 tool,
+                definition,
                 validator: Arc::new(validator),
                 output_validator,
                 discovery,
-                definition_serialized_bytes,
+                serialized_definition,
             },
         );
         *self
@@ -556,11 +582,11 @@ impl ToolRegistry {
             let Some(entry) = self.tools.get(id) else {
                 continue;
             };
-            if entry.tool.definition().allows_caller(caller) {
+            if entry.definition.allows_caller(caller) {
                 allowed.push(AllowedCatalogEntry {
-                    definition: entry.tool.definition(),
+                    definition: &entry.definition,
                     metadata: &entry.discovery,
-                    serialized_bytes: entry.definition_serialized_bytes,
+                    serialized_definition: &entry.serialized_definition,
                 });
             }
         }
@@ -593,8 +619,8 @@ impl ToolRegistry {
                 guard()?;
             }
             entries.push(CatalogEntry {
-                id: entry.tool.definition().id.clone(),
-                name: entry.tool.definition().name.clone(),
+                id: entry.definition.id.clone(),
+                name: entry.definition.name.clone(),
                 metadata: entry.discovery.clone(),
                 terms: Default::default(),
             });

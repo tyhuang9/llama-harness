@@ -80,9 +80,10 @@ impl ToolDiscoveryMetadata {
         let mut unique = BTreeSet::new();
         for alias in &self.aliases {
             validate_stable_identifier("alias", alias, tool_id)?;
-            if !unique.insert(alias) {
+            let normalized = tokenize(alias).join(" ");
+            if !unique.insert(normalized) {
                 return Err(HarnessError::InvalidTool(format!(
-                    "tool {tool_id} has duplicate discovery aliases"
+                    "tool {tool_id} has duplicate normalized discovery aliases"
                 )));
             }
         }
@@ -223,7 +224,7 @@ pub(crate) struct CatalogEntry {
 pub(crate) struct AllowedCatalogEntry<'a> {
     pub(crate) definition: &'a ToolDefinition,
     pub(crate) metadata: &'a ToolDiscoveryMetadata,
-    pub(crate) serialized_bytes: u64,
+    pub(crate) serialized_definition: &'a Arc<[u8]>,
 }
 
 pub(crate) struct CatalogIndex {
@@ -468,7 +469,9 @@ fn fits(
 ) -> Result<bool, HarnessError> {
     fits_lengths(
         entries.len(),
-        entries.iter().map(|entry| entry.serialized_bytes),
+        entries
+            .iter()
+            .map(|entry| entry.serialized_definition.len() as u64),
         limits,
     )
 }
@@ -479,7 +482,9 @@ fn fits_refs(
 ) -> Result<bool, HarnessError> {
     fits_lengths(
         entries.len(),
-        entries.iter().map(|entry| entry.serialized_bytes),
+        entries
+            .iter()
+            .map(|entry| entry.serialized_definition.len() as u64),
         limits,
     )
 }
@@ -1217,6 +1222,12 @@ mod tests {
             .register_with_discovery(
                 Arc::new(TestTool(definition("tool-2", "description"))),
                 ToolDiscoveryMetadata::deferred().with_aliases(["same", "same"]),
+            )
+            .is_err());
+        assert!(registry
+            .register_with_discovery(
+                Arc::new(TestTool(definition("tool-3", "description"))),
+                ToolDiscoveryMetadata::deferred().with_aliases(["same-token", "same_token"]),
             )
             .is_err());
     }
