@@ -1177,14 +1177,11 @@ fn elapsed_ms(started: Instant) -> u64 {
 
 fn outcome_for_error(error: &McpError) -> McpLifecycleOutcome {
     match error {
-        McpError::Transport(McpTransportError {
-            operation: _,
-            dispatch: McpDispatchState::NotDispatched,
-        }) => McpLifecycleOutcome::Cancelled,
+        McpError::Transport(McpTransportError { .. }) => McpLifecycleOutcome::Failed,
         McpError::CatalogUnavailable | McpError::Clock | McpError::InvalidCatalog(_) => {
             McpLifecycleOutcome::Rejected
         }
-        McpError::Transport(_) | McpError::Core(_) => McpLifecycleOutcome::Failed,
+        McpError::Core(_) => McpLifecycleOutcome::Failed,
     }
 }
 
@@ -1948,6 +1945,24 @@ mod tests {
         assert!(!encoded.contains("secret-native-name"));
         assert!(!encoded.contains("untrusted description"));
         assert!(manager.observer_health().failures > 0);
+    }
+
+    #[tokio::test]
+    async fn observer_preserves_pre_dispatch_refresh_failure_state() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        transport.fail_list.store(true, Ordering::Relaxed);
+        let observer = Arc::new(RecordingObserver(Mutex::new(Vec::new()), false));
+        let manager = manager(transport, clock, None, Some(observer.clone()));
+        assert!(manager.refresh(CancellationToken::new()).await.is_err());
+        let events = observer.0.lock().expect("test mutex");
+        let refresh = events
+            .iter()
+            .find(|event| event.operation == McpLifecycleOperation::Refresh)
+            .expect("refresh event");
+        assert_eq!(refresh.outcome, McpLifecycleOutcome::Failed);
+        assert_eq!(refresh.dispatch, McpDispatchState::NotDispatched);
+        assert!(!refresh.cancelled);
     }
 
     #[test]
