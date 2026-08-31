@@ -221,20 +221,21 @@ pub(crate) struct AllowedCatalogEntry<'a> {
 
 pub(crate) struct CatalogIndex {
     entries: Vec<CatalogEntry>,
-    document_frequency: BTreeMap<String, u32>,
+    positions: HashMap<String, usize>,
     fingerprint: CatalogFingerprint,
 }
 
 impl CatalogIndex {
     pub(crate) fn build(mut entries: Vec<CatalogEntry>) -> Self {
         entries.sort_by(|left, right| left.id.cmp(&right.id));
-        let mut document_frequency = BTreeMap::<String, u32>::new();
         for entry in &mut entries {
             entry.terms = indexed_terms(entry);
-            for term in entry.terms.keys() {
-                *document_frequency.entry(term.clone()).or_default() += 1;
-            }
         }
+        let positions = entries
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (entry.id.clone(), position))
+            .collect();
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"llama-harness-tool-catalog\0v1\0");
         for entry in &entries {
@@ -255,7 +256,7 @@ impl CatalogIndex {
         }
         Self {
             entries,
-            document_frequency,
+            positions,
             fingerprint: CatalogFingerprint {
                 version: CATALOG_FINGERPRINT_VERSION,
                 digest: hasher.finalize().to_hex().to_string(),
@@ -265,6 +266,12 @@ impl CatalogIndex {
 
     pub(crate) fn fingerprint(&self) -> CatalogFingerprint {
         self.fingerprint.clone()
+    }
+
+    fn entry(&self, tool_id: &str) -> Option<&CatalogEntry> {
+        self.positions
+            .get(tool_id)
+            .and_then(|position| self.entries.get(*position))
     }
 }
 
@@ -313,21 +320,17 @@ impl ToolRegistry {
         let (index, cache_hit) = self.catalog_index();
         base_stats.cache_hit = cache_hit;
 
-        let allowed_by_id = allowed
+        let mut scope_entries = allowed
             .iter()
-            .map(|entry| {
-                (
-                    entry.definition.id.as_str(),
-                    (entry.definition, entry.metadata),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+            .filter_map(|entry| index.entry(&entry.definition.id))
+            .collect::<Vec<_>>();
+        scope_entries.sort_by(|left, right| left.id.cmp(&right.id));
         let mut required = allowed
             .iter()
             .filter(|entry| entry.metadata.exposure == ToolExposure::Hot)
             .map(|entry| entry.definition.id.clone())
             .collect::<BTreeSet<_>>();
-        let ranked = rank(&index, query, &allowed_by_id, limits.max_expansion as usize);
+        let ranked = rank(&scope_entries, query, limits.max_expansion as usize);
         let exact = matches!(ranked, RankedSelection::Exact(_));
         let hot = allowed
             .iter()
@@ -446,28 +449,19 @@ impl RankedSelection {
     }
 }
 
-fn rank(
-    index: &CatalogIndex,
-    query: &str,
-    allowed: &HashMap<&str, (&ToolDefinition, &ToolDiscoveryMetadata)>,
-    max_expansion: usize,
-) -> RankedSelection {
+fn rank(entries: &[&CatalogEntry], query: &str, max_expansion: usize) -> RankedSelection {
     let normalized = normalize_phrase(query);
     let query_terms = tokenize(query);
-    let exact_id = index
-        .entries
+    let exact_id = entries
         .iter()
-        .filter(|entry| allowed.contains_key(entry.id.as_str()))
         .filter(|entry| entry.id == normalized)
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
     if exact_id.len() == 1 {
         return RankedSelection::Exact(exact_id);
     }
-    let exact_name = index
-        .entries
+    let exact_name = entries
         .iter()
-        .filter(|entry| allowed.contains_key(entry.id.as_str()))
         .filter(|entry| normalize_phrase(&entry.name) == normalized)
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
@@ -477,20 +471,16 @@ fn rank(
     if exact_name.len() > 1 {
         return RankedSelection::Exact(Vec::new());
     }
-    let exact_namespace = index
-        .entries
+    let exact_namespace = entries
         .iter()
-        .filter(|entry| allowed.contains_key(entry.id.as_str()))
         .filter(|entry| entry.metadata.namespace.as_deref() == Some(normalized.as_str()))
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
     if !exact_namespace.is_empty() {
         return RankedSelection::Exact(exact_namespace);
     }
-    let exact_alias = index
-        .entries
+    let exact_alias = entries
         .iter()
-        .filter(|entry| allowed.contains_key(entry.id.as_str()))
         .filter(|entry| {
             entry
                 .metadata
@@ -512,17 +502,21 @@ fn rank(
     if query_terms.is_empty() {
         return RankedSelection::Lexical(Vec::new());
     }
-    let documents = index.entries.len() as u64;
-    let mut scored = index
-        .entries
+    let documents = entries.len() as u64;
+    let mut document_frequency = BTreeMap::<&str, u64>::new();
+    for entry in entries {
+        for term in entry.terms.keys() {
+            *document_frequency.entry(term).or_default() += 1;
+        }
+    }
+    let mut scored = entries
         .iter()
-        .filter(|entry| allowed.contains_key(entry.id.as_str()))
         .filter_map(|entry| {
             let score = query_terms.iter().try_fold(0u64, |total, term| {
                 let Some(frequency) = entry.terms.get(term).copied().map(u64::from) else {
                     return Some(total);
                 };
-                let document_frequency = u64::from(*index.document_frequency.get(term)?);
+                let document_frequency = *document_frequency.get(term.as_str())?;
                 let idf = documents
                     .checked_add(1)?
                     .checked_mul(1_000)?
@@ -782,6 +776,116 @@ mod tests {
         assert!(expanded.contains("weather.tool.00"));
         assert!(expanded.contains("weather.tool.01"));
         assert!(expanded.contains("weather.tool.02"));
+    }
+
+    #[test]
+    fn hidden_and_caller_incompatible_tools_cannot_change_scope_local_ranking() {
+        fn permitted_registry() -> ToolRegistry {
+            let mut registry = ToolRegistry::default();
+            for (id, alias) in [
+                ("permitted.alpha", "rare"),
+                ("permitted.beta", "common"),
+                ("permitted.neutral", "neutral"),
+            ] {
+                register(
+                    &mut registry,
+                    id,
+                    "description",
+                    ToolDiscoveryMetadata::deferred().with_aliases([alias]),
+                );
+            }
+            registry
+        }
+
+        let baseline = permitted_registry();
+        let mut polluted = permitted_registry();
+        let mut polluted_allowlist = vec![
+            "permitted.alpha".into(),
+            "permitted.beta".into(),
+            "permitted.neutral".into(),
+        ];
+        for index in 0..100 {
+            let hidden_id = format!("hidden.tool.{index:03}");
+            let hidden = ToolDefinition::new(
+                &hidden_id,
+                "rare rare rare rare rare rare rare rare",
+                "description",
+                json!({"type": "object"}),
+            )
+            .with_allowed_callers([ToolCaller::Direct, ToolCaller::DeclarativePlan]);
+            polluted
+                .register_with_discovery(
+                    Arc::new(TestTool(hidden)),
+                    ToolDiscoveryMetadata::deferred()
+                        .with_aliases([format!("rare-hidden-{index:03}")]),
+                )
+                .unwrap();
+
+            let incompatible_id = format!("incompatible.tool.{index:03}");
+            let incompatible = ToolDefinition::new(
+                &incompatible_id,
+                "rare rare rare rare rare rare rare rare",
+                "description",
+                json!({"type": "object"}),
+            )
+            .with_allowed_callers([ToolCaller::Programmatic]);
+            polluted
+                .register_with_discovery(
+                    Arc::new(TestTool(incompatible)),
+                    ToolDiscoveryMetadata::deferred()
+                        .with_aliases([format!("rare-incompatible-{index:03}")]),
+                )
+                .unwrap();
+            polluted_allowlist.push(incompatible_id);
+        }
+
+        let baseline_allowlist = vec![
+            "permitted.alpha".into(),
+            "permitted.beta".into(),
+            "permitted.neutral".into(),
+        ];
+        let limits = ToolDiscoveryLimits::new()
+            .with_max_tools(2)
+            .with_max_expansion_tools(2);
+        for caller in [ToolCaller::Direct, ToolCaller::DeclarativePlan] {
+            let (baseline_scope, baseline_stats) = baseline
+                .select_scope(
+                    "rare common",
+                    &baseline_allowlist,
+                    caller,
+                    limits,
+                    &ProviderCapabilityLimits::new(),
+                )
+                .unwrap();
+            let (polluted_scope, polluted_stats) = polluted
+                .select_scope(
+                    "rare common",
+                    &polluted_allowlist,
+                    caller,
+                    limits,
+                    &ProviderCapabilityLimits::new(),
+                )
+                .unwrap();
+            let selected_ids = |scope: &ToolScope| {
+                scope
+                    .definitions()
+                    .iter()
+                    .map(|tool| tool.id.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(selected_ids(&baseline_scope), selected_ids(&polluted_scope));
+            assert_eq!(baseline_stats.candidate_count, 3);
+            assert_eq!(polluted_stats.candidate_count, 3);
+            assert_eq!(baseline_stats.selected_count, 2);
+            assert_eq!(polluted_stats.selected_count, 2);
+            assert_eq!(baseline_stats.deferred_candidate_count, 3);
+            assert_eq!(polluted_stats.deferred_candidate_count, 3);
+            assert_eq!(
+                baseline_stats.catalog_exceeded_budget,
+                polluted_stats.catalog_exceeded_budget
+            );
+            assert_eq!(baseline_stats.cache_hit, polluted_stats.cache_hit);
+        }
     }
 
     #[test]
