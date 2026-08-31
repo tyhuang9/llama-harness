@@ -1,4 +1,4 @@
-use crate::{PolicyDecision, RunStatus, RunStrategy};
+use crate::{PolicyDecision, RunStatus, RunStrategy, ToolCaller};
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{Arc, Mutex},
@@ -70,6 +70,21 @@ pub enum RunEvent {
     ModelResponded {
         /// Model call number that returned.
         call_number: u32,
+    },
+    /// A metadata-only tool catalog selection completed for one caller scope.
+    ToolDiscoveryCompleted {
+        /// Caller whose immutable scope was selected.
+        caller: ToolCaller,
+        /// Number of allowed, caller-compatible catalog candidates.
+        candidate_count: u32,
+        /// Number of definitions selected for model exposure.
+        selected_count: u32,
+        /// Number of candidates explicitly configured as deferred.
+        deferred_candidate_count: u32,
+        /// Whether the complete candidate catalog exceeded the effective budget.
+        catalog_exceeded_budget: bool,
+        /// Whether the immutable catalog index was already cached.
+        cache_hit: bool,
     },
     /// The runner selected an execution strategy using metadata-only inputs.
     StrategySelected {

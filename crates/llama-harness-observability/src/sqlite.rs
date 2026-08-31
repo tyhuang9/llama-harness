@@ -691,6 +691,7 @@ fn event_kind(event: &RunEvent) -> &'static str {
         RunEvent::ModelRequested { .. } => "model.requested",
         RunEvent::ModelRetrying { .. } => "model.retrying",
         RunEvent::ModelResponded { .. } => "model.responded",
+        RunEvent::ToolDiscoveryCompleted { .. } => "tool.discovery.completed",
         RunEvent::StrategySelected { .. } => "strategy.selected",
         RunEvent::StrategyFallback { .. } => "strategy.fallback",
         RunEvent::PlanLifecycle { .. } => "plan.lifecycle",
