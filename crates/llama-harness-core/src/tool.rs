@@ -432,6 +432,8 @@ pub struct ToolRegistry {
     catalog_build_count: AtomicU64,
     #[cfg(test)]
     pub(crate) discovery_checkpoint: Option<Arc<dyn Fn(ToolCaller) + Send + Sync>>,
+    #[cfg(test)]
+    pub(crate) discovery_cache_assembly_checkpoint: Option<Arc<dyn Fn(ToolCaller) + Send + Sync>>,
 }
 
 #[derive(Serialize)]
@@ -452,6 +454,8 @@ impl Default for ToolRegistry {
             catalog_build_count: AtomicU64::new(0),
             #[cfg(test)]
             discovery_checkpoint: None,
+            #[cfg(test)]
+            discovery_cache_assembly_checkpoint: None,
         }
     }
 }
@@ -664,6 +668,10 @@ impl ToolRegistry {
             });
         }
         let index = Arc::new(CatalogIndex::build(entries, guard)?);
+        #[cfg(test)]
+        if let Some(checkpoint) = &self.discovery_cache_assembly_checkpoint {
+            checkpoint(caller);
+        }
         guard()?;
         let mut cache = self
             .catalog_cache
@@ -729,6 +737,14 @@ impl ToolRegistry {
         checkpoint: Arc<dyn Fn(ToolCaller) + Send + Sync>,
     ) {
         self.discovery_checkpoint = Some(checkpoint);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_discovery_cache_assembly_checkpoint(
+        &mut self,
+        checkpoint: Arc<dyn Fn(ToolCaller) + Send + Sync>,
+    ) {
+        self.discovery_cache_assembly_checkpoint = Some(checkpoint);
     }
 
     pub(crate) fn validate(&self, tool_id: &str, arguments: &Value) -> Result<(), HarnessError> {

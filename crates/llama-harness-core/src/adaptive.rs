@@ -165,6 +165,7 @@ impl AgentRunner {
                             error,
                             &self.events,
                             RunStrategy::DeclarativePlan,
+                            preflight.started,
                         ));
                     }
                     Err(error) => return Err(error),
@@ -188,6 +189,7 @@ impl AgentRunner {
                             error,
                             &self.events,
                             RunStrategy::Adaptive,
+                            preflight.started,
                         ));
                     }
                     Err(error) => return Err(error),
@@ -264,6 +266,7 @@ impl AgentRunner {
         prepared_plan: PreparedPlanScope,
         preflight: RunPreflight,
     ) -> Result<RunResult, HarnessError> {
+        let started = preflight.started;
         let mut run = match StrategyRun::new(self, &request, requested, prepared_plan, preflight) {
             Ok(run) => run,
             Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
@@ -272,6 +275,7 @@ impl AgentRunner {
                     error,
                     &self.events,
                     requested,
+                    started,
                 ));
             }
             Err(error) => return Err(error),
@@ -628,7 +632,7 @@ impl<'a> StrategyRun<'a> {
             &request.cancellation,
             preflight.deadline,
         )?;
-        let started = StdInstant::now();
+        let started = preflight.started;
         let run_id = request
             .run_id
             .clone()
@@ -2206,7 +2210,7 @@ mod discovery_terminal_tests {
     use crate::{
         mock::{final_response, MockModelProvider},
         InMemoryEventSink, ModelCapabilities, ProviderCapabilityLimits, Tool, ToolDiscoveryLimits,
-        ToolDiscoveryMetadata, ToolRegistry,
+        ToolDiscoveryMetadata, ToolRegistry, ToolRisk,
     };
     use async_trait::async_trait;
     use serde_json::json;
@@ -2270,6 +2274,10 @@ mod discovery_terminal_tests {
                     "discovery terminal test tool",
                     json!({"type": "object"}),
                 )
+                .with_risk(ToolRisk::Low)
+                .with_read_only(true)
+                .with_idempotent(true)
+                .with_parallel_safe(true)
                 .with_allowed_callers([ToolCaller::Direct, ToolCaller::DeclarativePlan]),
                 calls: AtomicU32::new(0),
             });
@@ -2288,7 +2296,7 @@ mod discovery_terminal_tests {
         (registry, tools)
     }
 
-    fn assert_zero_usage(event: &RunEvent, strategy: RunStrategy) {
+    fn assert_zero_usage(event: &RunEvent, strategy: RunStrategy, expected_duration_ms: u64) {
         let RunEvent::StrategyUsage {
             strategy: actual,
             model_calls,
@@ -2327,10 +2335,10 @@ mod discovery_terminal_tests {
                 u64::from(*tool_completed),
                 u64::from(*tool_failed),
                 u64::from(*tool_cancelled),
-                *duration_ms,
             ],
-            [0; 15]
+            [0; 14]
         );
+        assert_eq!(*duration_ms, expected_duration_ms);
         assert_eq!(
             *model_calls,
             *planning_model_calls
@@ -2347,6 +2355,36 @@ mod discovery_terminal_tests {
             *tool_issued,
             *tool_completed + *tool_failed + *tool_cancelled
         );
+    }
+
+    fn assert_pre_event_terminal_records(
+        records: &[crate::EventRecord],
+        result: &RunResult,
+        usage_strategy: RunStrategy,
+    ) {
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(matches!(records[0].event, RunEvent::Started { .. }));
+        assert_zero_usage(&records[1].event, usage_strategy, result.duration_ms);
+        assert!(matches!(
+            records[2].event,
+            RunEvent::Completed { ref status } if status == &result.status
+        ));
+        assert!(!records.iter().any(|record| matches!(
+            record.event,
+            RunEvent::ToolDiscoveryCompleted { .. }
+                | RunEvent::ModelRequested { .. }
+                | RunEvent::PolicyDecided { .. }
+                | RunEvent::ApprovalRequested { .. }
+                | RunEvent::ToolEffectReused { .. }
+                | RunEvent::ToolCompleted { .. }
+        )));
     }
 
     fn run_stopped_discovery(
@@ -2410,6 +2448,7 @@ mod discovery_terminal_tests {
                 assert!(!result.cancelled);
                 assert_eq!(result.errors.len(), 1);
                 assert_eq!(result.errors[0].code, "timed_out");
+                assert!(result.duration_ms > 0);
             }
         }
         assert!(result.tool_calls.is_empty());
@@ -2425,29 +2464,7 @@ mod discovery_terminal_tests {
         );
 
         let records = events.events();
-        assert_eq!(records.len(), 3);
-        assert_eq!(
-            records
-                .iter()
-                .map(|record| record.sequence)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-        assert!(matches!(records[0].event, RunEvent::Started { .. }));
-        assert_zero_usage(&records[1].event, usage_strategy);
-        assert!(matches!(
-            records[2].event,
-            RunEvent::Completed { ref status } if status == &result.status
-        ));
-        assert!(!records.iter().any(|record| matches!(
-            record.event,
-            RunEvent::ToolDiscoveryCompleted { .. }
-                | RunEvent::ModelRequested { .. }
-                | RunEvent::PolicyDecided { .. }
-                | RunEvent::ApprovalRequested { .. }
-                | RunEvent::ToolEffectReused { .. }
-                | RunEvent::ToolCompleted { .. }
-        )));
+        assert_pre_event_terminal_records(&records, &result, usage_strategy);
     }
 
     #[test]
@@ -2510,5 +2527,187 @@ mod discovery_terminal_tests {
                 RunStrategy::Direct,
             );
         }
+    }
+
+    #[test]
+    fn discovery_time_is_included_in_completed_direct_adaptive_and_declarative_runs() {
+        for strategy in [
+            RunStrategy::Direct,
+            RunStrategy::Adaptive,
+            RunStrategy::DeclarativePlan,
+        ] {
+            let entered = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            let paused_caller = if strategy == RunStrategy::Direct {
+                ToolCaller::Direct
+            } else {
+                ToolCaller::DeclarativePlan
+            };
+            let (registry, _) =
+                registry_with_checkpoint(entered.clone(), release.clone(), paused_caller);
+            let responses = match strategy {
+                RunStrategy::Direct => vec![final_response("done")],
+                RunStrategy::Adaptive => vec![
+                    final_response(r#"{"strategy":"direct"}"#),
+                    final_response("done"),
+                ],
+                RunStrategy::DeclarativePlan => vec![
+                    final_response(
+                        json!({
+                            "strategy": "declarative_plan",
+                            "plan": {"nodes": [{
+                                "id": "read",
+                                "tool_id": "discovery.tool.099",
+                                "arguments": {}
+                            }]}
+                        })
+                        .to_string(),
+                    ),
+                    final_response("done"),
+                ],
+                RunStrategy::Programmatic => unreachable!(),
+            };
+            let provider = Arc::new(
+                MockModelProvider::scripted(responses).with_capabilities(planning_capabilities()),
+            );
+            let events = Arc::new(InMemoryEventSink::default());
+            let runner = Arc::new(
+                AgentRunner::builder(provider)
+                    .tools(registry)
+                    .event_sink(events.clone())
+                    .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
+                    .build(),
+            );
+            let mut agent = crate::AgentDefinition::new("discovery", "Discovery", "1", "mock");
+            agent.tool_allowlist = (0..100)
+                .map(|index| format!("discovery.tool.{index:03}"))
+                .collect();
+            let request = RunRequest::new(agent, "discovery.tool.099")
+                .with_run_id(format!("timed-completion-{strategy:?}"))
+                .with_trace_id(format!("timed-completion-trace-{strategy:?}"));
+            let run = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap()
+                    .block_on(runner.run_with_strategy(request, strategy))
+            });
+
+            entered.wait();
+            std::thread::sleep(Duration::from_millis(30));
+            release.wait();
+            let result = run.join().unwrap().unwrap();
+
+            assert_eq!(result.status, RunStatus::Completed);
+            assert!(result.duration_ms >= 20);
+            let usage_duration = events
+                .events()
+                .into_iter()
+                .find_map(|record| match record.event {
+                    RunEvent::StrategyUsage { duration_ms, .. } => Some(duration_ms),
+                    _ => None,
+                })
+                .expect("completed strategy usage event");
+            assert_eq!(usage_duration, result.duration_ms);
+        }
+    }
+
+    #[test]
+    fn cancelled_catalog_assembly_is_not_published_and_retry_builds_once() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (mut registry, tools) = registry_with_checkpoint(
+            Arc::new(Barrier::new(1)),
+            Arc::new(Barrier::new(1)),
+            ToolCaller::Programmatic,
+        );
+        let checkpoints = Arc::new(AtomicUsize::new(0));
+        let hook_entered = entered.clone();
+        let hook_release = release.clone();
+        registry.set_discovery_cache_assembly_checkpoint(Arc::new(move |caller| {
+            if caller == ToolCaller::Direct && checkpoints.fetch_add(1, Ordering::SeqCst) == 0 {
+                hook_entered.wait();
+                hook_release.wait();
+            }
+        }));
+        let provider = Arc::new(
+            MockModelProvider::scripted([final_response("retry completed")])
+                .with_capabilities(planning_capabilities()),
+        );
+        let events = Arc::new(InMemoryEventSink::default());
+        let runner = Arc::new(
+            AgentRunner::builder(provider.clone())
+                .tools(registry)
+                .event_sink(events.clone())
+                .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
+                .build(),
+        );
+        let allowlist = (0..100)
+            .map(|index| format!("discovery.tool.{index:03}"))
+            .collect::<Vec<_>>();
+        let mut agent = crate::AgentDefinition::new("discovery", "Discovery", "1", "mock");
+        agent.tool_allowlist = allowlist.clone();
+        let request = RunRequest::new(agent, "discovery.tool.099")
+            .with_run_id("cancelled-cache-assembly")
+            .with_trace_id("cancelled-cache-assembly-trace");
+        let cancellation = request.cancellation.clone();
+        let run_runner = runner.clone();
+        let run = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(run_runner.run_with_strategy(request, RunStrategy::Direct))
+        });
+
+        entered.wait();
+        cancellation.cancel();
+        release.wait();
+        let cancelled = run.join().unwrap().unwrap();
+
+        assert_eq!(cancelled.status, RunStatus::Cancelled);
+        assert!(cancelled.cancelled);
+        assert!(cancelled.tool_calls.is_empty());
+        assert!(cancelled.policy_decisions.is_empty());
+        assert!(cancelled.approvals.is_empty());
+        assert!(provider.requests().is_empty());
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.calls.load(Ordering::SeqCst))
+                .sum::<u32>(),
+            0
+        );
+        assert!(runner.tools.catalog_cache_is_empty());
+        assert_eq!(runner.tools.catalog_build_count(), 0);
+        assert_pre_event_terminal_records(&events.events(), &cancelled, RunStrategy::Direct);
+
+        let mut retry_agent = crate::AgentDefinition::new("discovery", "Discovery", "1", "mock");
+        retry_agent.tool_allowlist = allowlist;
+        let retry = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(
+                runner.run_with_strategy(
+                    RunRequest::new(retry_agent, "discovery.tool.099")
+                        .with_run_id("retry-cache-assembly")
+                        .with_trace_id("retry-cache-assembly-trace"),
+                    RunStrategy::Direct,
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(retry.status, RunStatus::Completed);
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(runner.tools.catalog_build_count(), 1);
+        assert!(!runner.tools.catalog_cache_is_empty());
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.calls.load(Ordering::SeqCst))
+                .sum::<u32>(),
+            0
+        );
     }
 }

@@ -46,6 +46,7 @@ pub struct AgentRunnerBuilder {
 pub(crate) struct RunPreflight {
     pub(crate) output_validator: Option<Validator>,
     pub(crate) deadline: Option<Instant>,
+    pub(crate) started: StdInstant,
 }
 
 impl AgentRunner {
@@ -85,11 +86,12 @@ impl AgentRunner {
                     error,
                     &self.events,
                     crate::RunStrategy::Direct,
+                    preflight.started,
                 ));
             }
             Err(error) => return Err(error),
         };
-        let started = StdInstant::now();
+        let started = preflight.started;
         let deadline = preflight.deadline;
         let run_id = request
             .run_id
@@ -628,11 +630,13 @@ pub(crate) fn validate_request(request: &RunRequest) -> Result<Option<Validator>
 
 pub(crate) fn preflight_request(request: &RunRequest) -> Result<RunPreflight, HarnessError> {
     let output_validator = validate_request(request)?;
+    let started = StdInstant::now();
     let deadline = absolute_deadline(request.agent.limits.max_run_duration_ms)?;
     check_stopped(&request.cancellation, deadline, "run deadline reached")?;
     Ok(RunPreflight {
         output_validator,
         deadline,
+        started,
     })
 }
 
@@ -660,12 +664,14 @@ pub(crate) fn pre_event_terminal_result(
     error: HarnessError,
     event_sink: &Arc<dyn EventSink>,
     strategy: crate::RunStrategy,
+    started: StdInstant,
 ) -> RunResult {
     debug_assert!(matches!(
         error,
         HarnessError::Cancelled | HarnessError::TimedOut(_)
     ));
-    let result = preflight_terminal_result(request, error);
+    let mut result = preflight_terminal_result(request, error);
+    result.duration_ms = started.elapsed().as_millis() as u64;
     let mut events = EventEmitter::new(
         result.id.clone(),
         result.trace_id.clone(),
