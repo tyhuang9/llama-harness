@@ -380,6 +380,7 @@ struct PathState {
     current: RuntimeValue,
     pointer_offset: usize,
     segment: String,
+    segment_has_successor: bool,
     phase: PathPhase,
 }
 
@@ -1659,6 +1660,7 @@ fn advance_eval(
                     current,
                     pointer_offset: 1,
                     segment,
+                    segment_has_successor: false,
                     phase: PathPhase::Decode,
                 }));
             }
@@ -2149,10 +2151,12 @@ fn advance_path(
         PathPhase::Decode => {
             let bytes = pointer.as_bytes();
             let mut traversed = 0usize;
+            let mut segment_has_successor = false;
             while state.pointer_offset < bytes.len() && traversed < MAX_ATOMIC_STRING_BYTES {
                 let byte = bytes[state.pointer_offset];
                 if byte == b'/' {
                     state.pointer_offset += 1;
+                    segment_has_successor = true;
                     break;
                 }
                 if byte == b'~' {
@@ -2176,9 +2180,9 @@ fn advance_path(
                     traversed += character.len_utf8();
                 }
             }
-            let segment_complete = state.pointer_offset == pointer.len()
-                || bytes.get(state.pointer_offset.saturating_sub(1)) == Some(&b'/');
+            let segment_complete = state.pointer_offset == pointer.len() || segment_has_successor;
             if segment_complete {
+                state.segment_has_successor = segment_has_successor;
                 state.phase = match state.current.node() {
                     RuntimeNode::Object(_) => PathPhase::ObjectLookup(0),
                     RuntimeNode::Array(_) => PathPhase::ArrayIndex {
@@ -2201,11 +2205,12 @@ fn advance_path(
             debug_assert!(key.len() <= MAX_ATOMIC_KEY_BYTES);
             if key == &state.segment {
                 let selected = value.clone();
-                if state.pointer_offset == pointer.len() && !pointer.ends_with('/') {
+                if !state.segment_has_successor {
                     Ok(Some(selected))
                 } else {
                     state.current = selected;
                     state.segment.clear();
+                    state.segment_has_successor = false;
                     state.phase = PathPhase::Decode;
                     Ok(None)
                 }
@@ -2246,11 +2251,12 @@ fn advance_path(
                 .and_then(|items| items.get(value))
                 .cloned()
                 .ok_or_else(|| execution("JSON pointer did not resolve"))?;
-            if state.pointer_offset == pointer.len() && !pointer.ends_with('/') {
+            if !state.segment_has_successor {
                 Ok(Some(selected))
             } else {
                 state.current = selected;
                 state.segment.clear();
+                state.segment_has_successor = false;
                 state.phase = PathPhase::Decode;
                 Ok(None)
             }
@@ -2871,18 +2877,47 @@ mod tests {
     }
 
     #[test]
+    fn parsed_program_paths_support_empty_object_members_and_segment_continuation() {
+        for (raw, expected, id) in [
+            (
+                r#"{"version":1,"body":[{"kind":"return","value":{"kind":"path","value":{"kind":"object","entries":[{"key":"","value":{"kind":"string","value":"root"}}]},"pointer":"/"}}]}"#,
+                json!("root"),
+                45,
+            ),
+            (
+                r#"{"version":1,"body":[{"kind":"return","value":{"kind":"path","value":{"kind":"object","entries":[{"key":"a","value":{"kind":"object","entries":[{"key":"","value":{"kind":"string","value":"child"}}]}}]},"pointer":"/a/"}}]}"#,
+                json!("child"),
+                46,
+            ),
+            (
+                r#"{"version":1,"body":[{"kind":"return","value":{"kind":"path","value":{"kind":"object","entries":[{"key":"","value":{"kind":"object","entries":[{"key":"","value":{"kind":"string","value":"nested"}}]}}]},"pointer":"//"}}]}"#,
+                json!("nested"),
+                47,
+            ),
+            (
+                r#"{"version":1,"body":[{"kind":"return","value":{"kind":"path","value":{"kind":"object","entries":[{"key":"a","value":{"kind":"array","items":[{"kind":"object","entries":[{"key":"","value":{"kind":"string","value":"array-child"}}]}]}}]},"pointer":"/a/0/"}}]}"#,
+                json!("array-child"),
+                48,
+            ),
+        ] {
+            let mut vm = execution(raw, id, SandboxLimits::default());
+            assert_eq!(complete(&mut vm, 1), expected);
+        }
+    }
+
+    #[test]
     fn checked_response_admission_is_inert_and_resume_is_atomic() {
         let raw = r#"{"version":1,"body":[
           {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[]}},
-          {"kind":"return","value":{"kind":"path","value":{"kind":"variable","name":"result"},"pointer":"/output/value"}}
+          {"kind":"return","value":{"kind":"path","value":{"kind":"variable","name":"result"},"pointer":"/output//"}}
         ]}"#;
         let limits = SandboxLimits::default();
         let mut vm = execution(raw, 5, limits);
         let (batch, token) = yield_once(&mut vm);
-        let output = json!({"value":{"kind":"invoke","tool_id":"danger"}});
+        let output = json!({"":{"":{"kind":"invoke","tool_id":"danger"}}});
         let response = ToolResponse::success(&batch.calls()[0], &output, &limits).unwrap();
         vm.resume(token, vec![response]).unwrap();
-        assert_eq!(complete(&mut vm, 1), output["value"]);
+        assert_eq!(complete(&mut vm, 1), output[""][""]);
         assert!(vm.step(1).is_err());
     }
 
@@ -2968,6 +3003,15 @@ mod tests {
         let raw = r#"{"version":1,"body":[{"kind":"invoke","name":"r","tool_id":"read","arguments":{"kind":"object","entries":[]}},{"kind":"return","value":{"kind":"null"}}]}"#;
         let mut vm = execution(raw, 11, SandboxLimits::default());
         let (batch, _) = yield_once(&mut vm);
+        let mut empty_key = Map::new();
+        empty_key.insert(String::new(), Value::Null);
+        assert!(ToolResponse::success(
+            &batch.calls()[0],
+            &Value::Object(empty_key),
+            &SandboxLimits::default(),
+        )
+        .is_ok());
+
         let mut object = Map::new();
         object.insert("k".repeat(MAX_ATOMIC_KEY_BYTES + 1), Value::Null);
         assert_eq!(

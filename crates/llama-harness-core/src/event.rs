@@ -177,7 +177,7 @@ pub enum RunEvent {
         loop_iterations: u64,
         /// Read-only fan-out batches yielded.
         fanout_batches: u32,
-        /// Failed or invalid broker results observed before this terminal execution state.
+        /// Failed or invalid broker results observed before VM completion.
         partial_failures: u32,
         /// Peak conservatively accounted VM bytes.
         peak_accounted_bytes: u64,

@@ -225,8 +225,8 @@ pub(crate) fn validate_ast(program: &Program, limits: &SandboxLimits) -> Result<
                         validate_count(entries.len(), limits.max_collection_items, "collection")?;
                         let mut keys = BTreeSet::new();
                         for ObjectEntry { key, value } in entries.iter().rev() {
-                            if key.is_empty() || key.len() > MAX_ATOMIC_KEY_BYTES {
-                                return Err(invalid("object keys must contain 1..=64 bytes"));
+                            if key.len() > MAX_ATOMIC_KEY_BYTES {
+                                return Err(invalid("object keys must contain at most 64 bytes"));
                             }
                             if !keys.insert(key.as_str()) {
                                 return Err(invalid("object keys must be unique"));

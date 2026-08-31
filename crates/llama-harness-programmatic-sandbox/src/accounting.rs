@@ -139,8 +139,8 @@ pub(crate) fn measure_value(
                     .try_reserve(values.len())
                     .map_err(|_| resource("value measurement allocation failed"))?;
                 for (key, child) in values.iter().rev() {
-                    if key.is_empty() || key.len() > MAX_ATOMIC_KEY_BYTES {
-                        return Err(resource("object keys must contain 1..=64 bytes"));
+                    if key.len() > MAX_ATOMIC_KEY_BYTES {
+                        return Err(resource("object keys must contain at most 64 bytes"));
                     }
                     measurement.retained =
                         checked_add(measurement.retained, key_retained_bytes(key.capacity())?)?;
@@ -220,6 +220,19 @@ mod tests {
             };
             assert_eq!(measure_value(&value, &limits).is_ok(), accepted);
         }
+    }
+
+    #[test]
+    fn empty_object_keys_are_measured_with_their_object_member_framing() {
+        let value = json!({"":null});
+        let measurement = measure_value(&value, &SandboxLimits::default()).unwrap();
+        assert_eq!(
+            measurement.serialized,
+            serde_json::to_vec(&value).unwrap().len()
+        );
+        assert!(
+            measurement.retained >= primitive_retained_bytes() + key_retained_bytes(0).unwrap()
+        );
     }
 
     #[test]

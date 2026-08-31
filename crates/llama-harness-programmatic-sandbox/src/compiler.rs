@@ -733,10 +733,7 @@ fn verify_instruction_expressions(
                     }
                     let mut unique = BTreeSet::new();
                     for key in keys {
-                        if key.is_empty()
-                            || key.len() > MAX_ATOMIC_KEY_BYTES
-                            || !unique.insert(key.as_str())
-                        {
+                        if key.len() > MAX_ATOMIC_KEY_BYTES || !unique.insert(key.as_str()) {
                             return Err(verify("bytecode object keys are invalid"));
                         }
                         add_constant_bytes(
@@ -1103,6 +1100,17 @@ mod tests {
         let program = compile(br#"{"version":1,"body":[{"kind":"let","name":"x","value":{"kind":"integer","value":1}},{"kind":"return","value":{"kind":"variable","name":"x"}}]}"#).unwrap();
         assert_eq!(program.local_count, 1);
         assert_eq!(program.code.len(), 2);
+    }
+
+    #[test]
+    fn verifier_accepts_empty_object_keys_with_bounded_accounting() {
+        let code = vec![Instruction::Return {
+            value: ExprCode(vec![
+                ExprInstruction::Constant(Value::Null),
+                ExprInstruction::Object(vec![String::new()]),
+            ]),
+        }];
+        assert!(verify_bytecode(&code, 0, &SandboxLimits::default()).is_ok());
     }
 
     #[test]
