@@ -352,7 +352,7 @@ impl CatalogCache {
         let entry = self.entries.iter().find(|entry| entry.key == *key)?;
         entry
             .last_used
-            .store(self.next_recency(), Ordering::Relaxed);
+            .fetch_max(self.next_recency(), Ordering::Relaxed);
         Some(Arc::clone(&entry.index))
     }
 
@@ -476,7 +476,7 @@ impl PreparedCatalogCache {
         let entry = self.entries.iter().find(|entry| entry.key == *key)?;
         entry
             .last_used
-            .store(self.next_recency(), Ordering::Relaxed);
+            .fetch_max(self.next_recency(), Ordering::Relaxed);
         Some(Arc::clone(&entry.catalog))
     }
 
