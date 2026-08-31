@@ -216,7 +216,9 @@ pub struct McpLimits {
     pub max_string_bytes: usize,
     /// Maximum negotiated capability names admitted from one context.
     pub max_context_capabilities: usize,
-    /// Maximum retired generations retained while shutdown drains.
+    /// Maximum aggregate pending, retired, and in-progress contexts retained
+    /// by this manager. Refresh fails before connecting when this bound is
+    /// exhausted.
     pub max_retired_generations: usize,
 }
 
@@ -565,6 +567,14 @@ impl Default for CatalogState {
     }
 }
 
+fn owned_context_count(state: &CatalogState) -> Option<usize> {
+    state
+        .pending_refresh_contexts
+        .len()
+        .checked_add(state.retired_contexts.len())?
+        .checked_add(usize::try_from(state.draining_contexts).ok()?)
+}
+
 /// Owns complete immutable catalog snapshots for one MCP server.
 ///
 /// A refresh validates every page before replacing the active snapshot. Tools
@@ -648,9 +658,8 @@ impl McpCatalogManager {
             return Err(McpError::CatalogUnavailable);
         }
         if self.state.lock().map_or(true, |state| {
-            state.retired_contexts.len() >= self.limits.max_retired_generations
-                || usize::try_from(state.draining_contexts)
-                    .map_or(true, |count| count >= self.limits.max_retired_generations)
+            owned_context_count(&state)
+                .is_none_or(|count| count >= self.limits.max_retired_generations)
         }) {
             return Err(McpError::CatalogUnavailable);
         }
@@ -914,7 +923,7 @@ impl McpCatalogManager {
     /// Closes the manager. The local state is closed before bounded transport shutdown.
     pub async fn close(&self, cancellation: CancellationToken) -> Result<(), McpError> {
         let _close = self.close_lock.lock().await;
-        let (contexts, draining) = {
+        let contexts = {
             let mut state = self
                 .state
                 .lock()
@@ -935,20 +944,16 @@ impl McpCatalogManager {
                     });
                 }
             }
-            (
-                state
-                    .retired_contexts
-                    .iter()
-                    .map(|entry| RetiredContext {
-                        context: Arc::clone(&entry.context),
-                        in_flight: Arc::clone(&entry.in_flight),
-                    })
-                    .collect::<Vec<_>>(),
-                state.draining_contexts,
-            )
+            state
+                .retired_contexts
+                .iter()
+                .map(|entry| RetiredContext {
+                    context: Arc::clone(&entry.context),
+                    in_flight: Arc::clone(&entry.in_flight),
+                })
+                .collect::<Vec<_>>()
         };
         let started = Instant::now();
-        let had_no_retryable_contexts = contexts.is_empty();
         let mut failed = false;
         for context in contexts {
             if tokio::time::timeout(self.timeouts.close, wait_for_drain(&context.in_flight))
@@ -963,7 +968,11 @@ impl McpCatalogManager {
                 failed = true;
             }
         }
-        let result = if draining > 0 && had_no_retryable_contexts {
+        let unresolved = self
+            .state
+            .lock()
+            .map_or(true, |state| owned_context_count(&state) != Some(0));
+        let result = if unresolved {
             Err(McpError::CleanupPending)
         } else if failed {
             Err(McpError::Transport(McpTransportError {
@@ -1005,13 +1014,8 @@ impl McpCatalogManager {
                 close_failures: u64::MAX,
             },
             |state| McpShutdownHealth {
-                pending_contexts: u64::try_from(
-                    state
-                        .retired_contexts
-                        .len()
-                        .saturating_add(state.pending_refresh_contexts.len()),
-                )
-                .unwrap_or(u64::MAX),
+                pending_contexts: u64::try_from(owned_context_count(&state).unwrap_or(usize::MAX))
+                    .unwrap_or(u64::MAX),
                 in_progress_contexts: state.draining_contexts,
                 close_failures: state.close_failures,
             },
@@ -1355,6 +1359,13 @@ async fn fetch_tools(
             result = tokio::time::timeout(timeout, transport.list_tools(context, cursor.as_deref(), cancellation.child_token())) => result.map_err(|_| McpTransportError { operation: McpOperation::ListTools, dispatch: McpDispatchState::PossiblyDispatched })??,
         };
         pages = pages.checked_add(1).ok_or(McpError::Clock)?;
+        let remaining_tools = limits
+            .max_tools
+            .checked_sub(items.len())
+            .ok_or_else(|| McpError::InvalidCatalog("tool limit exceeded".into()))?;
+        if page.tools.len() > remaining_tools {
+            return Err(McpError::InvalidCatalog("tool limit exceeded".into()));
+        }
         let page_bytes = admit_page(&page, limits)?;
         bytes = bytes
             .checked_add(page_bytes)
@@ -1395,9 +1406,6 @@ async fn fetch_tools(
             }
             validate_tool(&tool, limits)?;
             items.push(tool);
-            if items.len() > limits.max_tools {
-                return Err(McpError::InvalidCatalog("tool limit exceeded".into()));
-            }
         }
         cursor = page.next_cursor;
         if let Some(next) = &cursor {
@@ -1801,7 +1809,11 @@ fn validate_tool(tool: &McpTool, limits: &McpLimits) -> Result<(), McpError> {
 }
 
 fn admit_page(page: &McpToolPage, limits: &McpLimits) -> Result<usize, McpError> {
-    let mut bytes = 2usize; // object braces
+    // Serde serializes every public struct field. Count that framing here so
+    // catalog admission remains conservative without serializing the page.
+    let mut bytes = 2usize
+        .checked_add(3)
+        .ok_or_else(|| McpError::InvalidCatalog("catalog exceeds byte limit".into()))?; // braces plus four field separators
     let mut add = |value: usize| -> Result<(), McpError> {
         bytes = bytes
             .checked_add(value)
@@ -1813,6 +1825,10 @@ fn admit_page(page: &McpToolPage, limits: &McpLimits) -> Result<usize, McpError>
         }
         Ok(())
     };
+    add(json_field_prefix("tools")?)?;
+    add(2usize
+        .checked_add(page.tools.len().saturating_sub(1))
+        .ok_or_else(|| McpError::InvalidCatalog("catalog exceeds byte limit".into()))?)?;
     for tool in &page.tools {
         if tool.name.len() > limits.max_string_bytes
             || tool.description.len() > limits.max_string_bytes
@@ -1821,34 +1837,54 @@ fn admit_page(page: &McpToolPage, limits: &McpLimits) -> Result<usize, McpError>
                 "catalog string exceeds limit".into(),
             ));
         }
+        add(2usize
+            .checked_add(3)
+            .ok_or_else(|| McpError::InvalidCatalog("catalog exceeds byte limit".into()))?)?;
+        add(json_field_prefix("name")?)?;
         add(json_string_len(&tool.name)
             .map_err(|_| McpError::InvalidCatalog("catalog exceeds byte limit".into()))?)?;
+        add(json_field_prefix("description")?)?;
         add(json_string_len(&tool.description)
             .map_err(|_| McpError::InvalidCatalog("catalog exceeds byte limit".into()))?)?;
+        add(json_field_prefix("input_schema")?)?;
         add(
             admit_json_value(&tool.input_schema, limits, limits.max_catalog_bytes, true)
                 .map_err(|_| McpError::InvalidCatalog("unsafe or oversized schema".into()))?,
         )?;
+        add(json_field_prefix("output_schema")?)?;
         if let Some(schema) = &tool.output_schema {
             add(
                 admit_json_value(schema, limits, limits.max_catalog_bytes, true)
                     .map_err(|_| McpError::InvalidCatalog("unsafe or oversized schema".into()))?,
             )?;
+        } else {
+            add(4)?;
         }
     }
-    for string in [page.next_cursor.as_deref(), page.cache_scope.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        if string.len() > limits.max_string_bytes {
-            return Err(McpError::InvalidCatalog(
-                "catalog string exceeds limit".into(),
-            ));
-        }
-        add(json_string_len(string)
-            .map_err(|_| McpError::InvalidCatalog("catalog exceeds byte limit".into()))?)?;
-    }
+    add(json_field_prefix("next_cursor")?)?;
+    add(optional_json_string(page.next_cursor.as_deref(), limits)?)?;
+    add(json_field_prefix("ttl_ms")?)?;
+    add(page.ttl_ms.map_or(4, |value| value.to_string().len()))?;
+    add(json_field_prefix("cache_scope")?)?;
+    add(optional_json_string(page.cache_scope.as_deref(), limits)?)?;
     Ok(bytes)
+}
+
+fn json_field_prefix(name: &str) -> Result<usize, McpError> {
+    json_string_len(name)
+        .and_then(|length| length.checked_add(1).ok_or(()))
+        .map_err(|_| McpError::InvalidCatalog("catalog exceeds byte limit".into()))
+}
+
+fn optional_json_string(value: Option<&str>, limits: &McpLimits) -> Result<usize, McpError> {
+    match value {
+        Some(value) if value.len() <= limits.max_string_bytes => json_string_len(value)
+            .map_err(|_| McpError::InvalidCatalog("catalog exceeds byte limit".into())),
+        Some(_) => Err(McpError::InvalidCatalog(
+            "catalog string exceeds limit".into(),
+        )),
+        None => Ok(4),
+    }
 }
 
 fn validate_context(context: &McpContext, limits: &McpLimits) -> Result<(), McpError> {
@@ -1945,6 +1981,7 @@ fn admit_json_value(
                 add(2usize
                     .checked_add(values.len().saturating_sub(1))
                     .ok_or(())?)?;
+                ensure_child_capacity(values.len(), nodes, stack.len(), limits.max_json_nodes)?;
                 for child in values.iter().rev() {
                     stack.push((child, depth.checked_add(1).ok_or(())?));
                 }
@@ -1957,6 +1994,7 @@ fn admit_json_value(
                 add(2usize
                     .checked_add(values.len().saturating_sub(1))
                     .ok_or(())?)?;
+                ensure_child_capacity(values.len(), nodes, stack.len(), limits.max_json_nodes)?;
                 for (key, child) in values.iter().rev() {
                     if key.len() > limits.max_string_bytes {
                         return Err(());
@@ -1976,6 +2014,19 @@ fn admit_json_value(
         }
     }
     Ok(bytes)
+}
+
+fn ensure_child_capacity(
+    child_count: usize,
+    visited_nodes: usize,
+    queued_nodes: usize,
+    max_nodes: usize,
+) -> Result<(), ()> {
+    let remaining = max_nodes.checked_sub(visited_nodes).ok_or(())?;
+    if queued_nodes.checked_add(child_count).ok_or(())? > remaining {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn json_string_len(value: &str) -> Result<usize, ()> {
@@ -2020,9 +2071,13 @@ mod tests {
         yield_close: AtomicBool,
         hang_close: AtomicBool,
         fail_close: AtomicBool,
+        connects: AtomicU64,
         block_connect: AtomicBool,
         connect_started: AtomicBool,
         connect_release: tokio::sync::Notify,
+        block_list: AtomicBool,
+        list_started: AtomicBool,
+        list_release: tokio::sync::Notify,
         hang_call: AtomicBool,
         fail_list: AtomicBool,
         call_failure: Mutex<Option<McpTransportError>>,
@@ -2049,9 +2104,13 @@ mod tests {
                 yield_close: AtomicBool::new(false),
                 hang_close: AtomicBool::new(false),
                 fail_close: AtomicBool::new(false),
+                connects: AtomicU64::new(0),
                 block_connect: AtomicBool::new(false),
                 connect_started: AtomicBool::new(false),
                 connect_release: tokio::sync::Notify::new(),
+                block_list: AtomicBool::new(false),
+                list_started: AtomicBool::new(false),
+                list_release: tokio::sync::Notify::new(),
                 hang_call: AtomicBool::new(false),
                 fail_list: AtomicBool::new(false),
                 call_failure: Mutex::new(None),
@@ -2080,6 +2139,7 @@ mod tests {
     #[async_trait]
     impl McpTransport for FakeTransport {
         async fn connect(&self, _: CancellationToken) -> Result<McpContext, McpTransportError> {
+            self.connects.fetch_add(1, Ordering::Relaxed);
             if self.block_connect.load(Ordering::Relaxed) {
                 self.connect_started.store(true, Ordering::Release);
                 self.connect_release.notified().await;
@@ -2092,6 +2152,10 @@ mod tests {
             _: Option<&str>,
             _: CancellationToken,
         ) -> Result<McpToolPage, McpTransportError> {
+            if self.block_list.load(Ordering::Relaxed) {
+                self.list_started.store(true, Ordering::Release);
+                self.list_release.notified().await;
+            }
             if self.fail_list.load(Ordering::Relaxed) {
                 return Err(McpTransportError {
                     operation: McpOperation::ListTools,
@@ -2230,6 +2294,75 @@ mod tests {
 
         let large = Value::String("x".repeat(limits.max_string_bytes + 1));
         assert!(admit_json_value(&large, &limits, limits.max_catalog_bytes, true).is_err());
+    }
+
+    #[test]
+    fn iterative_admission_accepts_node_limit_and_rejects_n_plus_one_before_queueing() {
+        let limits = McpLimits {
+            max_json_nodes: 3,
+            ..McpLimits::default()
+        };
+        assert!(admit_json_value(
+            &Value::Array(vec![Value::Null, Value::Null]),
+            &limits,
+            limits.max_catalog_bytes,
+            true,
+        )
+        .is_ok());
+        assert!(admit_json_value(
+            &Value::Array(vec![Value::Null, Value::Null, Value::Null]),
+            &limits,
+            limits.max_catalog_bytes,
+            true,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn wide_page_tool_limit_rejects_before_schema_walks() {
+        let context = McpContext {
+            era: McpProtocolEra::Modern20260728,
+            version: "2026-07-28".into(),
+            capabilities: BTreeSet::from(["tools".into()]),
+            request_context: None,
+        };
+        let transport = FakeTransport::modern(100, vec![tool("one"), tool("two")]);
+        let limits = McpLimits {
+            max_tools: 1,
+            ..McpLimits::default()
+        };
+        assert!(matches!(
+            fetch_tools(
+                &transport,
+                &context,
+                CancellationToken::new(),
+                &limits,
+                Duration::from_millis(1),
+            )
+            .await,
+            Err(McpError::InvalidCatalog(_))
+        ));
+    }
+
+    #[test]
+    fn page_estimator_counts_structural_wrappers_at_the_byte_boundary() {
+        let page = McpToolPage {
+            tools: Vec::new(),
+            next_cursor: None,
+            ttl_ms: None,
+            cache_scope: None,
+        };
+        let full = admit_page(&page, &McpLimits::default()).expect("page estimate");
+        let at_limit = McpLimits {
+            max_catalog_bytes: full,
+            ..McpLimits::default()
+        };
+        assert_eq!(admit_page(&page, &at_limit).expect("exact boundary"), full);
+        let beyond_limit = McpLimits {
+            max_catalog_bytes: full - 1,
+            ..McpLimits::default()
+        };
+        assert!(admit_page(&page, &beyond_limit).is_err());
     }
 
     #[test]
@@ -2465,6 +2598,104 @@ mod tests {
         let (refreshed, ()) = tokio::join!(refresh, close);
         assert!(matches!(refreshed, Err(McpError::CatalogUnavailable)));
         assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn aborted_refreshes_accumulate_under_the_aggregate_context_bound() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        transport.block_list.store(true, Ordering::Relaxed);
+        let manager = Arc::new(
+            McpCatalogManager::with_configuration(
+                transport.clone(),
+                "server",
+                McpLimits {
+                    max_retired_generations: 2,
+                    ..McpLimits::default()
+                },
+                McpTimeouts::default(),
+                McpCachePolicy::default(),
+                clock,
+                None,
+            )
+            .expect("manager"),
+        );
+        for expected in 1..=2 {
+            transport.list_started.store(false, Ordering::Release);
+            let refresh_manager = Arc::clone(&manager);
+            let refresh =
+                tokio::spawn(
+                    async move { refresh_manager.refresh(CancellationToken::new()).await },
+                );
+            while !transport.list_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            refresh.abort();
+            assert!(refresh.await.expect_err("aborted refresh").is_cancelled());
+            assert_eq!(manager.shutdown_health().pending_contexts, expected);
+        }
+        assert_eq!(transport.connects.load(Ordering::Relaxed), 2);
+        assert!(matches!(
+            manager.refresh(CancellationToken::new()).await,
+            Err(McpError::CatalogUnavailable)
+        ));
+        assert_eq!(transport.connects.load(Ordering::Relaxed), 2);
+        transport.block_list.store(false, Ordering::Relaxed);
+        manager
+            .close(CancellationToken::new())
+            .await
+            .expect("drain retained contexts");
+        assert_eq!(manager.shutdown_health().pending_contexts, 0);
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn close_reports_pending_until_another_generation_drains() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        transport.hang_call.store(true, Ordering::Relaxed);
+        let manager = manager(transport.clone(), clock, None, None);
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("first refresh");
+        let first_tool = manager.active_tools().remove(0);
+        let call_cancellation = CancellationToken::new();
+        let task_cancellation = call_cancellation.clone();
+        let active_call = tokio::spawn(async move {
+            first_tool
+                .execute(serde_json::json!({}), task_cancellation)
+                .await
+        });
+        while transport.calls.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        transport.hang_call.store(false, Ordering::Relaxed);
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("replacement refresh");
+        assert_eq!(manager.shutdown_health().in_progress_contexts, 1);
+        assert!(matches!(
+            manager.close(CancellationToken::new()).await,
+            Err(McpError::CleanupPending)
+        ));
+        call_cancellation.cancel();
+        assert!(matches!(
+            active_call.await.expect("call task"),
+            Err(HarnessError::Cancelled)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while manager.shutdown_health().in_progress_contexts != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retired generation drains");
+        manager
+            .close(CancellationToken::new())
+            .await
+            .expect("all contexts closed");
     }
 
     #[tokio::test]
@@ -2709,7 +2940,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(matches!(
             manager.close(CancellationToken::new()).await,
-            Err(McpError::Transport(_))
+            Err(McpError::CleanupPending)
         ));
         assert_eq!(transport.closes.load(Ordering::Relaxed), 0);
         assert_eq!(manager.shutdown_health().in_progress_contexts, 1);
