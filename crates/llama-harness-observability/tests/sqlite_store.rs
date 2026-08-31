@@ -1,7 +1,7 @@
 use llama_harness_core::{
     mock::{final_response, MockModelProvider},
-    AgentDefinition, AgentRunner, EventRecord, EventSink, RunEvent, RunRequest, RunStatus,
-    RunStrategy, ToolCaller, ToolDiscoveryOutcome, ToolDiscoverySelection,
+    AgentDefinition, AgentRunner, EventRecord, EventSink, ProgramLifecycleOutcome, RunEvent,
+    RunRequest, RunStatus, RunStrategy, ToolCaller, ToolDiscoveryOutcome, ToolDiscoverySelection,
 };
 use llama_harness_observability::{
     AppendOutcome, RedactionConfig, RetentionPolicy, RunListQuery, SqliteEventSink,
@@ -250,6 +250,152 @@ fn discovery_events_persist_metadata_only() {
     ] {
         assert!(!export.contains(forbidden));
     }
+}
+
+#[test]
+fn programmatic_event_kinds_are_ordered_additive_and_redacted_on_reopen() {
+    let path = temporary_database("programmatic-events");
+    let canaries = [
+        "PROGRAM_SOURCE_CANARY",
+        "AST_VALUE_CANARY",
+        "TOOL_ID_CANARY",
+        "RAW_ERROR_CANARY",
+    ];
+    let store = SqliteEventSink::open(
+        &path,
+        TraceStoreConfig {
+            persist_raw_payloads: true,
+            redaction: RedactionConfig {
+                secret_values: canaries.iter().map(ToString::to_string).collect(),
+                ..RedactionConfig::default()
+            },
+            ..TraceStoreConfig::default()
+        },
+    )
+    .unwrap();
+    let run = "programmatic-events";
+    let trace = "programmatic-events-trace";
+    let events = vec![
+        (
+            record(
+                run,
+                trace,
+                1,
+                10,
+                RunEvent::ProgramLifecycle {
+                    attempt: 1,
+                    outcome: ProgramLifecycleOutcome::Started,
+                },
+            ),
+            Some(json!({
+                "program": "PROGRAM_SOURCE_CANARY",
+                "ast_value": "AST_VALUE_CANARY",
+                "tool": "TOOL_ID_CANARY"
+            })),
+        ),
+        (
+            record(
+                run,
+                trace,
+                2,
+                20,
+                RunEvent::ProgramValidated {
+                    attempt: 1,
+                    statement_count: 3,
+                    instruction_count: 5,
+                },
+            ),
+            None,
+        ),
+        (
+            record(
+                run,
+                trace,
+                3,
+                30,
+                RunEvent::ProgramExecutionCompleted {
+                    attempt: 1,
+                    fuel_used: 9,
+                    branches: 1,
+                    loop_iterations: 2,
+                    fanout_batches: 1,
+                    partial_failures: 0,
+                    peak_accounted_bytes: 64,
+                    duration_ms: 4,
+                },
+            ),
+            None,
+        ),
+        (
+            record(
+                run,
+                trace,
+                4,
+                40,
+                RunEvent::ToolRejected {
+                    call_id: "opaque-call".into(),
+                    tool_id: "registered-tool".into(),
+                    reason: "RAW_ERROR_CANARY".into(),
+                },
+            ),
+            None,
+        ),
+        (completed(run, trace, 5, 50, RunStatus::Completed), None),
+    ];
+    assert_eq!(
+        store.append_batch(events).unwrap(),
+        vec![AppendOutcome::Inserted; 5]
+    );
+    let export = store.export_run_json(run).unwrap().unwrap();
+    for canary in canaries {
+        assert!(!export.contains(canary));
+    }
+    drop(store);
+
+    let reopened = SqliteEventSink::open(&path, TraceStoreConfig::default()).unwrap();
+    let events = reopened.events_for_run(run, 10, 0).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.record.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert!(matches!(
+        events[0].record.event,
+        RunEvent::ProgramLifecycle {
+            outcome: ProgramLifecycleOutcome::Started,
+            ..
+        }
+    ));
+    assert!(matches!(
+        events[1].record.event,
+        RunEvent::ProgramValidated {
+            statement_count: 3,
+            instruction_count: 5,
+            ..
+        }
+    ));
+    assert!(matches!(
+        events[2].record.event,
+        RunEvent::ProgramExecutionCompleted {
+            fuel_used: 9,
+            fanout_batches: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &events[3].record.event,
+        RunEvent::ToolRejected { reason, .. } if reason == REDACTED_VALUE
+    ));
+    assert_eq!(
+        events[0].raw_payload.as_ref().unwrap()["program"],
+        REDACTED_VALUE
+    );
+    drop(reopened);
+    fs::remove_file(&path).unwrap();
+    let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = fs::remove_file(path.with_extension("sqlite-shm"));
 }
 
 #[test]

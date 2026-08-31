@@ -10,6 +10,8 @@
 //! that an embedding host may independently authorize and execute.
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod ast;
 mod compiler;

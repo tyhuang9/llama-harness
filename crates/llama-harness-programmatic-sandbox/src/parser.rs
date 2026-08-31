@@ -474,4 +474,124 @@ mod tests {
             SandboxErrorCode::InvalidLimits
         );
     }
+
+    #[test]
+    fn parser_enforces_exact_program_constant_local_and_collection_boundaries() {
+        let raw = br#"{"version":1,"body":[]}"#;
+        let exact_program_limit = SandboxLimits {
+            max_program_bytes: raw.len(),
+            ..SandboxLimits::default()
+        };
+        assert!(Program::from_json(raw, &exact_program_limit).is_ok());
+        let below_program_limit = SandboxLimits {
+            max_program_bytes: raw.len() - 1,
+            ..SandboxLimits::default()
+        };
+        assert_eq!(
+            Program::from_json(raw, &below_program_limit)
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::ResourceLimit
+        );
+
+        let constant = json!({"version":1,"body":[{
+            "kind":"return","value":{"kind":"string","value":"abc"}
+        }]});
+        for (limit, expected) in [
+            (2, SandboxErrorCode::ResourceLimit),
+            (3, SandboxErrorCode::InvalidProgram),
+            (4, SandboxErrorCode::InvalidProgram),
+        ] {
+            let limits = SandboxLimits {
+                max_constant_bytes: limit,
+                ..SandboxLimits::default()
+            };
+            let parsed = Program::from_json(&serde_json::to_vec(&constant).unwrap(), &limits);
+            if limit < 3 {
+                assert_eq!(parsed.unwrap_err().code(), expected);
+            } else {
+                assert!(parsed.is_ok());
+            }
+        }
+
+        let locals = json!({"version":1,"body":[
+            {"kind":"let","name":"first","value":{"kind":"null"}},
+            {"kind":"let","name":"second","value":{"kind":"null"}},
+            {"kind":"return","value":{"kind":"null"}}
+        ]});
+        let locals_bytes = serde_json::to_vec(&locals).unwrap();
+        assert_eq!(
+            Program::from_json(
+                &locals_bytes,
+                &SandboxLimits {
+                    max_locals: 1,
+                    ..SandboxLimits::default()
+                }
+            )
+            .unwrap_err()
+            .code(),
+            SandboxErrorCode::ResourceLimit
+        );
+        assert!(Program::from_json(
+            &locals_bytes,
+            &SandboxLimits {
+                max_locals: 2,
+                ..SandboxLimits::default()
+            }
+        )
+        .is_ok());
+
+        let collection = json!({"version":1,"body":[{
+            "kind":"return","value":{"kind":"array","items":[
+                {"kind":"integer","value":1},{"kind":"integer","value":2}
+            ]}
+        }]});
+        let collection_bytes = serde_json::to_vec(&collection).unwrap();
+        assert_eq!(
+            Program::from_json(
+                &collection_bytes,
+                &SandboxLimits {
+                    max_collection_items: 1,
+                    ..SandboxLimits::default()
+                }
+            )
+            .unwrap_err()
+            .code(),
+            SandboxErrorCode::ResourceLimit
+        );
+        assert!(Program::from_json(
+            &collection_bytes,
+            &SandboxLimits {
+                max_collection_items: 2,
+                ..SandboxLimits::default()
+            }
+        )
+        .is_ok());
+
+        let loop_program = json!({"version":1,"body":[
+            {"kind":"for_each","item":"item","collection":{"kind":"array","items":[]},"max_iterations":2,"body":[]},
+            {"kind":"return","value":{"kind":"null"}}
+        ]});
+        let loop_bytes = serde_json::to_vec(&loop_program).unwrap();
+        assert_eq!(
+            Program::from_json(
+                &loop_bytes,
+                &SandboxLimits {
+                    max_loop_iterations: 1,
+                    ..SandboxLimits::default()
+                }
+            )
+            .unwrap_err()
+            .code(),
+            SandboxErrorCode::ResourceLimit
+        );
+        assert!(Program::from_json(
+            &loop_bytes,
+            &SandboxLimits {
+                max_loop_iterations: 2,
+                ..SandboxLimits::default()
+            }
+        )
+        .is_ok());
+    }
 }

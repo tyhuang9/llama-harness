@@ -1140,6 +1140,97 @@ mod tests {
     }
 
     #[test]
+    fn independent_verifier_rejects_private_constant_stack_and_control_tampering() {
+        let limits = SandboxLimits::default();
+        let invalid_constant_type = vec![Instruction::Return {
+            value: ExprCode(vec![ExprInstruction::Constant(serde_json::json!(1.5))]),
+        }];
+        assert_eq!(
+            verify_bytecode(&invalid_constant_type, 0, &limits)
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::Verification
+        );
+
+        let oversized_constant = vec![Instruction::Return {
+            value: ExprCode(vec![ExprInstruction::Constant(serde_json::json!("abc"))]),
+        }];
+        assert_eq!(
+            verify_bytecode(
+                &oversized_constant,
+                0,
+                &SandboxLimits {
+                    max_constant_bytes: 2,
+                    ..SandboxLimits::default()
+                },
+            )
+            .unwrap_err()
+            .code(),
+            SandboxErrorCode::ResourceLimit
+        );
+
+        let stack_underflow = vec![Instruction::Return {
+            value: ExprCode(vec![ExprInstruction::Binary(BinaryOperator::Add)]),
+        }];
+        assert_eq!(
+            verify_bytecode(&stack_underflow, 0, &limits)
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::Verification
+        );
+
+        let stack_overflow = vec![Instruction::Return {
+            value: ExprCode(vec![
+                ExprInstruction::Constant(Value::Null),
+                ExprInstruction::Constant(Value::Null),
+                ExprInstruction::Array(2),
+            ]),
+        }];
+        assert_eq!(
+            verify_bytecode(
+                &stack_overflow,
+                0,
+                &SandboxLimits {
+                    max_operand_stack: 1,
+                    ..SandboxLimits::default()
+                },
+            )
+            .unwrap_err()
+            .code(),
+            SandboxErrorCode::ResourceLimit
+        );
+
+        let no_terminal_return = vec![Instruction::Let {
+            slot: 0,
+            value: ExprCode(vec![ExprInstruction::Constant(Value::Null)]),
+        }];
+        assert_eq!(
+            verify_bytecode(&no_terminal_return, 1, &limits)
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::Verification
+        );
+
+        let malformed_loop = vec![
+            Instruction::LoopStart {
+                collection: ExprCode(vec![ExprInstruction::Constant(Value::Array(Vec::new()))]),
+                item_slot: 0,
+                max_iterations: 1,
+                end_target: 2,
+            },
+            Instruction::Return {
+                value: ExprCode(vec![ExprInstruction::Constant(Value::Null)]),
+            },
+        ];
+        assert_eq!(
+            verify_bytecode(&malformed_loop, 1, &limits)
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::Verification
+        );
+    }
+
+    #[test]
     fn verified_program_debug_output_never_contains_constants() {
         let program = compile(br#"{"version":1,"body":[{"kind":"return","value":{"kind":"string","value":"CANARY_SECRET"}}]}"#).unwrap();
         let debug = alloc::format!("{program:?}");

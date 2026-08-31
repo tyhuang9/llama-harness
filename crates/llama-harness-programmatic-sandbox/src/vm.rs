@@ -1375,6 +1375,195 @@ mod tests {
     }
 
     #[test]
+    fn resume_rejects_duplicate_count_and_response_order_without_consuming_the_token() {
+        let program = json!({"version":1,"body":[
+            {"kind":"fan_out","name":"results","tool_id":"read","item":"item",
+             "collection":{"kind":"array","items":[{"kind":"integer","value":1},{"kind":"integer","value":2}]},"max_calls":2,
+             "arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"variable","name":"item"}}]}},
+            {"kind":"return","value":{"kind":"variable","name":"results"}}
+        ]});
+        let mut vm = execution(program, 42);
+        let (batch, token) = match vm.step(100).unwrap() {
+            StepOutcome::Yielded { batch, resume } => (batch, resume),
+            other => panic!("expected yield, got {other:?}"),
+        };
+        let ordered = vec![
+            ToolResponse::success(&batch.calls()[0], json!("first")),
+            ToolResponse::success(&batch.calls()[1], json!("second")),
+        ];
+        assert_eq!(
+            vm.resume(
+                ResumeToken {
+                    execution_id: ExecutionId(42),
+                    yield_ordinal: 99,
+                },
+                ordered.clone(),
+            )
+            .unwrap_err()
+            .code(),
+            SandboxErrorCode::InvalidResume
+        );
+        assert_eq!(
+            vm.resume(token, vec![ordered[0].clone()])
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::InvalidResume
+        );
+        let valid_token = match vm.step(1).unwrap_err().code() {
+            SandboxErrorCode::InvalidResume => ResumeToken {
+                execution_id: ExecutionId(42),
+                yield_ordinal: 0,
+            },
+            code => panic!("expected suspended execution, got {code:?}"),
+        };
+        assert_eq!(
+            vm.resume(valid_token, vec![ordered[1].clone(), ordered[0].clone()])
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::InvalidResume
+        );
+        vm.resume(
+            ResumeToken {
+                execution_id: ExecutionId(42),
+                yield_ordinal: 0,
+            },
+            ordered,
+        )
+        .unwrap();
+        assert!(matches!(vm.step(100).unwrap(), StepOutcome::Complete(_)));
+        assert_eq!(
+            vm.resume(
+                ResumeToken {
+                    execution_id: ExecutionId(42),
+                    yield_ordinal: 0,
+                },
+                Vec::new(),
+            )
+            .unwrap_err()
+            .code(),
+            SandboxErrorCode::InvalidResume
+        );
+    }
+
+    #[test]
+    fn every_nonterminal_slice_charges_fuel_and_fuel_limit_is_terminal() {
+        let program = json!({"version":1,"body":[
+            {"kind":"let","name":"value","value":{"kind":"integer","value":1}},
+            {"kind":"return","value":{"kind":"variable","name":"value"}}
+        ]});
+        let mut vm = execution(program, 43);
+        assert_eq!(vm.step(1).unwrap(), StepOutcome::Sliced);
+        assert_eq!(vm.metrics().fuel_used, 1);
+        assert_eq!(vm.step(1).unwrap(), StepOutcome::Complete(json!(1)));
+        assert_eq!(vm.metrics().fuel_used, 2);
+
+        let limits = SandboxLimits {
+            max_fuel: 1,
+            max_slice_fuel: 1,
+            ..SandboxLimits::default()
+        };
+        let bytes = serde_json::to_vec(&json!({"version":1,"body":[
+            {"kind":"let","name":"value","value":{"kind":"integer","value":1}},
+            {"kind":"return","value":{"kind":"variable","name":"value"}}
+        ]}))
+        .unwrap();
+        let verified = Program::from_json(&bytes, &limits)
+            .unwrap()
+            .compile(&limits)
+            .unwrap();
+        let mut exhausted = Execution::new(verified, ExecutionId(44)).unwrap();
+        assert_eq!(exhausted.step(1).unwrap(), StepOutcome::Sliced);
+        assert_eq!(
+            exhausted.step(1).unwrap_err().code(),
+            SandboxErrorCode::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn slice_and_yield_bounds_are_inclusive_and_refuse_the_next_unit_of_work() {
+        let program = json!({"version":1,"body":[
+            {"kind":"invoke","name":"first","tool_id":"read","arguments":{"kind":"object","entries":[]}},
+            {"kind":"invoke","name":"second","tool_id":"read","arguments":{"kind":"object","entries":[]}},
+            {"kind":"return","value":{"kind":"variable","name":"second"}}
+        ]});
+        let limits = SandboxLimits {
+            max_yields: 1,
+            max_slice_fuel: 1,
+            ..SandboxLimits::default()
+        };
+        let verified = Program::from_json(&serde_json::to_vec(&program).unwrap(), &limits)
+            .unwrap()
+            .compile(&limits)
+            .unwrap();
+        let mut vm = Execution::new(verified, ExecutionId(45)).unwrap();
+        assert_eq!(
+            vm.step(0).unwrap_err().code(),
+            SandboxErrorCode::ResourceLimit
+        );
+        assert_eq!(
+            vm.step(2).unwrap_err().code(),
+            SandboxErrorCode::ResourceLimit
+        );
+        let (batch, token) = match vm.step(1).unwrap() {
+            StepOutcome::Yielded { batch, resume } => (batch, resume),
+            other => panic!("expected first yield, got {other:?}"),
+        };
+        vm.resume(
+            token,
+            vec![ToolResponse::success(&batch.calls()[0], json!(1))],
+        )
+        .unwrap();
+        assert_eq!(
+            vm.step(1).unwrap_err().code(),
+            SandboxErrorCode::ResourceLimit
+        );
+        assert_eq!(vm.metrics().yields, 1);
+    }
+
+    #[test]
+    fn bounded_hostile_program_corpus_never_panics() {
+        let limits = SandboxLimits {
+            max_program_bytes: 128,
+            max_ast_nodes: 16,
+            max_nesting: 8,
+            max_bytecode_instructions: 32,
+            max_constant_bytes: 32,
+            max_locals: 4,
+            max_operand_stack: 8,
+            max_control_stack: 4,
+            max_fuel: 32,
+            max_slice_fuel: 8,
+            max_collection_items: 4,
+            max_loop_iterations: 4,
+            max_yields: 2,
+            max_fanout: 2,
+            max_live_bytes: 256,
+            max_cumulative_bytes: 256,
+            max_output_bytes: 128,
+        };
+        let corpus: &[&[u8]] = &[
+            b"",
+            b"\xff",
+            br#"{"version":1,"body":[{"kind":"return","value":{"kind":"integer","value":1e999}}]}"#,
+            br#"{"version":1,"body":[{"kind":"return","value":{"kind":"array","items":[[[[[[[[[0]]]]]]]]}}]}"#,
+            br#"{"version":1,"body":[{"kind":"return","value":{"kind":"string","value":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}"#,
+            br#"{"version":1,"body":[{"kind":"invoke","name":"x","tool_id":"read","arguments":{"kind":"null"}},{"kind":"return","value":{"kind":"variable","name":"x"}}]}"#,
+        ];
+        for raw in corpus {
+            let result = std::panic::catch_unwind(|| {
+                let _ = Program::from_json(raw, &limits)
+                    .and_then(|program| program.compile(&limits))
+                    .and_then(|verified| Execution::new(verified, ExecutionId(99)))
+                    .and_then(|mut execution| execution.step(1));
+            });
+            assert!(
+                result.is_ok(),
+                "hostile input must be reported, never panic"
+            );
+        }
+    }
+
+    #[test]
     fn checked_integer_overflow_is_terminal_error() {
         let program = json!({"version":1,"body":[{"kind":"return","value":{"kind":"binary","operator":"add","left":{"kind":"integer","value":9223372036854775807i64},"right":{"kind":"integer","value":1}}} ]});
         let mut vm = execution(program, 9);
