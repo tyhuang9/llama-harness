@@ -504,7 +504,12 @@ impl AgentRunner {
                     }
                     Err(_error)
                         if program_attempt == 0
-                            && model_calls < request.agent.limits.max_model_calls =>
+                            && request
+                                .agent
+                                .limits
+                                .max_model_calls
+                                .saturating_sub(model_calls)
+                                > 1 =>
                     {
                         events.emit(RunEvent::ProgramLifecycle {
                             attempt: program_attempt.saturating_add(1),
@@ -522,7 +527,7 @@ impl AgentRunner {
                             attempt: program_attempt.saturating_add(1),
                             outcome: ProgramLifecycleOutcome::Invalid,
                         });
-                        invalid_program_exhausted = program_attempt == 1;
+                        invalid_program_exhausted = true;
                         return Err(error);
                     }
                 }
@@ -612,10 +617,6 @@ impl AgentRunner {
                 }
             };
             let metrics = vm.metrics();
-            events.emit(RunEvent::ProgramLifecycle {
-                attempt: program_attempt.saturating_add(1),
-                outcome: ProgramLifecycleOutcome::Succeeded,
-            });
             events.emit(RunEvent::ProgramExecutionCompleted {
                 attempt: program_attempt.saturating_add(1),
                 fuel_used: metrics.fuel_used,
@@ -660,6 +661,10 @@ impl AgentRunner {
                 &output,
                 request.agent.limits.max_json_depth,
             )?;
+            events.emit(RunEvent::ProgramLifecycle {
+                attempt: program_attempt.saturating_add(1),
+                outcome: ProgramLifecycleOutcome::Succeeded,
+            });
             result.status = RunStatus::Completed;
             result.final_output = Some(output);
             Ok::<(), HarnessError>(())

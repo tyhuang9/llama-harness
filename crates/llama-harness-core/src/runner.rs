@@ -718,7 +718,7 @@ fn finish_programmatic_continuation(mut continuation: DirectContinuation) -> Run
     continuation.broker_state.finalize_usage();
     let usage = continuation.usage;
     continuation.events.emit(RunEvent::StrategyUsage {
-        strategy: crate::RunStrategy::Programmatic,
+        strategy: crate::RunStrategy::Direct,
         model_calls: continuation.model_calls,
         planning_model_calls: usage.planning_model_calls,
         repair_model_calls: usage.repair_model_calls,

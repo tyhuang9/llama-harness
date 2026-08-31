@@ -99,7 +99,8 @@ pub enum RunEvent {
         /// Effective maximum serialized tool-definition bytes for this scope.
         #[serde(default)]
         effective_schema_byte_budget: u64,
-        /// Exact serialized definition-array bytes selected or required.
+        /// Exact serialized definition-array byte count selected or required;
+        /// a size scalar that never includes definition content.
         #[serde(default)]
         selected_schema_bytes: u64,
         /// Number of deferred candidates admitted by bounded expansion.
@@ -164,7 +165,7 @@ pub enum RunEvent {
         /// Number of private verified bytecode instructions.
         instruction_count: u32,
     },
-    /// A program VM completed before final model synthesis.
+    /// A nonterminal program VM completion before final model synthesis.
     ProgramExecutionCompleted {
         /// One-based successfully executed program attempt.
         attempt: u32,
@@ -383,7 +384,7 @@ pub enum ProgramLifecycleOutcome {
     Validated,
     /// The provider output failed strict parsing or verification.
     Invalid,
-    /// VM execution completed and returned an inert value.
+    /// Final synthesis completed after VM execution and produced the terminal answer.
     Succeeded,
     /// The attempt was abandoned for the approved direct fallback before an effect.
     Fallback,

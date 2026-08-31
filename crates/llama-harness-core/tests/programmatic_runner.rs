@@ -5,10 +5,10 @@ use llama_harness_core::{
     mock::{final_response, MockModelProvider},
     AgentDefinition, AgentRunner, AllowAllPolicy, ApprovalHandler, ApprovalRecord, HarnessError,
     InMemoryEventSink, ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
-    PolicyDecision, PolicyEngine, ProgrammaticConformance, ProgrammaticHostConfig,
-    ProviderCapabilityLimits, ProviderHealth, RunEvent, RunRequest, RunStatus, RunStrategy,
-    StrategyFallbackReason, Tool, ToolCallContext, ToolCaller, ToolDefinition, ToolRegistry,
-    ToolResult, ToolRisk, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
+    PolicyDecision, PolicyEngine, ProgramLifecycleOutcome, ProgrammaticConformance,
+    ProgrammaticHostConfig, ProviderCapabilityLimits, ProviderHealth, RunEvent, RunRequest,
+    RunStatus, RunStrategy, StrategyFallbackReason, Tool, ToolCallContext, ToolCaller,
+    ToolDefinition, ToolRegistry, ToolResult, ToolRisk, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
     HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
 };
 use llama_harness_programmatic_sandbox::HARD_LIMITS;
@@ -1647,6 +1647,237 @@ async fn invalid_program_gets_exactly_one_repair_before_dispatch() {
         .unwrap();
     assert!(matches!(result.status, RunStatus::Completed));
     assert_eq!(provider.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn two_call_programmatic_budget_skips_repair_and_preserves_direct_fallback_capacity() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response("not json"), final_response("fallback")])
+            .with_capabilities(capabilities()),
+    );
+    let events = Arc::new(InMemoryEventSink::default());
+    let mut run_request = request(&[]);
+    run_request.agent.limits.max_model_calls = 2;
+    let result = AgentRunner::builder(provider.clone())
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(run_request, RunStrategy::Programmatic)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.final_output.as_deref(), Some("fallback"));
+    assert_eq!(provider.requests().len(), 2);
+    let usage = events
+        .events()
+        .iter()
+        .find_map(|record| match &record.event {
+            RunEvent::StrategyUsage {
+                strategy,
+                model_calls,
+                planning_model_calls,
+                repair_model_calls,
+                recovery_model_calls,
+                final_synthesis_model_calls,
+                reactive_model_calls,
+                ..
+            } => Some((
+                strategy.clone(),
+                *model_calls,
+                *planning_model_calls,
+                *repair_model_calls,
+                *recovery_model_calls,
+                *final_synthesis_model_calls,
+                *reactive_model_calls,
+            )),
+            _ => None,
+        });
+    assert_eq!(usage, Some((RunStrategy::Direct, 2, 1, 0, 0, 0, 1)));
+    let (_, model_calls, planning, repair, recovery, synthesis, reactive) = usage.unwrap();
+    assert_eq!(
+        model_calls,
+        planning + repair + recovery + synthesis + reactive
+    );
+    let records = events.events();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.event, RunEvent::Started { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.event, RunEvent::Completed { .. }))
+            .count(),
+        1
+    );
+    assert!(records.iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategySelected {
+            requested: RunStrategy::Programmatic,
+            selected: RunStrategy::Direct,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn three_call_programmatic_budget_allows_repair_and_reserves_final_synthesis() {
+    let repaired =
+        json!({"version":1,"body":[{"kind":"return","value":{"kind":"string","value":"safe"}}]});
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response("not json"),
+            final_response(serde_json::to_string(&repaired).unwrap()),
+            final_response("synthesized"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let events = Arc::new(InMemoryEventSink::default());
+    let mut run_request = request(&[]);
+    run_request.agent.limits.max_model_calls = 3;
+    let result = AgentRunner::builder(provider.clone())
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(run_request, RunStrategy::Programmatic)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.final_output.as_deref(), Some("synthesized"));
+    assert_eq!(provider.requests().len(), 3);
+    let usage = events
+        .events()
+        .iter()
+        .find_map(|record| match &record.event {
+            RunEvent::StrategyUsage {
+                strategy,
+                model_calls,
+                planning_model_calls,
+                repair_model_calls,
+                recovery_model_calls,
+                final_synthesis_model_calls,
+                reactive_model_calls,
+                ..
+            } => Some((
+                strategy.clone(),
+                *model_calls,
+                *planning_model_calls,
+                *repair_model_calls,
+                *recovery_model_calls,
+                *final_synthesis_model_calls,
+                *reactive_model_calls,
+            )),
+            _ => None,
+        });
+    assert_eq!(usage, Some((RunStrategy::Programmatic, 3, 1, 1, 0, 1, 0)));
+    let (_, model_calls, planning, repair, recovery, synthesis, reactive) = usage.unwrap();
+    assert_eq!(
+        model_calls,
+        planning + repair + recovery + synthesis + reactive
+    );
+}
+
+#[tokio::test]
+async fn program_lifecycle_succeeds_only_after_final_synthesis() {
+    let program =
+        json!({"version":1,"body":[{"kind":"return","value":{"kind":"string","value":"safe"}}]});
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(serde_json::to_string(&program).unwrap()),
+            final_response("synthesized"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider)
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(request(&[]), RunStrategy::Programmatic)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let records = events.events();
+    let lifecycle = records
+        .iter()
+        .filter_map(|record| match record.event {
+            RunEvent::ProgramLifecycle { attempt, outcome } => Some((attempt, outcome)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle,
+        vec![
+            (1, ProgramLifecycleOutcome::Started),
+            (1, ProgramLifecycleOutcome::Validated),
+            (1, ProgramLifecycleOutcome::Succeeded),
+        ]
+    );
+    let vm_completed = records
+        .iter()
+        .position(|record| matches!(record.event, RunEvent::ProgramExecutionCompleted { .. }))
+        .unwrap();
+    let succeeded = records
+        .iter()
+        .position(|record| {
+            matches!(
+                record.event,
+                RunEvent::ProgramLifecycle {
+                    outcome: ProgramLifecycleOutcome::Succeeded,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(vm_completed < succeeded);
+}
+
+#[tokio::test]
+async fn synthesis_failure_emits_only_the_program_failure_terminal_lifecycle() {
+    let program =
+        json!({"version":1,"body":[{"kind":"return","value":{"kind":"string","value":"safe"}}]});
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(serde_json::to_string(&program).unwrap()),
+            final_response("   "),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider)
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(request(&[]), RunStrategy::Programmatic)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    let records = events.events();
+    let lifecycle = records
+        .iter()
+        .filter_map(|record| match record.event {
+            RunEvent::ProgramLifecycle { attempt, outcome } => Some((attempt, outcome)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle,
+        vec![
+            (1, ProgramLifecycleOutcome::Started),
+            (1, ProgramLifecycleOutcome::Validated),
+            (1, ProgramLifecycleOutcome::Failed),
+        ]
+    );
+    assert!(records
+        .iter()
+        .any(|record| matches!(record.event, RunEvent::ProgramExecutionCompleted { .. })));
 }
 
 #[tokio::test]
