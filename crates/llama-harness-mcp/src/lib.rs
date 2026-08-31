@@ -232,6 +232,9 @@ pub enum McpError {
     /// A catalog is unavailable, expired, invalidated, or already closed.
     #[error("MCP catalog unavailable")]
     CatalogUnavailable,
+    /// Shutdown cleanup is still owned by an in-progress drain worker.
+    #[error("MCP shutdown cleanup pending")]
+    CleanupPending,
     /// The configured clock was non-monotonic or overflowed a deadline.
     #[error("MCP catalog clock failure")]
     Clock,
@@ -400,6 +403,8 @@ pub struct McpObserverHealth {
 pub struct McpShutdownHealth {
     /// Contexts retained for a later independent shutdown retry.
     pub pending_contexts: u64,
+    /// Contexts owned by deferred drain workers.
+    pub in_progress_contexts: u64,
     /// Bounded close attempts that did not complete.
     pub close_failures: u64,
 }
@@ -487,6 +492,7 @@ struct CatalogState {
     next_generation: u64,
     retired_contexts: Vec<McpContext>,
     close_failures: u64,
+    draining_contexts: u64,
 }
 
 type McpIdDeriver = dyn Fn(&str, &str) -> String + Send + Sync;
@@ -501,6 +507,7 @@ impl Default for CatalogState {
             next_generation: 1,
             retired_contexts: Vec::new(),
             close_failures: 0,
+            draining_contexts: 0,
         }
     }
 }
@@ -834,7 +841,7 @@ impl McpCatalogManager {
     /// Closes the manager. The local state is closed before bounded transport shutdown.
     pub async fn close(&self, cancellation: CancellationToken) -> Result<(), McpError> {
         let _close = self.close_lock.lock().await;
-        let contexts = {
+        let (contexts, draining) = {
             let mut state = self
                 .state
                 .lock()
@@ -846,9 +853,13 @@ impl McpCatalogManager {
                     state.retired_contexts.push(snapshot.context.clone());
                 }
             }
-            std::mem::take(&mut state.retired_contexts)
+            (
+                std::mem::take(&mut state.retired_contexts),
+                state.draining_contexts,
+            )
         };
         let started = Instant::now();
+        let had_no_retryable_contexts = contexts.is_empty();
         let mut failed = false;
         for context in contexts {
             if tokio::time::timeout(self.timeouts.close, wait_for_drain(&self.in_flight))
@@ -863,7 +874,9 @@ impl McpCatalogManager {
                 failed = true;
             }
         }
-        let result = if failed {
+        let result = if draining > 0 && had_no_retryable_contexts {
+            Err(McpError::CleanupPending)
+        } else if failed {
             Err(McpError::Transport(McpTransportError {
                 operation: McpOperation::Close,
                 dispatch: McpDispatchState::PossiblyDispatched,
@@ -899,10 +912,12 @@ impl McpCatalogManager {
         self.state.lock().map_or_else(
             |_| McpShutdownHealth {
                 pending_contexts: u64::MAX,
+                in_progress_contexts: u64::MAX,
                 close_failures: u64::MAX,
             },
             |state| McpShutdownHealth {
                 pending_contexts: u64::try_from(state.retired_contexts.len()).unwrap_or(u64::MAX),
+                in_progress_contexts: state.draining_contexts,
                 close_failures: state.close_failures,
             },
         )
@@ -960,6 +975,9 @@ impl McpCatalogManager {
         let timeout = self.timeouts.close;
         let observer = Arc::clone(&self.observer);
         let state = Arc::clone(&self.state);
+        if let Ok(mut state) = state.lock() {
+            state.draining_contexts = state.draining_contexts.saturating_add(1);
+        }
         tokio::spawn(async move {
             wait_for_drain(&calls).await;
             let started = Instant::now();
@@ -970,8 +988,9 @@ impl McpCatalogManager {
                 timeout,
             )
             .await;
-            if result.is_err() {
-                if let Ok(mut state) = state.lock() {
+            if let Ok(mut state) = state.lock() {
+                state.draining_contexts = state.draining_contexts.saturating_sub(1);
+                if result.is_err() {
                     state.retired_contexts.push(context);
                     state.close_failures = state.close_failures.saturating_add(1);
                 }
@@ -1269,9 +1288,10 @@ fn elapsed_ms(started: Instant) -> u64 {
 fn outcome_for_error(error: &McpError) -> McpLifecycleOutcome {
     match error {
         McpError::Transport(McpTransportError { .. }) => McpLifecycleOutcome::Failed,
-        McpError::CatalogUnavailable | McpError::Clock | McpError::InvalidCatalog(_) => {
-            McpLifecycleOutcome::Rejected
-        }
+        McpError::CatalogUnavailable
+        | McpError::CleanupPending
+        | McpError::Clock
+        | McpError::InvalidCatalog(_) => McpLifecycleOutcome::Rejected,
         McpError::Core(_) => McpLifecycleOutcome::Failed,
     }
 }
@@ -1280,6 +1300,7 @@ fn dispatch_for_error(error: &McpError) -> McpDispatchState {
     match error {
         McpError::Transport(error) => error.dispatch,
         McpError::CatalogUnavailable
+        | McpError::CleanupPending
         | McpError::Clock
         | McpError::InvalidCatalog(_)
         | McpError::Core(_) => McpDispatchState::NotDispatched,
@@ -2226,7 +2247,7 @@ mod tests {
         let clock = Arc::new(FakeClock::default());
         let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
         transport.hang_call.store(true, Ordering::Relaxed);
-        let manager = McpCatalogManager::with_configuration(
+        let mut manager = McpCatalogManager::with_configuration(
             transport.clone(),
             "server",
             McpLimits::default(),
@@ -2256,6 +2277,13 @@ mod tests {
             Err(McpError::Transport(_))
         ));
         assert_eq!(transport.closes.load(Ordering::Relaxed), 0);
+        assert_eq!(manager.shutdown_health().in_progress_contexts, 1);
+        assert!(matches!(
+            manager.close(CancellationToken::new()).await,
+            Err(McpError::CleanupPending)
+        ));
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 0);
+        manager.timeouts.close = Duration::from_millis(50);
         call_cancellation.cancel();
         assert!(matches!(
             task.await.expect("call task"),
@@ -2269,6 +2297,8 @@ mod tests {
         .await
         .expect("deferred close after drain");
         assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+        assert_eq!(manager.shutdown_health().in_progress_contexts, 0);
+        assert_eq!(manager.shutdown_health().pending_contexts, 0);
     }
 
     #[tokio::test]
