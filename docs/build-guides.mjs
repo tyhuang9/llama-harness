@@ -13,6 +13,7 @@ export const MAX_INLINE_DEPTH = 16;
 
 export const GUIDES = {
   "architecture.md": "architecture.html",
+  "adaptive-tool-calling.md": "adaptive-tool-calling.html",
   "developer-console.md": "developer-console.html",
   "distribution.md": "distribution.html",
   "embedding.md": "embedding.html",

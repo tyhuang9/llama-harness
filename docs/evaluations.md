@@ -63,6 +63,34 @@ let report = llama_harness::evals::evaluate_suite(
 
 Each call receives an owned fixture clone. Applications should create fresh sandbox state from it, register only the tools allowed for the case, run the real `AgentRunner`, return a final state snapshot, and clean up their sandbox. The standalone `llama-harness eval run` command validates input but deliberately returns a clear error until an embedding application or example adapter is configured; it never fabricates application-owned tools.
 
+## Forced strategy matrix
+
+Run Programmatic only as an explicitly forced strategy with the facade feature,
+host `ProgrammaticHostConfig`, and a provider that advertises strict AST V1
+conformance, nonzero program bytes, and at least two model calls. Keep the
+existing Direct and Adaptive baselines in the same suite; Adaptive must never
+select Programmatic.
+
+| Forced case | Required observation |
+| --- | --- |
+| Direct baseline | Completes through the existing sequential broker path. |
+| Adaptive baseline | Selects only Direct or declarative planning; never Programmatic. |
+| Programmatic, conforming provider | Records forced Programmatic selection, bounded lifecycle metadata, broker-audited calls, and a final result. |
+| Missing host feature/configuration or false/zero provider capability | Fails closed before a program tool call; it is not a Direct fallback. |
+| First invalid program, corrected program valid | Uses at most one pre-dispatch repair and records the repair lifecycle. |
+| Invalid program after the one repair, no dispatched effect | Starts a fresh Direct-scope sequential fallback and records `invalid_program`; do not count it as Programmatic success. |
+| Any failure after dispatch, including cancellation, deadline, invalid output, or resource limit | Ends terminally with the effect uncertain; no repair, restart, replay, fallback, or speculation. |
+| Read-only parallel-safe fan-out | Preserves source order, validates and reserves the entire bounded batch before dispatch, and respects the effective cap of eight. |
+| Mutation in fan-out or mixed read/write batch | Rejects the batch before dispatch; state-changing calls remain serial. |
+
+For every Programmatic case, assert the existing tool-sequence, exact canonical
+argument, policy/approval, cancellation, limit, and final-state expectations.
+Add privacy canaries that prove lifecycle events, SQLite export, errors, and
+debug formatting omit program source, AST, bytecode, constants, locals,
+arguments, and tool results. Evaluation artifacts retain only the explicit
+fixture, normalized outcome, and permitted trace reference; they never recover
+raw program payloads or hidden reasoning.
+
 Reports are serializable normalized JSON. Browse a saved report locally with:
 
 ```bash

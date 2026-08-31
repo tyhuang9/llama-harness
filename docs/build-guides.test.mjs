@@ -182,6 +182,8 @@ test("release guide preserves executable Cargo publication commands", () => {
     .filter((line) => line.startsWith("cargo publish "));
 
   assert.deepEqual(publishCommands, [
+    "cargo publish --locked --dry-run --package llama-harness-programmatic-sandbox",
+    "cargo publish --locked --package llama-harness-programmatic-sandbox",
     "cargo publish --locked --dry-run --package llama-harness-core",
     "cargo publish --locked --package llama-harness-core",
     "cargo publish --locked --dry-run --package llama-harness-ollama",

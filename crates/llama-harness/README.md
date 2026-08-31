@@ -29,6 +29,7 @@ llama-harness = { version = "0.1.0", features = ["ollama", "observability"] }
 | `observability` | `llama_harness::observability` | Redacted local SQLite event storage |
 | `evals` | `llama_harness::evals` | Deterministic evaluation and replay contracts |
 | `tauri` | `llama_harness::tauri` | Tauri event, approval, cancellation, and path helpers |
+| `programmatic` | `llama_harness::programmatic` | Explicitly opted-in deterministic program sandbox contracts |
 
 ## Run with Ollama
 
@@ -120,6 +121,11 @@ let _tool = ReadStatus(
 - Cancellation and deadlines prevent future harness work but cannot undo an
   external side effect that a tool has already started. Mutation tools should
   be idempotent or use application-level idempotency keys.
+- `programmatic` is disabled by default. It requires the facade feature, an
+  explicit `ProgrammaticHostConfig` on the runner, and a conforming provider;
+  `Adaptive` never selects it. The sandbox has no ambient authority, but it is
+  same-process code and every yielded tool request still goes through the core
+  broker, policy, approval, and effect-ledger gates.
 - The harness exposes no universal shell, filesystem, database, or network tool.
 
 See the [embedding guide](https://github.com/tyhuang9/llama-harness/blob/main/docs/embedding.md)

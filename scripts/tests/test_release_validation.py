@@ -297,6 +297,7 @@ class InputAndAbiTests(unittest.TestCase):
             "llama-harness-evals",
             "llama-harness-observability",
             "llama-harness-ollama",
+            "llama-harness-programmatic-sandbox",
             "llama-harness-tauri",
         ):
             self.assertIn(f'"{crate}"', preflight)
@@ -377,7 +378,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                 self.assertIn(command, workflow)
 
         documented_crates = set(
-            re.findall(r"--package (llama-harness(?:-[a-z]+)?)", workflow)
+            re.findall(r"--package (llama-harness(?:-[a-z]+)*)", workflow)
         )
         self.assertEqual(
             documented_crates,
@@ -386,6 +387,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                 "llama-harness-ollama",
                 "llama-harness-observability",
                 "llama-harness-evals",
+                "llama-harness-programmatic-sandbox",
                 "llama-harness-tauri",
                 "llama-harness",
             },
@@ -420,7 +422,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
             re.DOTALL,
         )
         self.assertIsNotNone(crate_block)
-        crates = set(re.findall(r'"(llama-harness(?:-[a-z]+)?)"', crate_block.group(1)))
+        crates = set(re.findall(r'"(llama-harness(?:-[a-z]+)*)"', crate_block.group(1)))
         self.assertEqual(
             crates,
             {
@@ -428,6 +430,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                 "llama-harness-ollama",
                 "llama-harness-observability",
                 "llama-harness-evals",
+                "llama-harness-programmatic-sandbox",
                 "llama-harness-tauri",
                 "llama-harness",
             },
@@ -460,7 +463,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                     .replace("publish = false\n", ""),
                     encoding="utf-8",
                 ),
-                "Expected exactly the six supported crates.io packages",
+                "Expected exactly the seven supported crates.io packages",
             ),
             (
                 "MSRV mismatch",

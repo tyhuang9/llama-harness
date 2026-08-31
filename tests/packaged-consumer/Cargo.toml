@@ -13,6 +13,7 @@ ollama = ["llama-harness/ollama"]
 observability = ["llama-harness/observability"]
 evals = ["llama-harness/evals"]
 tauri = ["llama-harness/tauri"]
+programmatic = ["llama-harness/programmatic"]
 
 [dependencies]
 llama-harness = "=0.1.0"

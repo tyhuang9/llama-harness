@@ -2,8 +2,8 @@
 
 Rust users depend on the `llama-harness` facade and explicitly enable only the
 features they need. The facade's core exports are always available; `ollama`,
-`observability`, `evals`, and `tauri` are optional named modules. These six Rust-facing crates
-are the 0.1 publication set. The CLI, protocol/runtime sidecar, Promptfoo
+`observability`, `evals`, `tauri`, and `programmatic` are optional named
+modules. These seven Rust-facing crates are the 0.1 publication set. The CLI, protocol/runtime sidecar, Promptfoo
 adapter, examples, console, and scripted test sidecar are not published.
 
 The Rust release requires Rust 1.88 and is validated independently of the

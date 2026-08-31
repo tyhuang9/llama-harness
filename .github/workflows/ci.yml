@@ -23,12 +23,12 @@ jobs:
       - name: Reject Tauri from the portable facade dependency graph
         shell: pwsh
         run: |
-          $tree = cargo tree --locked --package llama-harness --no-default-features --features "ollama,observability,evals"
+          $tree = cargo tree --locked --package llama-harness --no-default-features --features "ollama,observability,evals,programmatic"
           if ($tree -match '(?m)(llama-harness-tauri|tauri) v') {
             throw "The portable facade dependency graph unexpectedly contains Tauri."
           }
       - name: Test the portable facade and integrations
-        run: cargo test --locked --package llama-harness --no-default-features --features ollama,observability,evals
+        run: cargo test --locked --package llama-harness --no-default-features --features ollama,observability,evals,programmatic
 
   rust-full-platform:
     name: Full workspace / stable / ${{ matrix.os }}
@@ -114,6 +114,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings -D rustdoc::broken_intra_doc_links -D missing_docs
         run: >-
           cargo doc --locked --no-deps --all-features
+          --package llama-harness-programmatic-sandbox
           --package llama-harness-core
           --package llama-harness-ollama
           --package llama-harness-observability
@@ -150,7 +151,7 @@ jobs:
       - name: Install pinned cargo-semver-checks after the initial release
         if: steps.baseline_tag.outputs.exists == 'true'
         run: cargo install cargo-semver-checks --version 0.49.0 --locked
-      - name: Check the six recorded public APIs after the initial release
+      - name: Check the seven recorded public APIs after the initial release
         if: steps.baseline_tag.outputs.exists == 'true'
         shell: pwsh
         run: scripts/semver/check-rust-semver.ps1

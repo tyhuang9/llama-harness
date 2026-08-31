@@ -13,7 +13,7 @@ const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 256;
-const FACADE_FEATURES: &[&str] = &["ollama", "observability", "evals", "tauri"];
+const FACADE_FEATURES: &[&str] = &["ollama", "observability", "evals", "tauri", "programmatic"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PublishableCrate {
@@ -21,6 +21,9 @@ struct PublishableCrate {
 }
 
 const PUBLISHABLE_CRATES: &[PublishableCrate] = &[
+    PublishableCrate {
+        name: "llama-harness-programmatic-sandbox",
+    },
     PublishableCrate {
         name: "llama-harness-core",
     },
@@ -529,7 +532,7 @@ fn manifest_with_patches(
         );
     }
     if extracted_packages.len() != PUBLISHABLE_CRATES.len() {
-        return Err("cannot generate patches without all six extracted crates".into());
+        return Err("cannot generate patches without all seven extracted crates".into());
     }
 
     let mut patched = manifest.trim_end().to_owned();
@@ -754,18 +757,23 @@ mod tests {
 
     #[test]
     fn publishable_set_is_exact_and_unique() {
-        assert_eq!(PUBLISHABLE_CRATES.len(), 6);
+        assert_eq!(PUBLISHABLE_CRATES.len(), 7);
         let names = PUBLISHABLE_CRATES
             .iter()
             .map(|package| package.name)
             .collect::<HashSet<_>>();
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7);
         assert!(names.contains("llama-harness"));
         assert!(names.contains("llama-harness-core"));
-        assert_eq!(PUBLISHABLE_CRATES[0].name, "llama-harness-core");
-        assert_eq!(PUBLISHABLE_CRATES[3].name, "llama-harness-tauri");
-        assert_eq!(PUBLISHABLE_CRATES[4].name, "llama-harness-evals");
-        assert_eq!(PUBLISHABLE_CRATES[5].name, "llama-harness");
+        assert!(names.contains("llama-harness-programmatic-sandbox"));
+        assert_eq!(
+            PUBLISHABLE_CRATES[0].name,
+            "llama-harness-programmatic-sandbox"
+        );
+        assert_eq!(PUBLISHABLE_CRATES[1].name, "llama-harness-core");
+        assert_eq!(PUBLISHABLE_CRATES[4].name, "llama-harness-tauri");
+        assert_eq!(PUBLISHABLE_CRATES[5].name, "llama-harness-evals");
+        assert_eq!(PUBLISHABLE_CRATES[6].name, "llama-harness");
     }
 
     #[test]
@@ -779,7 +787,7 @@ mod tests {
                 .iter()
                 .filter(|argument| *argument == "--package")
                 .count(),
-            6
+            7
         );
         assert!(!arguments.iter().any(|argument| argument == "--workspace"));
         assert!(!arguments.iter().any(|argument| argument == "--all"));
@@ -818,7 +826,7 @@ mod tests {
             .collect::<Vec<_>>();
         let manifest = manifest_with_patches("[package]\nname = \"consumer\"\n", &packages)
             .expect("patch generation should succeed");
-        assert_eq!(manifest.matches(" = { path = ").count(), 6);
+        assert_eq!(manifest.matches(" = { path = ").count(), 7);
         assert!(manifest.contains("[patch.crates-io]"));
         assert!(manifest.contains("llama-harness = { path = \"/tmp/llama-harness\" }"));
     }

@@ -2,13 +2,57 @@
 
 `AgentRunner::run` uses `RunStrategy::Adaptive`. Hosts can use
 `run_with_strategy` to force `Direct` or `DeclarativePlan` for evaluation and
-debugging. `Programmatic` is reserved for the separately sandboxed runtime and
-fails closed in core.
+debugging. `Programmatic` is separately sandboxed, forced-only, and unavailable
+unless the facade/core feature and explicit host configuration are both present.
 
 Adaptive planning is capability gated. A provider must advertise structured
 plan support and sufficient plan, catalog, and model-call limits. Otherwise the
 run emits fallback metadata and uses the existing direct reactive loop. A
 forced declarative run never silently changes its selected strategy.
+
+## Programmatic tool calling
+
+Programmatic execution is an explicit same-process opt-in, not an Adaptive
+candidate. Compile the `programmatic` facade feature, configure
+`AgentRunnerBuilder::programmatic(ProgrammaticHostConfig { .. })`, and force
+`RunStrategy::Programmatic` only in a controlled rollout or evaluation. Omitting
+either the feature or builder configuration disables new programmatic runs;
+`Adaptive` continues to select only its existing Direct or declarative paths.
+
+The provider must advertise tool support, `StrictJsonAstV1` programmatic
+conformance, a nonzero `max_program_bytes` capability, and at least two model
+calls. A missing, false, or zero capability fails closed before any program
+tool call; it is not silently treated as Direct. The sandbox receives a strict
+versioned AST and privately verified bytecode, has no ambient filesystem,
+network, process, provider, registry, policy, or tool capability, and only
+yields inert owned-data batches back to the host.
+
+The host still owns the complete authority boundary. Every yielded call uses
+the same broker as Direct and declarative execution, including frozen caller
+and tool scope, canonical arguments, schema validation, policy, approval,
+effect ledger, deadlines, cancellation, transcript limits, and audited events.
+The effective bound for each resource is the minimum applicable library hard
+cap, host sandbox setting, Agent limit, and provider capability. Program runs
+require a finite deadline and VM admission; read-only, parallel-safe fan-out is
+bounded at eight and additionally limited by the host, provider, Agent, and
+broker caps. Mutations are always serialized.
+
+One correction prompt is permitted only before an effect is dispatched. If the
+corrected program is still invalid and no effect was issued, the runner starts
+a fresh Direct-scope sequential fallback and records the `invalid_program`
+fallback metadata; a forced run therefore never claims that Programmatic
+succeeded. Cancellation, deadline, resource, invalid-output, tool, resume, or
+result failures after dispatch leave the effect uncertain and terminal. They
+never repair, restart, replay, speculate, or fall back.
+
+To roll out safely, leave the feature disabled by default, gate the builder
+configuration in the host deployment, and force Programmatic only in an
+evaluation matrix with conforming providers. Removing that configuration or
+feature stops future programmatic runs, but cannot undo an external effect
+already dispatched; rely on application-level idempotency and the broker's
+uncertain-effect boundary for recovery. Program lifecycle telemetry and SQLite
+kind hooks are metadata-only; source, AST, bytecode, constants, local values,
+arguments, results, raw errors, and model identifiers are not recorded there.
 
 ## Broker safety boundary
 

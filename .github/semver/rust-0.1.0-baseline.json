@@ -3,6 +3,7 @@
   "baseline_tag": "v0.1.0",
   "crates": [
     "llama-harness-core",
+    "llama-harness-programmatic-sandbox",
     "llama-harness-ollama",
     "llama-harness-observability",
     "llama-harness-evals",

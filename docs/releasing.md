@@ -4,13 +4,14 @@ No package or release artifact is published by this repository's normal CI check
 
 ## Rust crates.io runbook
 
-This section is the manual runbook for the six Rust crates. It is independent
+This section is the manual runbook for the seven Rust crates. It is independent
 of the deferred sidecar/SDK artifact workflow below. Do not combine their
 authorizations or assume that a successful SDK validation publishes a crate.
 
 The initial Rust release uses the unified `0.1.0` version:
-`llama-harness-core`, `llama-harness-ollama`, `llama-harness-observability`,
-`llama-harness-tauri`, `llama-harness-evals`, and the `llama-harness` facade.
+`llama-harness-programmatic-sandbox`, `llama-harness-core`,
+`llama-harness-ollama`, `llama-harness-observability`, `llama-harness-tauri`,
+`llama-harness-evals`, and the `llama-harness` facade.
 Protocol/runtime, SDKs, Promptfoo integration, scripted runtime, examples,
 developer console, CLI, and release helper are not published in this milestone.
 
@@ -19,7 +20,7 @@ developer console, CLI, and release helper are not published in this milestone.
 Before publishing, record the exact reviewed commit on clean `main` as
 `SOURCE_COMMIT`. The worktree must have no unreviewed or uncommitted changes,
 and the requested version must match the workspace/package metadata and the
-changelog or prepared release notes. For `0.1.0`, recheck all six crate names
+changelog or prepared release notes. For `0.1.0`, recheck all seven crate names
 on crates.io immediately before the first publish; a name conflict or an
 existing `0.1.0` means stop and choose a forward version rather than trying to
 overwrite it.
@@ -39,9 +40,9 @@ pwsh -File scripts/release/check-rust-release.ps1 -Version 0.1.0 -SourceCommit $
 cargo run --locked -p xtask -- release-check
 ```
 
-The preflight validates the exact six-crate set, unified version, Rust 1.88
+The preflight validates the exact seven-crate set, unified version, Rust 1.88
 MSRV, nonempty changelog entry, clean worktree, and source commit. The helper
-runs formatting, linting, tests, and Rust documentation, creates all six
+runs formatting, linting, tests, and Rust documentation, creates all seven
 `.crate` archives, rejects unexpected, unsafe, or oversized archive contents,
 and checks extracted packages with the supported facade feature configurations.
 
@@ -77,6 +78,25 @@ completely validate the first layer: unpublished first-party dependencies are
 not yet resolvable from crates.io. Registry-dependent dry-runs begin only after
 the preceding layer is available in the crates.io index.
 
+### Programmatic sandbox package audit
+
+`llama-harness-programmatic-sandbox` is a separately published `no_std` plus
+`alloc` library, not an operating-system process sandbox. Its public boundary
+accepts only the versioned AST; verified bytecode remains private. The crate
+has `#![forbid(unsafe_code)]`, no `build.rs`, no build dependencies, and normal
+dependencies limited to `serde` and `serde_json` with their default features
+disabled. The release helper rejects unexpected archive paths and compiles the
+extracted standalone consumer. Recheck the package boundary before publishing:
+
+```powershell
+cargo check --locked --package llama-harness-programmatic-sandbox --no-default-features
+cargo tree --locked --package llama-harness-programmatic-sandbox --no-default-features --edges normal
+cargo package --locked --list --package llama-harness-programmatic-sandbox
+```
+
+Do not describe this crate as providing filesystem, network, process, or tool
+authority. The same-process host remains the only broker and policy authority.
+
 ### Publication and registry checks
 
 Publish manually in the following exact dependency order. A layer is complete only when
@@ -92,16 +112,27 @@ and confirm it still reports `SOURCE_COMMIT`:
 pwsh -File scripts/release/check-rust-release.ps1 -Version 0.1.0 -SourceCommit $SOURCE_COMMIT
 ```
 
-#### 1. Core
+#### 1. Programmatic sandbox
 
-Dry-run and publish `llama-harness-core`:
+Dry-run and publish `llama-harness-programmatic-sandbox`:
+
+```powershell
+cargo publish --locked --dry-run --package llama-harness-programmatic-sandbox
+cargo publish --locked --package llama-harness-programmatic-sandbox
+```
+
+#### 2. Core
+
+Wait for `llama-harness-programmatic-sandbox = 0.1.0` to appear in the index,
+build a fresh exact-version consumer, then dry-run and publish
+`llama-harness-core`:
 
 ```powershell
 cargo publish --locked --dry-run --package llama-harness-core
 cargo publish --locked --package llama-harness-core
 ```
 
-#### 2. Direct core integrations
+#### 3. Direct core integrations
 
 Wait for `llama-harness-core = 0.1.0` to appear in the index, create a new
 temporary consumer with `llama-harness-core = "=0.1.0"`, and build it. Then
@@ -116,7 +147,7 @@ cargo publish --locked --package llama-harness-observability
 cargo publish --locked --package llama-harness-tauri
 ```
 
-#### 3. Evaluations
+#### 4. Evaluations
 
 Wait for all three integration versions to be index-visible, build fresh
 exact-version consumers for each newly available crate, then dry-run and
@@ -127,7 +158,7 @@ cargo publish --locked --dry-run --package llama-harness-evals
 cargo publish --locked --package llama-harness-evals
 ```
 
-#### 4. Facade
+#### 5. Facade
 
 Wait for `llama-harness-evals = 0.1.0` to be index-visible, build a fresh
 `llama-harness-evals = "=0.1.0"` consumer, then dry-run and publish the
@@ -153,18 +184,19 @@ Create a fresh, outside-workspace consumer for every final profile. Its manifest
 must contain only `llama-harness = "=0.1.0"`; it must not contain path, Git, or
 patch overrides. Generate a new lockfile and build the default configuration,
 `--no-default-features`, each individual supported feature (`ollama`,
-`observability`, `evals`, and `tauri`), and `--all-features`.
+`observability`, `evals`, `tauri`, and `programmatic`), and `--all-features`.
 
-Verify the published `0.1.0` documentation pages for all six crates:
+Verify the published `0.1.0` documentation pages for all seven crates:
 
-1. `https://docs.rs/llama-harness-core/0.1.0`
-2. `https://docs.rs/llama-harness-ollama/0.1.0`
-3. `https://docs.rs/llama-harness-observability/0.1.0`
-4. `https://docs.rs/llama-harness-tauri/0.1.0`
-5. `https://docs.rs/llama-harness-evals/0.1.0`
-6. `https://docs.rs/llama-harness/0.1.0`
+1. `https://docs.rs/llama-harness-programmatic-sandbox/0.1.0`
+2. `https://docs.rs/llama-harness-core/0.1.0`
+3. `https://docs.rs/llama-harness-ollama/0.1.0`
+4. `https://docs.rs/llama-harness-observability/0.1.0`
+5. `https://docs.rs/llama-harness-tauri/0.1.0`
+6. `https://docs.rs/llama-harness-evals/0.1.0`
+7. `https://docs.rs/llama-harness/0.1.0`
 
-Add the approved backup crates.io login to all six crates, then verify each
+Add the approved backup crates.io login to all seven crates, then verify each
 owner list. Repeat these two commands for every crate name:
 
 ```powershell
@@ -172,7 +204,7 @@ cargo owner --add <backup-login> llama-harness-core
 cargo owner --list llama-harness-core
 ```
 
-Only after all six pages render, all six owner lists are confirmed, and the
+Only after all seven pages render, all seven owner lists are confirmed, and the
 final facade consumer passes, create the annotated `v0.1.0` tag pointing
 exactly to `SOURCE_COMMIT`, push that tag, and create the GitHub release from
 the checked-in notes:
@@ -195,7 +227,7 @@ If a layer partially releases, stop before its dependents, record which exact
 packages are visible, and diagnose from fresh consumers. Recover by publishing
 the remaining safe packages only when their exact dependency graph is still
 correct; otherwise publish a coordinated forward version. Do not tag or create
-a GitHub release until the entire six-crate set has passed the final checks.
+a GitHub release until the entire seven-crate set has passed the final checks.
 
 The rollback boundary is the registry publish: source changes, tags, and a
 GitHub release can be reverted or corrected, but a published crate cannot be
