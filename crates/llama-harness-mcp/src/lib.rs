@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn ids_are_stable_and_bounded() {
         let id = generated_id("server", "unsafe name / 1");
-        assert!(id.starts_with("mcp-server-unsafe-name-1-"));
+        assert!(id.starts_with("mcp-server-unsafename1-"));
         assert!(id.len() < 100);
     }
     #[test]
