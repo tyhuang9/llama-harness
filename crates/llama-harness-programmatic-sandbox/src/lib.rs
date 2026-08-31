@@ -12,12 +12,18 @@
 extern crate alloc;
 
 mod ast;
+mod compiler;
 mod error;
 mod limits;
 mod parser;
+mod vm;
 
 pub use ast::{
     BinaryOperator, Expression, ObjectEntry, Program, Statement, UnaryOperator, PROGRAM_VERSION_V1,
 };
+pub use compiler::VerifiedProgram;
 pub use error::{SandboxError, SandboxErrorCode};
 pub use limits::{SandboxLimits, HARD_LIMITS};
+pub use vm::{
+    Execution, ExecutionId, ResumeToken, StepOutcome, ToolBatch, ToolRequest, ToolResponse,
+};

@@ -1,4 +1,8 @@
-use crate::{parser::parse_program, SandboxError, SandboxLimits};
+use crate::{
+    compiler::{compile_program, VerifiedProgram},
+    parser::parse_program,
+    SandboxError, SandboxLimits,
+};
 use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +23,13 @@ impl Program {
     /// Parses and structurally bounds an untrusted UTF-8 JSON program.
     pub fn from_json(input: &[u8], limits: &SandboxLimits) -> Result<Self, SandboxError> {
         parse_program(input, limits)
+    }
+
+    /// Compiles and verifies this syntax tree into an opaque executable program.
+    ///
+    /// The private bytecode cannot be serialized or constructed by callers.
+    pub fn compile(self, limits: &SandboxLimits) -> Result<VerifiedProgram, SandboxError> {
+        compile_program(self, limits)
     }
 }
 

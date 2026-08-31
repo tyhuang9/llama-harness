@@ -197,11 +197,11 @@ fn validate_ast(program: &Program, limits: &SandboxLimits) -> Result<(), Sandbox
                         stack.push(Node::Expression(value, depth + 1));
                     }
                     Expression::Array { items } => {
-                        validate_bound(items.len(), limits.max_collection_items, "collection")?;
+                        validate_count(items.len(), limits.max_collection_items, "collection")?;
                         push_expressions(&mut stack, items, depth + 1)?;
                     }
                     Expression::Object { entries } => {
-                        validate_bound(entries.len(), limits.max_collection_items, "collection")?;
+                        validate_count(entries.len(), limits.max_collection_items, "collection")?;
                         let mut keys = BTreeSet::new();
                         for ObjectEntry { key, value } in entries.iter().rev() {
                             if key.is_empty() || key.len() > 256 {
@@ -321,6 +321,15 @@ fn validate_bound(value: usize, max: usize, label: &str) -> Result<(), SandboxEr
     Ok(())
 }
 
+fn validate_count(value: usize, max: usize, label: &str) -> Result<(), SandboxError> {
+    if value > max {
+        return Err(resource(alloc::format!(
+            "{label} size exceeds the effective limit"
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_depth(depth: usize, limits: &SandboxLimits) -> Result<(), SandboxError> {
     if depth > limits.max_nesting {
         return Err(resource("language nesting limit exceeded"));
@@ -390,11 +399,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_nested_duplicates_trailing_data_and_unbalanced_json() {
+        let limits = SandboxLimits::default();
+        for raw in [
+            br#"{"version":1,"body":[{"kind":"return","value":{"kind":"integer","value":1,"value":2}}]}"#.as_slice(),
+            br#"{"version":1,"body":[]} true"#.as_slice(),
+            br#"{"version":1,"body":[{"kind":"return","value":{"kind":"null"}}]"#.as_slice(),
+        ] {
+            assert_eq!(
+                Program::from_json(raw, &limits).unwrap_err().code(),
+                SandboxErrorCode::InvalidProgram
+            );
+        }
+    }
+
+    #[test]
     fn rejects_invalid_version_utf8_depth_and_size() {
         assert!(parse(json!({"version":2,"body":[]})).is_err());
         assert!(Program::from_json(&[0xff], &SandboxLimits::default()).is_err());
-        let mut limits = SandboxLimits::default();
-        limits.max_nesting = 2;
+        let mut limits = SandboxLimits {
+            max_nesting: 2,
+            ..SandboxLimits::default()
+        };
         assert!(Program::from_json(br#"{"version":1,"body":[[]]}"#, &limits).is_err());
         limits = SandboxLimits::default();
         limits.max_program_bytes = 8;
@@ -421,8 +447,10 @@ mod tests {
 
     #[test]
     fn limit_validation_is_fail_closed() {
-        let mut limits = SandboxLimits::default();
-        limits.max_fuel = 0;
+        let mut limits = SandboxLimits {
+            max_fuel: 0,
+            ..SandboxLimits::default()
+        };
         assert_eq!(
             limits.validate().unwrap_err().code(),
             SandboxErrorCode::InvalidLimits
