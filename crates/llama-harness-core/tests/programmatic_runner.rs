@@ -1683,7 +1683,7 @@ async fn two_call_programmatic_budget_skips_repair_and_preserves_direct_fallback
                 reactive_model_calls,
                 ..
             } => Some((
-                strategy.clone(),
+                *strategy,
                 *model_calls,
                 *planning_model_calls,
                 *repair_model_calls,
@@ -1764,7 +1764,7 @@ async fn three_call_programmatic_budget_allows_repair_and_reserves_final_synthes
                 reactive_model_calls,
                 ..
             } => Some((
-                strategy.clone(),
+                *strategy,
                 *model_calls,
                 *planning_model_calls,
                 *repair_model_calls,
