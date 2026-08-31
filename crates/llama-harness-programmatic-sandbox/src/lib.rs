@@ -13,6 +13,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod accounting;
 mod ast;
 mod compiler;
 mod error;

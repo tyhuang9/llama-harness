@@ -1,6 +1,8 @@
 use crate::{
+    accounting::{key_retained_bytes, measure_value, string_retained_bytes},
+    parser::validate_ast,
     BinaryOperator, Expression, Program, SandboxError, SandboxErrorCode, SandboxLimits, Statement,
-    UnaryOperator, PROGRAM_VERSION_V1,
+    UnaryOperator,
 };
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -119,9 +121,7 @@ pub(crate) fn compile_program(
     limits: &SandboxLimits,
 ) -> Result<VerifiedProgram, SandboxError> {
     limits.validate()?;
-    if program.version != PROGRAM_VERSION_V1 {
-        return Err(verify("unsupported program version"));
-    }
+    validate_ast(&program, limits)?;
     let mut compiler = Compiler {
         code: Vec::new(),
         next_slot: 0,
@@ -485,12 +485,17 @@ impl Compiler {
 
 fn instruction_slots(instruction: &Instruction) -> Vec<usize> {
     match instruction {
-        Instruction::Let { slot, .. }
-        | Instruction::Map { slot, .. }
-        | Instruction::Filter { slot, .. }
-        | Instruction::Invoke { slot, .. }
-        | Instruction::FanOut { slot, .. } => vec![*slot],
+        Instruction::Let { slot, .. } | Instruction::Invoke { slot, .. } => vec![*slot],
         Instruction::LoopStart { item_slot, .. } => vec![*item_slot],
+        Instruction::Map {
+            slot, item_slot, ..
+        }
+        | Instruction::Filter {
+            slot, item_slot, ..
+        }
+        | Instruction::FanOut {
+            slot, item_slot, ..
+        } => vec![*slot, *item_slot],
         Instruction::Reduce {
             slot,
             item_slot,
@@ -531,6 +536,7 @@ fn verify_bytecode(
         expression_instructions = expression_instructions
             .checked_add(verify_instruction_expressions(
                 instruction,
+                local_count,
                 limits,
                 &mut constant_bytes,
             )?)
@@ -654,6 +660,7 @@ fn verify_bytecode(
 
 fn verify_instruction_expressions(
     instruction: &Instruction,
+    local_count: usize,
     limits: &SandboxLimits,
     constant_bytes: &mut usize,
 ) -> Result<usize, SandboxError> {
@@ -666,11 +673,17 @@ fn verify_instruction_expressions(
         for opcode in &expression.0 {
             match opcode {
                 ExprInstruction::Constant(value) => {
-                    verify_constant(value, 1, limits, constant_bytes)?;
+                    verify_constant_domain(value)?;
+                    let measurement = measure_value(value, limits)?;
+                    add_constant_bytes(constant_bytes, measurement.retained, limits)?;
                 }
                 ExprInstruction::Path(pointer) => {
                     verify_pointer(pointer)?;
-                    add_constant_bytes(constant_bytes, pointer.len(), limits)?;
+                    add_constant_bytes(
+                        constant_bytes,
+                        string_retained_bytes(pointer.capacity())?,
+                        limits,
+                    )?;
                 }
                 ExprInstruction::Array(count) if *count > limits.max_collection_items => {
                     return Err(resource("bytecode array size exceeds the effective limit"));
@@ -684,8 +697,15 @@ fn verify_instruction_expressions(
                         if key.is_empty() || key.len() > 256 || !unique.insert(key.as_str()) {
                             return Err(verify("bytecode object keys are invalid"));
                         }
-                        add_constant_bytes(constant_bytes, key.len(), limits)?;
+                        add_constant_bytes(
+                            constant_bytes,
+                            key_retained_bytes(key.capacity())?,
+                            limits,
+                        )?;
                     }
+                }
+                ExprInstruction::Load(slot) if *slot >= local_count => {
+                    return Err(verify("bytecode local load slot is invalid"));
                 }
                 ExprInstruction::Load(_)
                 | ExprInstruction::Array(_)
@@ -695,6 +715,35 @@ fn verify_instruction_expressions(
         }
     }
     Ok(total)
+}
+
+fn verify_constant_domain(value: &Value) -> Result<(), SandboxError> {
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(1)
+        .map_err(|_| resource("constant verification allocation failed"))?;
+    pending.push(value);
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Number(number) if number.as_i64().is_none() => {
+                return Err(verify("bytecode constants must be signed integers"));
+            }
+            Value::Array(values) => {
+                pending
+                    .try_reserve(values.len())
+                    .map_err(|_| resource("constant verification allocation failed"))?;
+                pending.extend(values.iter());
+            }
+            Value::Object(values) => {
+                pending
+                    .try_reserve(values.len())
+                    .map_err(|_| resource("constant verification allocation failed"))?;
+                pending.extend(values.values());
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+    Ok(())
 }
 
 fn verify_definite_local_initialization(
@@ -870,49 +919,6 @@ fn verify_instruction_loads(
         _ => {
             for expression in instruction_expressions(instruction) {
                 verify_loads(expression, available)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn verify_constant(
-    value: &Value,
-    depth: usize,
-    limits: &SandboxLimits,
-    constant_bytes: &mut usize,
-) -> Result<(), SandboxError> {
-    if depth > limits.max_nesting {
-        return Err(resource("bytecode constant nesting limit exceeded"));
-    }
-    match value {
-        Value::Null | Value::Bool(_) => Ok(()),
-        Value::Number(number) if number.as_i64().is_some() => Ok(()),
-        Value::Number(_) => Err(verify("bytecode constants must be signed integers")),
-        Value::String(value) => add_constant_bytes(constant_bytes, value.len(), limits),
-        Value::Array(values) => {
-            if values.len() > limits.max_collection_items {
-                return Err(resource(
-                    "bytecode constant array exceeds the effective limit",
-                ));
-            }
-            for value in values {
-                verify_constant(value, depth + 1, limits, constant_bytes)?;
-            }
-            Ok(())
-        }
-        Value::Object(values) => {
-            if values.len() > limits.max_collection_items {
-                return Err(resource(
-                    "bytecode constant object exceeds the effective limit",
-                ));
-            }
-            for (key, value) in values {
-                if key.is_empty() || key.len() > 256 {
-                    return Err(verify("bytecode constant object key is invalid"));
-                }
-                add_constant_bytes(constant_bytes, key.len(), limits)?;
-                verify_constant(value, depth + 1, limits, constant_bytes)?;
             }
             Ok(())
         }
@@ -1228,6 +1234,149 @@ mod tests {
                 .code(),
             SandboxErrorCode::Verification
         );
+    }
+
+    #[test]
+    fn directly_constructed_public_ast_uses_the_strict_structural_validator() {
+        let limits = SandboxLimits::default();
+        let invalid_name = Program {
+            version: 1,
+            body: vec![
+                Statement::Let {
+                    name: "not-valid!".into(),
+                    value: Expression::Null,
+                },
+                Statement::Return {
+                    value: Expression::Null,
+                },
+            ],
+        };
+        assert_eq!(
+            invalid_name.compile(&limits).unwrap_err().code(),
+            SandboxErrorCode::InvalidProgram
+        );
+
+        let duplicate_keys = Program {
+            version: 1,
+            body: vec![Statement::Return {
+                value: Expression::Object {
+                    entries: vec![
+                        crate::ObjectEntry {
+                            key: "secret".into(),
+                            value: Expression::Null,
+                        },
+                        crate::ObjectEntry {
+                            key: "secret".into(),
+                            value: Expression::Boolean { value: true },
+                        },
+                    ],
+                },
+            }],
+        };
+        let debug = alloc::format!("{duplicate_keys:?}");
+        assert!(!debug.contains("secret"));
+        assert_eq!(
+            duplicate_keys.compile(&limits).unwrap_err().code(),
+            SandboxErrorCode::InvalidProgram
+        );
+
+        let invalid_bound = Program {
+            version: 1,
+            body: vec![
+                Statement::Map {
+                    name: "mapped".into(),
+                    item: "item".into(),
+                    collection: Expression::Array { items: Vec::new() },
+                    max_items: 0,
+                    value: Expression::Variable {
+                        name: "item".into(),
+                    },
+                },
+                Statement::Return {
+                    value: Expression::Null,
+                },
+            ],
+        };
+        assert_eq!(
+            invalid_bound.compile(&limits).unwrap_err().code(),
+            SandboxErrorCode::ResourceLimit
+        );
+
+        let deep_result = std::panic::catch_unwind(|| {
+            let mut value = Expression::Null;
+            for _ in 0..10_000 {
+                value = Expression::Path {
+                    value: alloc::boxed::Box::new(value),
+                    pointer: String::new(),
+                };
+            }
+            Program {
+                version: 1,
+                body: vec![Statement::Return { value }],
+            }
+            .compile(&limits)
+        });
+        assert!(
+            deep_result.is_ok(),
+            "deep direct AST must not overflow the stack"
+        );
+        assert_eq!(
+            deep_result.unwrap().unwrap_err().code(),
+            SandboxErrorCode::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_every_out_of_range_scoped_slot_before_vm_admission() {
+        let limits = SandboxLimits::default();
+        let empty = || ExprCode(vec![ExprInstruction::Array(0)]);
+        let null = || ExprCode(vec![ExprInstruction::Constant(Value::Null)]);
+        let programs = [
+            vec![Instruction::LoopStart {
+                collection: empty(),
+                item_slot: 1,
+                max_iterations: 1,
+                end_target: 2,
+            }],
+            vec![Instruction::Map {
+                slot: 0,
+                item_slot: 1,
+                collection: empty(),
+                max_items: 1,
+                value: null(),
+            }],
+            vec![Instruction::Filter {
+                slot: 0,
+                item_slot: 1,
+                collection: empty(),
+                max_items: 1,
+                predicate: null(),
+            }],
+            vec![Instruction::FanOut {
+                slot: 0,
+                tool_id: "read".into(),
+                item_slot: 1,
+                collection: empty(),
+                max_calls: 1,
+                arguments: null(),
+                call_site: 0,
+            }],
+            vec![Instruction::Reduce {
+                slot: 0,
+                item_slot: 1,
+                accumulator_slot: 2,
+                collection: empty(),
+                max_items: 1,
+                initial: null(),
+                value: null(),
+            }],
+        ];
+        for (index, code) in programs.iter().enumerate() {
+            let local_count = if index == programs.len() - 1 { 2 } else { 1 };
+            let error = verify_bytecode(code, local_count, &limits).unwrap_err();
+            assert_eq!(error.code(), SandboxErrorCode::Verification);
+            assert_eq!(error.message(), "bytecode local slot is invalid");
+        }
     }
 
     #[test]

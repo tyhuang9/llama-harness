@@ -1,4 +1,5 @@
 use crate::{
+    accounting::{key_retained_bytes, primitive_retained_bytes, string_retained_bytes},
     Expression, ObjectEntry, Program, SandboxError, SandboxErrorCode, SandboxLimits, Statement,
     PROGRAM_VERSION_V1,
 };
@@ -13,9 +14,6 @@ pub(crate) fn parse_program(input: &[u8], limits: &SandboxLimits) -> Result<Prog
     validate_json_nesting(input, limits.max_nesting)?;
     let program: Program = serde_json::from_slice(input)
         .map_err(|_| invalid("program does not match the strict V1 JSON schema"))?;
-    if program.version != PROGRAM_VERSION_V1 {
-        return Err(invalid("unsupported program version"));
-    }
     validate_ast(&program, limits)?;
     Ok(program)
 }
@@ -67,7 +65,11 @@ enum Node<'a> {
     Expression(&'a Expression, usize),
 }
 
-fn validate_ast(program: &Program, limits: &SandboxLimits) -> Result<(), SandboxError> {
+pub(crate) fn validate_ast(program: &Program, limits: &SandboxLimits) -> Result<(), SandboxError> {
+    limits.validate()?;
+    if program.version != PROGRAM_VERSION_V1 {
+        return Err(invalid("unsupported program version"));
+    }
     let mut stack = Vec::new();
     stack
         .try_reserve(program.body.len())
@@ -196,14 +198,22 @@ fn validate_ast(program: &Program, limits: &SandboxLimits) -> Result<(), Sandbox
             Node::Expression(expression, depth) => {
                 ensure_depth(depth, limits)?;
                 match expression {
-                    Expression::Null | Expression::Boolean { .. } | Expression::Integer { .. } => {}
-                    Expression::String { value } => {
-                        add_constant(&mut constant_bytes, value.len(), limits)?
+                    Expression::Null | Expression::Boolean { .. } | Expression::Integer { .. } => {
+                        add_constant(&mut constant_bytes, primitive_retained_bytes(), limits)?;
                     }
+                    Expression::String { value } => add_constant(
+                        &mut constant_bytes,
+                        string_retained_bytes(value.capacity())?,
+                        limits,
+                    )?,
                     Expression::Variable { name } => validate_name(name)?,
                     Expression::Path { value, pointer } => {
                         validate_pointer(pointer)?;
-                        add_constant(&mut constant_bytes, pointer.len(), limits)?;
+                        add_constant(
+                            &mut constant_bytes,
+                            string_retained_bytes(pointer.capacity())?,
+                            limits,
+                        )?;
                         stack.push(Node::Expression(value, depth + 1));
                     }
                     Expression::Array { items } => {
@@ -220,7 +230,11 @@ fn validate_ast(program: &Program, limits: &SandboxLimits) -> Result<(), Sandbox
                             if !keys.insert(key.as_str()) {
                                 return Err(invalid("object keys must be unique"));
                             }
-                            add_constant(&mut constant_bytes, key.len(), limits)?;
+                            add_constant(
+                                &mut constant_bytes,
+                                key_retained_bytes(key.capacity())?,
+                                limits,
+                            )?;
                             stack.push(Node::Expression(value, depth + 1));
                         }
                     }
@@ -497,20 +511,21 @@ mod tests {
         let constant = json!({"version":1,"body":[{
             "kind":"return","value":{"kind":"string","value":"abc"}
         }]});
-        for (limit, expected) in [
-            (2, SandboxErrorCode::ResourceLimit),
-            (3, SandboxErrorCode::InvalidProgram),
-            (4, SandboxErrorCode::InvalidProgram),
+        let exact_constant_bytes = string_retained_bytes(3).unwrap();
+        for (limit, accepted) in [
+            (exact_constant_bytes - 1, false),
+            (exact_constant_bytes, true),
+            (exact_constant_bytes + 1, true),
         ] {
             let limits = SandboxLimits {
                 max_constant_bytes: limit,
                 ..SandboxLimits::default()
             };
             let parsed = Program::from_json(&serde_json::to_vec(&constant).unwrap(), &limits);
-            if limit < 3 {
-                assert_eq!(parsed.unwrap_err().code(), expected);
-            } else {
+            if accepted {
                 assert!(parsed.is_ok());
+            } else {
+                assert_eq!(parsed.unwrap_err().code(), SandboxErrorCode::ResourceLimit);
             }
         }
 

@@ -10,13 +10,23 @@ use serde::{Deserialize, Serialize};
 pub const PROGRAM_VERSION_V1: u32 = 1;
 
 /// A strictly versioned program syntax tree.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Program {
     /// Must equal [`PROGRAM_VERSION_V1`].
     pub version: u32,
     /// Statements executed in declared order.
     pub body: Vec<Statement>,
+}
+
+impl core::fmt::Debug for Program {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Program")
+            .field("version", &self.version)
+            .field("statement_count", &self.body.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Program {
@@ -34,7 +44,7 @@ impl Program {
 }
 
 /// One immutable program operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Statement {
     /// Binds one expression to a new immutable local.
@@ -139,8 +149,38 @@ pub enum Statement {
     },
 }
 
+impl core::fmt::Debug for Statement {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let kind = match self {
+            Self::Let { .. } => "let",
+            Self::Branch { .. } => "branch",
+            Self::ForEach { .. } => "for_each",
+            Self::Map { .. } => "map",
+            Self::Filter { .. } => "filter",
+            Self::Reduce { .. } => "reduce",
+            Self::Invoke { .. } => "invoke",
+            Self::FanOut { .. } => "fan_out",
+            Self::Return { .. } => "return",
+        };
+        formatter
+            .debug_struct("Statement")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Statement {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        detach_statement(self, &mut pending);
+        while let Some(mut statement) = pending.pop() {
+            detach_statement(&mut statement, &mut pending);
+        }
+    }
+}
+
 /// A deterministic expression without dynamic calls or mutable state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Expression {
     /// JSON null.
@@ -200,14 +240,141 @@ pub enum Expression {
     },
 }
 
+impl core::fmt::Debug for Expression {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let kind = match self {
+            Self::Null => "null",
+            Self::Boolean { .. } => "boolean",
+            Self::Integer { .. } => "integer",
+            Self::String { .. } => "string",
+            Self::Variable { .. } => "variable",
+            Self::Path { .. } => "path",
+            Self::Array { .. } => "array",
+            Self::Object { .. } => "object",
+            Self::Binary { .. } => "binary",
+            Self::Unary { .. } => "unary",
+        };
+        formatter
+            .debug_struct("Expression")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Expression {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        detach_expression(self, &mut pending);
+        while let Some(mut expression) = pending.pop() {
+            detach_expression(&mut expression, &mut pending);
+        }
+    }
+}
+
 /// One object-construction entry.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectEntry {
     /// Object key.
     pub key: String,
     /// Object value expression.
     pub value: Expression,
+}
+
+impl core::fmt::Debug for ObjectEntry {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ObjectEntry")
+            .field("key", &"<redacted>")
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
+fn detach_statement(statement: &mut Statement, pending: &mut Vec<Statement>) {
+    match statement {
+        Statement::Let { value, .. } | Statement::Return { value } => {
+            drop(core::mem::replace(value, Expression::Null));
+        }
+        Statement::Branch {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            drop(core::mem::replace(condition, Expression::Null));
+            pending.append(then_body);
+            pending.append(else_body);
+        }
+        Statement::ForEach {
+            collection, body, ..
+        } => {
+            drop(core::mem::replace(collection, Expression::Null));
+            pending.append(body);
+        }
+        Statement::Map {
+            collection, value, ..
+        } => {
+            drop(core::mem::replace(collection, Expression::Null));
+            drop(core::mem::replace(value, Expression::Null));
+        }
+        Statement::Filter {
+            collection,
+            predicate,
+            ..
+        } => {
+            drop(core::mem::replace(collection, Expression::Null));
+            drop(core::mem::replace(predicate, Expression::Null));
+        }
+        Statement::Reduce {
+            collection,
+            initial,
+            value,
+            ..
+        } => {
+            drop(core::mem::replace(collection, Expression::Null));
+            drop(core::mem::replace(initial, Expression::Null));
+            drop(core::mem::replace(value, Expression::Null));
+        }
+        Statement::Invoke { arguments, .. } => {
+            drop(core::mem::replace(arguments, Expression::Null));
+        }
+        Statement::FanOut {
+            collection,
+            arguments,
+            ..
+        } => {
+            drop(core::mem::replace(collection, Expression::Null));
+            drop(core::mem::replace(arguments, Expression::Null));
+        }
+    }
+}
+
+fn detach_expression(expression: &mut Expression, pending: &mut Vec<Expression>) {
+    match expression {
+        Expression::Path { value, .. } | Expression::Unary { value, .. } => {
+            let child = core::mem::replace(value, alloc::boxed::Box::new(Expression::Null));
+            pending.push(*child);
+        }
+        Expression::Array { items } => pending.append(items),
+        Expression::Object { entries } => {
+            let entries = core::mem::take(entries);
+            pending.reserve(entries.len());
+            for entry in entries {
+                pending.push(entry.value);
+            }
+        }
+        Expression::Binary { left, right, .. } => {
+            let left = core::mem::replace(left, alloc::boxed::Box::new(Expression::Null));
+            let right = core::mem::replace(right, alloc::boxed::Box::new(Expression::Null));
+            pending.push(*left);
+            pending.push(*right);
+        }
+        Expression::Null
+        | Expression::Boolean { .. }
+        | Expression::Integer { .. }
+        | Expression::String { .. }
+        | Expression::Variable { .. } => {}
+    }
 }
 
 /// Deterministic binary operators.

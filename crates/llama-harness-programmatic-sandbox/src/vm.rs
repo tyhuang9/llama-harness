@@ -1,12 +1,13 @@
 use crate::{
+    accounting::{
+        array_framing_retained_bytes, checked_add, cloned_value_allocation_bytes,
+        key_retained_bytes, measure_value, object_framing_retained_bytes, primitive_retained_bytes,
+        serialized_string_len, string_retained_bytes, vector_allocation_bytes,
+    },
     compiler::{ExprCode, ExprInstruction, Instruction, VerifiedProgram},
     BinaryOperator, SandboxError, SandboxErrorCode, UnaryOperator,
 };
-use alloc::{
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
+use alloc::{string::String, vec::Vec};
 use serde_json::{Map, Number, Value};
 
 /// Host-supplied identifier that scopes resume tokens to one live execution.
@@ -127,6 +128,7 @@ impl ToolResponse {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ResumeToken {
     execution_id: ExecutionId,
+    program_attempt: u32,
     yield_ordinal: u32,
 }
 
@@ -196,6 +198,7 @@ enum Work {
         index: usize,
         value: ExprCode,
         output: Vec<Value>,
+        fuel_remaining: u64,
     },
     Filter {
         slot: usize,
@@ -204,6 +207,7 @@ enum Work {
         index: usize,
         predicate: ExprCode,
         output: Vec<Value>,
+        fuel_remaining: u64,
     },
     Reduce {
         slot: usize,
@@ -213,6 +217,7 @@ enum Work {
         index: usize,
         value: ExprCode,
         accumulator: Value,
+        fuel_remaining: u64,
     },
     FanOut {
         slot: usize,
@@ -223,6 +228,7 @@ enum Work {
         arguments: ExprCode,
         call_site: u32,
         calls: Vec<ToolRequest>,
+        fuel_remaining: u64,
     },
 }
 
@@ -251,6 +257,7 @@ pub struct Execution {
     branches: u64,
     loop_iterations: u64,
     fanout_batches: u32,
+    instruction_meter: Option<(usize, u64)>,
     terminal: bool,
 }
 
@@ -267,28 +274,43 @@ impl Execution {
         execution_id: ExecutionId,
         program_attempt: u32,
     ) -> Result<Self, SandboxError> {
+        let structural_bytes = checked_add(
+            vector_allocation_bytes::<Option<Value>>(program.local_count)?,
+            vector_allocation_bytes::<LoopFrame>(program.limits.max_control_stack)?,
+        )?;
+        if structural_bytes > program.limits.max_live_bytes {
+            return Err(resource("live byte limit exceeded"));
+        }
+        if structural_bytes > program.limits.max_cumulative_bytes {
+            return Err(resource("cumulative byte limit exceeded"));
+        }
         let mut locals = Vec::new();
         locals
             .try_reserve_exact(program.local_count)
             .map_err(|_| resource("local allocation failed"))?;
         locals.resize_with(program.local_count, || None);
+        let mut loops = Vec::new();
+        loops
+            .try_reserve_exact(program.limits.max_control_stack)
+            .map_err(|_| resource("control stack allocation failed"))?;
         Ok(Self {
             program,
             execution_id,
             program_attempt,
             pc: 0,
             locals,
-            loops: Vec::new(),
+            loops,
             work: None,
             pending: None,
             fuel_used: 0,
             yields: 0,
             dynamic_ordinal: 0,
-            live_bytes: 0,
-            cumulative_bytes: 0,
+            live_bytes: structural_bytes,
+            cumulative_bytes: structural_bytes,
             branches: 0,
             loop_iterations: 0,
             fanout_batches: 0,
+            instruction_meter: None,
             terminal: false,
         })
     }
@@ -319,6 +341,17 @@ impl Execution {
                 "slice fuel must be nonzero and within the effective limit",
             ));
         }
+        let result = self.step_inner(slice_fuel);
+        if result.is_err() {
+            self.terminal = true;
+            self.work = None;
+            self.pending = None;
+            self.instruction_meter = None;
+        }
+        result
+    }
+
+    fn step_inner(&mut self, slice_fuel: u64) -> Result<StepOutcome, SandboxError> {
         let mut remaining = slice_fuel;
         loop {
             if self.work.is_some() {
@@ -335,14 +368,61 @@ impl Execution {
                 return Err(execution("verified program reached no-return state"));
             }
             let instruction = self.program.code[self.pc].clone();
-            let minimum = instruction_minimum_cost(&instruction);
-            if !self.charge(&mut remaining, minimum)? {
+            if self.instruction_meter.is_none() {
+                let mut cost =
+                    instruction_metered_cost(&instruction, &self.locals, &self.program.limits)?;
+                match &instruction {
+                    Instruction::LoopStart { end_target, .. } => {
+                        cost = checked_fuel_add(
+                            cost,
+                            usize_to_fuel(end_target.saturating_sub(self.pc))?,
+                        )?;
+                    }
+                    Instruction::LoopNext { body_target } => {
+                        if let Some(frame) = self.loops.last() {
+                            if frame.body_target != *body_target {
+                                return Err(execution("loop frame target mismatch"));
+                            }
+                            if let Some(item) = frame.items.get(frame.index.saturating_add(1)) {
+                                cost = checked_fuel_add(
+                                    cost,
+                                    usize_to_fuel(
+                                        measure_value(item, &self.program.limits)?.retained,
+                                    )?,
+                                )?;
+                                cost = checked_fuel_add(
+                                    cost,
+                                    usize_to_fuel(vector_allocation_bytes::<usize>(
+                                        frame.body_slots.len(),
+                                    )?)?,
+                                )?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.instruction_meter = Some((self.pc, cost));
+            }
+            let (metered_pc, fuel_remaining) = self
+                .instruction_meter
+                .as_mut()
+                .ok_or_else(|| execution("instruction meter is missing"))?;
+            if *metered_pc != self.pc {
+                return Err(execution("instruction meter program counter mismatch"));
+            }
+            if !burn_fuel(
+                &mut self.fuel_used,
+                self.program.limits.max_fuel,
+                &mut remaining,
+                fuel_remaining,
+            )? {
                 return Ok(StepOutcome::Sliced);
             }
+            self.instruction_meter = None;
             match instruction {
                 Instruction::Let { slot, value } => {
                     let result = self.eval(&value)?;
-                    self.store(slot, result)?;
+                    self.store_precharged(slot, result)?;
                     self.pc += 1;
                 }
                 Instruction::Branch {
@@ -368,16 +448,20 @@ impl Execution {
                         self.pc = end_target;
                         continue;
                     }
-                    self.precharge_bytes(serialized_array_len(&items)?)?;
-                    self.precharge_value(&items[0])?;
-                    self.locals[item_slot] = Some(items[0].clone());
+                    self.precharge_cloned_value(&items[0])?;
+                    self.locals[item_slot] =
+                        Some(clone_json_value(&items[0], &self.program.limits)?);
                     self.loop_iterations = self.loop_iterations.saturating_add(1);
-                    self.loops
-                        .try_reserve(1)
-                        .map_err(|_| resource("control stack allocation failed"))?;
                     if self.loops.len() >= self.program.limits.max_control_stack {
                         return Err(resource("control stack limit exceeded"));
                     }
+                    let body_instruction_count = end_target
+                        .checked_sub(self.pc.saturating_add(2))
+                        .ok_or_else(|| execution("loop body target is invalid"))?;
+                    let body_slot_capacity = body_instruction_count
+                        .checked_mul(3)
+                        .ok_or_else(|| resource("loop local tracking limit exceeded"))?;
+                    self.precharge_bytes(vector_allocation_bytes::<usize>(body_slot_capacity)?)?;
                     let body_slots = loop_body_slots(&self.program.code, self.pc + 1, end_target)?;
                     self.loops.push(LoopFrame {
                         items,
@@ -398,18 +482,56 @@ impl Execution {
                             return Err(execution("loop frame target mismatch"));
                         }
                         frame.index += 1;
-                        (frame.index < frame.items.len()).then(|| {
-                            (
-                                frame.item_slot,
-                                frame.items[frame.index].clone(),
-                                frame.body_slots.clone(),
-                            )
-                        })
+                        (frame.index < frame.items.len()).then_some((
+                            frame.item_slot,
+                            frame.index,
+                            frame.body_slots.len(),
+                        ))
                     };
-                    if let Some((item_slot, item, body_slots)) = next {
+                    if let Some((item_slot, item_index, body_slot_count)) = next {
+                        let item_retained = measure_value(
+                            &self
+                                .loops
+                                .last()
+                                .ok_or_else(|| execution("loop stack underflow"))?
+                                .items[item_index],
+                            &self.program.limits,
+                        )?
+                        .retained;
+                        self.precharge_bytes(item_retained)?;
+                        let clone_bytes = cloned_value_allocation_bytes(
+                            &self
+                                .loops
+                                .last()
+                                .ok_or_else(|| execution("loop stack underflow"))?
+                                .items[item_index],
+                            &self.program.limits,
+                        )?
+                        .checked_sub(item_retained)
+                        .ok_or_else(|| resource("value clone accounting underflowed"))?;
+                        self.precharge_bytes(clone_bytes)?;
+                        self.precharge_bytes(vector_allocation_bytes::<usize>(body_slot_count)?)?;
+                        let item = clone_json_value(
+                            &self
+                                .loops
+                                .last()
+                                .ok_or_else(|| execution("loop stack underflow"))?
+                                .items[item_index],
+                            &self.program.limits,
+                        )?;
+                        let mut body_slots = Vec::new();
+                        body_slots
+                            .try_reserve_exact(body_slot_count)
+                            .map_err(|_| resource("loop local tracking allocation failed"))?;
+                        body_slots.extend_from_slice(
+                            &self
+                                .loops
+                                .last()
+                                .ok_or_else(|| execution("loop stack underflow"))?
+                                .body_slots,
+                        );
                         clear_loop_body_slots(&mut self.locals, &body_slots);
                         self.loop_iterations = self.loop_iterations.saturating_add(1);
-                        self.precharge_value(&item)?;
                         self.locals[item_slot] = Some(item);
                         self.pc = body_target;
                     } else {
@@ -435,11 +557,11 @@ impl Execution {
                         max_items,
                         self.program.limits.max_collection_items,
                     )?;
-                    self.precharge_bytes(serialized_array_syntax_len(items.len())?)?;
-                    self.precharge_bytes(serialized_array_len(&items)?)?;
+                    self.precharge_bytes(array_framing_retained_bytes()?)?;
+                    self.precharge_bytes(vector_allocation_bytes::<Value>(items.len())?)?;
                     let mut output = Vec::new();
                     output
-                        .try_reserve(items.len())
+                        .try_reserve_exact(items.len())
                         .map_err(|_| resource("collection allocation failed"))?;
                     self.work = Some(Work::Map {
                         slot,
@@ -448,6 +570,7 @@ impl Execution {
                         index: 0,
                         value,
                         output,
+                        fuel_remaining: 0,
                     });
                 }
                 Instruction::Filter {
@@ -466,11 +589,11 @@ impl Execution {
                     // Reserve the worst-case serialized array framing before the
                     // output vector grows. A filtered result may retain fewer
                     // elements, so this is deliberately conservative.
-                    self.precharge_bytes(serialized_array_syntax_len(items.len())?)?;
-                    self.precharge_bytes(serialized_array_len(&items)?)?;
+                    self.precharge_bytes(array_framing_retained_bytes()?)?;
+                    self.precharge_bytes(vector_allocation_bytes::<Value>(items.len())?)?;
                     let mut output = Vec::new();
                     output
-                        .try_reserve(items.len())
+                        .try_reserve_exact(items.len())
                         .map_err(|_| resource("collection allocation failed"))?;
                     self.work = Some(Work::Filter {
                         slot,
@@ -479,6 +602,7 @@ impl Execution {
                         index: 0,
                         predicate,
                         output,
+                        fuel_remaining: 0,
                     });
                 }
                 Instruction::Reduce {
@@ -496,9 +620,7 @@ impl Execution {
                         max_items,
                         self.program.limits.max_collection_items,
                     )?;
-                    self.precharge_bytes(serialized_array_len(&items)?)?;
                     let accumulator = self.eval(&initial)?;
-                    self.precharge_value(&accumulator)?;
                     self.work = Some(Work::Reduce {
                         slot,
                         item_slot,
@@ -507,6 +629,7 @@ impl Execution {
                         index: 0,
                         value,
                         accumulator,
+                        fuel_remaining: 0,
                     });
                 }
                 Instruction::Invoke {
@@ -517,8 +640,15 @@ impl Execution {
                 } => {
                     let arguments = self.eval(&arguments)?;
                     require_object(&arguments)?;
+                    self.precharge_bytes(string_retained_bytes(tool_id.len())?)?;
                     let request = self.request(tool_id, call_site, arguments)?;
-                    return self.suspend(slot, vec![request], false);
+                    self.precharge_bytes(vector_allocation_bytes::<ToolRequest>(1)?)?;
+                    let mut calls = Vec::new();
+                    calls
+                        .try_reserve_exact(1)
+                        .map_err(|_| resource("tool batch allocation failed"))?;
+                    calls.push(request);
+                    return self.suspend(slot, calls, false);
                 }
                 Instruction::FanOut {
                     slot,
@@ -531,10 +661,10 @@ impl Execution {
                 } => {
                     let items = expect_array(self.eval(&collection)?, "fan-out collection")?;
                     validate_items(items.len(), max_calls, self.program.limits.max_fanout)?;
-                    self.precharge_bytes(serialized_array_len(&items)?)?;
+                    self.precharge_bytes(vector_allocation_bytes::<ToolRequest>(items.len())?)?;
                     let mut calls = Vec::new();
                     calls
-                        .try_reserve(items.len())
+                        .try_reserve_exact(items.len())
                         .map_err(|_| resource("fan-out allocation failed"))?;
                     self.work = Some(Work::FanOut {
                         slot,
@@ -545,15 +675,15 @@ impl Execution {
                         arguments,
                         call_site,
                         calls,
+                        fuel_remaining: 0,
                     });
                 }
                 Instruction::Return { value } => {
                     let output = self.eval(&value)?;
-                    let serialized_bytes = serialized_value_len(&output)?;
-                    if serialized_bytes > self.program.limits.max_output_bytes {
+                    let measurement = measure_value(&output, &self.program.limits)?;
+                    if measurement.serialized > self.program.limits.max_output_bytes {
                         return Err(resource("output byte limit exceeded"));
                     }
-                    self.precharge_bytes(serialized_bytes)?;
                     self.terminal = true;
                     return Ok(StepOutcome::Complete(output));
                 }
@@ -562,29 +692,81 @@ impl Execution {
     }
 
     /// Resumes exactly the currently suspended yield. The token is consumed.
+    ///
+    /// Any invalid resume attempt terminalizes the execution. This makes token
+    /// loss explicit and prevents callers from replaying a yield after the
+    /// non-clone token has been consumed. Once token, batch identity, and all
+    /// response bounds are accepted, any later failure is also terminal.
     pub fn resume(
         &mut self,
         token: ResumeToken,
         responses: Vec<ToolResponse>,
     ) -> Result<(), SandboxError> {
+        if self.terminal {
+            discard_tool_responses(responses);
+            return Err(execution("execution is already terminal"));
+        }
+
+        let validation = self.validate_resume(&token, &responses);
+        let response_bytes = match validation {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.terminalize();
+                discard_tool_responses(responses);
+                return Err(error);
+            }
+        };
+
+        // Acceptance point: all caller-controlled data has been checked while
+        // the suspension was still intact. From here onward every failure is
+        // terminal and the accepted effect can never be yielded again.
+        let result = (|| {
+            let pending = self
+                .pending
+                .take()
+                .ok_or_else(|| resume_error("execution is not suspended"))?;
+            self.live_bytes = self
+                .live_bytes
+                .checked_add(response_bytes)
+                .ok_or_else(|| resource("live byte limit exceeded"))?;
+            self.cumulative_bytes = self
+                .cumulative_bytes
+                .checked_add(response_bytes)
+                .ok_or_else(|| resource("cumulative byte limit exceeded"))?;
+            self.apply_responses(pending, responses)
+        })();
+        if result.is_err() {
+            self.terminalize();
+        }
+        result
+    }
+
+    fn validate_resume(
+        &self,
+        token: &ResumeToken,
+        responses: &[ToolResponse],
+    ) -> Result<usize, SandboxError> {
         let pending = self
             .pending
-            .take()
+            .as_ref()
             .ok_or_else(|| resume_error("execution is not suspended"))?;
-        if token.execution_id != self.execution_id || token.yield_ordinal != pending.yield_ordinal {
-            self.pending = Some(pending);
+        if token.execution_id != self.execution_id
+            || token.program_attempt != self.program_attempt
+            || token.yield_ordinal != pending.yield_ordinal
+        {
             return Err(resume_error(
                 "resume token does not match the suspended execution",
             ));
         }
-        if responses.len() != pending.requests.len() {
-            self.pending = Some(pending);
+        if responses.len() != pending.requests.len()
+            || responses.len() > self.program.limits.max_collection_items
+            || responses.len() > self.program.limits.max_fanout
+        {
             return Err(resume_error(
                 "response count does not match the yielded batch",
             ));
         }
         if !pending.fan_out && responses.len() != 1 {
-            self.pending = Some(pending);
             return Err(resume_error("single-call response is missing"));
         }
         if responses
@@ -592,30 +774,75 @@ impl Execution {
             .zip(pending.requests.iter())
             .any(|(response, expected)| (response.call_site, response.dynamic_ordinal) != *expected)
         {
-            self.pending = Some(pending);
             return Err(resume_error(
                 "response identity does not match yielded request order",
             ));
         }
 
+        let mut retained = if pending.fan_out {
+            checked_add(
+                array_framing_retained_bytes()?,
+                vector_allocation_bytes::<Value>(responses.len())?,
+            )?
+        } else {
+            0
+        };
+        let mut serialized = if pending.fan_out {
+            checked_add(2, responses.len().saturating_sub(1))?
+        } else {
+            0
+        };
+        for response in responses {
+            let output = measure_value(&response.output, &self.program.limits)?;
+            let wrapper_depth = output
+                .max_depth
+                .checked_add(if pending.fan_out { 2 } else { 1 })
+                .ok_or_else(|| resource("response nesting limit exceeded"))?;
+            if wrapper_depth > self.program.limits.max_nesting {
+                return Err(resource("response nesting limit exceeded"));
+            }
+            let wrapper = response_wrapper_retained_bytes(output.retained)?;
+            retained = checked_add(retained, wrapper)?;
+            serialized = checked_add(
+                serialized,
+                response_wrapper_serialized_bytes(response.ok, output.serialized)?,
+            )?;
+        }
+        if serialized > self.program.limits.max_output_bytes {
+            return Err(resource("response serialized byte limit exceeded"));
+        }
+        let next_live = self
+            .live_bytes
+            .checked_add(retained)
+            .ok_or_else(|| resource("live byte limit exceeded"))?;
+        let next_cumulative = self
+            .cumulative_bytes
+            .checked_add(retained)
+            .ok_or_else(|| resource("cumulative byte limit exceeded"))?;
+        if next_live > self.program.limits.max_live_bytes {
+            return Err(resource("live byte limit exceeded"));
+        }
+        if next_cumulative > self.program.limits.max_cumulative_bytes {
+            return Err(resource("cumulative byte limit exceeded"));
+        }
+        Ok(retained)
+    }
+
+    fn apply_responses(
+        &mut self,
+        pending: Pending,
+        responses: Vec<ToolResponse>,
+    ) -> Result<(), SandboxError> {
         let mut values = Vec::new();
         if pending.fan_out {
-            self.precharge_bytes(serialized_array_syntax_len(responses.len())?)?;
             values
-                .try_reserve(responses.len())
+                .try_reserve_exact(responses.len())
                 .map_err(|_| resource("response allocation failed"))?;
         }
-        for (response, expected) in responses.into_iter().zip(pending.requests.iter()) {
-            debug_assert_eq!(
-                (response.call_site, response.dynamic_ordinal),
-                *expected,
-                "response identity was prevalidated"
-            );
-            self.precharge_value(&response.output)?;
-            self.precharge_bytes(response_object_syntax_len(response.ok)?)?;
+        for response in responses {
             let mut object = Map::new();
-            object.insert("ok".into(), Value::Bool(response.ok));
-            object.insert("output".into(), response.output);
+            object.insert(clone_string("ok")?, Value::Bool(response.ok));
+            object.insert(clone_string("output")?, response.output);
             if pending.fan_out {
                 values.push(Value::Object(object));
             } else {
@@ -625,8 +852,18 @@ impl Execution {
         if pending.fan_out {
             self.store_precharged(pending.slot, Value::Array(values))?;
         }
-        self.pc += 1;
+        self.pc = self
+            .pc
+            .checked_add(1)
+            .ok_or_else(|| execution("program counter overflowed"))?;
         Ok(())
+    }
+
+    fn terminalize(&mut self) {
+        self.terminal = true;
+        self.pending = None;
+        self.work = None;
+        self.instruction_meter = None;
     }
 
     fn advance_work(&mut self, remaining: &mut u64) -> Result<bool, SandboxError> {
@@ -634,7 +871,6 @@ impl Execution {
             .work
             .take()
             .ok_or_else(|| execution("work state is missing"))?;
-        let mut advanced = true;
         let done = match &mut work {
             Work::Map {
                 slot,
@@ -643,22 +879,44 @@ impl Execution {
                 index,
                 value,
                 output,
+                fuel_remaining,
             } => {
                 if *index == items.len() {
                     self.store_precharged(*slot, Value::Array(core::mem::take(output)))?;
                     self.locals[*item_slot] = None;
                     self.pc += 1;
                     true
-                } else if !self.charge(remaining, expression_cost(value))? {
-                    advanced = false;
-                    false
                 } else {
-                    self.precharge_value(&items[*index])?;
-                    self.locals[*item_slot] = Some(items[*index].clone());
+                    if *fuel_remaining == 0 {
+                        *fuel_remaining = expression_metered_cost_with_overrides(
+                            value,
+                            &self.locals,
+                            &self.program.limits,
+                            &[(*item_slot, &items[*index])],
+                        )?;
+                        *fuel_remaining = checked_fuel_add(
+                            *fuel_remaining,
+                            usize_to_fuel(
+                                measure_value(&items[*index], &self.program.limits)?.retained,
+                            )?,
+                        )?;
+                    }
+                    if !burn_fuel(
+                        &mut self.fuel_used,
+                        self.program.limits.max_fuel,
+                        remaining,
+                        fuel_remaining,
+                    )? {
+                        self.work = Some(work);
+                        return Ok(false);
+                    }
+                    self.precharge_cloned_value(&items[*index])?;
+                    self.locals[*item_slot] =
+                        Some(clone_json_value(&items[*index], &self.program.limits)?);
                     let mapped = self.eval(value)?;
-                    self.precharge_value(&mapped)?;
                     output.push(mapped);
                     *index += 1;
+                    *fuel_remaining = 0;
                     false
                 }
             }
@@ -669,23 +927,46 @@ impl Execution {
                 index,
                 predicate,
                 output,
+                fuel_remaining,
             } => {
                 if *index == items.len() {
                     self.store_precharged(*slot, Value::Array(core::mem::take(output)))?;
                     self.locals[*item_slot] = None;
                     self.pc += 1;
                     true
-                } else if !self.charge(remaining, expression_cost(predicate))? {
-                    advanced = false;
-                    false
                 } else {
-                    self.precharge_value(&items[*index])?;
-                    self.locals[*item_slot] = Some(items[*index].clone());
+                    if *fuel_remaining == 0 {
+                        *fuel_remaining = expression_metered_cost_with_overrides(
+                            predicate,
+                            &self.locals,
+                            &self.program.limits,
+                            &[(*item_slot, &items[*index])],
+                        )?;
+                        *fuel_remaining = checked_fuel_add(
+                            *fuel_remaining,
+                            usize_to_fuel(
+                                measure_value(&items[*index], &self.program.limits)?.retained,
+                            )?,
+                        )?;
+                    }
+                    if !burn_fuel(
+                        &mut self.fuel_used,
+                        self.program.limits.max_fuel,
+                        remaining,
+                        fuel_remaining,
+                    )? {
+                        self.work = Some(work);
+                        return Ok(false);
+                    }
+                    self.precharge_cloned_value(&items[*index])?;
+                    self.locals[*item_slot] =
+                        Some(clone_json_value(&items[*index], &self.program.limits)?);
                     if expect_bool(self.eval(predicate)?, "filter predicate")? {
-                        self.precharge_value(&items[*index])?;
-                        output.push(items[*index].clone());
+                        self.precharge_cloned_value(&items[*index])?;
+                        output.push(clone_json_value(&items[*index], &self.program.limits)?);
                     }
                     *index += 1;
+                    *fuel_remaining = 0;
                     false
                 }
             }
@@ -697,24 +978,56 @@ impl Execution {
                 index,
                 value,
                 accumulator,
+                fuel_remaining,
             } => {
                 if *index == items.len() {
-                    self.store(*slot, accumulator.clone())?;
+                    let result = core::mem::replace(accumulator, Value::Null);
+                    self.store_precharged(*slot, result)?;
                     self.locals[*item_slot] = None;
                     self.locals[*accumulator_slot] = None;
                     self.pc += 1;
                     true
-                } else if !self.charge(remaining, expression_cost(value))? {
-                    advanced = false;
-                    false
                 } else {
-                    self.precharge_value(&items[*index])?;
-                    self.precharge_value(accumulator)?;
-                    self.locals[*item_slot] = Some(items[*index].clone());
-                    self.locals[*accumulator_slot] = Some(accumulator.clone());
+                    if *fuel_remaining == 0 {
+                        *fuel_remaining = expression_metered_cost_with_overrides(
+                            value,
+                            &self.locals,
+                            &self.program.limits,
+                            &[
+                                (*item_slot, &items[*index]),
+                                (*accumulator_slot, accumulator),
+                            ],
+                        )?;
+                        *fuel_remaining = checked_fuel_add(
+                            *fuel_remaining,
+                            checked_fuel_add(
+                                usize_to_fuel(
+                                    measure_value(&items[*index], &self.program.limits)?.retained,
+                                )?,
+                                usize_to_fuel(
+                                    measure_value(accumulator, &self.program.limits)?.retained,
+                                )?,
+                            )?,
+                        )?;
+                    }
+                    if !burn_fuel(
+                        &mut self.fuel_used,
+                        self.program.limits.max_fuel,
+                        remaining,
+                        fuel_remaining,
+                    )? {
+                        self.work = Some(work);
+                        return Ok(false);
+                    }
+                    self.precharge_cloned_value(&items[*index])?;
+                    self.precharge_cloned_value(accumulator)?;
+                    self.locals[*item_slot] =
+                        Some(clone_json_value(&items[*index], &self.program.limits)?);
+                    self.locals[*accumulator_slot] =
+                        Some(clone_json_value(accumulator, &self.program.limits)?);
                     *accumulator = self.eval(value)?;
-                    self.precharge_value(accumulator)?;
                     *index += 1;
+                    *fuel_remaining = 0;
                     false
                 }
             }
@@ -726,21 +1039,48 @@ impl Execution {
                 tool_id,
                 call_site,
                 calls,
+                fuel_remaining,
                 ..
             } => {
                 if *index == items.len() {
                     self.locals[*item_slot] = None;
                     true
-                } else if !self.charge(remaining, expression_cost(arguments))? {
-                    advanced = false;
-                    false
                 } else {
-                    self.precharge_value(&items[*index])?;
-                    self.locals[*item_slot] = Some(items[*index].clone());
+                    if *fuel_remaining == 0 {
+                        *fuel_remaining = expression_metered_cost_with_overrides(
+                            arguments,
+                            &self.locals,
+                            &self.program.limits,
+                            &[(*item_slot, &items[*index])],
+                        )?;
+                        *fuel_remaining = checked_fuel_add(
+                            *fuel_remaining,
+                            checked_fuel_add(
+                                usize_to_fuel(
+                                    measure_value(&items[*index], &self.program.limits)?.retained,
+                                )?,
+                                usize_to_fuel(string_retained_bytes(tool_id.len())?)?,
+                            )?,
+                        )?;
+                    }
+                    if !burn_fuel(
+                        &mut self.fuel_used,
+                        self.program.limits.max_fuel,
+                        remaining,
+                        fuel_remaining,
+                    )? {
+                        self.work = Some(work);
+                        return Ok(false);
+                    }
+                    self.precharge_cloned_value(&items[*index])?;
+                    self.locals[*item_slot] =
+                        Some(clone_json_value(&items[*index], &self.program.limits)?);
                     let args = self.eval(arguments)?;
                     require_object(&args)?;
-                    calls.push(self.request(tool_id.clone(), *call_site, args)?);
+                    self.precharge_bytes(string_retained_bytes(tool_id.len())?)?;
+                    calls.push(self.request(clone_string(tool_id)?, *call_site, args)?);
                     *index += 1;
+                    *fuel_remaining = 0;
                     false
                 }
             }
@@ -752,7 +1092,7 @@ impl Execution {
         } else {
             self.work = Some(work);
         }
-        Ok(advanced)
+        Ok(true)
     }
 
     fn finish_fanout_if_ready(&mut self) -> Result<Option<StepOutcome>, SandboxError> {
@@ -789,10 +1129,14 @@ impl Execution {
         if fan_out {
             self.fanout_batches = self.fanout_batches.saturating_add(1);
         }
-        let requests = calls
-            .iter()
-            .map(|call| (call.call_site, call.dynamic_ordinal))
-            .collect();
+        self.precharge_bytes(vector_allocation_bytes::<(u32, u64)>(calls.len())?)?;
+        let mut requests = Vec::new();
+        requests
+            .try_reserve_exact(calls.len())
+            .map_err(|_| resource("pending request allocation failed"))?;
+        for call in &calls {
+            requests.push((call.call_site, call.dynamic_ordinal));
+        }
         self.pending = Some(Pending {
             yield_ordinal,
             slot,
@@ -806,6 +1150,7 @@ impl Execution {
             },
             resume: ResumeToken {
                 execution_id: self.execution_id,
+                program_attempt: self.program_attempt,
                 yield_ordinal,
             },
         })
@@ -817,8 +1162,6 @@ impl Execution {
         call_site: u32,
         arguments: Value,
     ) -> Result<ToolRequest, SandboxError> {
-        self.precharge_value(&arguments)?;
-        self.precharge_bytes(tool_id.len())?;
         let dynamic_ordinal = self.dynamic_ordinal;
         self.dynamic_ordinal = self
             .dynamic_ordinal
@@ -834,38 +1177,75 @@ impl Execution {
         })
     }
 
-    fn eval(&self, code: &ExprCode) -> Result<Value, SandboxError> {
+    fn eval(&mut self, code: &ExprCode) -> Result<Value, SandboxError> {
         let mut stack = Vec::new();
+        let capacity = self.program.limits.max_operand_stack.min(code.0.len());
+        self.precharge_bytes(vector_allocation_bytes::<Value>(capacity)?)?;
         stack
-            .try_reserve(self.program.limits.max_operand_stack.min(code.0.len()))
+            .try_reserve_exact(capacity)
             .map_err(|_| resource("operand stack allocation failed"))?;
         for instruction in &code.0 {
             match instruction {
-                ExprInstruction::Constant(value) => stack.push(value.clone()),
-                ExprInstruction::Load(slot) => stack.push(
-                    self.locals
-                        .get(*slot)
-                        .and_then(Option::as_ref)
-                        .cloned()
-                        .ok_or_else(|| {
-                            execution("local is unavailable in this control-flow path")
-                        })?,
-                ),
+                ExprInstruction::Constant(value) => {
+                    self.precharge_cloned_value(value)?;
+                    stack.push(clone_json_value(value, &self.program.limits)?);
+                }
+                ExprInstruction::Load(slot) => {
+                    let retained = measure_value(
+                        self.locals
+                            .get(*slot)
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| {
+                                execution("local is unavailable in this control-flow path")
+                            })?,
+                        &self.program.limits,
+                    )?
+                    .retained;
+                    self.precharge_bytes(retained)?;
+                    let clone_bytes = cloned_value_allocation_bytes(
+                        self.locals
+                            .get(*slot)
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| {
+                                execution("local is unavailable in this control-flow path")
+                            })?,
+                        &self.program.limits,
+                    )?
+                    .checked_sub(retained)
+                    .ok_or_else(|| resource("value clone accounting underflowed"))?;
+                    self.precharge_bytes(clone_bytes)?;
+                    let value =
+                        self.locals
+                            .get(*slot)
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| {
+                                execution("local is unavailable in this control-flow path")
+                            })?;
+                    stack.push(clone_json_value(value, &self.program.limits)?);
+                }
                 ExprInstruction::Path(pointer) => {
                     let value = pop(&mut stack)?;
-                    stack.push(
-                        value
-                            .pointer(pointer)
-                            .cloned()
-                            .ok_or_else(|| execution("JSON pointer did not resolve"))?,
-                    );
+                    let selected = value
+                        .pointer(pointer)
+                        .ok_or_else(|| execution("JSON pointer did not resolve"))?;
+                    self.precharge_cloned_value(selected)?;
+                    stack.push(clone_json_value(selected, &self.program.limits)?);
                 }
                 ExprInstruction::Array(count) => {
                     let start = stack
                         .len()
                         .checked_sub(*count)
                         .ok_or_else(|| execution("operand stack underflow"))?;
-                    let items = stack.split_off(start);
+                    self.precharge_bytes(array_framing_retained_bytes()?)?;
+                    self.precharge_bytes(vector_allocation_bytes::<Value>(*count)?)?;
+                    let mut items = Vec::new();
+                    items
+                        .try_reserve_exact(*count)
+                        .map_err(|_| resource("array allocation failed"))?;
+                    while stack.len() > start {
+                        items.push(pop(&mut stack)?);
+                    }
+                    items.reverse();
                     stack.push(Value::Array(items));
                 }
                 ExprInstruction::Object(keys) => {
@@ -873,7 +1253,19 @@ impl Execution {
                         .len()
                         .checked_sub(keys.len())
                         .ok_or_else(|| execution("operand stack underflow"))?;
-                    let values = stack.split_off(start);
+                    self.precharge_bytes(object_framing_retained_bytes()?)?;
+                    for key in keys {
+                        self.precharge_bytes(key_retained_bytes(key.len())?)?;
+                    }
+                    let mut values = Vec::new();
+                    self.precharge_bytes(vector_allocation_bytes::<Value>(keys.len())?)?;
+                    values
+                        .try_reserve_exact(keys.len())
+                        .map_err(|_| resource("object staging allocation failed"))?;
+                    while stack.len() > start {
+                        values.push(pop(&mut stack)?);
+                    }
+                    values.reverse();
                     let mut object = Map::new();
                     for (key, value) in keys.iter().cloned().zip(values) {
                         object.insert(key, value);
@@ -883,11 +1275,15 @@ impl Execution {
                 ExprInstruction::Binary(operator) => {
                     let right = pop(&mut stack)?;
                     let left = pop(&mut stack)?;
-                    stack.push(binary(*operator, left, right)?);
+                    let result = binary(*operator, left, right, &self.program.limits)?;
+                    self.precharge_value(&result)?;
+                    stack.push(result);
                 }
                 ExprInstruction::Unary(operator) => {
                     let value = pop(&mut stack)?;
-                    stack.push(unary(*operator, value)?);
+                    let result = unary(*operator, value)?;
+                    self.precharge_value(&result)?;
+                    stack.push(result);
                 }
             }
         }
@@ -897,44 +1293,27 @@ impl Execution {
         pop(&mut stack)
     }
 
-    fn charge(&mut self, remaining: &mut u64, cost: u64) -> Result<bool, SandboxError> {
-        if cost > *remaining {
-            return Ok(false);
-        }
-        let next = self
-            .fuel_used
-            .checked_add(cost)
-            .ok_or_else(|| resource("fuel limit exceeded"))?;
-        if next > self.program.limits.max_fuel {
-            return Err(resource("fuel limit exceeded"));
-        }
-        self.fuel_used = next;
-        *remaining -= cost;
-        Ok(true)
-    }
-
-    fn store(&mut self, slot: usize, value: Value) -> Result<(), SandboxError> {
-        if self.locals.get(slot).and_then(Option::as_ref).is_some() {
-            return Err(execution("immutable local was already initialized"));
-        }
-        self.precharge_value(&value)?;
-        self.locals[slot] = Some(value);
-        Ok(())
-    }
-
     /// Stores a composite whose values and JSON framing were charged before its
     /// backing collection grew. This avoids charging host responses twice when
     /// they are wrapped as inert VM results.
     fn store_precharged(&mut self, slot: usize, value: Value) -> Result<(), SandboxError> {
-        if self.locals.get(slot).and_then(Option::as_ref).is_some() {
+        let target = self
+            .locals
+            .get_mut(slot)
+            .ok_or_else(|| execution("local slot is invalid"))?;
+        if target.is_some() {
             return Err(execution("immutable local was already initialized"));
         }
-        self.locals[slot] = Some(value);
+        *target = Some(value);
         Ok(())
     }
 
     fn precharge_value(&mut self, value: &Value) -> Result<(), SandboxError> {
-        self.precharge_bytes(serialized_value_len(value)?)
+        self.precharge_bytes(measure_value(value, &self.program.limits)?.retained)
+    }
+
+    fn precharge_cloned_value(&mut self, value: &Value) -> Result<(), SandboxError> {
+        self.precharge_bytes(cloned_value_allocation_bytes(value, &self.program.limits)?)
     }
 
     fn precharge_bytes(&mut self, bytes: usize) -> Result<(), SandboxError> {
@@ -958,27 +1337,242 @@ impl Execution {
     }
 }
 
-fn instruction_minimum_cost(instruction: &Instruction) -> u64 {
-    let expression = match instruction {
-        Instruction::Let { value, .. } | Instruction::Return { value } => expression_cost(value),
-        Instruction::Branch { condition, .. } => expression_cost(condition),
+fn instruction_metered_cost(
+    instruction: &Instruction,
+    locals: &[Option<Value>],
+    limits: &crate::SandboxLimits,
+) -> Result<u64, SandboxError> {
+    let mut cost = 1u64;
+    let expression_cost = |expression: &ExprCode| {
+        expression_metered_cost_with_overrides(expression, locals, limits, &[])
+    };
+    match instruction {
+        Instruction::Let { value, .. }
+        | Instruction::Branch {
+            condition: value, ..
+        } => {
+            cost = checked_fuel_add(cost, expression_cost(value)?)?;
+        }
+        Instruction::Return { value } => {
+            let evaluation = expression_metered_cost_with_overrides(value, locals, limits, &[])?;
+            // Returning traverses the completed value again to enforce exact
+            // compact-JSON output size, so reserve an equal conservative pass.
+            cost = checked_fuel_add(cost, checked_fuel_add(evaluation, evaluation)?)?;
+        }
         Instruction::LoopStart { collection, .. }
         | Instruction::Map { collection, .. }
-        | Instruction::Filter { collection, .. }
-        | Instruction::FanOut { collection, .. } => expression_cost(collection),
+        | Instruction::Filter { collection, .. } => {
+            cost = checked_fuel_add(cost, expression_cost(collection)?)?;
+        }
         Instruction::Reduce {
             collection,
             initial,
             ..
-        } => expression_cost(collection).saturating_add(expression_cost(initial)),
-        Instruction::Invoke { arguments, .. } => expression_cost(arguments),
-        Instruction::Jump { .. } | Instruction::LoopNext { .. } => 1,
-    };
-    expression.max(1)
+        } => {
+            cost = checked_fuel_add(cost, expression_cost(collection)?)?;
+            cost = checked_fuel_add(cost, expression_cost(initial)?)?;
+        }
+        Instruction::Invoke {
+            arguments, tool_id, ..
+        } => {
+            cost = checked_fuel_add(cost, expression_cost(arguments)?)?;
+            cost = checked_fuel_add(cost, usize_to_fuel(string_retained_bytes(tool_id.len())?)?)?;
+        }
+        Instruction::FanOut {
+            collection,
+            tool_id,
+            ..
+        } => {
+            cost = checked_fuel_add(cost, expression_cost(collection)?)?;
+            cost = checked_fuel_add(cost, usize_to_fuel(string_retained_bytes(tool_id.len())?)?)?;
+        }
+        Instruction::Jump { .. } | Instruction::LoopNext { .. } => {}
+    }
+    Ok(cost)
 }
 
-fn expression_cost(code: &ExprCode) -> u64 {
-    (code.0.len() as u64).max(1)
+fn expression_metered_cost_with_overrides(
+    code: &ExprCode,
+    locals: &[Option<Value>],
+    limits: &crate::SandboxLimits,
+    overrides: &[(usize, &Value)],
+) -> Result<u64, SandboxError> {
+    #[derive(Clone, Copy)]
+    struct Weight {
+        retained: u64,
+        clone_cost: u64,
+    }
+
+    let mut weights = Vec::new();
+    weights
+        .try_reserve_exact(code.0.len())
+        .map_err(|_| resource("fuel metering allocation failed"))?;
+    let mut cost = usize_to_fuel(code.0.len())?.max(1);
+    for instruction in &code.0 {
+        match instruction {
+            ExprInstruction::Constant(value) => {
+                let weight = Weight {
+                    retained: usize_to_fuel(measure_value(value, limits)?.retained)?,
+                    clone_cost: usize_to_fuel(cloned_value_allocation_bytes(value, limits)?)?,
+                };
+                cost = checked_fuel_add(cost, weight.clone_cost)?;
+                weights.push(weight);
+            }
+            ExprInstruction::Load(slot) => {
+                let value = overrides
+                    .iter()
+                    .find_map(|(candidate, value)| (*candidate == *slot).then_some(*value))
+                    .or_else(|| locals.get(*slot).and_then(Option::as_ref))
+                    .ok_or_else(|| execution("local is unavailable in this control-flow path"))?;
+                let weight = Weight {
+                    retained: usize_to_fuel(measure_value(value, limits)?.retained)?,
+                    clone_cost: usize_to_fuel(cloned_value_allocation_bytes(value, limits)?)?,
+                };
+                cost = checked_fuel_add(cost, weight.clone_cost)?;
+                weights.push(weight);
+            }
+            ExprInstruction::Path(pointer) => {
+                let weight = weights
+                    .pop()
+                    .ok_or_else(|| execution("expression meter stack underflow"))?;
+                cost = checked_fuel_add(cost, usize_to_fuel(pointer.len())?)?;
+                cost = checked_fuel_add(cost, weight.clone_cost)?;
+                weights.push(weight);
+            }
+            ExprInstruction::Array(count) => {
+                let start = weights
+                    .len()
+                    .checked_sub(*count)
+                    .ok_or_else(|| execution("expression meter stack underflow"))?;
+                let mut children = Weight {
+                    retained: 0,
+                    clone_cost: 0,
+                };
+                for child in weights.drain(start..) {
+                    children.retained = checked_fuel_add(children.retained, child.retained)?;
+                    children.clone_cost = checked_fuel_add(children.clone_cost, child.clone_cost)?;
+                }
+                let framing = usize_to_fuel(array_framing_retained_bytes()?)?;
+                let allocation = usize_to_fuel(vector_allocation_bytes::<Value>(*count)?)?;
+                cost = checked_fuel_add(cost, usize_to_fuel(*count)?)?;
+                cost = checked_fuel_add(cost, checked_fuel_add(framing, allocation)?)?;
+                weights.push(Weight {
+                    retained: checked_fuel_add(children.retained, framing)?,
+                    clone_cost: checked_fuel_add(
+                        children.clone_cost,
+                        checked_fuel_add(framing, allocation)?,
+                    )?,
+                });
+            }
+            ExprInstruction::Object(keys) => {
+                let start = weights
+                    .len()
+                    .checked_sub(keys.len())
+                    .ok_or_else(|| execution("expression meter stack underflow"))?;
+                let mut children = Weight {
+                    retained: 0,
+                    clone_cost: 0,
+                };
+                for child in weights.drain(start..) {
+                    children.retained = checked_fuel_add(children.retained, child.retained)?;
+                    children.clone_cost = checked_fuel_add(children.clone_cost, child.clone_cost)?;
+                }
+                let mut framing = usize_to_fuel(object_framing_retained_bytes()?)?;
+                for key in keys {
+                    framing =
+                        checked_fuel_add(framing, usize_to_fuel(key_retained_bytes(key.len())?)?)?;
+                }
+                let staging = usize_to_fuel(vector_allocation_bytes::<Value>(keys.len())?)?;
+                cost = checked_fuel_add(cost, checked_fuel_add(framing, staging)?)?;
+                weights.push(Weight {
+                    retained: checked_fuel_add(children.retained, framing)?,
+                    clone_cost: checked_fuel_add(
+                        children.clone_cost,
+                        checked_fuel_add(framing, staging)?,
+                    )?,
+                });
+            }
+            ExprInstruction::Binary(operator) => {
+                let right = weights
+                    .pop()
+                    .ok_or_else(|| execution("expression meter stack underflow"))?;
+                let left = weights
+                    .pop()
+                    .ok_or_else(|| execution("expression meter stack underflow"))?;
+                if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) {
+                    cost =
+                        checked_fuel_add(cost, checked_fuel_add(left.retained, right.retained)?)?;
+                }
+                cost = checked_fuel_add(cost, usize_to_fuel(primitive_retained_bytes())?)?;
+                weights.push(Weight {
+                    retained: usize_to_fuel(primitive_retained_bytes())?,
+                    clone_cost: usize_to_fuel(cloned_value_allocation_bytes(
+                        &Value::Null,
+                        limits,
+                    )?)?,
+                });
+            }
+            ExprInstruction::Unary(operator) => {
+                let operand = weights
+                    .pop()
+                    .ok_or_else(|| execution("expression meter stack underflow"))?;
+                if matches!(
+                    operator,
+                    UnaryOperator::Sum | UnaryOperator::All | UnaryOperator::Any
+                ) {
+                    cost = checked_fuel_add(cost, operand.retained)?;
+                }
+                cost = checked_fuel_add(cost, usize_to_fuel(primitive_retained_bytes())?)?;
+                weights.push(Weight {
+                    retained: usize_to_fuel(primitive_retained_bytes())?,
+                    clone_cost: usize_to_fuel(cloned_value_allocation_bytes(
+                        &Value::Null,
+                        limits,
+                    )?)?,
+                });
+            }
+        }
+    }
+    if weights.len() != 1 {
+        return Err(execution("expression meter did not produce one value"));
+    }
+    Ok(cost.max(1))
+}
+
+fn burn_fuel(
+    fuel_used: &mut u64,
+    max_fuel: u64,
+    slice_remaining: &mut u64,
+    work_remaining: &mut u64,
+) -> Result<bool, SandboxError> {
+    if *work_remaining == 0 {
+        return Ok(true);
+    }
+    let available = max_fuel
+        .checked_sub(*fuel_used)
+        .ok_or_else(|| resource("fuel limit exceeded"))?;
+    if available == 0 {
+        return Err(resource("fuel limit exceeded"));
+    }
+    let charged = (*work_remaining).min(*slice_remaining).min(available);
+    *fuel_used = fuel_used
+        .checked_add(charged)
+        .ok_or_else(|| resource("fuel limit exceeded"))?;
+    *slice_remaining -= charged;
+    *work_remaining -= charged;
+    if *work_remaining > 0 && *slice_remaining > 0 && *fuel_used == max_fuel {
+        return Err(resource("fuel limit exceeded"));
+    }
+    Ok(*work_remaining == 0)
+}
+
+fn checked_fuel_add(left: u64, right: u64) -> Result<u64, SandboxError> {
+    left.checked_add(right)
+        .ok_or_else(|| resource("fuel cost overflowed"))
+}
+
+fn usize_to_fuel(value: usize) -> Result<u64, SandboxError> {
+    u64::try_from(value).map_err(|_| resource("fuel cost overflowed"))
 }
 
 fn pop(stack: &mut Vec<Value>) -> Result<Value, SandboxError> {
@@ -1014,6 +1608,187 @@ fn validate_items(actual: usize, declared: usize, effective: usize) -> Result<()
     }
 }
 
+fn response_wrapper_retained_bytes(output_retained: usize) -> Result<usize, SandboxError> {
+    let mut total = object_framing_retained_bytes()?;
+    total = checked_add(total, key_retained_bytes("ok".len())?)?;
+    total = checked_add(total, primitive_retained_bytes())?;
+    total = checked_add(total, key_retained_bytes("output".len())?)?;
+    checked_add(total, output_retained)
+}
+
+fn response_wrapper_serialized_bytes(
+    ok: bool,
+    output_serialized: usize,
+) -> Result<usize, SandboxError> {
+    checked_add(response_object_syntax_len(ok)?, output_serialized)
+}
+
+fn discard_tool_responses(responses: Vec<ToolResponse>) {
+    for response in responses {
+        discard_json_value(response.output);
+    }
+}
+
+fn discard_json_value(value: Value) {
+    let mut pending = Vec::new();
+    pending.push(value);
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Array(mut children) => pending.append(&mut children),
+            Value::Object(children) => {
+                for (_, child) in children {
+                    pending.push(child);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+}
+
+enum CloneOperation<'a> {
+    Visit(&'a Value),
+    FinishArray(usize),
+    FinishObject(Vec<String>),
+}
+
+fn clone_json_value(source: &Value, limits: &crate::SandboxLimits) -> Result<Value, SandboxError> {
+    let measurement = measure_value(source, limits)?;
+    let mut operations = Vec::new();
+    operations
+        .try_reserve_exact(measurement.nodes.saturating_mul(2))
+        .map_err(|_| resource("value clone allocation failed"))?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(measurement.nodes)
+        .map_err(|_| resource("value clone allocation failed"))?;
+    operations.push(CloneOperation::Visit(source));
+
+    while let Some(operation) = operations.pop() {
+        match operation {
+            CloneOperation::Visit(value) => match value {
+                Value::Null => values.push(Value::Null),
+                Value::Bool(value) => values.push(Value::Bool(*value)),
+                Value::Number(value) => values.push(Value::Number(value.clone())),
+                Value::String(value) => values.push(Value::String(clone_string(value)?)),
+                Value::Array(items) => {
+                    operations.push(CloneOperation::FinishArray(items.len()));
+                    for item in items.iter().rev() {
+                        operations.push(CloneOperation::Visit(item));
+                    }
+                }
+                Value::Object(entries) => {
+                    let mut keys = Vec::new();
+                    keys.try_reserve_exact(entries.len())
+                        .map_err(|_| resource("value clone allocation failed"))?;
+                    for key in entries.keys() {
+                        keys.push(clone_string(key)?);
+                    }
+                    operations.push(CloneOperation::FinishObject(keys));
+                    for value in entries.values().rev() {
+                        operations.push(CloneOperation::Visit(value));
+                    }
+                }
+            },
+            CloneOperation::FinishArray(count) => {
+                let start = values
+                    .len()
+                    .checked_sub(count)
+                    .ok_or_else(|| execution("value clone stack underflow"))?;
+                let mut array = Vec::new();
+                array
+                    .try_reserve_exact(count)
+                    .map_err(|_| resource("value clone allocation failed"))?;
+                while values.len() > start {
+                    array.push(pop(&mut values)?);
+                }
+                array.reverse();
+                values.push(Value::Array(array));
+            }
+            CloneOperation::FinishObject(keys) => {
+                let start = values
+                    .len()
+                    .checked_sub(keys.len())
+                    .ok_or_else(|| execution("value clone stack underflow"))?;
+                let mut children = Vec::new();
+                children
+                    .try_reserve_exact(keys.len())
+                    .map_err(|_| resource("value clone allocation failed"))?;
+                while values.len() > start {
+                    children.push(pop(&mut values)?);
+                }
+                children.reverse();
+                let mut object = Map::new();
+                for (key, value) in keys.into_iter().zip(children) {
+                    object.insert(key, value);
+                }
+                values.push(Value::Object(object));
+            }
+        }
+    }
+    if values.len() != 1 {
+        return Err(execution("value clone did not produce one value"));
+    }
+    pop(&mut values)
+}
+
+fn clone_string(source: &str) -> Result<String, SandboxError> {
+    let mut cloned = String::new();
+    cloned
+        .try_reserve_exact(source.len())
+        .map_err(|_| resource("string clone allocation failed"))?;
+    cloned.push_str(source);
+    Ok(cloned)
+}
+
+fn values_equal(
+    left: &Value,
+    right: &Value,
+    limits: &crate::SandboxLimits,
+) -> Result<bool, SandboxError> {
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(1)
+        .map_err(|_| resource("equality allocation failed"))?;
+    pending.push((left, right));
+    while let Some((left, right)) = pending.pop() {
+        match (left, right) {
+            (Value::Null, Value::Null) => {}
+            (Value::Bool(left), Value::Bool(right)) if left == right => {}
+            (Value::Number(left), Value::Number(right)) if left == right => {}
+            (Value::String(left), Value::String(right)) if left == right => {}
+            (Value::Array(left), Value::Array(right)) if left.len() == right.len() => {
+                if left.len() > limits.max_collection_items {
+                    return Err(resource("collection item limit exceeded"));
+                }
+                pending
+                    .try_reserve(left.len())
+                    .map_err(|_| resource("equality allocation failed"))?;
+                for pair in left.iter().zip(right).rev() {
+                    pending.push(pair);
+                }
+            }
+            (Value::Object(left), Value::Object(right)) if left.len() == right.len() => {
+                if left.len() > limits.max_collection_items {
+                    return Err(resource("collection item limit exceeded"));
+                }
+                pending
+                    .try_reserve(left.len())
+                    .map_err(|_| resource("equality allocation failed"))?;
+                for ((left_key, left_value), (right_key, right_value)) in
+                    left.iter().zip(right).rev()
+                {
+                    if left_key != right_key {
+                        return Ok(false);
+                    }
+                    pending.push((left_value, right_value));
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 fn loop_body_slots(
     code: &[Instruction],
     body_target: usize,
@@ -1026,8 +1801,12 @@ fn loop_body_slots(
         .get(body_target..end)
         .ok_or_else(|| execution("loop body target is invalid"))?;
     let mut slots = Vec::new();
+    let capacity = body
+        .len()
+        .checked_mul(3)
+        .ok_or_else(|| resource("loop local tracking limit exceeded"))?;
     slots
-        .try_reserve(body.len().saturating_mul(3))
+        .try_reserve_exact(capacity)
         .map_err(|_| resource("loop local tracking allocation failed"))?;
     for instruction in body {
         match instruction {
@@ -1071,7 +1850,12 @@ fn integer(value: &Value) -> Result<i64, SandboxError> {
         .as_i64()
         .ok_or_else(|| execution("integer operation requires i64 operands"))
 }
-fn binary(operator: BinaryOperator, left: Value, right: Value) -> Result<Value, SandboxError> {
+fn binary(
+    operator: BinaryOperator,
+    left: Value,
+    right: Value,
+    limits: &crate::SandboxLimits,
+) -> Result<Value, SandboxError> {
     use BinaryOperator::*;
     let value = match operator {
         Add => Value::Number(Number::from(
@@ -1099,8 +1883,8 @@ fn binary(operator: BinaryOperator, left: Value, right: Value) -> Result<Value, 
                 .checked_rem(integer(&right)?)
                 .ok_or_else(|| execution("checked integer remainder failed"))?,
         )),
-        Equal => Value::Bool(left == right),
-        NotEqual => Value::Bool(left != right),
+        Equal => Value::Bool(values_equal(&left, &right, limits)?),
+        NotEqual => Value::Bool(!values_equal(&left, &right, limits)?),
         LessThan => Value::Bool(integer(&left)? < integer(&right)?),
         LessThanOrEqual => Value::Bool(integer(&left)? <= integer(&right)?),
         GreaterThan => Value::Bool(integer(&left)? > integer(&right)?),
@@ -1158,72 +1942,14 @@ fn unary(operator: UnaryOperator, value: Value) -> Result<Value, SandboxError> {
     }
 }
 
-/// Exact compact JSON length without allocating a serialization buffer. This
-/// is the unit used for final output and value-retention accounting.
-fn serialized_value_len(value: &Value) -> Result<usize, SandboxError> {
-    match value {
-        Value::Null => Ok(4),
-        Value::Bool(true) => Ok(4),
-        Value::Bool(false) => Ok(5),
-        Value::Number(number) => Ok(number.to_string().len()),
-        Value::String(value) => serialized_string_len(value),
-        Value::Array(values) => serialized_array_len(values),
-        Value::Object(values) => {
-            let mut total = 2usize;
-            for (index, (key, value)) in values.iter().enumerate() {
-                if index > 0 {
-                    total = checked_bytes(total, 1)?;
-                }
-                total = checked_bytes(total, serialized_string_len(key)?)?;
-                total = checked_bytes(total, 1)?;
-                total = checked_bytes(total, serialized_value_len(value)?)?;
-            }
-            Ok(total)
-        }
-    }
-}
-
-fn serialized_array_len(values: &[Value]) -> Result<usize, SandboxError> {
-    let mut total = serialized_array_syntax_len(values.len())?;
-    for value in values {
-        total = checked_bytes(total, serialized_value_len(value)?)?;
-    }
-    Ok(total)
-}
-
-fn serialized_array_syntax_len(count: usize) -> Result<usize, SandboxError> {
-    checked_bytes(2, count.saturating_sub(1))
-}
-
 fn response_object_syntax_len(ok: bool) -> Result<usize, SandboxError> {
     let mut total = 2usize;
-    total = checked_bytes(total, serialized_string_len("ok")?)?;
-    total = checked_bytes(total, 1)?;
-    total = checked_bytes(total, if ok { 4 } else { 5 })?;
-    total = checked_bytes(total, 1)?;
-    total = checked_bytes(total, serialized_string_len("output")?)?;
-    checked_bytes(total, 1)
-}
-
-fn serialized_string_len(value: &str) -> Result<usize, SandboxError> {
-    let mut total = 2usize;
-    for byte in value.bytes() {
-        total = checked_bytes(
-            total,
-            match byte {
-                b'"' | b'\\' => 2,
-                0x00..=0x1f => 6,
-                _ => 1,
-            },
-        )?;
-    }
-    Ok(total)
-}
-
-fn checked_bytes(total: usize, additional: usize) -> Result<usize, SandboxError> {
-    total
-        .checked_add(additional)
-        .ok_or_else(|| resource("value byte limit exceeded"))
+    total = checked_add(total, serialized_string_len("ok")?)?;
+    total = checked_add(total, 1)?;
+    total = checked_add(total, if ok { 4 } else { 5 })?;
+    total = checked_add(total, 1)?;
+    total = checked_add(total, serialized_string_len("output")?)?;
+    checked_add(total, 1)
 }
 
 fn resource(message: impl Into<String>) -> SandboxError {
@@ -1240,11 +1966,20 @@ fn resume_error(message: impl Into<String>) -> SandboxError {
 mod tests {
     use super::*;
     use crate::{Program, SandboxLimits};
+    use alloc::vec;
     use serde_json::json;
 
     fn execution(program: serde_json::Value, id: u64) -> Execution {
-        let bytes = serde_json::to_vec(&program).unwrap();
         let limits = SandboxLimits::default();
+        execution_with_limits(program, id, limits)
+    }
+
+    fn execution_with_limits(
+        program: serde_json::Value,
+        id: u64,
+        limits: SandboxLimits,
+    ) -> Execution {
+        let bytes = serde_json::to_vec(&program).unwrap();
         let verified = Program::from_json(&bytes, &limits)
             .unwrap()
             .compile(&limits)
@@ -1258,6 +1993,21 @@ mod tests {
                 StepOutcome::Sliced => {}
                 StepOutcome::Complete(value) => return value,
                 StepOutcome::Yielded { .. } => panic!("unexpected tool yield"),
+            }
+        }
+    }
+
+    fn next_event(execution: &mut Execution, slice_fuel: u64) -> Result<StepOutcome, SandboxError> {
+        loop {
+            let before = execution.metrics().fuel_used;
+            match execution.step(slice_fuel)? {
+                StepOutcome::Sliced => {
+                    assert!(
+                        execution.metrics().fuel_used > before,
+                        "every sliced transition must consume fuel"
+                    );
+                }
+                outcome => return Ok(outcome),
             }
         }
     }
@@ -1292,7 +2042,7 @@ mod tests {
             {"kind":"return","value":{"kind":"variable","name":"results"}}
         ]});
         let mut vm = execution(program, 7);
-        let (batch, token) = match vm.step(1_024).unwrap() {
+        let (batch, token) = match next_event(&mut vm, 1).unwrap() {
             StepOutcome::Yielded { batch, resume } => (batch, resume),
             other => panic!("expected yield, got {other:?}"),
         };
@@ -1316,7 +2066,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            vm.step(1_024).unwrap(),
+            next_event(&mut vm, 1).unwrap(),
             StepOutcome::Complete(json!([
                 {"ok":true,"output":{"value":"safe"}},
                 {"ok":false,"output":null}
@@ -1334,11 +2084,11 @@ mod tests {
         };
         let mut first = execution(program(), 1);
         let mut second = execution(program(), 2);
-        let (first_batch, first_token) = match first.step(100).unwrap() {
+        let (first_batch, first_token) = match next_event(&mut first, 1).unwrap() {
             StepOutcome::Yielded { batch, resume } => (batch, resume),
             _ => unreachable!(),
         };
-        let (second_batch, second_token) = match second.step(100).unwrap() {
+        let (second_batch, _second_token) = match next_event(&mut second, 1).unwrap() {
             StepOutcome::Yielded { batch, resume } => (batch, resume),
             _ => unreachable!(),
         };
@@ -1352,97 +2102,192 @@ mod tests {
                 .code(),
             SandboxErrorCode::InvalidResume
         );
-        second
+        assert_eq!(
+            second.step(100).unwrap_err().code(),
+            SandboxErrorCode::Execution
+        );
+        assert_eq!(
+            first.step(100).unwrap_err().code(),
+            SandboxErrorCode::InvalidResume
+        );
+
+        let mut valid = execution(program(), 3);
+        let (valid_batch, valid_token) = match next_event(&mut valid, 1).unwrap() {
+            StepOutcome::Yielded { batch, resume } => (batch, resume),
+            _ => unreachable!(),
+        };
+        valid
             .resume(
-                second_token,
-                vec![ToolResponse::success(&second_batch.calls()[0], json!(2))],
+                valid_token,
+                vec![ToolResponse::success(&valid_batch.calls()[0], json!(3))],
             )
             .unwrap();
         assert!(matches!(
-            second.step(100).unwrap(),
+            next_event(&mut valid, 1).unwrap(),
             StepOutcome::Complete(_)
         ));
-        first
-            .resume(
-                ResumeToken {
-                    execution_id: ExecutionId(1),
-                    yield_ordinal: 0,
-                },
-                vec![ToolResponse::success(&first_batch.calls()[0], json!(1))],
-            )
-            .unwrap();
-        assert!(matches!(first.step(100).unwrap(), StepOutcome::Complete(_)));
+        drop(first_batch);
     }
 
     #[test]
-    fn resume_rejects_duplicate_count_and_response_order_without_consuming_the_token() {
+    fn invalid_resume_terminalizes_without_reopening_or_replaying_the_yield() {
         let program = json!({"version":1,"body":[
             {"kind":"fan_out","name":"results","tool_id":"read","item":"item",
              "collection":{"kind":"array","items":[{"kind":"integer","value":1},{"kind":"integer","value":2}]},"max_calls":2,
              "arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"variable","name":"item"}}]}},
             {"kind":"return","value":{"kind":"variable","name":"results"}}
         ]});
-        let mut vm = execution(program, 42);
-        let (batch, token) = match vm.step(100).unwrap() {
+        let suspend = |id| {
+            let mut vm = execution(program.clone(), id);
+            let yielded = next_event(&mut vm, 1).unwrap();
+            match yielded {
+                StepOutcome::Yielded { batch, resume } => (vm, batch, resume),
+                other => panic!("expected yield, got {other:?}"),
+            }
+        };
+
+        let (mut count_vm, count_batch, count_token) = suspend(42);
+        let first = ToolResponse::success(&count_batch.calls()[0], json!("first"));
+        assert_eq!(
+            count_vm
+                .resume(count_token, vec![first])
+                .unwrap_err()
+                .code(),
+            SandboxErrorCode::InvalidResume
+        );
+        assert_eq!(
+            count_vm.step(100).unwrap_err().code(),
+            SandboxErrorCode::Execution
+        );
+
+        let (mut order_vm, order_batch, order_token) = suspend(43);
+        let reversed = vec![
+            ToolResponse::success(&order_batch.calls()[1], json!("second")),
+            ToolResponse::success(&order_batch.calls()[0], json!("first")),
+        ];
+        assert_eq!(
+            order_vm.resume(order_token, reversed).unwrap_err().code(),
+            SandboxErrorCode::InvalidResume
+        );
+        assert_eq!(
+            order_vm.step(100).unwrap_err().code(),
+            SandboxErrorCode::Execution
+        );
+
+        let (mut valid_vm, valid_batch, valid_token) = suspend(44);
+        let ordered = vec![
+            ToolResponse::success(&valid_batch.calls()[0], json!("first")),
+            ToolResponse::success(&valid_batch.calls()[1], json!("second")),
+        ];
+        valid_vm.resume(valid_token, ordered).unwrap();
+        assert!(matches!(
+            next_event(&mut valid_vm, 1).unwrap(),
+            StepOutcome::Complete(_)
+        ));
+        assert_eq!(
+            valid_vm.step(100).unwrap_err().code(),
+            SandboxErrorCode::Execution
+        );
+    }
+
+    #[test]
+    fn tool_response_boundary_rejects_hostile_values_before_vm_mutation() {
+        let program = json!({"version":1,"body":[
+            {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[]}},
+            {"kind":"return","value":{"kind":"variable","name":"result"}}
+        ]});
+        let limits = SandboxLimits {
+            max_nesting: 16,
+            max_collection_items: 2,
+            ..SandboxLimits::default()
+        };
+        let attempt = |id: u64, output: Value| {
+            let mut vm = execution_with_limits(program.clone(), id, limits);
+            let (batch, token) = match next_event(&mut vm, 1).unwrap() {
+                StepOutcome::Yielded { batch, resume } => (batch, resume),
+                other => panic!("expected yield, got {other:?}"),
+            };
+            let before = vm.metrics();
+            let result = vm.resume(
+                token,
+                vec![ToolResponse::success(&batch.calls()[0], output)],
+            );
+            (vm, before, result)
+        };
+
+        let mut too_deep = Value::Null;
+        for _ in 0..limits.max_nesting {
+            too_deep = Value::Array(vec![too_deep]);
+        }
+        let mut extremely_deep = Value::Null;
+        for _ in 0..10_000 {
+            extremely_deep = Value::Array(vec![extremely_deep]);
+        }
+        for (id, hostile) in [
+            (51, too_deep),
+            (52, Value::Array(vec![Value::Null; 3])),
+            (53, json!(1.5)),
+            (54, extremely_deep),
+        ] {
+            let (mut vm, before, result) = attempt(id, hostile);
+            assert_eq!(result.unwrap_err().code(), SandboxErrorCode::ResourceLimit);
+            assert_eq!(vm.metrics().retained_bytes, before.retained_bytes);
+            assert_eq!(vm.metrics().cumulative_bytes, before.cumulative_bytes);
+            assert_eq!(vm.metrics().yields, before.yields);
+            assert_eq!(vm.step(1).unwrap_err().code(), SandboxErrorCode::Execution);
+        }
+
+        let inert = json!({"kind":"invoke","tool_id":"danger","arguments":{"kind":"return"}});
+        let mut vm = execution(program, 55);
+        let (batch, token) = match next_event(&mut vm, 1).unwrap() {
             StepOutcome::Yielded { batch, resume } => (batch, resume),
             other => panic!("expected yield, got {other:?}"),
         };
-        let ordered = vec![
-            ToolResponse::success(&batch.calls()[0], json!("first")),
-            ToolResponse::success(&batch.calls()[1], json!("second")),
-        ];
-        assert_eq!(
-            vm.resume(
-                ResumeToken {
-                    execution_id: ExecutionId(42),
-                    yield_ordinal: 99,
-                },
-                ordered.clone(),
-            )
-            .unwrap_err()
-            .code(),
-            SandboxErrorCode::InvalidResume
-        );
-        assert_eq!(
-            vm.resume(token, vec![ordered[0].clone()])
-                .unwrap_err()
-                .code(),
-            SandboxErrorCode::InvalidResume
-        );
-        let valid_token = match vm.step(1).unwrap_err().code() {
-            SandboxErrorCode::InvalidResume => ResumeToken {
-                execution_id: ExecutionId(42),
-                yield_ordinal: 0,
-            },
-            code => panic!("expected suspended execution, got {code:?}"),
-        };
-        assert_eq!(
-            vm.resume(valid_token, vec![ordered[1].clone(), ordered[0].clone()])
-                .unwrap_err()
-                .code(),
-            SandboxErrorCode::InvalidResume
-        );
         vm.resume(
-            ResumeToken {
-                execution_id: ExecutionId(42),
-                yield_ordinal: 0,
-            },
-            ordered,
+            token,
+            vec![ToolResponse::success(&batch.calls()[0], inert.clone())],
         )
         .unwrap();
-        assert!(matches!(vm.step(100).unwrap(), StepOutcome::Complete(_)));
-        assert_eq!(
+        let output = match next_event(&mut vm, 1).unwrap() {
+            StepOutcome::Complete(output) => output,
+            other => panic!("expected completion, got {other:?}"),
+        };
+        assert_eq!(output, json!({"ok":true,"output":inert}));
+        assert_eq!(vm.metrics().yields, 1, "response-shaped code stays inert");
+    }
+
+    #[test]
+    fn response_serialized_boundary_is_inclusive() {
+        let program = json!({"version":1,"body":[
+            {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[]}},
+            {"kind":"return","value":{"kind":"variable","name":"result"}}
+        ]});
+        let output = json!("x");
+        let output_bytes = measure_value(&output, &SandboxLimits::default())
+            .unwrap()
+            .serialized;
+        let exact = response_wrapper_serialized_bytes(true, output_bytes).unwrap();
+        let attempt = |limit, id| {
+            let limits = SandboxLimits {
+                max_output_bytes: limit,
+                ..SandboxLimits::default()
+            };
+            let mut vm = execution_with_limits(program.clone(), id, limits);
+            let (batch, token) = match next_event(&mut vm, 1).unwrap() {
+                StepOutcome::Yielded { batch, resume } => (batch, resume),
+                _ => unreachable!(),
+            };
             vm.resume(
-                ResumeToken {
-                    execution_id: ExecutionId(42),
-                    yield_ordinal: 0,
-                },
-                Vec::new(),
+                token,
+                vec![ToolResponse::success(&batch.calls()[0], output.clone())],
             )
-            .unwrap_err()
-            .code(),
-            SandboxErrorCode::InvalidResume
+        };
+        assert_eq!(
+            attempt(exact - 1, 55).unwrap_err().code(),
+            SandboxErrorCode::ResourceLimit
         );
+        assert!(attempt(exact, 56).is_ok());
+        assert!(attempt(exact + 1, 57).is_ok());
     }
 
     #[test]
@@ -1452,10 +2297,25 @@ mod tests {
             {"kind":"return","value":{"kind":"variable","name":"value"}}
         ]});
         let mut vm = execution(program, 43);
-        assert_eq!(vm.step(1).unwrap(), StepOutcome::Sliced);
-        assert_eq!(vm.metrics().fuel_used, 1);
-        assert_eq!(vm.step(1).unwrap(), StepOutcome::Complete(json!(1)));
-        assert_eq!(vm.metrics().fuel_used, 2);
+        let mut slices = 0usize;
+        loop {
+            let before = vm.metrics().fuel_used;
+            match vm.step(1).unwrap() {
+                StepOutcome::Sliced => {
+                    slices += 1;
+                    assert_eq!(vm.metrics().fuel_used, before + 1);
+                }
+                StepOutcome::Complete(value) => {
+                    assert_eq!(value, json!(1));
+                    break;
+                }
+                StepOutcome::Yielded { .. } => unreachable!(),
+            }
+        }
+        assert!(
+            slices > 1,
+            "expression work must resume across slice-one calls"
+        );
 
         let limits = SandboxLimits {
             max_fuel: 1,
@@ -1477,6 +2337,105 @@ mod tests {
             exhausted.step(1).unwrap_err().code(),
             SandboxErrorCode::ResourceLimit
         );
+    }
+
+    #[test]
+    fn slice_one_completes_expression_larger_than_the_default_slice_deterministically() {
+        let items = (0..64)
+            .map(|value| json!({"kind":"integer","value":value}))
+            .collect::<Vec<_>>();
+        let program = json!({"version":1,"body":[{
+            "kind":"return","value":{"kind":"array","items":items}
+        }]});
+        let limits = SandboxLimits {
+            max_slice_fuel: 1,
+            ..SandboxLimits::default()
+        };
+        let execute = |id| {
+            let mut vm = execution_with_limits(program.clone(), id, limits);
+            let mut slices = 0u64;
+            loop {
+                let before = vm.metrics().fuel_used;
+                match vm.step(1).unwrap() {
+                    StepOutcome::Sliced => {
+                        slices += 1;
+                        assert_eq!(vm.metrics().fuel_used, before + 1);
+                    }
+                    StepOutcome::Complete(output) => {
+                        return (output, vm.metrics(), slices);
+                    }
+                    StepOutcome::Yielded { .. } => unreachable!(),
+                }
+            }
+        };
+        let first = execute(58);
+        let second = execute(58);
+        assert_eq!(first, second);
+        assert!(
+            first.2 > SandboxLimits::default().max_slice_fuel,
+            "the expression must exceed the former atomic slice size"
+        );
+    }
+
+    #[test]
+    fn fuel_boundary_is_exact_at_n_minus_one_n_and_n_plus_one() {
+        let program = json!({"version":1,"body":[{
+            "kind":"return","value":{"kind":"null"}
+        }]});
+        let mut baseline = execution(program.clone(), 59);
+        assert_eq!(
+            next_event(&mut baseline, 1).unwrap(),
+            StepOutcome::Complete(Value::Null)
+        );
+        let exact = baseline.metrics().fuel_used;
+        let attempt = |max_fuel, id| {
+            let limits = SandboxLimits {
+                max_fuel,
+                max_slice_fuel: 1,
+                ..SandboxLimits::default()
+            };
+            let mut vm = execution_with_limits(program.clone(), id, limits);
+            let outcome = next_event(&mut vm, 1);
+            (outcome, vm.metrics())
+        };
+        assert_eq!(
+            attempt(exact - 1, 60).0.unwrap_err().code(),
+            SandboxErrorCode::ResourceLimit
+        );
+        for (limit, id) in [(exact, 61), (exact + 1, 62)] {
+            let (outcome, metrics) = attempt(limit, id);
+            assert_eq!(outcome.unwrap(), StepOutcome::Complete(Value::Null));
+            assert_eq!(metrics.fuel_used, exact);
+        }
+    }
+
+    #[test]
+    fn identical_public_resume_sequences_are_deterministic() {
+        let program = json!({"version":1,"body":[
+            {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[
+                {"key":"id","value":{"kind":"integer","value":7}}
+            ]}},
+            {"kind":"return","value":{"kind":"variable","name":"result"}}
+        ]});
+        let execute = || {
+            let mut vm = execution(program.clone(), 63);
+            let (batch, token) = match next_event(&mut vm, 1).unwrap() {
+                StepOutcome::Yielded { batch, resume } => (batch, resume),
+                other => panic!("expected yield, got {other:?}"),
+            };
+            let request = batch.calls()[0].clone();
+            vm.resume(
+                token,
+                vec![ToolResponse::success(&request, json!({"value":9}))],
+            )
+            .unwrap();
+            let output = match next_event(&mut vm, 1).unwrap() {
+                StepOutcome::Complete(output) => output,
+                other => panic!("expected completion, got {other:?}"),
+            };
+            (request, output, vm.metrics())
+        };
+        assert_eq!(execute(), execute());
     }
 
     #[test]
@@ -1504,7 +2463,7 @@ mod tests {
             vm.step(2).unwrap_err().code(),
             SandboxErrorCode::ResourceLimit
         );
-        let (batch, token) = match vm.step(1).unwrap() {
+        let (batch, token) = match next_event(&mut vm, 1).unwrap() {
             StepOutcome::Yielded { batch, resume } => (batch, resume),
             other => panic!("expected first yield, got {other:?}"),
         };
@@ -1513,10 +2472,16 @@ mod tests {
             vec![ToolResponse::success(&batch.calls()[0], json!(1))],
         )
         .unwrap();
-        assert_eq!(
-            vm.step(1).unwrap_err().code(),
-            SandboxErrorCode::ResourceLimit
-        );
+        loop {
+            match vm.step(1) {
+                Ok(StepOutcome::Sliced) => {}
+                Err(error) => {
+                    assert_eq!(error.code(), SandboxErrorCode::ResourceLimit);
+                    break;
+                }
+                Ok(other) => panic!("expected yield-limit failure, got {other:?}"),
+            }
+        }
         assert_eq!(vm.metrics().yields, 1);
     }
 
@@ -1568,7 +2533,7 @@ mod tests {
         let program = json!({"version":1,"body":[{"kind":"return","value":{"kind":"binary","operator":"add","left":{"kind":"integer","value":9223372036854775807i64},"right":{"kind":"integer","value":1}}} ]});
         let mut vm = execution(program, 9);
         assert_eq!(
-            vm.step(100).unwrap_err().code(),
+            next_event(&mut vm, 1).unwrap_err().code(),
             SandboxErrorCode::Execution
         );
     }
@@ -1590,15 +2555,17 @@ mod tests {
         }
 
         assert_eq!(
-            compile_with("1234", 7).step(100).unwrap(),
+            next_event(&mut compile_with("1234", 7), 1).unwrap(),
             StepOutcome::Complete(json!("1234"))
         );
         assert_eq!(
-            compile_with("12345", 7).step(100).unwrap(),
+            next_event(&mut compile_with("12345", 7), 1).unwrap(),
             StepOutcome::Complete(json!("12345"))
         );
         assert_eq!(
-            compile_with("123456", 7).step(100).unwrap_err().code(),
+            next_event(&mut compile_with("123456", 7), 1)
+                .unwrap_err()
+                .code(),
             SandboxErrorCode::ResourceLimit
         );
 
@@ -1606,10 +2573,6 @@ mod tests {
             {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[]}},
             {"kind":"return","value":{"kind":"variable","name":"result"}}
         ]});
-        let response_output = json!({"ok":true,"output":"x"});
-        let expected = serialized_value_len(&json!({})).unwrap()
-            + "read".len()
-            + (serialized_value_len(&response_output).unwrap() * 2);
         let build_response_vm = |limit| {
             let limits = SandboxLimits {
                 max_live_bytes: limit,
@@ -1623,36 +2586,33 @@ mod tests {
                     .unwrap();
             Execution::new(verified, ExecutionId(23)).unwrap()
         };
-        let mut at_limit = build_response_vm(expected);
-        let (batch, token) = match at_limit.step(100).unwrap() {
-            StepOutcome::Yielded { batch, resume } => (batch, resume),
-            _ => unreachable!(),
-        };
-        at_limit
-            .resume(
+        let execute_response = |limit| -> Result<usize, SandboxError> {
+            let mut vm = build_response_vm(limit);
+            let (batch, token) = match next_event(&mut vm, 1)? {
+                StepOutcome::Yielded { batch, resume } => (batch, resume),
+                _ => {
+                    return Err(SandboxError::new(
+                        SandboxErrorCode::Execution,
+                        "expected response test yield",
+                    ));
+                }
+            };
+            vm.resume(
                 token,
                 vec![ToolResponse::success(&batch.calls()[0], json!("x"))],
-            )
-            .unwrap();
-        assert!(matches!(
-            at_limit.step(100).unwrap(),
-            StepOutcome::Complete(_)
-        ));
-        assert_eq!(at_limit.metrics().cumulative_bytes, expected);
-
-        let mut below_limit = build_response_vm(expected - 1);
-        let (batch, token) = match below_limit.step(100).unwrap() {
-            StepOutcome::Yielded { batch, resume } => (batch, resume),
-            _ => unreachable!(),
+            )?;
+            if !matches!(next_event(&mut vm, 1)?, StepOutcome::Complete(_)) {
+                return Err(SandboxError::new(
+                    SandboxErrorCode::Execution,
+                    "expected response test completion",
+                ));
+            }
+            Ok(vm.metrics().cumulative_bytes)
         };
-        below_limit
-            .resume(
-                token,
-                vec![ToolResponse::success(&batch.calls()[0], json!("x"))],
-            )
-            .unwrap();
+        let expected = execute_response(SandboxLimits::default().max_cumulative_bytes).unwrap();
+        assert_eq!(execute_response(expected).unwrap(), expected);
         assert_eq!(
-            below_limit.step(100).unwrap_err().code(),
+            execute_response(expected - 1).unwrap_err().code(),
             SandboxErrorCode::ResourceLimit
         );
 
@@ -1674,7 +2634,7 @@ mod tests {
                     .unwrap();
             Execution::new(verified, ExecutionId(24)).unwrap()
         };
-        let mut baseline = build_intermediate_vm(4 * 1024);
+        let mut baseline = build_intermediate_vm(64 * 1024);
         loop {
             match baseline.step(1_024).unwrap() {
                 StepOutcome::Sliced => {}
