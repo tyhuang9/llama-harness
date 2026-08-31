@@ -848,8 +848,7 @@ mod tests {
             .with_aliases(["forecast", "temperature"]);
         let mut first = ToolRegistry::default();
         register(&mut first, "weather.current", "SECRET-A", metadata.clone());
-        let first_fingerprint = first.catalog_fingerprint();
-        let (_, first_stats) = scope(
+        let (_, cold_stats) = scope(
             &first,
             "SECRET-A",
             &["weather.current".into()],
@@ -857,7 +856,17 @@ mod tests {
             ProviderCapabilityLimits::new(),
         )
         .unwrap();
-        assert!(first_stats.cache_hit);
+        assert!(!cold_stats.cache_hit);
+        let (_, warm_stats) = scope(
+            &first,
+            "temperature",
+            &["weather.current".into()],
+            ToolDiscoveryLimits::new().with_max_tools(0),
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert!(warm_stats.cache_hit);
+        let first_fingerprint = first.catalog_fingerprint();
 
         let mut second = ToolRegistry::default();
         register(&mut second, "weather.current", "SECRET-B", metadata);
