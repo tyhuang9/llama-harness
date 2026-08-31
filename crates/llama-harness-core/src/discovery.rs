@@ -5,7 +5,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +32,11 @@ pub(crate) const MAX_DISCOVERY_IDENTIFIER_BYTES: usize = 128;
 pub(crate) const DISCOVERY_GUARD_INTERVAL: usize = 64;
 pub(crate) const MAX_SCOPE_CATALOG_CACHE_ENTRIES: usize = 16;
 pub(crate) const MAX_PREPARED_CATALOG_CACHE_ENTRIES: usize = 32;
+pub(crate) const MAX_SCOPE_CATALOG_CACHE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_PREPARED_CATALOG_CACHE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_DEFERRED_LEXICAL_TERMS: usize = 256;
+pub(crate) const MAX_DEFERRED_LEXICAL_BYTES: usize = 1024;
+const TREE_NODE_OVERHEAD: usize = 4 * std::mem::size_of::<usize>();
 
 /// Whether a registered tool is always exposed or selected only when relevant.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,6 +106,36 @@ impl ToolDiscoveryMetadata {
                 return Err(HarnessError::InvalidTool(format!(
                     "tool {tool_id} has duplicate normalized discovery aliases"
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_deferred_lexical_shape(
+        &self,
+        tool_id: &str,
+        tool_name: &str,
+    ) -> Result<(), HarnessError> {
+        if self.exposure != ToolExposure::Deferred {
+            return Ok(());
+        }
+        let mut term_count = 0usize;
+        let mut lexical_bytes = 0usize;
+        for value in std::iter::once(tool_id)
+            .chain(std::iter::once(tool_name))
+            .chain(self.namespace.iter().map(String::as_str))
+            .chain(self.aliases.iter().map(String::as_str))
+        {
+            for term in tokenize(value) {
+                term_count = term_count.saturating_add(1);
+                lexical_bytes = lexical_bytes.saturating_add(term.len());
+                if term_count > MAX_DEFERRED_LEXICAL_TERMS
+                    || lexical_bytes > MAX_DEFERRED_LEXICAL_BYTES
+                {
+                    return Err(HarnessError::InvalidTool(format!(
+                        "tool {tool_id} deferred discovery terms exceed the lexical index limit"
+                    )));
+                }
             }
         }
         Ok(())
@@ -277,31 +315,109 @@ impl CatalogCacheKey {
             tools: Arc::from(tools),
         }
     }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.tools
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(String, u64)>()),
+            )
+            .saturating_add(
+                self.tools
+                    .iter()
+                    .map(|(id, _)| id.capacity())
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+}
+
+struct CatalogCacheEntry {
+    key: CatalogCacheKey,
+    index: Arc<CatalogIndex>,
+    retained_bytes: usize,
+    last_used: AtomicU64,
 }
 
 #[derive(Default)]
 pub(crate) struct CatalogCache {
-    entries: VecDeque<(CatalogCacheKey, Arc<CatalogIndex>)>,
+    entries: VecDeque<CatalogCacheEntry>,
+    retained_bytes: usize,
+    evictions: u64,
+    clock: AtomicU64,
 }
 
 impl CatalogCache {
     pub(crate) fn get(&self, key: &CatalogCacheKey) -> Option<Arc<CatalogIndex>> {
-        self.entries
-            .iter()
-            .find(|(candidate, _)| candidate == key)
-            .map(|(_, index)| Arc::clone(index))
+        let entry = self.entries.iter().find(|entry| entry.key == *key)?;
+        entry
+            .last_used
+            .store(self.next_recency(), Ordering::Relaxed);
+        Some(Arc::clone(&entry.index))
     }
 
-    pub(crate) fn insert(&mut self, key: CatalogCacheKey, index: Arc<CatalogIndex>) {
-        if self.entries.len() == MAX_SCOPE_CATALOG_CACHE_ENTRIES {
-            self.entries.pop_front();
+    pub(crate) fn insert(&mut self, key: CatalogCacheKey, index: Arc<CatalogIndex>) -> bool {
+        let retained_bytes = key.retained_bytes().saturating_add(index.retained_bytes());
+        if retained_bytes > MAX_SCOPE_CATALOG_CACHE_BYTES {
+            return false;
         }
-        self.entries.push_back((key, index));
+        while self.entries.len() >= MAX_SCOPE_CATALOG_CACHE_ENTRIES
+            || self.retained_bytes.saturating_add(retained_bytes) > MAX_SCOPE_CATALOG_CACHE_BYTES
+        {
+            let Some(position) = self.least_recently_used_position() else {
+                break;
+            };
+            let Some(evicted) = self.entries.remove(position) else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(evicted.retained_bytes);
+            self.evictions = self.evictions.saturating_add(1);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.entries.push_back(CatalogCacheEntry {
+            key,
+            index,
+            retained_bytes,
+            last_used: AtomicU64::new(self.next_recency()),
+        });
+        true
+    }
+
+    fn next_recency(&self) -> u64 {
+        self.clock
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+    }
+
+    fn least_recently_used_position(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(position, entry)| (entry.last_used.load(Ordering::Relaxed), *position))
+            .map(|(position, _)| position)
     }
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -323,26 +439,110 @@ impl PreparedCatalogKey {
         guard()?;
         Ok(Self(Arc::from(tools)))
     }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.0
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(String, u64)>()),
+            )
+            .saturating_add(
+                self.0
+                    .iter()
+                    .map(|(id, _)| id.capacity())
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+}
+
+struct PreparedCatalogCacheEntry {
+    key: PreparedCatalogKey,
+    catalog: Arc<PreparedToolCatalog>,
+    retained_bytes: usize,
+    last_used: AtomicU64,
 }
 
 #[derive(Default)]
 pub(crate) struct PreparedCatalogCache {
-    entries: VecDeque<(PreparedCatalogKey, Arc<PreparedToolCatalog>)>,
+    entries: VecDeque<PreparedCatalogCacheEntry>,
+    retained_bytes: usize,
+    evictions: u64,
+    clock: AtomicU64,
 }
 
 impl PreparedCatalogCache {
     pub(crate) fn get(&self, key: &PreparedCatalogKey) -> Option<Arc<PreparedToolCatalog>> {
-        self.entries
-            .iter()
-            .find(|(candidate, _)| candidate == key)
-            .map(|(_, catalog)| Arc::clone(catalog))
+        let entry = self.entries.iter().find(|entry| entry.key == *key)?;
+        entry
+            .last_used
+            .store(self.next_recency(), Ordering::Relaxed);
+        Some(Arc::clone(&entry.catalog))
     }
 
-    pub(crate) fn insert(&mut self, key: PreparedCatalogKey, catalog: Arc<PreparedToolCatalog>) {
-        if self.entries.len() == MAX_PREPARED_CATALOG_CACHE_ENTRIES {
-            self.entries.pop_front();
+    pub(crate) fn insert(
+        &mut self,
+        key: PreparedCatalogKey,
+        catalog: Arc<PreparedToolCatalog>,
+    ) -> bool {
+        let retained_bytes = key
+            .retained_bytes()
+            .saturating_add(prepared_catalog_retained_bytes(&catalog));
+        if retained_bytes > MAX_PREPARED_CATALOG_CACHE_BYTES {
+            return false;
         }
-        self.entries.push_back((key, catalog));
+        while self.entries.len() >= MAX_PREPARED_CATALOG_CACHE_ENTRIES
+            || self.retained_bytes.saturating_add(retained_bytes) > MAX_PREPARED_CATALOG_CACHE_BYTES
+        {
+            let Some(position) = self.least_recently_used_position() else {
+                break;
+            };
+            let Some(evicted) = self.entries.remove(position) else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(evicted.retained_bytes);
+            self.evictions = self.evictions.saturating_add(1);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.entries.push_back(PreparedCatalogCacheEntry {
+            key,
+            catalog,
+            retained_bytes,
+            last_used: AtomicU64::new(self.next_recency()),
+        });
+        true
+    }
+
+    fn next_recency(&self) -> u64 {
+        self.clock
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+    }
+
+    fn least_recently_used_position(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(position, entry)| (entry.last_used.load(Ordering::Relaxed), *position))
+            .map(|(position, _)| position)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -382,6 +582,124 @@ impl CatalogIndex {
             document_frequency,
             total_document_len,
         })
+    }
+
+    fn retained_bytes(&self) -> usize {
+        let entries = self
+            .entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<CatalogEntry>());
+        let entry_allocations = self.entries.iter().fold(0usize, |total, entry| {
+            total
+                .saturating_add(entry.id.capacity())
+                .saturating_add(entry.name.capacity())
+                .saturating_add(
+                    entry
+                        .metadata
+                        .namespace
+                        .as_ref()
+                        .map_or(0, String::capacity),
+                )
+                .saturating_add(
+                    entry
+                        .metadata
+                        .aliases
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                )
+                .saturating_add(
+                    entry
+                        .metadata
+                        .aliases
+                        .iter()
+                        .map(String::capacity)
+                        .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(string_u32_map_retained_bytes(&entry.terms))
+        });
+        std::mem::size_of::<Self>()
+            .saturating_add(entries)
+            .saturating_add(entry_allocations)
+            .saturating_add(string_u32_map_retained_bytes(&self.document_frequency))
+    }
+}
+
+fn string_u32_map_retained_bytes(map: &BTreeMap<String, u32>) -> usize {
+    map.iter().fold(0usize, |total, (term, _)| {
+        total
+            .saturating_add(std::mem::size_of::<(String, u32)>())
+            .saturating_add(TREE_NODE_OVERHEAD)
+            .saturating_add(term.capacity())
+    })
+}
+
+fn prepared_catalog_retained_bytes(catalog: &PreparedToolCatalog) -> usize {
+    let definitions = catalog
+        .definitions()
+        .iter()
+        .fold(0usize, |total, definition| {
+            total.saturating_add(tool_definition_retained_bytes(definition))
+        });
+    std::mem::size_of::<PreparedToolCatalog>()
+        .saturating_add(definitions)
+        .saturating_add(catalog.serialized_definitions().len())
+        .saturating_add(catalog.provider_tools_json().get().len())
+}
+
+fn tool_definition_retained_bytes(definition: &ToolDefinition) -> usize {
+    std::mem::size_of::<ToolDefinition>()
+        .saturating_add(definition.id.capacity())
+        .saturating_add(definition.name.capacity())
+        .saturating_add(definition.description.capacity())
+        .saturating_add(
+            definition
+                .concurrency_key
+                .as_ref()
+                .map_or(0, String::capacity),
+        )
+        .saturating_add(
+            definition.allowed_callers.len().saturating_mul(
+                std::mem::size_of::<ToolCaller>().saturating_add(TREE_NODE_OVERHEAD),
+            ),
+        )
+        .saturating_add(json_value_retained_bytes(&definition.arguments_schema))
+        .saturating_add(
+            definition
+                .output_schema
+                .as_ref()
+                .map_or(0, json_value_retained_bytes),
+        )
+}
+
+fn json_value_retained_bytes(value: &serde_json::Value) -> usize {
+    let base = std::mem::size_of::<serde_json::Value>();
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => base,
+        serde_json::Value::String(value) => base.saturating_add(value.capacity()),
+        serde_json::Value::Array(values) => base
+            .saturating_add(
+                values
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<serde_json::Value>()),
+            )
+            .saturating_add(values.iter().fold(0usize, |total, value| {
+                total.saturating_add(
+                    json_value_retained_bytes(value)
+                        .saturating_sub(std::mem::size_of::<serde_json::Value>()),
+                )
+            })),
+        serde_json::Value::Object(values) => {
+            base.saturating_add(values.iter().fold(0usize, |total, (key, value)| {
+                total
+                    .saturating_add(std::mem::size_of::<(String, serde_json::Value)>())
+                    .saturating_add(TREE_NODE_OVERHEAD)
+                    .saturating_add(key.capacity())
+                    .saturating_add(
+                        json_value_retained_bytes(value)
+                            .saturating_sub(std::mem::size_of::<serde_json::Value>()),
+                    )
+            }))
+        }
     }
 }
 
@@ -696,10 +1014,11 @@ fn scope_with_stats(
     let prepared = if let Some(existing) = cache.get(&cache_key) {
         existing
     } else {
-        cache.insert(cache_key, Arc::clone(&prepared));
-        registry
-            .prepared_catalog_build_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cache.insert(cache_key, Arc::clone(&prepared)) {
+            registry
+                .prepared_catalog_build_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         prepared
     };
     drop(cache);
@@ -1135,12 +1454,21 @@ fn rounded_divide(numerator: u128, denominator: u128) -> u128 {
 
 fn indexed_terms(entry: &CatalogEntry) -> BTreeMap<String, u32> {
     let mut terms = BTreeMap::<String, u32>::new();
-    for value in std::iter::once(entry.id.as_str())
+    let mut term_count = 0usize;
+    let mut lexical_bytes = 0usize;
+    'values: for value in std::iter::once(entry.id.as_str())
         .chain(std::iter::once(entry.name.as_str()))
         .chain(entry.metadata.namespace.iter().map(String::as_str))
         .chain(entry.metadata.aliases.iter().map(String::as_str))
     {
         for term in tokenize(value) {
+            let next_count = term_count.saturating_add(1);
+            let next_bytes = lexical_bytes.saturating_add(term.len());
+            if next_count > MAX_DEFERRED_LEXICAL_TERMS || next_bytes > MAX_DEFERRED_LEXICAL_BYTES {
+                break 'values;
+            }
+            term_count = next_count;
+            lexical_bytes = next_bytes;
             let frequency = terms.entry(term).or_default();
             *frequency = frequency.saturating_add(1);
         }
@@ -1358,6 +1686,7 @@ mod tests {
             }
             assert!(registry.catalog_cache_is_empty());
             assert_eq!(registry.catalog_build_count(), 0);
+            assert_eq!(registry.catalog_cache_metrics(), (0, 0, 0));
         }
     }
 
@@ -2277,6 +2606,332 @@ mod tests {
                 ToolDiscoveryMetadata::deferred().with_aliases(["same-token", "same_token"]),
             )
             .is_err());
+    }
+
+    #[test]
+    fn deferred_lexical_caps_reject_adversarial_shapes_without_invalidating_warm_caches() {
+        let mut registry = ToolRegistry::default();
+        for id in ["bounded.alpha", "bounded.beta"] {
+            register(
+                &mut registry,
+                id,
+                "description",
+                ToolDiscoveryMetadata::deferred(),
+            );
+        }
+        let allowlist = vec!["bounded.alpha".into(), "bounded.beta".into()];
+        let limits = ToolDiscoveryLimits::new().with_max_tools(1);
+        scope(
+            &registry,
+            "bounded request",
+            &allowlist,
+            limits,
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        let (_, warm) = scope(
+            &registry,
+            "bounded request",
+            &allowlist,
+            limits,
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert!(warm.cache_hit);
+        let fingerprint = registry.catalog_fingerprint();
+        let catalog_metrics = registry.catalog_cache_metrics();
+        let prepared_metrics = registry.prepared_catalog_cache_metrics();
+
+        let term_aliases = (0..32)
+            .map(|alias| {
+                (0..9)
+                    .map(|term| format!("t{alias:02}{term}"))
+                    .collect::<Vec<_>>()
+                    .join("-")
+            })
+            .collect::<Vec<_>>();
+        let term_error = registry
+            .register_with_discovery(
+                Arc::new(TestTool(definition("deferred.term.shape", "description"))),
+                ToolDiscoveryMetadata::deferred().with_aliases(term_aliases),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            term_error,
+            HarnessError::InvalidTool(message) if message.contains("lexical index limit")
+        ));
+
+        let byte_aliases = (0..16)
+            .map(|index| format!("a{index:02}{}", "x".repeat(87)))
+            .collect::<Vec<_>>();
+        let byte_error = registry
+            .register_with_discovery(
+                Arc::new(TestTool(definition("deferred.byte.shape", "description"))),
+                ToolDiscoveryMetadata::deferred().with_aliases(byte_aliases.clone()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            byte_error,
+            HarnessError::InvalidTool(message) if message.contains("lexical index limit")
+        ));
+
+        assert_eq!(registry.catalog_fingerprint(), fingerprint);
+        assert_eq!(registry.catalog_cache_metrics(), catalog_metrics);
+        assert_eq!(registry.prepared_catalog_cache_metrics(), prepared_metrics);
+        registry
+            .register_with_discovery(
+                Arc::new(TestTool(definition("hot.byte.shape", "description"))),
+                ToolDiscoveryMetadata::hot().with_aliases(byte_aliases),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn byte_weighted_caches_are_bounded_lru_and_eviction_preserves_output() {
+        fn lexical_index() -> Arc<CatalogIndex> {
+            let terms = (0..MAX_QUERY_TERMS)
+                .map(|index| format!("term{index:02}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let entries = (0..1_000)
+                .map(|index| CatalogEntry {
+                    id: format!("cache.tool.{index:04}"),
+                    name: terms.clone(),
+                    metadata: ToolDiscoveryMetadata::deferred(),
+                    terms: BTreeMap::new(),
+                    document_len: 0,
+                })
+                .collect();
+            Arc::new(CatalogIndex::build(entries, &mut || Ok(())).unwrap())
+        }
+
+        let index = lexical_index();
+        let query = (0..MAX_QUERY_TERMS)
+            .map(|term| format!("term{term:02}"))
+            .chain(std::iter::once("request".to_owned()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expected = rank(&index, &query, 8, &mut || Ok(())).unwrap();
+        let keys = (0..MAX_SCOPE_CATALOG_CACHE_ENTRIES)
+            .map(|scope| {
+                CatalogCacheKey::new(
+                    ToolCaller::Direct,
+                    (0..1_000)
+                        .map(|tool| (format!("scope{scope:02}.tool.{tool:04}"), 1))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let entry_weight = keys[0]
+            .retained_bytes()
+            .saturating_add(index.retained_bytes());
+        assert!(entry_weight < MAX_SCOPE_CATALOG_CACHE_BYTES);
+        let insertions = MAX_SCOPE_CATALOG_CACHE_BYTES / entry_weight + 1;
+        assert!(insertions > 2 && insertions <= MAX_SCOPE_CATALOG_CACHE_ENTRIES);
+        let mut cache = CatalogCache::default();
+        for key in keys.iter().take(insertions - 1) {
+            assert!(cache.insert(key.clone(), Arc::clone(&index)));
+        }
+        assert!(cache.get(&keys[0]).is_some());
+        assert!(cache.insert(keys[insertions - 1].clone(), Arc::clone(&index)));
+        assert!(cache.get(&keys[1]).is_none());
+        assert!(cache.get(&keys[0]).is_some());
+        assert_eq!(cache.evictions(), 1);
+        assert!(cache.retained_bytes() <= MAX_SCOPE_CATALOG_CACHE_BYTES);
+        assert!(cache.len() < MAX_SCOPE_CATALOG_CACHE_ENTRIES);
+        let after_eviction = rank(&index, &query, 8, &mut || Ok(())).unwrap();
+        assert_eq!(after_eviction.ids(), expected.ids());
+
+        let description = "x".repeat(1024 * 1024);
+        let make_prepared = |index| {
+            let id = format!("prepared.{index:02}");
+            let definition = ToolDefinition::new(&id, &id, &description, json!({"type": "object"}));
+            let catalog =
+                Arc::new(PreparedToolCatalog::from_definitions(vec![definition]).unwrap());
+            let key = PreparedCatalogKey(Arc::from(vec![(id, 1)]));
+            (key, catalog)
+        };
+        let first_prepared = make_prepared(0);
+        let prepared_weight = first_prepared
+            .0
+            .retained_bytes()
+            .saturating_add(prepared_catalog_retained_bytes(&first_prepared.1));
+        assert!(prepared_weight < MAX_PREPARED_CATALOG_CACHE_BYTES);
+        let prepared_insertions = MAX_PREPARED_CATALOG_CACHE_BYTES / prepared_weight + 1;
+        assert!(
+            prepared_insertions > 2 && prepared_insertions <= MAX_PREPARED_CATALOG_CACHE_ENTRIES
+        );
+        let mut prepared = Vec::with_capacity(prepared_insertions);
+        prepared.push(first_prepared);
+        prepared.extend((1..prepared_insertions).map(make_prepared));
+        let first_provider_json = prepared[0].1.provider_tools_json().get().to_owned();
+        let mut prepared_cache = PreparedCatalogCache::default();
+        for (key, catalog) in prepared.iter().take(prepared_insertions - 1) {
+            assert!(prepared_cache.insert(key.clone(), Arc::clone(catalog)));
+        }
+        assert!(prepared_cache.get(&prepared[0].0).is_some());
+        assert!(prepared_cache.insert(
+            prepared[prepared_insertions - 1].0.clone(),
+            Arc::clone(&prepared[prepared_insertions - 1].1),
+        ));
+        assert!(prepared_cache.get(&prepared[1].0).is_none());
+        assert!(prepared_cache.get(&prepared[0].0).is_some());
+        assert_eq!(prepared_cache.evictions(), 1);
+        assert!(prepared_cache.retained_bytes() <= MAX_PREPARED_CATALOG_CACHE_BYTES);
+        assert!(prepared_cache.len() < MAX_PREPARED_CATALOG_CACHE_ENTRIES);
+        assert_eq!(
+            prepared[0].1.provider_tools_json().get(),
+            first_provider_json
+        );
+
+        let tiny_index = Arc::new(
+            CatalogIndex::build(
+                vec![CatalogEntry {
+                    id: "tiny.tool".into(),
+                    name: "Tiny tool".into(),
+                    metadata: ToolDiscoveryMetadata::deferred(),
+                    terms: BTreeMap::new(),
+                    document_len: 0,
+                }],
+                &mut || Ok(()),
+            )
+            .unwrap(),
+        );
+        let count_keys = (0..=MAX_SCOPE_CATALOG_CACHE_ENTRIES)
+            .map(|index| {
+                CatalogCacheKey::new(ToolCaller::Direct, vec![(format!("k{index:02}"), 1)])
+            })
+            .collect::<Vec<_>>();
+        let mut count_cache = CatalogCache::default();
+        for key in count_keys.iter().take(MAX_SCOPE_CATALOG_CACHE_ENTRIES) {
+            assert!(count_cache.insert(key.clone(), Arc::clone(&tiny_index)));
+        }
+        assert!(count_cache.get(&count_keys[0]).is_some());
+        assert!(count_cache.insert(
+            count_keys[MAX_SCOPE_CATALOG_CACHE_ENTRIES].clone(),
+            Arc::clone(&tiny_index),
+        ));
+        assert!(count_cache.get(&count_keys[1]).is_none());
+        assert!(count_cache.get(&count_keys[0]).is_some());
+        assert_eq!(count_cache.len(), MAX_SCOPE_CATALOG_CACHE_ENTRIES);
+        assert_eq!(count_cache.evictions(), 1);
+        assert!(count_cache.retained_bytes() <= MAX_SCOPE_CATALOG_CACHE_BYTES);
+
+        let tiny_prepared = Arc::new(
+            PreparedToolCatalog::from_definitions(vec![ToolDefinition::new(
+                "tiny.prepared",
+                "Tiny prepared",
+                "description",
+                json!({"type": "object"}),
+            )])
+            .unwrap(),
+        );
+        let prepared_count_keys = (0..=MAX_PREPARED_CATALOG_CACHE_ENTRIES)
+            .map(|index| PreparedCatalogKey(Arc::from(vec![(format!("p{index:02}"), 1)])))
+            .collect::<Vec<_>>();
+        let mut prepared_count_cache = PreparedCatalogCache::default();
+        for key in prepared_count_keys
+            .iter()
+            .take(MAX_PREPARED_CATALOG_CACHE_ENTRIES)
+        {
+            assert!(prepared_count_cache.insert(key.clone(), Arc::clone(&tiny_prepared)));
+        }
+        assert!(prepared_count_cache.get(&prepared_count_keys[0]).is_some());
+        assert!(prepared_count_cache.insert(
+            prepared_count_keys[MAX_PREPARED_CATALOG_CACHE_ENTRIES].clone(),
+            Arc::clone(&tiny_prepared),
+        ));
+        assert!(prepared_count_cache.get(&prepared_count_keys[1]).is_none());
+        assert!(prepared_count_cache.get(&prepared_count_keys[0]).is_some());
+        assert_eq!(
+            prepared_count_cache.len(),
+            MAX_PREPARED_CATALOG_CACHE_ENTRIES
+        );
+        assert_eq!(prepared_count_cache.evictions(), 1);
+        assert!(prepared_count_cache.retained_bytes() <= MAX_PREPARED_CATALOG_CACHE_BYTES);
+    }
+
+    #[test]
+    fn oversized_cache_entries_are_uncached_without_publishing_build_counters() {
+        let alias_tokens = (0..249)
+            .map(|index| format!("{index:02x}"))
+            .collect::<Vec<_>>();
+        let aliases = alias_tokens
+            .chunks(32)
+            .map(|chunk| chunk.join("-"))
+            .collect::<Vec<_>>();
+        let metadata = ToolDiscoveryMetadata::deferred().with_aliases(aliases);
+        let mut registry = ToolRegistry::default();
+        let mut allowlist = Vec::with_capacity(1_000);
+        for index in 0..1_000 {
+            let id = format!("maxshape.tool.{index:04}");
+            let definition =
+                ToolDefinition::new(&id, "needle", "description", json!({"type": "object"}))
+                    .with_allowed_callers([ToolCaller::Direct, ToolCaller::DeclarativePlan]);
+            registry
+                .register_with_discovery(Arc::new(TestTool(definition)), metadata.clone())
+                .unwrap();
+            allowlist.push(id);
+        }
+        let limits = ToolDiscoveryLimits::new().with_max_tools(1);
+        let (first, first_stats) = scope(
+            &registry,
+            "unmatched request",
+            &allowlist,
+            limits,
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        let (second, second_stats) = scope(
+            &registry,
+            "unmatched request",
+            &allowlist,
+            limits,
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert!(first.is_empty() && second.is_empty());
+        assert!(!first_stats.cache_hit && !second_stats.cache_hit);
+        assert_eq!(registry.catalog_build_count(), 0);
+        assert_eq!(registry.catalog_cache_metrics(), (0, 0, 0));
+
+        let mut prepared_registry = ToolRegistry::default();
+        let description = "x".repeat(3 * 1024 * 1024);
+        register(
+            &mut prepared_registry,
+            "oversized.prepared",
+            &description,
+            ToolDiscoveryMetadata::deferred(),
+        );
+        let prepared_allowlist = vec!["oversized.prepared".into()];
+        let prepared_limits = ToolDiscoveryLimits::new()
+            .with_max_tools(1)
+            .with_max_tool_schema_bytes(8 * 1024 * 1024);
+        let (prepared_first, _) = scope(
+            &prepared_registry,
+            "oversized.prepared",
+            &prepared_allowlist,
+            prepared_limits,
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        let (prepared_second, _) = scope(
+            &prepared_registry,
+            "oversized.prepared",
+            &prepared_allowlist,
+            prepared_limits,
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_first.serialized_definitions(),
+            prepared_second.serialized_definitions()
+        );
+        assert_eq!(prepared_registry.prepared_catalog_build_count(), 0);
+        assert_eq!(
+            prepared_registry.prepared_catalog_cache_metrics(),
+            (0, 0, 0)
+        );
     }
 
     #[test]

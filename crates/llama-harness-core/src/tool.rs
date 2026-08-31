@@ -542,6 +542,7 @@ impl ToolRegistry {
                     "tool {id} safe discovery metadata exceeds {MAX_TOOL_SAFE_METADATA_BYTES} bytes"
                 )));
             }
+            discovery.validate_deferred_lexical_shape(&id, &definition.name)?;
         }
 
         let schema = &definition.arguments_schema;
@@ -680,13 +681,15 @@ impl ToolRegistry {
         // The standard-library sort inside the key constructor is bounded by
         // the authorized catalog. Check immediately after that atomic step.
         guard()?;
-        if let Some(index) = self
-            .catalog_cache
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-        {
-            guard()?;
+        let cached = {
+            let cache = self
+                .catalog_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.get(&key)
+        };
+        guard()?;
+        if let Some(index) = cached {
             return Ok((index, true));
         }
         let mut entries = Vec::with_capacity(allowed.len());
@@ -716,8 +719,9 @@ impl ToolRegistry {
         if let Some(existing) = cache.get(&key) {
             return Ok((existing, true));
         }
-        cache.insert(key, Arc::clone(&index));
-        self.catalog_build_count.fetch_add(1, Ordering::Relaxed);
+        if cache.insert(key, Arc::clone(&index)) {
+            self.catalog_build_count.fetch_add(1, Ordering::Relaxed);
+        }
         Ok((index, false))
     }
 
@@ -770,6 +774,24 @@ impl ToolRegistry {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_cache_metrics(&self) -> (usize, usize, u64) {
+        let cache = self
+            .catalog_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (cache.len(), cache.retained_bytes(), cache.evictions())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_catalog_cache_metrics(&self) -> (usize, usize, u64) {
+        let cache = self
+            .prepared_catalog_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (cache.len(), cache.retained_bytes(), cache.evictions())
     }
 
     #[cfg(test)]
