@@ -1,4 +1,4 @@
-use llama_harness_core::{EventRecord, EventSink, RunEvent, RunStatus};
+use llama_harness_core::{EventRecord, EventSink, RunEvent, RunStatus, ToolCaller};
 use llama_harness_observability::{
     AppendOutcome, RedactionConfig, RetentionPolicy, RunListQuery, SqliteEventSink,
     TraceStoreConfig, TraceStoreError, REDACTED_VALUE,
@@ -59,6 +59,41 @@ fn temporary_database(name: &str) -> PathBuf {
         "llama-harness-{name}-{}-{stamp}.sqlite",
         std::process::id()
     ))
+}
+
+#[test]
+fn discovery_events_persist_metadata_only() {
+    let store = SqliteEventSink::open_in_memory(TraceStoreConfig::default()).unwrap();
+    store
+        .append(&record(
+            "run-discovery",
+            "trace-discovery",
+            1,
+            10,
+            RunEvent::ToolDiscoveryCompleted {
+                caller: ToolCaller::Direct,
+                candidate_count: 1_000,
+                selected_count: 2,
+                deferred_candidate_count: 999,
+                catalog_exceeded_budget: true,
+                cache_hit: true,
+            },
+        ))
+        .unwrap();
+    let persisted = store.events_for_run("run-discovery", 10, 0).unwrap();
+    assert!(matches!(
+        persisted[0].record.event,
+        RunEvent::ToolDiscoveryCompleted {
+            candidate_count: 1_000,
+            selected_count: 2,
+            ..
+        }
+    ));
+    let export = store.export_run_json("run-discovery").unwrap().unwrap();
+    assert!(export.contains("tool_discovery_completed"));
+    for forbidden in ["query", "tool_ids", "aliases", "schema", "fingerprint"] {
+        assert!(!export.contains(forbidden));
+    }
 }
 
 #[test]
