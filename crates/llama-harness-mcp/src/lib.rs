@@ -286,16 +286,15 @@ impl Default for McpCachePolicy {
 pub enum McpCacheScope {
     /// Cache entry can be shared across authorization contexts.
     Public,
-    /// Cache entry is bound to one host-supplied authorization context.
-    Private,
 }
 
 impl McpCacheScope {
     fn parse(value: &str) -> Result<Self, McpError> {
         match value {
             "public" => Ok(Self::Public),
-            "private" => Ok(Self::Private),
-            _ => Err(McpError::InvalidCatalog("unsupported cache scope".into())),
+            _ => Err(McpError::InvalidCatalog(
+                "unsupported or private cache scope".into(),
+            )),
         }
     }
 }
@@ -506,7 +505,6 @@ pub struct McpCatalogManager {
     state: Arc<Mutex<CatalogState>>,
     refresh_lock: tokio::sync::Mutex<()>,
     observer: Arc<ObserverHub>,
-    authorization_context: Option<Arc<str>>,
     registration_group: ToolRegistrationGroup,
     in_flight: Arc<InFlightCalls>,
 }
@@ -539,48 +537,7 @@ impl McpCatalogManager {
         clock: Arc<dyn McpClock>,
         observer: Option<Arc<dyn McpObserver>>,
     ) -> Result<Self, McpError> {
-        Self::with_configuration_and_authorization_context(
-            transport,
-            server_id,
-            limits,
-            timeouts,
-            cache_policy,
-            clock,
-            observer,
-            None,
-        )
-    }
-
-    /// Creates a manager with an optional host-owned authorization cache binding.
-    ///
-    /// A modern `private` catalog is rejected unless this binding is present;
-    /// callers should use one manager per authorization context.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_configuration_and_authorization_context(
-        transport: Arc<dyn McpTransport>,
-        server_id: impl Into<String>,
-        limits: McpLimits,
-        timeouts: McpTimeouts,
-        cache_policy: McpCachePolicy,
-        clock: Arc<dyn McpClock>,
-        observer: Option<Arc<dyn McpObserver>>,
-        authorization_context: Option<String>,
-    ) -> Result<Self, McpError> {
         let server_id = validate_server_id(server_id.into())?;
-        let authorization_context = authorization_context
-            .map(|value| {
-                if value.is_empty()
-                    || value.len() > 4096
-                    || value.bytes().any(|byte| byte.is_ascii_control())
-                {
-                    Err(McpError::InvalidCatalog(
-                        "invalid authorization cache context".into(),
-                    ))
-                } else {
-                    Ok(Arc::<str>::from(value))
-                }
-            })
-            .transpose()?;
         validate_duration(cache_policy.legacy_ttl)?;
         if let Some(max_stale) = cache_policy.max_stale {
             validate_duration(max_stale)?;
@@ -598,7 +555,6 @@ impl McpCatalogManager {
                 observer,
                 ..ObserverHub::default()
             }),
-            authorization_context,
             registration_group: ToolRegistrationGroup::new(format!("mcp:{server_id}"))
                 .map_err(McpError::Core)?,
             in_flight: Arc::new(InFlightCalls::default()),
@@ -708,11 +664,6 @@ impl McpCatalogManager {
             stale_until_ms,
             tools: managed,
         });
-        if scope == Some(McpCacheScope::Private) && self.authorization_context.is_none() {
-            return Err(McpError::InvalidCatalog(
-                "private cache requires host authorization context".into(),
-            ));
-        }
         let previous = {
             let mut state = self
                 .state
@@ -1469,7 +1420,7 @@ fn generated_id(server: &str, native: &str) -> String {
     format!(
         "mcp-{server}-{}-{}",
         if slug.is_empty() { "tool" } else { &slug },
-        &blake3::hash(native.as_bytes()).to_hex()[..12]
+        &blake3::hash(native.as_bytes()).to_hex()[..32]
     )
 }
 fn validate_server_id(id: String) -> Result<String, McpError> {
@@ -1738,30 +1689,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_catalog_requires_host_authorization_binding() {
+    async fn private_catalog_is_rejected_until_execution_time_auth_context_exists() {
         let clock = Arc::new(FakeClock::default());
         let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
         transport.pages.lock().expect("test mutex")[0].cache_scope = Some("private".into());
-        let unbound = manager(transport.clone(), clock.clone(), None, None);
+        let manager = manager(transport, clock, None, None);
         assert!(matches!(
-            unbound.refresh(CancellationToken::new()).await,
+            manager.refresh(CancellationToken::new()).await,
             Err(McpError::InvalidCatalog(_))
         ));
-        let bound = McpCatalogManager::with_configuration_and_authorization_context(
-            transport,
-            "server",
-            McpLimits::default(),
-            McpTimeouts::default(),
-            McpCachePolicy::default(),
-            clock,
-            None,
-            Some("host-auth-context-a".into()),
-        )
-        .expect("bound manager");
-        bound
-            .refresh(CancellationToken::new())
-            .await
-            .expect("bound private refresh");
     }
 
     #[tokio::test]

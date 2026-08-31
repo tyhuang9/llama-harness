@@ -23,10 +23,10 @@ never retried after dispatch because a remote effect may be uncertain.
 
 `McpCatalogManager` installs only a fully validated immutable snapshot. Modern
 `tools/list` pages use MCP's `ttlMs` hint (zero is immediately stale) and a
-consistent `cacheScope` of `public` or `private`; the manager uses the shortest
-page TTL for a complete catalog. A private catalog is rejected unless the host
-binds the manager to one authorization context, and that manager must not be
-shared with another context. A legacy snapshot uses the host-selected age.
+consistent public `cacheScope`; the manager uses the shortest page TTL for a
+complete catalog. Private cache scope is deliberately rejected in this release:
+the core call context does not yet carry an enforceable execution-time
+authorization capability. A legacy snapshot uses the host-selected age.
 List-change invalidation and expiry fail closed unless a host deliberately
 configures a bounded stale allowance. Refresh never mutates an active runner,
 and old, invalidated, expired, or closed snapshots reject before dispatch.
