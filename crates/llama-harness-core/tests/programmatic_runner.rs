@@ -48,6 +48,13 @@ struct AdmissionProgramProvider {
     generated: Arc<Semaphore>,
 }
 
+struct SynthesisBarrierProvider {
+    program: String,
+    planning_calls: AtomicU32,
+    synthesis_entered: Arc<Semaphore>,
+    synthesis_releases: Arc<Semaphore>,
+}
+
 #[async_trait]
 impl ModelProvider for ConcurrentProgramProvider {
     fn id(&self) -> &str {
@@ -102,6 +109,43 @@ impl ModelProvider for AdmissionProgramProvider {
             Ok(ModelResponse::new("mock-model").with_final_output("admission done"))
         } else {
             self.generated.add_permits(1);
+            Ok(ModelResponse::new("mock-model").with_final_output(self.program.clone()))
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for SynthesisBarrierProvider {
+    fn id(&self) -> &str {
+        "synthesis-barrier"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        capabilities()
+    }
+
+    async fn health(&self) -> Result<ProviderHealth, HarnessError> {
+        Ok(ProviderHealth::healthy())
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError> {
+        Ok(vec![
+            ModelInfo::new("mock-model").with_capabilities(capabilities())
+        ])
+    }
+
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError> {
+        if request.tools.is_empty() {
+            self.synthesis_entered.add_permits(1);
+            let permit = self
+                .synthesis_releases
+                .acquire()
+                .await
+                .expect("synthesis barrier remains open");
+            permit.forget();
+            Ok(ModelResponse::new("mock-model").with_final_output("synthesized"))
+        } else {
+            self.planning_calls.fetch_add(1, Ordering::SeqCst);
             Ok(ModelResponse::new("mock-model").with_final_output(self.program.clone()))
         }
     }
@@ -1015,6 +1059,163 @@ async fn live_vm_admission_rejects_n_plus_one_and_reuses_released_capacity() {
         8 * 1024 * 1024,
         "active slots bound aggregate retained sandbox memory"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn live_run_admission_holds_capacity_through_final_synthesis() {
+    const MAX_ACTIVE_RUNS: usize = 2;
+    let program = json!({"version":1,"body":[
+        {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"integer","value":1}}]}},
+        {"kind":"return","value":{"kind":"variable","name":"result"}}
+    ]})
+    .to_string();
+    let provider = Arc::new(SynthesisBarrierProvider {
+        program,
+        planning_calls: AtomicU32::new(0),
+        synthesis_entered: Arc::new(Semaphore::new(0)),
+        synthesis_releases: Arc::new(Semaphore::new(0)),
+    });
+    let tool = Arc::new(CountingTool::new("read", true, true));
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .programmatic(ProgrammaticHostConfig {
+                max_active_vms: MAX_ACTIVE_RUNS,
+                ..ProgrammaticHostConfig::default()
+            })
+            .build(),
+    );
+
+    let first_runner = runner.clone();
+    let mut first = tokio::spawn(async move {
+        first_runner
+            .run_with_strategy(
+                request(&["read"]).with_run_id("synthesis-held-first"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+    let second_runner = runner.clone();
+    let mut second = tokio::spawn(async move {
+        second_runner
+            .run_with_strategy(
+                request(&["read"]).with_run_id("synthesis-held-second"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+    for _ in 0..MAX_ACTIVE_RUNS {
+        provider.synthesis_entered.acquire().await.unwrap().forget();
+    }
+    assert_eq!(tool.calls.load(Ordering::SeqCst), MAX_ACTIVE_RUNS as u32);
+    assert_eq!(provider.planning_calls.load(Ordering::SeqCst), 2);
+
+    let third_runner = runner.clone();
+    let third = tokio::spawn(async move {
+        third_runner
+            .run_with_strategy(
+                request(&["read"]).with_run_id("synthesis-held-third"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+    let third = tokio::time::timeout(Duration::from_millis(1), third)
+        .await
+        .expect("N+1 run must fail while earlier runs are in final synthesis")
+        .unwrap();
+    assert_eq!(third.status, RunStatus::LimitReached);
+    assert!(third.final_output.is_none());
+    assert!(third.tool_calls.is_empty());
+    assert_eq!(provider.planning_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), MAX_ACTIVE_RUNS as u32);
+
+    provider.synthesis_releases.add_permits(1);
+    let first_finished = tokio::select! {
+        result = &mut first => {
+            assert_eq!(result.unwrap().status, RunStatus::Completed);
+            true
+        }
+        result = &mut second => {
+            assert_eq!(result.unwrap().status, RunStatus::Completed);
+            false
+        }
+    };
+    let replacement_runner = runner.clone();
+    let replacement = tokio::spawn(async move {
+        replacement_runner
+            .run_with_strategy(
+                request(&["read"]).with_run_id("synthesis-held-replacement"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+    provider.synthesis_entered.acquire().await.unwrap().forget();
+    assert_eq!(provider.planning_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 3);
+
+    provider.synthesis_releases.add_permits(2);
+    if first_finished {
+        assert_eq!(second.await.unwrap().status, RunStatus::Completed);
+    } else {
+        assert_eq!(first.await.unwrap().status, RunStatus::Completed);
+    }
+    assert_eq!(replacement.await.unwrap().status, RunStatus::Completed);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sliced_programmatic_execution_yields_to_cancellation_before_completion() {
+    let body = (0..64)
+        .map(|index| {
+            json!({
+                "kind":"let",
+                "name":format!("value_{index}"),
+                "value":{"kind":"integer","value":index},
+            })
+        })
+        .chain(std::iter::once(json!({
+            "kind":"return",
+            "value":{"kind":"variable","name":"value_63"},
+        })))
+        .collect::<Vec<_>>();
+    let program = json!({"version":1,"body":body}).to_string();
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(program),
+            final_response("must not synthesize"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let runner = AgentRunner::builder(provider.clone())
+        .programmatic(ProgrammaticHostConfig {
+            limits: SandboxLimits {
+                max_slice_fuel: 1,
+                ..SandboxLimits::default()
+            },
+            ..ProgrammaticHostConfig::default()
+        })
+        .build();
+    let run_request = request(&[]).with_run_id("slice-fairness-cancellation");
+    let cancellation = run_request.cancellation.clone();
+    let canceller = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+    });
+
+    let result = runner
+        .run_with_strategy(run_request, RunStrategy::Programmatic)
+        .await
+        .unwrap();
+    canceller.await.unwrap();
+
+    assert_eq!(result.status, RunStatus::Cancelled);
+    assert!(result.final_output.is_none());
+    assert_eq!(provider.requests().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]

@@ -18,4 +18,6 @@ Raw request and response payloads are disabled by default. When an application e
 
 SQLite uses WAL mode and a configurable busy timeout. One sink serializes its own writes with a mutex, making cloneable sinks safe to use from concurrent local runs without holding a lock across model calls, tool execution, or approvals. Call `append` when persistence errors must be handled by the caller. `EventSink::emit` has no error return by design, so it records the latest write failure for inspection through `last_emit_error`.
 
+Opening a schema-v1 database upgrades it to v2 inside one SQLite transaction by creating a replacement table, copying every event, replacing the old table, and rebuilding indexes. This is a full-table rewrite: plan temporary disk space comparable to the table and its indexes, expect the migration transaction to hold a write lock, and rely on SQLite rollback if any migration statement fails. Back up and rehearse the upgrade on a representative copy before opening a large production trace database.
+
 OpenTelemetry is intentionally not included in the initial crate: it remains an optional future export adapter, not a reason to make telemetry infrastructure a runtime dependency.

@@ -33,16 +33,31 @@ and tool scope, canonical arguments, schema validation, policy, approval,
 effect ledger, deadlines, cancellation, transcript limits, and audited events.
 The effective bound for each resource is the minimum applicable library hard
 cap, host sandbox setting, Agent limit, and provider capability. Program runs
-require a finite deadline and live-VM admission. A slot is acquired
+require a finite deadline and Programmatic-run admission. A slot is acquired
 nonblocking before a candidate program is requested, parsed, and compiled.
 If all slots are held, the candidate immediately ends as `LimitReached` with
 no model or tool work. An admitted slot remains held while its `Execution`
 retains state across broker, policy, approval, or tool waits, and is released
-only after terminal VM state is dropped. `max_active_vms` therefore bounds
-aggregate sandbox retention to that many effective per-VM live-byte caps; it
-is not a per-slice compute throttle. Read-only, parallel-safe fan-out is
+only after final synthesis and output validation make the whole Programmatic
+run terminal. `max_active_vms` therefore bounds concurrent Programmatic-run
+state—program and model buffers, VM state, canonical tool transcript, and
+final synthesis buffers—not only sandbox VM live bytes; it is not a per-slice
+compute throttle. For conservative host capacity planning, multiply the slot
+count by the sum of the effective program-byte cap, model-response cap,
+sandbox live-byte cap, transcript cap, and the effective bounded batch count
+times the tool-result cap. This is an upper envelope rather than an exact heap
+measurement because those bounded buffers can overlap. Read-only, parallel-safe fan-out is
 bounded at eight and additionally limited by the host, provider, Agent, and
 broker caps. Mutations are always serialized.
+
+The runner yields to Tokio after every fuel slice and rechecks cancellation and
+the absolute deadline before it starts the next slice. This keeps slice-fuel
+fairness explicit even for a program that has no tool, policy, or provider
+await points. The sandbox verifier's allocation complexity remains bounded by
+the effective bytecode, local, control-stack, and operand-stack limits. Operand
+stack reuse across independent resumable evaluation states is a separately
+profiled follow-up; the current VM retains its bounded stack with each active
+continuation to preserve isolation and accounting.
 
 One correction prompt is permitted only before an effect is dispatched and
 only while more than one model call remains: one call stays reserved for final
