@@ -153,7 +153,7 @@ pub(crate) struct EffectiveLimits {
 }
 
 /// Versioned BLAKE3 identity for an immutable safe-metadata catalog index.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CatalogFingerprint {
     /// Canonical fingerprint format version.

@@ -89,8 +89,8 @@ fn request(count: usize, input: &str) -> RunRequest {
 
 #[tokio::test]
 async fn direct_e2e_reuses_one_immutable_selected_scope_and_emits_private_counters() {
-    let count = 100;
-    let target = "catalog.tool.073";
+    let count = 1_000;
+    let target = "catalog.tool.733";
     let provider = Arc::new(
         MockModelProvider::scripted([
             tool_response(ToolCall::new("call-1", target, "{}")),
@@ -112,7 +112,7 @@ async fn direct_e2e_reuses_one_immutable_selected_scope_and_emits_private_counte
         .unwrap();
 
     assert_eq!(result.status, RunStatus::Completed);
-    assert_eq!(tools[73].calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tools[733].calls.load(Ordering::SeqCst), 1);
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     for model_request in &requests {
@@ -139,9 +139,9 @@ async fn direct_e2e_reuses_one_immutable_selected_scope_and_emits_private_counte
             _ => None,
         })
         .expect("discovery event");
-    assert_eq!(discovery.0, 100);
+    assert_eq!(discovery.0, 1_000);
     assert_eq!(discovery.1, 1);
-    assert_eq!(discovery.2, 100);
+    assert_eq!(discovery.2, 1_000);
     assert!(discovery.3);
     assert!(!discovery.4.contains(target));
     assert!(!discovery.4.contains("alias"));
