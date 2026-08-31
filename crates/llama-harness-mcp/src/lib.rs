@@ -670,7 +670,7 @@ impl McpCatalogManager {
             stale_until_ms,
             tools: managed,
         });
-        let previous = match {
+        let previous = {
             let mut state = self
                 .state
                 .lock()
@@ -681,8 +681,6 @@ impl McpCatalogManager {
             let previous = state.active.replace(Arc::clone(&snapshot));
             state.invalidated = false;
             previous
-        } {
-            previous => previous,
         };
         if let Some(previous) = previous {
             self.schedule_close_after_drain(previous.context.clone());
