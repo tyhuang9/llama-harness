@@ -66,7 +66,7 @@ impl RedactionConfig {
 
     fn redacts_key(&self, key: &str) -> bool {
         let normalized = key.to_ascii_lowercase();
-        let tokens = key_tokens(&normalized);
+        let tokens = key_tokens(key);
         self.key_fragments.iter().any(|configured| {
             let configured = configured.trim().to_ascii_lowercase();
             if configured.is_empty() {
@@ -93,8 +93,28 @@ impl RedactionConfig {
     }
 }
 
-fn key_tokens(key: &str) -> Vec<&str> {
-    key.split(|character: char| character == '_' || !character.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .collect()
+fn key_tokens(key: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for component in key
+        .split(|character: char| character == '_' || !character.is_ascii_alphanumeric())
+        .filter(|component| !component.is_empty())
+    {
+        let bytes = component.as_bytes();
+        let mut start = 0;
+        for index in 1..bytes.len() {
+            let previous = bytes[index - 1];
+            let current = bytes[index];
+            let next = bytes.get(index + 1).copied();
+            let camel_case = previous.is_ascii_lowercase() && current.is_ascii_uppercase();
+            let acronym = previous.is_ascii_uppercase()
+                && current.is_ascii_uppercase()
+                && next.is_some_and(|next| next.is_ascii_lowercase());
+            if camel_case || acronym {
+                tokens.push(component[start..index].to_ascii_lowercase());
+                start = index;
+            }
+        }
+        tokens.push(component[start..].to_ascii_lowercase());
+    }
+    tokens
 }

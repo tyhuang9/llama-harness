@@ -10,7 +10,7 @@ The store supports run lookup, filterable summaries, paged event reads, redacted
 
 ## Redaction and raw data
 
-All structured events are converted to JSON and redacted before they are written. The default redaction covers common sensitive field names including authorization, cookies, passwords, secrets, tokens, and API keys. Applications may supply additional key fragments and literal values through `RedactionConfig`.
+All structured events are converted to JSON and redacted before they are written. The default redaction covers common sensitive field names including authorization, cookies, passwords, secrets, tokens, API keys, and program artifacts. Matching is case-insensitive and token-aware across separators, camel case, and acronyms, so names such as `accessToken`, `openaiApiKey`, and `programAST` are redacted without broad substring matching. Applications may supply additional key fragments and literal values through `RedactionConfig`.
 
 Raw request and response payloads are disabled by default. When an application explicitly enables `TraceStoreConfig::persist_raw_payloads`, it must pass the raw value through `append_with_raw` or `append_batch`; that value is redacted and size-bounded before storage. The store never captures or displays hidden model chain-of-thought. Persist only user-visible or application-approved diagnostics.
 

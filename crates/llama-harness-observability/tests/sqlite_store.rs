@@ -715,8 +715,18 @@ fn default_redaction_matches_artifact_key_tokens_without_hiding_capabilities() {
     let redacted = RedactionConfig::default().redact(&json!({
         "program": "program-source",
         "program_source": "program-source",
+        "programSource": "program-source",
+        "programAST": "program-source",
+        "programBytecode": "program-source",
         "vm-locals": "program-source",
+        "vmLocals": "program-source",
+        "accessToken": "api-secret",
+        "authToken": "api-secret",
+        "refreshToken": "api-secret",
+        "passwordHash": "api-secret",
+        "clientSecret": "api-secret",
         "openai_api_key": "api-secret",
+        "openaiApiKey": "api-secret",
         "x-api-key": "api-secret",
         "api_keynote": "visible",
         "resource_api": "visible",
@@ -726,14 +736,123 @@ fn default_redaction_matches_artifact_key_tokens_without_hiding_capabilities() {
     }));
     assert_eq!(redacted["program"], REDACTED_VALUE);
     assert_eq!(redacted["program_source"], REDACTED_VALUE);
+    assert_eq!(redacted["programSource"], REDACTED_VALUE);
+    assert_eq!(redacted["programAST"], REDACTED_VALUE);
+    assert_eq!(redacted["programBytecode"], REDACTED_VALUE);
     assert_eq!(redacted["vm-locals"], REDACTED_VALUE);
+    assert_eq!(redacted["vmLocals"], REDACTED_VALUE);
+    assert_eq!(redacted["accessToken"], REDACTED_VALUE);
+    assert_eq!(redacted["authToken"], REDACTED_VALUE);
+    assert_eq!(redacted["refreshToken"], REDACTED_VALUE);
+    assert_eq!(redacted["passwordHash"], REDACTED_VALUE);
+    assert_eq!(redacted["clientSecret"], REDACTED_VALUE);
     assert_eq!(redacted["openai_api_key"], REDACTED_VALUE);
+    assert_eq!(redacted["openaiApiKey"], REDACTED_VALUE);
     assert_eq!(redacted["x-api-key"], REDACTED_VALUE);
     assert_eq!(redacted["api_keynote"], "visible");
     assert_eq!(redacted["resource_api"], "visible");
     assert_eq!(redacted["programmatic_conformance"], "strict_json_ast_v1");
     assert_eq!(redacted["locale"], "en-US");
     assert_eq!(redacted["resource"], "programmatic-resource");
+}
+
+#[test]
+fn camel_case_redaction_persists_across_reopen_queries_and_exports() {
+    let path = temporary_database("camel-case-redaction");
+    let store = SqliteEventSink::open(
+        &path,
+        TraceStoreConfig {
+            persist_raw_payloads: true,
+            ..TraceStoreConfig::default()
+        },
+    )
+    .unwrap();
+    let canaries = [
+        "ACCESS_TOKEN_CANARY",
+        "AUTH_TOKEN_CANARY",
+        "REFRESH_TOKEN_CANARY",
+        "PASSWORD_HASH_CANARY",
+        "CLIENT_SECRET_CANARY",
+        "OPENAI_API_KEY_CANARY",
+        "X_API_KEY_CANARY",
+        "PROGRAM_SOURCE_CANARY",
+        "PROGRAM_AST_CANARY",
+        "PROGRAM_BYTECODE_CANARY",
+        "VM_LOCALS_CANARY",
+    ];
+    let event = record(
+        "camel-case-redaction",
+        "camel-case-redaction-trace",
+        1,
+        10,
+        RunEvent::ModelResponded { call_number: 1 },
+    );
+    let raw = json!({
+        "accessToken": canaries[0],
+        "authToken": canaries[1],
+        "refreshToken": canaries[2],
+        "passwordHash": canaries[3],
+        "clientSecret": canaries[4],
+        "openaiApiKey": canaries[5],
+        "x-api-key": canaries[6],
+        "programSource": canaries[7],
+        "programAST": canaries[8],
+        "programBytecode": canaries[9],
+        "vmLocals": canaries[10],
+        "programmatic_conformance": "strict_json_ast_v1",
+        "locale": "en-US",
+        "resource_api": "visible-resource-api",
+        "resource": "visible-resource"
+    });
+    store.append_with_raw(&event, Some(&raw)).unwrap();
+    let export = store
+        .export_run_json("camel-case-redaction")
+        .unwrap()
+        .unwrap();
+    for canary in canaries {
+        assert!(!export.contains(canary));
+    }
+    drop(store);
+
+    let reopened = SqliteEventSink::open(&path, TraceStoreConfig::default()).unwrap();
+    let events = reopened
+        .events_for_run("camel-case-redaction", 10, 0)
+        .unwrap();
+    assert!(matches!(
+        events[0].record.event,
+        RunEvent::ModelResponded { call_number: 1 }
+    ));
+    let raw = events[0].raw_payload.as_ref().unwrap();
+    for key in [
+        "accessToken",
+        "authToken",
+        "refreshToken",
+        "passwordHash",
+        "clientSecret",
+        "openaiApiKey",
+        "x-api-key",
+        "programSource",
+        "programAST",
+        "programBytecode",
+        "vmLocals",
+    ] {
+        assert_eq!(raw[key], REDACTED_VALUE);
+    }
+    assert_eq!(raw["programmatic_conformance"], "strict_json_ast_v1");
+    assert_eq!(raw["locale"], "en-US");
+    assert_eq!(raw["resource_api"], "visible-resource-api");
+    assert_eq!(raw["resource"], "visible-resource");
+    let export = reopened
+        .export_run_json("camel-case-redaction")
+        .unwrap()
+        .unwrap();
+    for canary in canaries {
+        assert!(!export.contains(canary));
+    }
+    drop(reopened);
+    fs::remove_file(&path).unwrap();
+    let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = fs::remove_file(path.with_extension("sqlite-shm"));
 }
 
 #[test]
