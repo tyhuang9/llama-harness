@@ -5,7 +5,8 @@ use llama_harness_core::{
     GenerationOptions, HarnessError, InMemoryEventSink, JsonMap, Message, MessageRole,
     ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, PolicyDecision,
     PolicyEngine, ProviderHealth, RunEvent, RunOverrides, RunRequest, RunStatus, RunStrategy, Tool,
-    ToolCall, ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    ToolCall, ToolCaller, ToolDefinition, ToolDiscoveryOutcome, ToolDiscoverySelection,
+    ToolRegistry, ToolResult, ToolRisk,
 };
 use serde_json::{json, Value};
 use std::{
@@ -311,6 +312,27 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
     assert_eq!(feedback[0].tool_calls[1].id, "second");
     assert_eq!(feedback[1].tool_call_id.as_deref(), Some("first"));
     assert_eq!(feedback[2].tool_call_id.as_deref(), Some("second"));
+    match &events.events()[1].event {
+        RunEvent::ToolDiscoveryCompleted {
+            caller,
+            outcome,
+            selection,
+            candidate_count,
+            selected_count,
+            deferred_candidate_count,
+            catalog_exceeded_budget,
+            ..
+        } => {
+            assert_eq!(*caller, ToolCaller::Direct);
+            assert_eq!(*outcome, ToolDiscoveryOutcome::Selected);
+            assert_eq!(*selection, ToolDiscoverySelection::FullCatalog);
+            assert_eq!(*candidate_count, 1);
+            assert_eq!(*selected_count, 1);
+            assert_eq!(*deferred_candidate_count, 0);
+            assert!(!catalog_exceeded_budget);
+        }
+        event => panic!("expected tool discovery event, got {event:?}"),
+    }
     assert_eq!(
         events
             .events()
@@ -322,7 +344,21 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
                 run_id: String::new(),
                 trace_id: String::new(),
             }),
-            std::mem::discriminant(&events.events()[1].event),
+            std::mem::discriminant(&RunEvent::ToolDiscoveryCompleted {
+                caller: ToolCaller::Direct,
+                outcome: ToolDiscoveryOutcome::Selected,
+                selection: ToolDiscoverySelection::FullCatalog,
+                candidate_count: 1,
+                selected_count: 1,
+                deferred_candidate_count: 0,
+                effective_tool_count_budget: 0,
+                effective_schema_byte_budget: 0,
+                selected_schema_bytes: 0,
+                expansion_count: 0,
+                expansion_limit: 0,
+                catalog_exceeded_budget: false,
+                duration_ms: 0,
+            }),
             std::mem::discriminant(&RunEvent::StrategySelected {
                 requested: RunStrategy::Direct,
                 selected: RunStrategy::Direct,
