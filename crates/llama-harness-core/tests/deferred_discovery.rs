@@ -137,7 +137,7 @@ fn request(count: usize, input: &str) -> RunRequest {
 async fn legacy_hot_registration_preserves_unrestricted_small_catalog_definitions() {
     let definitions = vec![
         ToolDefinition::new(
-            "Mixed Case/工具 !?.",
+            "  Mixed Case/工具 !?.  ",
             "Unicode display 名称",
             "legacy hot definition",
             json!({"type": "object"}),
@@ -162,24 +162,31 @@ async fn legacy_hot_registration_preserves_unrestricted_small_catalog_definition
         .with_allowed_callers([ToolCaller::Direct]),
     ];
     let mut registry = ToolRegistry::default();
+    let mut tools = Vec::new();
     for definition in &definitions {
-        registry
-            .register(Arc::new(CountingTool {
-                definition: definition.clone(),
-                calls: AtomicU32::new(0),
-                result: ToolResult::success(json!({"ok": true})),
-            }))
-            .unwrap();
+        let tool = Arc::new(CountingTool {
+            definition: definition.clone(),
+            calls: AtomicU32::new(0),
+            result: ToolResult::success(json!({"ok": true})),
+        });
+        registry.register(tool.clone()).unwrap();
+        tools.push(tool);
     }
     let provider = Arc::new(
-        MockModelProvider::scripted([final_response("done")])
-            .with_capabilities(capabilities(10, false)),
+        MockModelProvider::scripted([
+            tool_response(ToolCall::new("legacy-call", &definitions[0].id, "{}")),
+            final_response("done"),
+        ])
+        .with_capabilities(capabilities(10, false)),
     );
     let mut agent = AgentDefinition::new("legacy", "Legacy", "1", "mock-model");
     agent.tool_allowlist = definitions
         .iter()
         .map(|definition| definition.id.clone())
         .collect();
+    agent
+        .tool_allowlist
+        .push(definitions[0].id.trim().to_owned());
     let result = AgentRunner::builder(provider.clone())
         .tools(registry)
         .build()
@@ -191,12 +198,15 @@ async fn legacy_hot_registration_preserves_unrestricted_small_catalog_definition
         .unwrap();
     assert_eq!(result.status, RunStatus::Completed);
     let requests = provider.requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].tools, definitions);
-    assert_eq!(
-        serde_json::to_vec(&requests[0].tools).unwrap(),
-        serde_json::to_vec(&definitions).unwrap()
-    );
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(request.tools, definitions);
+        assert_eq!(
+            serde_json::to_vec(&request.tools).unwrap(),
+            serde_json::to_vec(&definitions).unwrap()
+        );
+    }
+    assert_eq!(tools[0].calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -463,43 +473,89 @@ async fn adaptive_invalid_plan_and_planner_failure_fallbacks_reuse_selected_scop
 
 #[tokio::test]
 async fn known_unselected_and_unknown_calls_have_the_same_external_rejection() {
-    async fn rejection(tool_id: &str) -> (String, u32) {
-        let count = 30;
-        let target = "catalog.tool.005";
+    async fn rejection(known_probe: bool) -> (Value, Vec<Value>, Vec<Value>, u32) {
+        let target = "catalog.target";
+        let probe = "catalog.probe";
+        let replacement = "catalog.replacement";
         let provider = Arc::new(
             MockModelProvider::scripted([
-                tool_response(ToolCall::new("bypass", tool_id, "{}")),
+                tool_response(ToolCall::new("bypass", probe, "{}")),
                 final_response("done"),
             ])
             .with_capabilities(capabilities(1, false)),
         );
-        let (registry, tools) = registry(count);
-        let runner = AgentRunner::builder(provider)
+        let events = Arc::new(InMemoryEventSink::default());
+        let mut registry = ToolRegistry::default();
+        let mut tools = Vec::new();
+        let mut allowlist = vec![target.into(), probe.into(), replacement.into()];
+        for id in std::iter::once(target.to_owned())
+            .chain((0..28).map(|index| format!("catalog.distractor.{index:03}")))
+            .chain(std::iter::once(if known_probe {
+                probe.to_owned()
+            } else {
+                replacement.to_owned()
+            }))
+        {
+            if id.starts_with("catalog.distractor") {
+                allowlist.push(id.clone());
+            }
+            let tool = Arc::new(CountingTool::new(&id));
+            registry
+                .register_with_discovery(
+                    tool.clone(),
+                    ToolDiscoveryMetadata::deferred()
+                        .with_aliases([format!("alias-{}", tools.len())]),
+                )
+                .unwrap();
+            tools.push(tool);
+        }
+        let mut agent = AgentDefinition::new("equivalence", "Equivalence", "1", "mock-model");
+        agent.tool_allowlist = allowlist;
+        let run_request = RunRequest::new(agent, target)
+            .with_run_id("equivalent-run")
+            .with_trace_id("equivalent-trace");
+        let runner = AgentRunner::builder(provider.clone())
             .tools(registry)
+            .event_sink(events.clone())
             .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
             .build();
         let result = runner
-            .run_with_strategy(request(count, target), RunStrategy::Direct)
+            .run_with_strategy(run_request, RunStrategy::Direct)
             .await
             .unwrap();
-        let rejection = result
-            .errors
-            .iter()
-            .find(|error| error.message.contains("tool unavailable"))
-            .expect("unavailable error")
-            .message
-            .clone();
+        let result = json!({
+            "status": result.status,
+            "final_output": result.final_output,
+            "tool_calls": result.tool_calls,
+            "errors": result.errors,
+        });
+        let requests = provider
+            .requests()
+            .into_iter()
+            .map(|request| serde_json::to_value(request).unwrap())
+            .collect::<Vec<_>>();
+        let event_values = events
+            .events()
+            .into_iter()
+            .map(|record| {
+                let mut value = serde_json::to_value(record.event).unwrap();
+                if value.get("type") == Some(&Value::String("strategy_usage".into())) {
+                    value["duration_ms"] = json!(0);
+                }
+                value
+            })
+            .collect::<Vec<_>>();
         let calls = tools
             .iter()
             .map(|tool| tool.calls.load(Ordering::SeqCst))
             .sum();
-        (rejection, calls)
+        (result, requests, event_values, calls)
     }
 
-    let known = rejection("catalog.tool.006").await;
-    let unknown = rejection("catalog.tool.999").await;
+    let known = rejection(true).await;
+    let unknown = rejection(false).await;
     assert_eq!(known, unknown);
-    assert_eq!(known.1, 0);
+    assert_eq!(known.3, 0);
 }
 
 #[tokio::test]
@@ -558,6 +614,49 @@ async fn hot_overflow_fails_before_model_use_and_zero_provider_capacity_is_no_to
 }
 
 #[tokio::test]
+async fn exact_namespace_overflow_fails_before_provider_model_tool_or_events() {
+    for strategy in [RunStrategy::Direct, RunStrategy::DeclarativePlan] {
+        let provider = Arc::new(
+            MockModelProvider::scripted([final_response("unused")])
+                .with_capabilities(capabilities(1, true)),
+        );
+        let events = Arc::new(InMemoryEventSink::default());
+        let mut registry = ToolRegistry::default();
+        let mut tools = Vec::new();
+        for id in ["exact.one", "exact.two"] {
+            let tool = Arc::new(CountingTool::new(id));
+            registry
+                .register_with_discovery(
+                    tool.clone(),
+                    ToolDiscoveryMetadata::deferred().with_namespace("exact"),
+                )
+                .unwrap();
+            tools.push(tool);
+        }
+        let mut agent = AgentDefinition::new("exact", "Exact", "1", "mock-model");
+        agent.tool_allowlist = vec!["exact.one".into(), "exact.two".into()];
+        let error = AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .event_sink(events.clone())
+            .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
+            .build()
+            .run_with_strategy(RunRequest::new(agent, "exact"), strategy)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HarnessError::ResourceLimit(_)));
+        assert!(provider.requests().is_empty());
+        assert!(events.events().is_empty());
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.calls.load(Ordering::SeqCst))
+                .sum::<u32>(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
 async fn adaptive_capability_fallback_matches_forced_direct_discovery() {
     let count = 100;
     let target = "catalog.tool.042";
@@ -596,6 +695,51 @@ async fn adaptive_capability_fallback_matches_forced_direct_discovery() {
         .collect::<Vec<_>>();
     assert_eq!(direct_ids, adaptive_ids);
     assert_eq!(direct_ids, vec![target]);
+}
+
+#[tokio::test]
+async fn forced_direct_and_declarative_use_the_same_selected_definition() {
+    let count = 100;
+    let target = "catalog.tool.042";
+    let direct_provider = Arc::new(
+        MockModelProvider::scripted([final_response("direct")])
+            .with_capabilities(capabilities(1, true)),
+    );
+    let plan = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "selected", "tool_id": target, "arguments": {}}]}
+    })
+    .to_string();
+    let declarative_provider = Arc::new(
+        MockModelProvider::scripted([final_response(plan), final_response("declarative")])
+            .with_capabilities(capabilities(1, true)),
+    );
+    let (direct_registry, _) = registry(count);
+    let (declarative_registry, tools) = registry(count);
+    AgentRunner::builder(direct_provider.clone())
+        .tools(direct_registry)
+        .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
+        .build()
+        .run_with_strategy(request(count, target), RunStrategy::Direct)
+        .await
+        .unwrap();
+    AgentRunner::builder(declarative_provider.clone())
+        .tools(declarative_registry)
+        .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
+        .build()
+        .run_with_strategy(request(count, target), RunStrategy::DeclarativePlan)
+        .await
+        .unwrap();
+
+    let direct_tools = direct_provider.requests()[0].tools.clone();
+    let declarative_requests = declarative_provider.requests();
+    assert_eq!(direct_tools, declarative_requests[0].tools);
+    assert!(declarative_requests
+        .iter()
+        .all(|request| request.tools == direct_tools));
+    assert_eq!(direct_tools.len(), 1);
+    assert_eq!(direct_tools[0].id, target);
+    assert_eq!(tools[42].calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -1,7 +1,8 @@
 use crate::{
     discovery::{
-        fingerprint_catalog, AllowedCatalogEntry, CatalogCache, CatalogCacheKey, CatalogEntry,
-        CatalogFingerprint, CatalogIndex, ToolDiscoveryMetadata, DISCOVERY_GUARD_INTERVAL,
+        bounded_index_value, fingerprint_catalog, AllowedCatalogEntry, CatalogCache,
+        CatalogCacheKey, CatalogEntry, CatalogFingerprint, CatalogIndex, ToolDiscoveryMetadata,
+        DISCOVERY_GUARD_INTERVAL,
     },
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len},
     AgentLimits, HarnessError,
@@ -423,6 +424,7 @@ pub(crate) struct RegisteredTool {
 /// Registry of tools and their compiled argument validators.
 pub struct ToolRegistry {
     pub(crate) tools: HashMap<String, RegisteredTool>,
+    exact_tool_ids: HashMap<String, String>,
     pub(crate) catalog_generation: u64,
     pub(crate) catalog_cache: RwLock<CatalogCache>,
     pub(crate) fingerprint_cache: RwLock<Option<CatalogFingerprint>>,
@@ -440,6 +442,7 @@ impl Default for ToolRegistry {
     fn default() -> Self {
         Self {
             tools: HashMap::new(),
+            exact_tool_ids: HashMap::new(),
             catalog_generation: 0,
             catalog_cache: RwLock::new(CatalogCache::default()),
             fingerprint_cache: RwLock::new(None),
@@ -477,7 +480,7 @@ impl ToolRegistry {
         mut discovery: ToolDiscoveryMetadata,
         strict_discovery_metadata: bool,
     ) -> Result<(), HarnessError> {
-        let mut definition = tool.definition().clone();
+        let definition = tool.definition().clone();
         let id = if strict_discovery_metadata {
             validate_tool_identifier(&definition.id)?;
             validate_tool_name(&definition.id, &definition.name)?;
@@ -487,7 +490,6 @@ impl ToolRegistry {
             if id.is_empty() {
                 return Err(HarnessError::InvalidTool("tool id is required".into()));
             }
-            definition.id = id.clone();
             id
         };
         if self.tools.contains_key(&id) {
@@ -547,6 +549,8 @@ impl ToolRegistry {
         let next_generation = self.catalog_generation.checked_add(1).ok_or_else(|| {
             HarnessError::InvalidTool("tool catalog generation is exhausted".into())
         })?;
+        self.exact_tool_ids
+            .insert(definition.id.clone(), id.clone());
         self.tools.insert(
             id,
             RegisteredTool {
@@ -572,7 +576,7 @@ impl ToolRegistry {
 
     /// Returns a registered tool by ID.
     pub fn get(&self, id: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(id).map(|entry| Arc::clone(&entry.tool))
+        self.registered(id).map(|entry| Arc::clone(&entry.tool))
     }
 
     #[cfg(test)]
@@ -597,12 +601,12 @@ impl ToolRegistry {
             if position % DISCOVERY_GUARD_INTERVAL == 0 {
                 guard()?;
             }
-            if !seen.insert(id.as_str()) {
-                continue;
-            }
-            let Some(entry) = self.tools.get(id) else {
+            let Some(entry) = self.registered(id) else {
                 continue;
             };
+            if !seen.insert(entry.definition.id.as_str()) {
+                continue;
+            }
             if entry.definition.allows_caller(caller) {
                 allowed.push(AllowedCatalogEntry {
                     definition: &entry.definition,
@@ -645,7 +649,7 @@ impl ToolRegistry {
             }
             entries.push(CatalogEntry {
                 id: entry.definition.id.clone(),
-                name: entry.definition.name.clone(),
+                name: bounded_index_value(&entry.definition.name),
                 metadata: entry.metadata.clone(),
                 terms: Default::default(),
                 document_len: 0,
@@ -713,8 +717,7 @@ impl ToolRegistry {
 
     pub(crate) fn validate(&self, tool_id: &str, arguments: &Value) -> Result<(), HarnessError> {
         let entry = self
-            .tools
-            .get(tool_id)
+            .registered(tool_id)
             .ok_or_else(|| HarnessError::InvalidTool(format!("unknown tool: {tool_id}")))?;
         entry.validator.validate(arguments).map_err(|_| {
             HarnessError::InvalidArguments(format!("tool {tool_id} arguments failed validation"))
@@ -727,8 +730,7 @@ impl ToolRegistry {
         output: &Value,
     ) -> Result<(), HarnessError> {
         let entry = self
-            .tools
-            .get(tool_id)
+            .registered(tool_id)
             .ok_or_else(|| HarnessError::InvalidTool(format!("unknown tool: {tool_id}")))?;
         if let Some(validator) = &entry.output_validator {
             validator.validate(output).map_err(|_| {
@@ -736,6 +738,14 @@ impl ToolRegistry {
             })?;
         }
         Ok(())
+    }
+
+    fn registered(&self, id: &str) -> Option<&RegisteredTool> {
+        self.tools.get(id).or_else(|| {
+            self.exact_tool_ids
+                .get(id)
+                .and_then(|registry_id| self.tools.get(registry_id))
+        })
     }
 }
 

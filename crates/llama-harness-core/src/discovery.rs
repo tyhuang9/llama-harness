@@ -659,7 +659,8 @@ fn rank(
             guard()?;
         }
         for term in entry.terms.keys() {
-            *document_frequency.entry(term).or_default() += 1;
+            let frequency = document_frequency.entry(term).or_default();
+            *frequency = frequency.saturating_add(1);
         }
     }
     let mut scored = Vec::new();
@@ -740,24 +741,23 @@ fn bm25_term_score(
 }
 
 fn indexed_terms(entry: &CatalogEntry) -> BTreeMap<String, u32> {
-    let mut terms = BTreeMap::new();
+    let mut terms = BTreeMap::<String, u32>::new();
     for value in std::iter::once(entry.id.as_str())
         .chain(std::iter::once(entry.name.as_str()))
         .chain(entry.metadata.namespace.iter().map(String::as_str))
         .chain(entry.metadata.aliases.iter().map(String::as_str))
     {
         for term in tokenize(value) {
-            *terms.entry(term).or_default() += 1;
+            let frequency = terms.entry(term).or_default();
+            *frequency = frequency.saturating_add(1);
         }
     }
     terms
 }
 
 fn tokenize(value: &str) -> Vec<String> {
-    value
-        .char_indices()
-        .take_while(|(index, _)| *index < MAX_DISCOVERY_QUERY_BYTES)
-        .map(|(_, character)| character)
+    bounded_index_value(value)
+        .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() {
                 character.to_ascii_lowercase()
@@ -769,6 +769,14 @@ fn tokenize(value: &str) -> Vec<String> {
         .split_whitespace()
         .take(MAX_QUERY_TERMS)
         .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) fn bounded_index_value(value: &str) -> String {
+    value
+        .char_indices()
+        .take_while(|(index, _)| *index < MAX_DISCOVERY_QUERY_BYTES)
+        .map(|(_, character)| character)
         .collect()
 }
 
@@ -810,7 +818,10 @@ mod tests {
     use crate::{Tool, ToolResult};
     use async_trait::async_trait;
     use serde_json::{json, Value};
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Barrier,
+    };
     use tokio_util::sync::CancellationToken;
 
     struct TestTool(ToolDefinition);
@@ -895,37 +906,66 @@ mod tests {
     }
 
     #[test]
-    fn guarded_large_catalog_traversal_cancels_without_warming_the_index() {
-        let count = 1_000;
-        let mut registry = ToolRegistry::default();
-        for id in allowlist(count) {
-            register(
-                &mut registry,
-                &id,
-                "description",
-                ToolDiscoveryMetadata::deferred(),
+    fn synchronized_large_catalog_stop_never_publishes_a_partial_cache() {
+        let count = 1_000usize;
+        for timed_out in [false, true] {
+            let mut registry = ToolRegistry::default();
+            for id in allowlist(count) {
+                register(
+                    &mut registry,
+                    &id,
+                    "description",
+                    ToolDiscoveryMetadata::deferred(),
+                );
+            }
+            let synchronized = Arc::new(Barrier::new(2));
+            let stopped = Arc::new(AtomicBool::new(false));
+            let worker_barrier = Arc::clone(&synchronized);
+            let worker_stopped = Arc::clone(&stopped);
+            let worker = std::thread::spawn(move || {
+                worker_barrier.wait();
+                worker_stopped.store(true, Ordering::Release);
+            });
+            let minimum_traversal_checkpoints = count.div_ceil(DISCOVERY_GUARD_INTERVAL);
+            let mut checkpoints = 0usize;
+            let mut synchronized_once = false;
+            let result = registry.select_scope_guarded(
+                "tool 0999",
+                &allowlist(count),
+                ToolCaller::Direct,
+                ToolDiscoveryLimits::new().with_max_tools(1),
+                &ProviderCapabilityLimits::new(),
+                &mut || {
+                    checkpoints = checkpoints.saturating_add(1);
+                    if !synchronized_once && checkpoints >= minimum_traversal_checkpoints {
+                        synchronized_once = true;
+                        synchronized.wait();
+                        while !stopped.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                    }
+                    if stopped.load(Ordering::Acquire) {
+                        if timed_out {
+                            Err(HarnessError::TimedOut("synchronized deadline".into()))
+                        } else {
+                            Err(HarnessError::Cancelled)
+                        }
+                    } else {
+                        Ok(())
+                    }
+                },
             );
+            worker.join().unwrap();
+            assert!(synchronized_once);
+            assert!(checkpoints >= minimum_traversal_checkpoints);
+            if timed_out {
+                assert!(matches!(result, Err(HarnessError::TimedOut(_))));
+            } else {
+                assert!(matches!(result, Err(HarnessError::Cancelled)));
+            }
+            assert!(registry.catalog_cache_is_empty());
+            assert_eq!(registry.catalog_build_count(), 0);
         }
-        let mut checkpoints = 0;
-        let result = registry.select_scope_guarded(
-            "tool 0999",
-            &allowlist(count),
-            ToolCaller::Direct,
-            ToolDiscoveryLimits::new().with_max_tools(1),
-            &ProviderCapabilityLimits::new(),
-            &mut || {
-                checkpoints += 1;
-                if checkpoints == 20 {
-                    Err(HarnessError::Cancelled)
-                } else {
-                    Ok(())
-                }
-            },
-        );
-        assert!(matches!(result, Err(HarnessError::Cancelled)));
-        assert_eq!(checkpoints, 20);
-        assert!(registry.catalog_cache_is_empty());
-        assert_eq!(registry.catalog_build_count(), 0);
     }
 
     #[test]
