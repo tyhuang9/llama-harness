@@ -529,7 +529,6 @@ pub(crate) fn emit_discovery(
         selected_count: stats.selected_count,
         deferred_candidate_count: stats.deferred_candidate_count,
         catalog_exceeded_budget: stats.catalog_exceeded_budget,
-        cache_hit: stats.cache_hit,
     });
 }
 

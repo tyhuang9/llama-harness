@@ -76,7 +76,6 @@ fn discovery_events_persist_metadata_only() {
                 selected_count: 2,
                 deferred_candidate_count: 999,
                 catalog_exceeded_budget: true,
-                cache_hit: true,
             },
         ))
         .unwrap();
@@ -89,12 +88,18 @@ fn discovery_events_persist_metadata_only() {
             selected_count: 2,
             deferred_candidate_count: 999,
             catalog_exceeded_budget: true,
-            cache_hit: true,
         }
     ));
     let export = store.export_run_json("run-discovery").unwrap().unwrap();
     assert!(export.contains("tool_discovery_completed"));
-    for forbidden in ["query", "tool_ids", "aliases", "schema", "fingerprint"] {
+    for forbidden in [
+        "query",
+        "tool_ids",
+        "aliases",
+        "schema",
+        "fingerprint",
+        "cache_hit",
+    ] {
         assert!(!export.contains(forbidden));
     }
 }

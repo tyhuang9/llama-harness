@@ -83,8 +83,6 @@ pub enum RunEvent {
         deferred_candidate_count: u32,
         /// Whether the complete candidate catalog exceeded the effective budget.
         catalog_exceeded_budget: bool,
-        /// Whether the immutable catalog index was already cached.
-        cache_hit: bool,
     },
     /// The runner selected an execution strategy using metadata-only inputs.
     StrategySelected {

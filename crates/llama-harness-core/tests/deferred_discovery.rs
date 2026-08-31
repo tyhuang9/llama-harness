@@ -192,6 +192,7 @@ async fn direct_e2e_reuses_one_immutable_selected_scope_and_emits_private_counte
     assert!(!discovery.4.contains(target));
     assert!(!discovery.4.contains("alias"));
     assert!(!discovery.4.contains("fingerprint"));
+    assert!(!discovery.4.contains("cache"));
 }
 
 #[tokio::test]
@@ -349,18 +350,13 @@ async fn adaptive_invalid_plan_and_planner_failure_fallbacks_reuse_selected_scop
         .events()
         .into_iter()
         .filter_map(|record| match record.event {
-            RunEvent::ToolDiscoveryCompleted {
-                caller, cache_hit, ..
-            } => Some((caller, cache_hit)),
+            RunEvent::ToolDiscoveryCompleted { caller, .. } => Some(caller),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
         invalid_discovery,
-        vec![
-            (ToolCaller::DeclarativePlan, false),
-            (ToolCaller::Direct, true)
-        ]
+        vec![ToolCaller::DeclarativePlan, ToolCaller::Direct]
     );
 
     let failure_events = Arc::new(InMemoryEventSink::default());
@@ -391,16 +387,11 @@ async fn adaptive_invalid_plan_and_planner_failure_fallbacks_reuse_selected_scop
             .events()
             .into_iter()
             .filter_map(|record| match record.event {
-                RunEvent::ToolDiscoveryCompleted {
-                    caller, cache_hit, ..
-                } => Some((caller, cache_hit)),
+                RunEvent::ToolDiscoveryCompleted { caller, .. } => Some(caller),
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        vec![
-            (ToolCaller::DeclarativePlan, false),
-            (ToolCaller::Direct, true)
-        ]
+        vec![ToolCaller::DeclarativePlan, ToolCaller::Direct]
     );
 }
 
@@ -614,7 +605,6 @@ async fn direct_and_adaptive_preflight_rejects_before_large_catalog_discovery() 
         record.event,
         RunEvent::ToolDiscoveryCompleted {
             caller: ToolCaller::Direct,
-            cache_hit: false,
             ..
         }
     )));
