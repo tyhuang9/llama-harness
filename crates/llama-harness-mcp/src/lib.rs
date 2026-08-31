@@ -576,16 +576,21 @@ impl McpCatalogManager {
         let (context, tools, scope, bytes, pages) = match built {
             Ok(value) => value,
             Err(error) => {
+                let cancelled = cancellation.is_cancelled();
                 self.observer.emit(event(
                     McpLifecycleOperation::Refresh,
-                    outcome_for_error(&error),
+                    if cancelled {
+                        McpLifecycleOutcome::Cancelled
+                    } else {
+                        outcome_for_error(&error)
+                    },
                     elapsed,
                     0,
                     0,
                     0,
                     false,
-                    false,
-                    McpDispatchState::NotDispatched,
+                    cancelled,
+                    dispatch_for_error(&error),
                     None,
                 ));
                 return Err(error);
@@ -650,6 +655,7 @@ impl McpCatalogManager {
             .iter()
             .any(|tool| !generated_ids.insert(tool.definition().id.clone()))
         {
+            self.discard_context(context).await;
             return Err(McpError::InvalidCatalog("generated ID collision".into()));
         }
         let snapshot = Arc::new(ActiveCatalog {
@@ -664,7 +670,7 @@ impl McpCatalogManager {
             stale_until_ms,
             tools: managed,
         });
-        let previous = {
+        let previous = match {
             let mut state = self
                 .state
                 .lock()
@@ -675,6 +681,8 @@ impl McpCatalogManager {
             let previous = state.active.replace(Arc::clone(&snapshot));
             state.invalidated = false;
             previous
+        } {
+            previous => previous,
         };
         if let Some(previous) = previous {
             self.schedule_close_after_drain(previous.context.clone());
@@ -762,22 +770,25 @@ impl McpCatalogManager {
         let started = Instant::now();
         let result = match context {
             Some(context) => {
-                tokio::time::timeout(self.timeouts.close, wait_for_drain(&self.in_flight))
+                if tokio::time::timeout(self.timeouts.close, wait_for_drain(&self.in_flight))
                     .await
-                    .map_err(|_| {
-                        McpError::Transport(McpTransportError {
-                            operation: McpOperation::Close,
-                            dispatch: McpDispatchState::PossiblyDispatched,
-                        })
-                    })?;
-                close_context(
-                    self.transport.as_ref(),
-                    context,
-                    cancellation.child_token(),
-                    self.timeouts.close,
-                )
-                .await
-                .map_err(McpError::from)
+                    .is_err()
+                {
+                    self.schedule_close_after_drain(context);
+                    Err(McpError::Transport(McpTransportError {
+                        operation: McpOperation::Close,
+                        dispatch: McpDispatchState::PossiblyDispatched,
+                    }))
+                } else {
+                    close_context(
+                        self.transport.as_ref(),
+                        context,
+                        cancellation.child_token(),
+                        self.timeouts.close,
+                    )
+                    .await
+                    .map_err(McpError::from)
+                }
             }
             None => Ok(()),
         };
@@ -806,6 +817,16 @@ impl McpCatalogManager {
 
     fn is_closed(&self) -> bool {
         self.state.lock().map(|state| state.closed).unwrap_or(true)
+    }
+
+    async fn discard_context(&self, context: McpContext) {
+        let _ = close_context(
+            self.transport.as_ref(),
+            context,
+            CancellationToken::new(),
+            self.timeouts.close,
+        )
+        .await;
     }
 
     fn schedule_close_after_drain(&self, context: McpContext) {
@@ -1126,6 +1147,16 @@ fn outcome_for_error(error: &McpError) -> McpLifecycleOutcome {
             McpLifecycleOutcome::Rejected
         }
         McpError::Transport(_) | McpError::Core(_) => McpLifecycleOutcome::Failed,
+    }
+}
+
+fn dispatch_for_error(error: &McpError) -> McpDispatchState {
+    match error {
+        McpError::Transport(error) => error.dispatch,
+        McpError::CatalogUnavailable
+        | McpError::Clock
+        | McpError::InvalidCatalog(_)
+        | McpError::Core(_) => McpDispatchState::NotDispatched,
     }
 }
 
