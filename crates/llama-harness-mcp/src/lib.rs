@@ -700,6 +700,11 @@ impl McpCatalogManager {
         if tools.is_empty() {
             return Err(McpError::CatalogUnavailable);
         }
+        for tool in &tools {
+            if registry.get(&tool.definition().id).is_some() {
+                return Err(McpError::InvalidCatalog("generated ID collision".into()));
+            }
+        }
         let mut staged = ToolRegistry::default();
         for tool in &tools {
             staged.register_with_discovery(Arc::clone(tool), ToolDiscoveryMetadata::deferred())?;
