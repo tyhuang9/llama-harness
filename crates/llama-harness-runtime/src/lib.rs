@@ -1003,6 +1003,7 @@ fn to_core_limits(limits: WireAgentLimits) -> AgentLimits {
         max_tool_result_bytes: limits.max_tool_result_bytes.min(1024 * 1024),
         max_transcript_bytes: limits.max_transcript_bytes.min(4 * 1024 * 1024),
         max_json_depth: limits.max_json_depth.min(64),
+        ..AgentLimits::default()
     }
 }
 fn to_core_generation(generation: WireGenerationOptions) -> GenerationOptions {
@@ -1225,6 +1226,49 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn core_limit_mapping_preserves_wire_fields_and_defaults_programmatic_only_limits() {
+        let limits = to_core_limits(WireAgentLimits {
+            max_model_calls: 99,
+            max_tool_calls: 99,
+            max_identical_tool_calls: 99,
+            max_run_duration_ms: Some(999_999),
+            max_model_call_duration_ms: Some(999_999),
+            max_output_repairs: 99,
+            max_provider_retries: 99,
+            max_input_bytes: 999_999,
+            max_request_payload_bytes: 999_999,
+            max_model_response_bytes: 9_999_999,
+            max_tool_arguments_bytes: 999_999,
+            max_tool_result_bytes: 9_999_999,
+            max_transcript_bytes: 99_999_999,
+            max_json_depth: 999,
+        });
+
+        assert_eq!(limits.max_model_calls, 32);
+        assert_eq!(limits.max_tool_calls, 64);
+        assert_eq!(limits.max_identical_tool_calls, 8);
+        assert_eq!(limits.max_run_duration_ms, Some(300_000));
+        assert_eq!(limits.max_model_call_duration_ms, Some(120_000));
+        assert_eq!(limits.max_output_repairs, 4);
+        assert_eq!(limits.max_provider_retries, 4);
+        assert_eq!(limits.max_input_bytes, 64 * 1024);
+        assert_eq!(limits.max_request_payload_bytes, 256 * 1024);
+        assert_eq!(limits.max_model_response_bytes, 1024 * 1024);
+        assert_eq!(limits.max_tool_arguments_bytes, 64 * 1024);
+        assert_eq!(limits.max_tool_result_bytes, 1024 * 1024);
+        assert_eq!(limits.max_transcript_bytes, 4 * 1024 * 1024);
+        assert_eq!(limits.max_json_depth, 64);
+        assert_eq!(
+            limits.max_programmatic_program_bytes,
+            AgentLimits::default().max_programmatic_program_bytes
+        );
+        assert_eq!(
+            limits.max_programmatic_fanout_concurrency,
+            AgentLimits::default().max_programmatic_fanout_concurrency
+        );
+    }
 
     struct CountingTool {
         definition: ToolDefinition,
