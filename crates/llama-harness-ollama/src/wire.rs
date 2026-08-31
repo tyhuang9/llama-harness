@@ -123,6 +123,7 @@ pub(crate) fn chat_request<'a>(
         stream,
         keep_alive: keep_alive.map(str::to_owned),
         tools: prepared_tools
+            .filter(|_| !tools.is_empty())
             .map(|prepared| WireTools::Prepared(prepared.provider_tools_json()))
             .or_else(|| {
                 (!tools.is_empty())
@@ -248,5 +249,84 @@ mod tests {
             serde_json::to_vec(&legacy).unwrap(),
             serde_json::to_vec(&cached).unwrap()
         );
+
+        let empty = Arc::new(PreparedToolCatalog::from_definitions(Vec::new()).unwrap());
+        let legacy_empty = chat_request(
+            "model".into(),
+            &[],
+            &[],
+            None,
+            &GenerationOptions::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let cached_empty = chat_request(
+            "model".into(),
+            &[],
+            &[],
+            Some(&empty),
+            &GenerationOptions::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&legacy_empty).unwrap(),
+            serde_json::to_vec(&cached_empty).unwrap()
+        );
+        assert!(!serde_json::to_string(&cached_empty)
+            .unwrap()
+            .contains("\"tools\""));
+
+        let hostile = vec![ToolDefinition::new(
+            "hostile",
+            "Hostile",
+            "quote \" slash \\ newline\n {\"tools\":[{\"injected\":true}]}",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"payload": {"const": "\\\"}],\\\"evil\\\":true"}}
+            }),
+        )];
+        let hostile_prepared =
+            Arc::new(PreparedToolCatalog::from_definitions(hostile.clone()).unwrap());
+        let hostile_legacy = chat_request(
+            "model".into(),
+            &[],
+            &hostile,
+            None,
+            &GenerationOptions::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let hostile_cached = chat_request(
+            "model".into(),
+            &[],
+            &hostile,
+            Some(&hostile_prepared),
+            &GenerationOptions::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let legacy_bytes = serde_json::to_vec(&hostile_legacy).unwrap();
+        let cached_bytes = serde_json::to_vec(&hostile_cached).unwrap();
+        assert_eq!(cached_bytes, legacy_bytes);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&cached_bytes).unwrap(),
+            serde_json::from_slice::<Value>(&legacy_bytes).unwrap()
+        );
+
+        assert!(chat_request(
+            "model".into(),
+            &[],
+            &tools,
+            Some(&hostile_prepared),
+            &GenerationOptions::default(),
+            None,
+            false,
+        )
+        .is_err());
     }
 }

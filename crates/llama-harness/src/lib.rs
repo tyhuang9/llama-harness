@@ -44,9 +44,9 @@ pub use llama_harness_core::{
     IssueSafety, JsonMap, Message, MessageRole, ModelCapabilities, ModelEventStream, ModelInfo,
     ModelProvider, ModelRequest, ModelResponse, ModelStreamController, ModelStreamEvent,
     ModelStreamFailureKind, NetworkEgress, PartialToolCall, PlanConcurrency, PlanNode,
-    PolicyDecision, PolicyEngine, ProviderCapabilityLimits, ProviderHealth, ResultBinding,
-    ResultRef, RunError, RunEvent, RunOverrides, RunRequest, RunResult, RunStatus, RunStrategy,
-    SafeDefaultPolicy, SpeculationPolicy, Tool, ToolCall, ToolCallAssembler,
+    PolicyDecision, PolicyEngine, PreparedToolCatalog, ProviderCapabilityLimits, ProviderHealth,
+    ResultBinding, ResultRef, RunError, RunEvent, RunOverrides, RunRequest, RunResult, RunStatus,
+    RunStrategy, SafeDefaultPolicy, SpeculationPolicy, Tool, ToolCall, ToolCallAssembler,
     ToolCallAssemblyLimits, ToolCallContext, ToolCallDelta, ToolCaller, ToolDefinition,
     ToolDiscoveryLimits, ToolDiscoveryMetadata, ToolExposure, ToolRegistry, ToolResult, ToolRisk,
     Usage, ValidatedModelStreamEvent, AGENT_MANIFEST_VERSION, CATALOG_FINGERPRINT_VERSION,
@@ -94,5 +94,7 @@ mod tests {
         let _: Result<AgentManifest, AgentManifestError> = load_agent_manifest_path("missing.yaml");
         let context = ToolCallContext::new("run", "trace", "call", "tool");
         assert_eq!(context.run_id, "run");
+        let prepared = PreparedToolCatalog::from_definitions(Vec::new()).unwrap();
+        assert!(prepared.definitions().is_empty());
     }
 }

@@ -2613,6 +2613,113 @@ mod discovery_terminal_tests {
         }
     }
 
+    fn run_stopped_while_waiting_for_warm_prepared_cache(strategy: RunStrategy, stop: StopKind) {
+        let entered = Arc::new(Barrier::new(2));
+        let (mut registry, tools) = registry_with_checkpoint(
+            Arc::new(Barrier::new(1)),
+            Arc::new(Barrier::new(1)),
+            ToolCaller::Programmatic,
+        );
+        let allowlist = (0..100)
+            .map(|index| format!("discovery.tool.{index:03}"))
+            .collect::<Vec<_>>();
+        let caller = if strategy == RunStrategy::Direct {
+            ToolCaller::Direct
+        } else {
+            ToolCaller::DeclarativePlan
+        };
+        registry
+            .select_scope(
+                "discovery.tool.099",
+                &allowlist,
+                caller,
+                ToolDiscoveryLimits::new().with_max_tools(1),
+                &planning_capabilities().limits,
+            )
+            .unwrap();
+        let builds = registry.prepared_catalog_build_count();
+        let hook_entered = entered.clone();
+        registry.set_prepared_cache_read_checkpoint(Arc::new(move |actual| {
+            if actual == caller {
+                hook_entered.wait();
+            }
+        }));
+        let provider = Arc::new(
+            MockModelProvider::scripted([final_response("unused")])
+                .with_capabilities(planning_capabilities()),
+        );
+        let events = Arc::new(InMemoryEventSink::default());
+        let runner = Arc::new(
+            AgentRunner::builder(provider.clone())
+                .tools(registry)
+                .event_sink(events.clone())
+                .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
+                .build(),
+        );
+        let mut agent = crate::AgentDefinition::new("discovery", "Discovery", "1", "mock");
+        agent.tool_allowlist = allowlist;
+        if matches!(stop, StopKind::Deadline) {
+            agent.limits.max_run_duration_ms = Some(500);
+        }
+        let request = RunRequest::new(agent, "discovery.tool.099");
+        let cancellation = request.cancellation.clone();
+        let cache_lock = runner
+            .tools
+            .prepared_catalog_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let run_runner = runner.clone();
+        let run = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(run_runner.run_with_strategy(request, strategy))
+        });
+
+        entered.wait();
+        match stop {
+            StopKind::Cancel => cancellation.cancel(),
+            StopKind::Deadline => std::thread::sleep(Duration::from_millis(550)),
+        }
+        drop(cache_lock);
+        let result = run.join().unwrap().unwrap();
+        assert_eq!(
+            result.status,
+            if matches!(stop, StopKind::Cancel) {
+                RunStatus::Cancelled
+            } else {
+                RunStatus::Failed
+            }
+        );
+        if matches!(stop, StopKind::Deadline) {
+            assert!(result.duration_ms > 0);
+        }
+        assert!(provider.requests().is_empty());
+        assert_eq!(runner.tools.prepared_catalog_build_count(), builds);
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.calls.load(Ordering::SeqCst))
+                .sum::<u32>(),
+            0
+        );
+        assert_pre_event_terminal_records(&events.events(), &result, strategy);
+    }
+
+    #[test]
+    fn blocked_warm_prepared_cache_reads_stop_cleanly_for_every_strategy() {
+        for strategy in [
+            RunStrategy::Direct,
+            RunStrategy::Adaptive,
+            RunStrategy::DeclarativePlan,
+        ] {
+            for stop in [StopKind::Cancel, StopKind::Deadline] {
+                run_stopped_while_waiting_for_warm_prepared_cache(strategy, stop);
+            }
+        }
+    }
+
     #[test]
     fn cancelled_catalog_assembly_is_not_published_and_retry_builds_once() {
         let entered = Arc::new(Barrier::new(2));

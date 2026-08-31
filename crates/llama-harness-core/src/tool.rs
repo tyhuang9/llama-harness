@@ -437,6 +437,8 @@ pub struct ToolRegistry {
     pub(crate) discovery_checkpoint: Option<Arc<dyn Fn(ToolCaller) + Send + Sync>>,
     #[cfg(test)]
     pub(crate) discovery_cache_assembly_checkpoint: Option<Arc<dyn Fn(ToolCaller) + Send + Sync>>,
+    #[cfg(test)]
+    pub(crate) prepared_cache_read_checkpoint: Option<Arc<dyn Fn(ToolCaller) + Send + Sync>>,
 }
 
 #[derive(Serialize)]
@@ -475,6 +477,8 @@ impl Default for ToolRegistry {
             discovery_checkpoint: None,
             #[cfg(test)]
             discovery_cache_assembly_checkpoint: None,
+            #[cfg(test)]
+            prepared_cache_read_checkpoint: None,
         }
     }
 }
@@ -782,6 +786,14 @@ impl ToolRegistry {
         checkpoint: Arc<dyn Fn(ToolCaller) + Send + Sync>,
     ) {
         self.discovery_cache_assembly_checkpoint = Some(checkpoint);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_prepared_cache_read_checkpoint(
+        &mut self,
+        checkpoint: Arc<dyn Fn(ToolCaller) + Send + Sync>,
+    ) {
+        self.prepared_cache_read_checkpoint = Some(checkpoint);
     }
 
     pub(crate) fn validate(&self, tool_id: &str, arguments: &Value) -> Result<(), HarnessError> {

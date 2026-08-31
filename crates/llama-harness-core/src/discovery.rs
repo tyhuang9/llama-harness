@@ -307,13 +307,19 @@ impl CatalogCache {
 pub(crate) struct PreparedCatalogKey(Arc<[(String, u64)]>);
 
 impl PreparedCatalogKey {
-    fn new(entries: &[&AllowedCatalogEntry<'_>]) -> Self {
-        Self(Arc::from(
-            entries
-                .iter()
-                .map(|entry| (entry.definition.id.clone(), entry.version))
-                .collect::<Vec<_>>(),
-        ))
+    fn new(
+        entries: &[&AllowedCatalogEntry<'_>],
+        guard: &mut impl FnMut() -> Result<(), HarnessError>,
+    ) -> Result<Self, HarnessError> {
+        let mut tools = Vec::with_capacity(entries.len());
+        for (position, entry) in entries.iter().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            tools.push((entry.definition.id.clone(), entry.version));
+        }
+        guard()?;
+        Ok(Self(Arc::from(tools)))
     }
 }
 
@@ -605,24 +611,35 @@ fn scope_with_stats(
         return Ok((ToolScope::empty(caller), stats));
     }
     if exceeded {
+        guard()?;
         entries.sort_by(|left, right| left.definition.id.cmp(&right.definition.id));
         guard()?;
     }
-    let cache_key = PreparedCatalogKey::new(&entries);
+    let cache_key = PreparedCatalogKey::new(&entries, guard)?;
     guard()?;
-    if let Some(prepared) = registry
-        .prepared_catalog_cache
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&cache_key)
-    {
+    #[cfg(test)]
+    if let Some(checkpoint) = &registry.prepared_cache_read_checkpoint {
+        checkpoint(caller);
+    }
+    let cached = {
+        let cache = registry
+            .prepared_catalog_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.get(&cache_key)
+    };
+    guard()?;
+    if let Some(prepared) = cached {
         stats.selected_count = prepared.definitions().len() as u32;
         stats.catalog_exceeded_budget = exceeded;
-        let tool_ids = prepared
-            .definitions()
-            .iter()
-            .map(|definition| definition.id.clone())
-            .collect();
+        let mut tool_ids = BTreeSet::new();
+        for (position, definition) in prepared.definitions().iter().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            tool_ids.insert(definition.id.clone());
+        }
+        guard()?;
         return Ok((
             ToolScope {
                 caller,
@@ -674,6 +691,8 @@ fn scope_with_stats(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         prepared
     };
+    drop(cache);
+    guard()?;
     Ok((
         ToolScope {
             caller,

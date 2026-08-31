@@ -1,11 +1,12 @@
 use futures_util::StreamExt;
 use llama_harness_core::{
     GenerationOptions, HarnessError, Message, MessageRole, ModelProvider, ModelRequest,
-    ModelStreamEvent, ModelStreamFailureKind, ToolCall, ToolDefinition, ToolRisk,
+    ModelStreamEvent, ModelStreamFailureKind, PreparedToolCatalog, ToolCall, ToolDefinition,
+    ToolRisk,
 };
 use llama_harness_ollama::{OllamaProvider, OllamaStreamEvent};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -52,6 +53,26 @@ fn provider(base_url: &str) -> OllamaProvider {
         .base_url(base_url)
         .build()
         .unwrap()
+}
+
+#[tokio::test]
+async fn empty_prepared_catalog_completes_with_legacy_no_tool_body() {
+    let (base_url, task) = server(vec![json_response(
+        200,
+        json!({"model":"qwen3:8b","done":true,"message":{"content":"done"}}),
+    )])
+    .await;
+    let mut model_request = request(CancellationToken::new());
+    model_request.prepared_tools = Some(Arc::new(
+        PreparedToolCatalog::from_definitions(Vec::new()).unwrap(),
+    ));
+
+    let response = provider(&base_url).complete(model_request).await.unwrap();
+
+    assert_eq!(response.final_output.as_deref(), Some("done"));
+    let requests = task.await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(body.get("tools").is_none());
 }
 
 fn json_response(status: u16, body: Value) -> Vec<u8> {
