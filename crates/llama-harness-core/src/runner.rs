@@ -1,13 +1,14 @@
 use crate::{
     agent::{RunRequest, RunResult, RunStatus},
     broker::{BrokerState, PrepareOutcome, ToolBroker, ToolConcurrencyLimiter},
+    discovery::ToolScope,
     event::{EventEmitter, EventSink, InMemoryEventSink, RunEvent},
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len, AgentLimits},
     message::Message,
     model::{ModelProvider, ModelRequest, ModelResponse},
     policy::{ApprovalHandler, DenyApproval, PolicyEngine, SafeDefaultPolicy},
     tool::{ToolCall, ToolCaller, ToolRegistry, ToolResult},
-    GenerationOptions, HarnessError, RunError, ToolDiscoveryLimits, ToolScope,
+    GenerationOptions, HarnessError, RunError, ToolDiscoveryLimits,
 };
 use jsonschema::Validator;
 use serde_json::Value;

@@ -164,35 +164,26 @@ pub struct CatalogFingerprint {
 
 /// Immutable set of tools selected for one caller and one run.
 #[derive(Clone, Debug)]
-pub struct ToolScope {
+pub(crate) struct ToolScope {
     caller: ToolCaller,
     tool_ids: BTreeSet<String>,
     definitions: Arc<[ToolDefinition]>,
 }
 
 impl ToolScope {
-    /// Returns the execution caller this scope was selected for.
-    pub fn caller(&self) -> ToolCaller {
+    pub(crate) fn caller(&self) -> ToolCaller {
         self.caller
     }
 
-    /// Returns whether the scope admits the exact registered tool ID.
-    pub fn contains(&self, tool_id: &str) -> bool {
+    pub(crate) fn contains(&self, tool_id: &str) -> bool {
         self.tool_ids.contains(tool_id)
     }
 
-    /// Returns selected definitions in deterministic allowlist order.
-    pub fn definitions(&self) -> &[ToolDefinition] {
+    pub(crate) fn definitions(&self) -> &[ToolDefinition] {
         &self.definitions
     }
 
-    /// Returns the number of selected definitions.
-    pub fn len(&self) -> usize {
-        self.definitions.len()
-    }
-
-    /// Returns whether no tools were selected.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.definitions.is_empty()
     }
 
@@ -297,16 +288,18 @@ impl ToolRegistry {
             .iter()
             .filter(|entry| entry.metadata.exposure == ToolExposure::Deferred)
             .count();
-        let (index, cache_hit) = self.catalog_index();
-        let base_stats = ToolDiscoveryStats {
+        let mut base_stats = ToolDiscoveryStats {
             candidate_count: allowed.len() as u32,
             selected_count: 0,
             deferred_candidate_count: deferred_count as u32,
             catalog_exceeded_budget: false,
-            cache_hit,
+            cache_hit: false,
         };
 
-        if limits.max_tools == 0 || limits.max_bytes == 0 {
+        // A serialized tool-definition array is at least `[]`. Treat providers
+        // that cannot carry even that representation as having no tool
+        // capacity, without constructing or consulting the catalog index.
+        if limits.max_tools == 0 || limits.max_bytes < 2 || allowed.is_empty() {
             return Ok((ToolScope::empty(caller), base_stats));
         }
         let all_definitions = allowed
@@ -316,6 +309,9 @@ impl ToolRegistry {
         if fits(&allowed, limits)? {
             return Ok(scope_with_stats(caller, all_definitions, base_stats, false));
         }
+
+        let (index, cache_hit) = self.catalog_index();
+        base_stats.cache_hit = cache_hit;
 
         let allowed_by_id = allowed
             .iter()
@@ -695,7 +691,7 @@ mod tests {
                 ProviderCapabilityLimits::new(),
             )
             .unwrap();
-            assert_eq!(selected.len(), 1);
+            assert_eq!(selected.definitions().len(), 1);
             assert!(selected.contains(&target));
             assert_eq!(stats.candidate_count, count as u32);
             assert!(stats.catalog_exceeded_budget);
@@ -771,7 +767,7 @@ mod tests {
             ProviderCapabilityLimits::new(),
         )
         .unwrap();
-        assert_eq!(exact_name.len(), 1);
+        assert_eq!(exact_name.definitions().len(), 1);
         assert!(exact_name.contains("weather.tool.07"));
 
         let (expanded, _) = scope(
@@ -782,7 +778,7 @@ mod tests {
             ProviderCapabilityLimits::new(),
         )
         .unwrap();
-        assert_eq!(expanded.len(), 3);
+        assert_eq!(expanded.definitions().len(), 3);
         assert!(expanded.contains("weather.tool.00"));
         assert!(expanded.contains("weather.tool.01"));
         assert!(expanded.contains("weather.tool.02"));
@@ -819,6 +815,7 @@ mod tests {
             )
             .unwrap()
             .0
+            .definitions()
             .len(),
             1
         );
@@ -839,6 +836,34 @@ mod tests {
         )
         .unwrap();
         assert!(empty.is_empty());
+
+        for provider_bytes in [0, 1] {
+            let (empty, stats) = scope(
+                &registry,
+                "weather.current",
+                &ids,
+                exact,
+                ProviderCapabilityLimits::new()
+                    .with_max_tools(1)
+                    .with_max_tool_schema_bytes(provider_bytes),
+            )
+            .unwrap();
+            assert!(empty.is_empty());
+            assert!(!stats.cache_hit);
+        }
+
+        let empty_registry = ToolRegistry::default();
+        let (empty, stats) = scope(
+            &empty_registry,
+            "anything",
+            &[],
+            ToolDiscoveryLimits::new().with_max_tool_schema_bytes(1),
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert!(empty.is_empty());
+        assert!(!stats.cache_hit);
+        assert!(!empty_registry.catalog_index().1);
     }
 
     #[test]
@@ -848,11 +873,18 @@ mod tests {
             .with_aliases(["forecast", "temperature"]);
         let mut first = ToolRegistry::default();
         register(&mut first, "weather.current", "SECRET-A", metadata.clone());
+        register(
+            &mut first,
+            "weather.future",
+            "SECRET-C",
+            ToolDiscoveryMetadata::deferred(),
+        );
+        let ids = vec!["weather.current".into(), "weather.future".into()];
         let (_, cold_stats) = scope(
             &first,
             "SECRET-A",
-            &["weather.current".into()],
-            ToolDiscoveryLimits::new().with_max_tools(0),
+            &ids,
+            ToolDiscoveryLimits::new().with_max_tools(1),
             ProviderCapabilityLimits::new(),
         )
         .unwrap();
@@ -860,8 +892,8 @@ mod tests {
         let (_, warm_stats) = scope(
             &first,
             "temperature",
-            &["weather.current".into()],
-            ToolDiscoveryLimits::new().with_max_tools(0),
+            &ids,
+            ToolDiscoveryLimits::new().with_max_tools(1),
             ProviderCapabilityLimits::new(),
         )
         .unwrap();
@@ -870,17 +902,45 @@ mod tests {
 
         let mut second = ToolRegistry::default();
         register(&mut second, "weather.current", "SECRET-B", metadata);
+        register(
+            &mut second,
+            "weather.future",
+            "SECRET-D",
+            ToolDiscoveryMetadata::deferred(),
+        );
         assert_eq!(first_fingerprint, second.catalog_fingerprint());
+
+        let duplicate = first.register_with_discovery(
+            Arc::new(TestTool(definition("weather.current", "duplicate"))),
+            ToolDiscoveryMetadata::deferred(),
+        );
+        assert!(duplicate.is_err());
+        assert_eq!(first_fingerprint, first.catalog_fingerprint());
+        let (_, preserved_stats) = scope(
+            &first,
+            "temperature",
+            &ids,
+            ToolDiscoveryLimits::new().with_max_tools(1),
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert!(preserved_stats.cache_hit);
 
         register(
             &mut first,
-            "weather.future",
-            "SECRET-C",
+            "weather.archive",
+            "SECRET-E",
             ToolDiscoveryMetadata::deferred(),
         );
         assert_ne!(first_fingerprint, first.catalog_fingerprint());
 
         let mut permuted = ToolRegistry::default();
+        register(
+            &mut permuted,
+            "weather.archive",
+            "SECRET-W",
+            ToolDiscoveryMetadata::deferred(),
+        );
         register(
             &mut permuted,
             "weather.future",

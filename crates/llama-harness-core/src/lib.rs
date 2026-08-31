@@ -29,7 +29,7 @@ pub use agent_manifest::{
     AGENT_MANIFEST_VERSION,
 };
 pub use discovery::{
-    CatalogFingerprint, ToolDiscoveryLimits, ToolDiscoveryMetadata, ToolExposure, ToolScope,
+    CatalogFingerprint, ToolDiscoveryLimits, ToolDiscoveryMetadata, ToolExposure,
     CATALOG_FINGERPRINT_VERSION,
 };
 pub use error::{HarnessError, ModelStreamFailureKind, RunError};

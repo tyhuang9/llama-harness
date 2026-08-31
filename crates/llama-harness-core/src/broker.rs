@@ -1,9 +1,9 @@
 use crate::{
+    discovery::ToolScope,
     limits::{ensure_json_depth, serialized_len},
     runner::{await_guarded, check_stopped},
     ApprovalHandler, HarnessError, PolicyDecision, PolicyEngine, RunError, RunEvent, RunRequest,
     RunResult, RunStatus, Tool, ToolCall, ToolCallContext, ToolCaller, ToolRegistry, ToolResult,
-    ToolScope,
 };
 use serde_json::Value;
 use std::{
