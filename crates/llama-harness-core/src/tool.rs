@@ -445,6 +445,10 @@ impl ToolRegistry {
     }
 
     /// Registers a tool with validated, privacy-safe discovery metadata.
+    ///
+    /// Indexed identifiers are canonical lowercase ASCII and tool names are
+    /// canonical printable ASCII. Registration rejects overlong or aggregate
+    /// metadata before changing the registry or its catalog cache.
     pub fn register_with_discovery(
         &mut self,
         tool: Arc<dyn Tool>,
