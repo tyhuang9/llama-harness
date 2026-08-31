@@ -4,18 +4,20 @@ use llama_harness_core::{
     AgentDefinition, AgentLimits, AgentRunner, ApprovalHandler, ApprovalRecord, EventRecord,
     GenerationOptions, HarnessError, InMemoryEventSink, JsonMap, Message, MessageRole,
     ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, PolicyDecision,
-    PolicyEngine, ProviderHealth, RunEvent, RunOverrides, RunRequest, RunStatus, RunStrategy, Tool,
-    ToolCall, ToolCaller, ToolDefinition, ToolDiscoveryOutcome, ToolDiscoverySelection,
-    ToolRegistry, ToolResult, ToolRisk,
+    PolicyEngine, ProviderHealth, RunEvent, RunOverrides, RunRequest, RunResult, RunStatus,
+    RunStrategy, Tool, ToolCall, ToolCaller, ToolDefinition, ToolDiscoveryOutcome,
+    ToolDiscoverySelection, ToolRegistry, ToolResult, ToolRisk,
+    HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY, HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
 };
 use serde_json::{json, Value};
 use std::{
     future::pending,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
 };
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 fn request() -> RunRequest {
@@ -135,6 +137,57 @@ impl Tool for TestTool {
     }
 }
 
+struct CancellationBarrierTool {
+    definition: ToolDefinition,
+    calls: AtomicU32,
+    entered: Arc<Notify>,
+    observed_cancellation: AtomicBool,
+    cooperative: bool,
+}
+
+impl CancellationBarrierTool {
+    fn new(cooperative: bool) -> Self {
+        Self {
+            definition: ToolDefinition::new(
+                "read",
+                "read",
+                "cancellation barrier",
+                json!({"type":"object"}),
+            )
+            .with_risk(ToolRisk::Low)
+            .with_idempotent(true)
+            .with_read_only(true),
+            calls: AtomicU32::new(0),
+            entered: Arc::new(Notify::new()),
+            observed_cancellation: AtomicBool::new(false),
+            cooperative,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CancellationBarrierTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(
+        &self,
+        _: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, HarnessError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_waiters();
+        if self.cooperative {
+            cancellation.cancelled().await;
+            self.observed_cancellation.store(true, Ordering::SeqCst);
+            Ok(ToolResult::success(json!({"cancelled": true})))
+        } else {
+            pending().await
+        }
+    }
+}
+
 fn registry(tool: Arc<dyn Tool>) -> ToolRegistry {
     let mut registry = ToolRegistry::default();
     registry.register(tool).unwrap();
@@ -250,6 +303,14 @@ fn completed_events(records: &[EventRecord]) -> Vec<RunStatus> {
         .collect()
 }
 
+fn assert_public_surfaces_exclude(result: &RunResult, events: &InMemoryEventSink, canary: &str) {
+    assert!(!serde_json::to_string(result).unwrap().contains(canary));
+    assert!(!format!("{result:?}").contains(canary));
+    assert!(!serde_json::to_string(&events.events())
+        .unwrap()
+        .contains(canary));
+}
+
 #[tokio::test]
 async fn public_api_runs_a_scripted_final_response() {
     let runner = AgentRunner::builder(Arc::new(MockModelProvider::scripted([final_response(
@@ -259,6 +320,35 @@ async fn public_api_runs_a_scripted_final_response() {
     let result = runner.run(request()).await.unwrap();
     assert_eq!(result.status, RunStatus::Completed);
     assert_eq!(result.final_output.as_deref(), Some("ok"));
+}
+
+#[tokio::test]
+async fn agent_programmatic_limits_fail_closed_for_zero_and_values_above_hard_caps() {
+    for (program_bytes, fanout_concurrency) in [
+        (0, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY),
+        (
+            HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES.saturating_add(1),
+            HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
+        ),
+        (HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES, 0),
+        (
+            HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
+            HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY.saturating_add(1),
+        ),
+    ] {
+        let provider = Arc::new(MockModelProvider::scripted([final_response("unused")]));
+        let mut run_request = request();
+        run_request.agent.limits.max_programmatic_program_bytes = program_bytes;
+        run_request.agent.limits.max_programmatic_fanout_concurrency = fanout_concurrency;
+        assert!(matches!(
+            AgentRunner::builder(provider.clone())
+                .build()
+                .run(run_request)
+                .await,
+            Err(HarnessError::InvalidRequest(_))
+        ));
+        assert!(provider.requests().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -608,6 +698,64 @@ async fn active_cancellation_interrupts_policy_approval_and_tool_awaits() {
     assert_eq!(pending_tool.calls.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn direct_active_tool_cancellation_drains_the_child_token_before_terminal_result() {
+    let tool = Arc::new(CancellationBarrierTool::new(true));
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("barrier", "read", "{}")),
+        final_response("must not synthesize"),
+    ]));
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry(tool.clone()))
+            .build(),
+    );
+    let run_request = request();
+    let cancellation = run_request.cancellation.clone();
+    let entered = tool.entered.clone();
+    let entered_wait = entered.notified();
+    let run = tokio::spawn(async move { runner.run(run_request).await });
+
+    entered_wait.await;
+    cancellation.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), run)
+        .await
+        .expect("cooperative direct tool cancellation must drain")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Cancelled);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(tool.observed_cancellation.load(Ordering::SeqCst));
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn non_cooperative_tool_cleanup_grace_is_bounded_after_cancellation() {
+    let tool = Arc::new(CancellationBarrierTool::new(false));
+    let provider = Arc::new(MockModelProvider::scripted([tool_response(call(
+        "barrier", "read", "{}",
+    ))]));
+    let runner = Arc::new(
+        AgentRunner::builder(provider)
+            .tools(registry(tool.clone()))
+            .build(),
+    );
+    let run_request = request();
+    let cancellation = run_request.cancellation.clone();
+    let entered = tool.entered.clone();
+    let entered_wait = entered.notified();
+    let run = tokio::spawn(async move { runner.run(run_request).await });
+
+    entered_wait.await;
+    cancellation.cancel();
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Cancelled);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(!tool.observed_cancellation.load(Ordering::SeqCst));
+}
+
 #[tokio::test(start_paused = true)]
 async fn provider_per_call_timeout_and_absolute_deadline_are_active() {
     let mut provider_timeout = request();
@@ -790,6 +938,97 @@ async fn callback_errors_return_failed_results_and_terminal_events() {
         completed_events(&tool_sink.events()),
         vec![RunStatus::Failed]
     );
+}
+
+#[tokio::test]
+async fn direct_public_error_surfaces_exclude_provider_policy_approval_tool_and_output_canaries() {
+    const PROVIDER: &str = "provider-error-canary";
+    const POLICY: &str = "policy-error-canary";
+    const APPROVAL: &str = "approval-error-canary";
+    const TOOL: &str = "tool-error-canary";
+    const OUTPUT: &str = "invalid-output-canary";
+
+    let provider_events = Arc::new(InMemoryEventSink::default());
+    let provider_result =
+        AgentRunner::builder(Arc::new(MockModelProvider::scripted([MockStep::Error(
+            HarnessError::Provider(PROVIDER.into()),
+        )])))
+        .event_sink(provider_events.clone())
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+    assert_public_surfaces_exclude(&provider_result, &provider_events, PROVIDER);
+
+    let policy_events = Arc::new(InMemoryEventSink::default());
+    let policy_result =
+        AgentRunner::builder(Arc::new(MockModelProvider::scripted([tool_response(
+            call("policy", "read", "{}"),
+        )])))
+        .tools(registry(Arc::new(TestTool::read(
+            "read",
+            json!({"type":"object"}),
+        ))))
+        .policy(Arc::new(FixedPolicy(Err(HarnessError::Policy(
+            POLICY.into(),
+        )))))
+        .event_sink(policy_events.clone())
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+    assert_public_surfaces_exclude(&policy_result, &policy_events, POLICY);
+
+    let approval_events = Arc::new(InMemoryEventSink::default());
+    let approval_result =
+        AgentRunner::builder(Arc::new(MockModelProvider::scripted([tool_response(
+            call("approval", "read", "{}"),
+        )])))
+        .tools(registry(Arc::new(TestTool::read(
+            "read",
+            json!({"type":"object"}),
+        ))))
+        .policy(Arc::new(FixedPolicy(Ok(PolicyDecision::RequireApproval {
+            reason: "approval required".into(),
+        }))))
+        .approvals(Arc::new(TestApproval(ApprovalBehavior::Error(
+            HarnessError::Approval(APPROVAL.into()),
+        ))))
+        .event_sink(approval_events.clone())
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+    assert_public_surfaces_exclude(&approval_result, &approval_events, APPROVAL);
+
+    let tool_events = Arc::new(InMemoryEventSink::default());
+    let tool_result = AgentRunner::builder(Arc::new(MockModelProvider::scripted([tool_response(
+        call("tool", "read", "{}"),
+    )])))
+    .tools(registry(Arc::new(
+        TestTool::read("read", json!({"type":"object"})).failing(HarnessError::Tool(TOOL.into())),
+    )))
+    .event_sink(tool_events.clone())
+    .build()
+    .run(request())
+    .await
+    .unwrap();
+    assert_public_surfaces_exclude(&tool_result, &tool_events, TOOL);
+
+    let output_events = Arc::new(InMemoryEventSink::default());
+    let mut output_request = request();
+    output_request.agent.output_schema = Some(json!({"type":"object"}));
+    output_request.agent.limits.max_output_repairs = 0;
+    let output_result =
+        AgentRunner::builder(Arc::new(MockModelProvider::scripted([final_response(
+            OUTPUT,
+        )])))
+        .event_sink(output_events.clone())
+        .build()
+        .run(output_request)
+        .await
+        .unwrap();
+    assert_public_surfaces_exclude(&output_result, &output_events, OUTPUT);
 }
 
 #[tokio::test]
@@ -1474,7 +1713,7 @@ async fn declared_failure_bypasses_success_output_schema() {
     assert!(result
         .errors
         .iter()
-        .any(|error| error.message == "declared failure"));
+        .any(|error| error.message == "tool returned a failure result"));
     let feedback: ToolResult = serde_json::from_str(
         &provider.requests()[1]
             .messages

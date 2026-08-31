@@ -197,10 +197,22 @@ impl HarnessError {
             Self::ResourceLimit(_) => "resource_limit",
             Self::InvalidOutput(_) => "invalid_output",
         };
-        RunError {
-            code: code.into(),
-            message: self.to_string(),
-        }
+        let message = match self {
+            Self::InvalidRequest(_) => "invalid request",
+            Self::InvalidTool(_) => "invalid tool",
+            Self::InvalidArguments(_) => "invalid tool arguments",
+            Self::Provider(_) | Self::RetryableProvider(_) => "provider request failed",
+            Self::ModelStream { kind } => kind.message(),
+            Self::UnsupportedCapability(_) => "requested capability is unavailable",
+            Self::Policy(_) => "policy evaluation failed",
+            Self::Approval(_) => "approval handling failed",
+            Self::Tool(_) => "tool execution failed",
+            Self::Cancelled => "run cancelled",
+            Self::TimedOut(_) => "operation timed out",
+            Self::ResourceLimit(_) => "resource limit reached",
+            Self::InvalidOutput(_) => "invalid structured output",
+        };
+        RunError::new(code, message)
     }
 }
 
@@ -318,6 +330,32 @@ mod tests {
             assert_eq!(run_error.message, message);
             let serialized = serde_json::to_string(&run_error).unwrap();
             assert!(!serialized.contains("sentinel-provider-controlled-value"));
+        }
+    }
+
+    #[test]
+    fn value_bearing_errors_map_to_value_free_public_run_errors() {
+        const CANARY: &str = "value-bearing-error-canary";
+        let errors = [
+            HarnessError::InvalidRequest(CANARY.into()),
+            HarnessError::InvalidTool(CANARY.into()),
+            HarnessError::InvalidArguments(CANARY.into()),
+            HarnessError::Provider(CANARY.into()),
+            HarnessError::RetryableProvider(CANARY.into()),
+            HarnessError::UnsupportedCapability(CANARY.into()),
+            HarnessError::Policy(CANARY.into()),
+            HarnessError::Approval(CANARY.into()),
+            HarnessError::Tool(CANARY.into()),
+            HarnessError::TimedOut(CANARY.into()),
+            HarnessError::ResourceLimit(CANARY.into()),
+            HarnessError::InvalidOutput(CANARY.into()),
+        ];
+
+        for error in errors {
+            let run_error = error.run_error();
+            assert!(!run_error.message.contains(CANARY));
+            assert!(!serde_json::to_string(&run_error).unwrap().contains(CANARY));
+            assert!(!format!("{run_error:?}").contains(CANARY));
         }
     }
 }

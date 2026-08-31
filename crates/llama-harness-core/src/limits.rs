@@ -12,6 +12,13 @@ const DEFAULT_MAX_TOOL_RESULT_BYTES: u64 = 1024 * 1024;
 const DEFAULT_MAX_TRANSCRIPT_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_MAX_JSON_DEPTH: u32 = 64;
 
+/// Immutable library ceiling for generated program bytes in a Programmatic run.
+pub const HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES: u64 = 256 * 1024;
+/// Immutable library ceiling for concurrent Programmatic read-only fan-out calls.
+pub const HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY: u32 = 8;
+const DEFAULT_MAX_PROGRAMMATIC_PROGRAM_BYTES: u64 = 64 * 1024;
+const DEFAULT_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY: u32 = 8;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 /// Resource and payload limits applied to an agent run.
@@ -46,6 +53,16 @@ pub struct AgentLimits {
     pub max_transcript_bytes: u64,
     /// Maximum nesting depth for JSON values.
     pub max_json_depth: u32,
+    /// Maximum generated Programmatic program size in bytes.
+    ///
+    /// This is intersected with the immutable library ceiling, explicit host
+    /// configuration, and the provider's advertised Programmatic limit.
+    pub max_programmatic_program_bytes: u64,
+    /// Maximum concurrent read-only Programmatic fan-out calls.
+    ///
+    /// This is intersected with the immutable library ceiling, explicit host
+    /// configuration, and the provider's advertised parallel-call limit.
+    pub max_programmatic_fanout_concurrency: u32,
 }
 
 impl Default for AgentLimits {
@@ -65,7 +82,25 @@ impl Default for AgentLimits {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_transcript_bytes: DEFAULT_MAX_TRANSCRIPT_BYTES,
             max_json_depth: DEFAULT_MAX_JSON_DEPTH,
+            max_programmatic_program_bytes: DEFAULT_MAX_PROGRAMMATIC_PROGRAM_BYTES,
+            max_programmatic_fanout_concurrency: DEFAULT_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
         }
+    }
+}
+
+impl AgentLimits {
+    /// Sets the Programmatic generation and read-only fan-out limits.
+    ///
+    /// Values are validated before a run and cannot increase the library or
+    /// host limits selected for Programmatic execution.
+    pub fn with_programmatic_limits(
+        mut self,
+        max_programmatic_program_bytes: u64,
+        max_programmatic_fanout_concurrency: u32,
+    ) -> Self {
+        self.max_programmatic_program_bytes = max_programmatic_program_bytes;
+        self.max_programmatic_fanout_concurrency = max_programmatic_fanout_concurrency;
+        self
     }
 }
 

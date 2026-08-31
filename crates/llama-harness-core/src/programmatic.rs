@@ -14,7 +14,7 @@ use crate::{
 use futures_util::future::join_all;
 use llama_harness_programmatic_sandbox::{
     Execution, ExecutionId, Program, SandboxErrorCode, SandboxLimits, StepOutcome, ToolBatch,
-    ToolResponse,
+    ToolResponse, HARD_LIMITS,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -184,9 +184,10 @@ impl AgentRunner {
             }
         };
 
-        let mut limits = config.limits;
+        let mut limits = config.limits.constrained_by(HARD_LIMITS);
         limits.max_program_bytes = limits
             .max_program_bytes
+            .min(request.agent.limits.max_programmatic_program_bytes as usize)
             .min(usize::try_from(provider_program_bytes).unwrap_or(usize::MAX));
         limits.validate().map_err(|_| {
             HarnessError::UnsupportedCapability(
@@ -628,6 +629,7 @@ impl AgentRunner {
                 .programmatic
                 .as_ref()
                 .map_or(0, |config| config.max_fanout_concurrency)
+                .min(request.agent.limits.max_programmatic_fanout_concurrency as usize)
                 .min(provider_parallel)
                 .min(batch.calls().len().min(MAX_FANOUT_CONCURRENCY));
             if prepared.len() > effective {

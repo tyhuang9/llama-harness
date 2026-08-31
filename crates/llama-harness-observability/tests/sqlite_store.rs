@@ -522,6 +522,41 @@ fn raw_payloads_are_opt_in_bounded_and_redacted_before_write_and_export() {
 }
 
 #[test]
+fn raw_payload_capture_never_persists_program_artifacts_by_default() {
+    const PROGRAM_CANARY: &str = "program-artifact-canary";
+    let store = SqliteEventSink::open_in_memory(TraceStoreConfig {
+        persist_raw_payloads: true,
+        ..TraceStoreConfig::default()
+    })
+    .unwrap();
+    let event = record(
+        "run-program-artifact",
+        "trace-program-artifact",
+        1,
+        10,
+        RunEvent::ProgramLifecycle {
+            attempt: 1,
+            outcome: ProgramLifecycleOutcome::Started,
+        },
+    );
+    let raw_payload = json!({
+        "program": PROGRAM_CANARY,
+        "bytecode": PROGRAM_CANARY,
+        "nested": {"ast": PROGRAM_CANARY, "source": PROGRAM_CANARY}
+    });
+
+    store.append_with_raw(&event, Some(&raw_payload)).unwrap();
+    let persisted = store.events_for_run("run-program-artifact", 10, 0).unwrap();
+    let serialized = format!("{persisted:?}");
+    let export = store
+        .export_run_json("run-program-artifact")
+        .unwrap()
+        .unwrap();
+    assert!(!serialized.contains(PROGRAM_CANARY));
+    assert!(!export.contains(PROGRAM_CANARY));
+}
+
+#[test]
 fn batch_writes_are_transactional_and_run_queries_filter_paginate_export_and_retain() {
     let store = SqliteEventSink::open_in_memory(TraceStoreConfig::default()).unwrap();
     let inserted = store

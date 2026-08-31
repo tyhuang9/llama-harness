@@ -256,13 +256,13 @@ impl AgentRunner {
                         });
                         break response;
                     }
-                    Err(HarnessError::RetryableProvider(reason))
+                    Err(HarnessError::RetryableProvider(_))
                         if provider_retries < request.agent.limits.max_provider_retries =>
                     {
                         provider_retries += 1;
                         events.emit(RunEvent::ModelRetrying {
                             next_call_number: model_calls.saturating_add(1),
-                            reason,
+                            reason: "retryable provider failure".into(),
                         });
                     }
                     Err(error) => {
@@ -391,11 +391,7 @@ impl AgentRunner {
                         } else if !execution.result.ok {
                             result.errors.push(RunError::new(
                                 "tool_error",
-                                execution
-                                    .result
-                                    .error
-                                    .clone()
-                                    .unwrap_or_else(|| "tool returned a failure result".into()),
+                                "tool returned a failure result",
                             ));
                         }
                         if let Err(error) = push_tool_message(
@@ -723,9 +719,19 @@ pub(crate) fn validate_request(request: &RunRequest) -> Result<Option<Validator>
         || limits.max_tool_result_bytes == 0
         || limits.max_transcript_bytes == 0
         || limits.max_json_depth == 0
+        || limits.max_programmatic_program_bytes == 0
+        || limits.max_programmatic_fanout_concurrency == 0
     {
         return Err(HarnessError::InvalidRequest(
             "call, byte, transcript, and depth limits must be greater than zero".into(),
+        ));
+    }
+    if limits.max_programmatic_program_bytes > crate::limits::HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES
+        || limits.max_programmatic_fanout_concurrency
+            > crate::limits::HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY
+    {
+        return Err(HarnessError::InvalidRequest(
+            "programmatic limits exceed immutable library ceilings".into(),
         ));
     }
     if request.input.len() as u64 > limits.max_input_bytes {

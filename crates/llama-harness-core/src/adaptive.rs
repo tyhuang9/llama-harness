@@ -525,7 +525,7 @@ impl AgentRunner {
                     }
                     run.result.errors.push(RunError::new(
                         "invalid_plan",
-                        format!("declarative plan was invalid: {error}"),
+                        "declarative plan was invalid",
                     ));
                     return Ok(run.finish());
                 }
@@ -663,7 +663,7 @@ impl AgentRunner {
                                         });
                                         run.terminate(error);
                                     }
-                                    Err(error) => {
+                                    Err(_) => {
                                         run.events.emit(RunEvent::PlanLifecycle {
                                             phase: PlanPhase::Recovery,
                                             attempt: 1,
@@ -671,7 +671,7 @@ impl AgentRunner {
                                         });
                                         run.result.errors.push(RunError::new(
                                             "plan_recovery_failed",
-                                            format!("recovery plan was invalid: {error}"),
+                                            "recovery plan was invalid",
                                         ));
                                     }
                                 }
@@ -893,7 +893,7 @@ impl<'a> StrategyRun<'a> {
                     });
                     return Ok(Some(response));
                 }
-                Err(HarnessError::RetryableProvider(reason))
+                Err(HarnessError::RetryableProvider(_))
                     if provider_retries < self.request.agent.limits.max_provider_retries =>
                 {
                     if reserve_final_synthesis && !self.can_spend_optional_model_call() {
@@ -904,7 +904,7 @@ impl<'a> StrategyRun<'a> {
                     provider_retries += 1;
                     self.events.emit(RunEvent::ModelRetrying {
                         next_call_number: self.model_calls.saturating_add(1),
-                        reason,
+                        reason: "retryable provider failure".into(),
                     });
                 }
                 Err(error) => return Err(error),
@@ -1745,11 +1745,7 @@ impl<'a> StrategyRun<'a> {
                             });
                             self.result.errors.push(RunError::new(
                                 "tool_error",
-                                execution
-                                    .result
-                                    .error
-                                    .clone()
-                                    .unwrap_or_else(|| "tool returned a failure result".into()),
+                                "tool returned a failure result",
                             ));
                             wave_failure.get_or_insert(PlanFailureKind::Recoverable);
                         } else {
@@ -2007,11 +2003,7 @@ impl<'a> StrategyRun<'a> {
                         } else if !execution.result.ok {
                             self.result.errors.push(RunError::new(
                                 "tool_error",
-                                execution
-                                    .result
-                                    .error
-                                    .clone()
-                                    .unwrap_or_else(|| "tool returned a failure result".into()),
+                                "tool returned a failure result",
                             ));
                         }
                         execution.result

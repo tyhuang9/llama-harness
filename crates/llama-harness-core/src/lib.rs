@@ -40,7 +40,10 @@ pub use event::{
     ProgramLifecycleOutcome, RunEvent, StrategyFallbackReason, StrategySelectionReason,
     ToolDiscoveryOutcome, ToolDiscoverySelection,
 };
-pub use limits::{AgentLimits, GenerationOptions};
+pub use limits::{
+    AgentLimits, GenerationOptions, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
+    HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
+};
 #[cfg(feature = "programmatic")]
 pub use llama_harness_programmatic_sandbox as programmatic_sandbox;
 pub use message::{Message, MessageRole};

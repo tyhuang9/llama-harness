@@ -2,12 +2,14 @@ use crate::{
     discovery::ToolScope,
     limits::{ensure_json_depth, serialized_len},
     runner::{await_guarded, check_stopped},
-    ApprovalHandler, HarnessError, PolicyDecision, PolicyEngine, RunError, RunEvent, RunRequest,
-    RunResult, RunStatus, Tool, ToolCall, ToolCallContext, ToolCaller, ToolRegistry, ToolResult,
+    ApprovalHandler, ApprovalRecord, HarnessError, PolicyDecision, PolicyEngine, RunError,
+    RunEvent, RunRequest, RunResult, RunStatus, Tool, ToolCall, ToolCallContext, ToolCaller,
+    ToolRegistry, ToolResult,
 };
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Arc, Weak},
     time::Instant as StdInstant,
 };
@@ -17,6 +19,11 @@ use tokio::{
 };
 
 use crate::event::EventEmitter;
+
+/// A dispatched tool has a short, bounded opportunity to observe cooperative
+/// cancellation before its keyed-concurrency permit is released. This does not
+/// make an interrupted effect retryable: callers still record it as uncertain.
+const TOOL_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Runner-wide keyed permits shared by direct and planned invocations.
 #[derive(Default)]
@@ -215,10 +222,7 @@ impl<'a> ToolBroker<'a> {
                 events,
                 state,
                 &call,
-                format!(
-                    "tool arguments exceed {} bytes",
-                    request.agent.limits.max_tool_arguments_bytes
-                ),
+                "tool arguments exceed byte limit",
             );
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                 "tool arguments exceed byte limit",
@@ -227,25 +231,27 @@ impl<'a> ToolBroker<'a> {
 
         let arguments: Value = match serde_json::from_str(&call.arguments_json) {
             Ok(value) => value,
-            Err(error) => {
-                self.reject(
-                    result,
-                    events,
-                    state,
-                    &call,
-                    format!("malformed JSON: {error}"),
-                );
+            Err(_) => {
+                self.reject(result, events, state, &call, "malformed tool arguments");
                 return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                     "malformed tool arguments",
                 )));
             }
         };
-        if let Err(error) = ensure_json_depth(
+        if ensure_json_depth(
             "tool arguments",
             &arguments,
             request.agent.limits.max_json_depth,
-        ) {
-            self.reject(result, events, state, &call, error.to_string());
+        )
+        .is_err()
+        {
+            self.reject(
+                result,
+                events,
+                state,
+                &call,
+                "tool arguments exceed JSON depth limit",
+            );
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                 "tool arguments exceed JSON depth limit",
             )));
@@ -259,7 +265,7 @@ impl<'a> ToolBroker<'a> {
                 events,
                 state,
                 &call,
-                "canonical tool arguments exceed byte limit".into(),
+                "tool arguments exceed byte limit",
             );
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                 "tool arguments exceed byte limit",
@@ -276,13 +282,13 @@ impl<'a> ToolBroker<'a> {
         }
 
         if !self.scope.contains(&call.tool_id) || self.scope.caller() != caller {
-            self.reject(result, events, state, &call, "tool unavailable".into());
+            self.reject(result, events, state, &call, "tool unavailable");
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                 "tool unavailable",
             )));
         }
         let Some(tool) = self.tools.get(&call.tool_id) else {
-            self.reject(result, events, state, &call, "tool unavailable".into());
+            self.reject(result, events, state, &call, "tool unavailable");
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                 "tool unavailable",
             )));
@@ -293,31 +299,25 @@ impl<'a> ToolBroker<'a> {
             .iter()
             .any(|id| id == &call.tool_id)
         {
-            self.reject(
-                result,
-                events,
-                state,
-                &call,
-                "tool is not allowed for agent".into(),
-            );
+            self.reject(result, events, state, &call, "tool is not allowed");
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                 "tool is not allowed",
             )));
         }
         if !tool.definition().allows_caller(caller) {
+            self.reject(result, events, state, &call, "tool caller is not allowed");
+            return Ok(PrepareOutcome::Rejected(ToolResult::failure(
+                "tool caller is not allowed",
+            )));
+        }
+        if self.tools.validate(&call.tool_id, &arguments).is_err() {
             self.reject(
                 result,
                 events,
                 state,
                 &call,
-                format!("tool does not allow {} calls", caller_name(caller)),
+                "tool arguments failed validation",
             );
-            return Ok(PrepareOutcome::Rejected(ToolResult::failure(
-                "tool caller is not allowed",
-            )));
-        }
-        if let Err(error) = self.tools.validate(&call.tool_id, &arguments) {
-            self.reject(result, events, state, &call, error.to_string());
             return Ok(PrepareOutcome::Rejected(ToolResult::failure(
                 "tool arguments failed validation",
             )));
@@ -600,20 +600,15 @@ impl<'a> ToolBroker<'a> {
             None,
         )
         .await?;
+        let public_decision = public_policy_decision(&decision);
         events.emit(RunEvent::PolicyDecided {
             call_id: call.id.clone(),
-            decision: decision.clone(),
+            decision: public_decision.clone(),
         });
-        result.policy_decisions.push(decision.clone());
+        result.policy_decisions.push(public_decision);
 
-        if let PolicyDecision::Deny { reason } = decision {
-            self.reject(
-                result,
-                events,
-                state,
-                call,
-                format!("policy denied: {reason}"),
-            );
+        if let PolicyDecision::Deny { .. } = decision {
+            self.reject(result, events, state, call, "policy denied");
             return Ok(Some(ToolResult::failure("policy denied")));
         }
 
@@ -634,16 +629,18 @@ impl<'a> ToolBroker<'a> {
             approval.call_id = call.id.clone();
             approval.tool_id = call.tool_id.clone();
             let granted = approval.granted;
-            let reason = approval.reason.clone();
-            result.approvals.push(approval);
+            result.approvals.push(ApprovalRecord {
+                call_id: approval.call_id,
+                tool_id: approval.tool_id,
+                granted,
+                reason: if granted {
+                    "approval granted".into()
+                } else {
+                    "approval denied".into()
+                },
+            });
             if !granted {
-                self.reject(
-                    result,
-                    events,
-                    state,
-                    call,
-                    format!("approval denied: {reason}"),
-                );
+                self.reject(result, events, state, call, "approval denied");
                 return Ok(Some(ToolResult::failure("approval denied")));
             }
         }
@@ -709,12 +706,12 @@ impl<'a> ToolBroker<'a> {
             prepared.arguments.clone(),
             tool_cancellation.clone(),
         );
-        let mut tool_result = await_guarded(
+        let mut tool_result = await_dispatched_tool(
             execution,
             &request.cancellation,
             deadline,
             "tool execution exceeded run deadline",
-            Some(&tool_cancellation),
+            &tool_cancellation,
         )
         .await?;
 
@@ -734,9 +731,9 @@ impl<'a> ToolBroker<'a> {
             self.tools
                 .validate_output(&prepared.call.tool_id, &tool_result.output)
                 .err()
-                .map(|error| {
+                .map(|_| {
                     tool_result = ToolResult::failure("tool output failed validation");
-                    RunError::new("tool_error", error.to_string())
+                    RunError::new("tool_error", "tool output failed validation")
                 })
         } else {
             None
@@ -802,13 +799,13 @@ impl<'a> ToolBroker<'a> {
         events: &mut EventEmitter,
         state: &mut BrokerState,
         call: &ToolCall,
-        reason: String,
+        reason: &'static str,
     ) {
         state.tool_rejected += 1;
         events.emit(RunEvent::ToolRejected {
             call_id: call.id.clone(),
             tool_id: call.tool_id.clone(),
-            reason: reason.clone(),
+            reason: reason.into(),
         });
         result.errors.push(RunError::new("tool_rejected", reason));
     }
@@ -867,19 +864,82 @@ impl<'a> ToolBroker<'a> {
     }
 }
 
+fn public_policy_decision(decision: &PolicyDecision) -> PolicyDecision {
+    match decision {
+        PolicyDecision::Allow { .. } => PolicyDecision::Allow {
+            reason: "policy allowed the call".into(),
+        },
+        PolicyDecision::Deny { .. } => PolicyDecision::Deny {
+            reason: "policy denied the call".into(),
+        },
+        PolicyDecision::RequireApproval { .. } => PolicyDecision::RequireApproval {
+            reason: "policy requires approval".into(),
+        },
+    }
+}
+
+/// Awaits a tool after the broker has marked its effect as dispatched.
+///
+/// Unlike [`await_guarded`], cancellation and deadline expiry do not drop the
+/// active future immediately. The child token is signalled first and the same
+/// future is polled through a bounded cleanup grace so cooperative tools can
+/// quiesce while keyed-concurrency admission remains held. A non-cooperative
+/// future is still dropped after that grace; the terminal error ensures the
+/// caller records the potentially active effect as uncertain and never replays
+/// or recovers it.
+async fn await_dispatched_tool<T, F>(
+    future: F,
+    cancellation: &tokio_util::sync::CancellationToken,
+    deadline: Option<Instant>,
+    timeout_message: &str,
+    child_cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<T, HarnessError>
+where
+    F: Future<Output = Result<T, HarnessError>>,
+{
+    enum AwaitOutcome<T> {
+        Completed(Result<T, HarnessError>),
+        Cancelled,
+        TimedOut,
+    }
+
+    tokio::pin!(future);
+    let outcome = if let Some(deadline) = deadline {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => AwaitOutcome::Cancelled,
+            _ = tokio::time::sleep_until(deadline) => {
+                AwaitOutcome::TimedOut
+            },
+            result = &mut future => AwaitOutcome::Completed(result),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => AwaitOutcome::Cancelled,
+            result = &mut future => AwaitOutcome::Completed(result),
+        }
+    };
+
+    match outcome {
+        AwaitOutcome::Completed(result) => result,
+        AwaitOutcome::Cancelled => {
+            child_cancellation.cancel();
+            let _ = tokio::time::timeout(TOOL_CLEANUP_GRACE, &mut future).await;
+            Err(HarnessError::Cancelled)
+        }
+        AwaitOutcome::TimedOut => {
+            child_cancellation.cancel();
+            let _ = tokio::time::timeout(TOOL_CLEANUP_GRACE, &mut future).await;
+            Err(HarnessError::TimedOut(timeout_message.into()))
+        }
+    }
+}
+
 pub(crate) fn canonical_signature(tool_id: &str, arguments: &Value) -> String {
     format!(
         "{}:{}",
         tool_id,
         serde_json::to_string(arguments).unwrap_or_default()
     )
-}
-
-fn caller_name(caller: ToolCaller) -> &'static str {
-    match caller {
-        ToolCaller::Direct => "direct",
-        ToolCaller::DeclarativePlan => "declarative plan",
-        ToolCaller::Programmatic => "programmatic",
-        ToolCaller::Speculative => "speculative",
-    }
 }

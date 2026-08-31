@@ -11,9 +11,10 @@ use llama_harness_core::{
 };
 use serde_json::{json, Value};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
 };
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 fn capabilities() -> ModelCapabilities {
@@ -27,6 +28,33 @@ fn request(tool_ids: &[&str]) -> RunRequest {
     agent.tool_allowlist = tool_ids.iter().map(|id| (*id).into()).collect();
     agent.limits.max_model_calls = 4;
     RunRequest::new(agent, "complete the task").with_run_id("programmatic-test-run")
+}
+
+fn return_program_with_exact_serialized_bytes(bytes: usize) -> String {
+    let empty = json!({"version":1,"body":[{
+        "kind":"return",
+        "value":{"kind":"string","value":""}
+    }]})
+    .to_string();
+    assert!(bytes >= empty.len());
+    let source = json!({"version":1,"body":[{
+        "kind":"return",
+        "value":{"kind":"string","value":"x".repeat(bytes - empty.len())}
+    }]})
+    .to_string();
+    assert_eq!(source.len(), bytes);
+    source
+}
+
+fn two_read_fanout_program() -> String {
+    json!({"version":1,"body":[
+        {"kind":"fan_out","name":"results","tool_id":"read","item":"i",
+         "collection":{"kind":"array","items":[{"kind":"integer","value":1},{"kind":"integer","value":2}]},
+         "max_calls":2,
+         "arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"variable","name":"i"}}]}},
+        {"kind":"return","value":{"kind":"variable","name":"results"}}
+    ]})
+    .to_string()
 }
 
 struct CountingTool {
@@ -125,6 +153,50 @@ impl Tool for RecordingTool {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.contexts.lock().unwrap().push(context.clone());
         Ok(self.result.clone())
+    }
+}
+
+struct CancellationBarrierTool {
+    definition: ToolDefinition,
+    calls: AtomicU32,
+    entered: Arc<Notify>,
+    observed_cancellation: AtomicBool,
+}
+
+impl CancellationBarrierTool {
+    fn mutation(id: &str) -> Self {
+        Self {
+            definition: ToolDefinition::new(
+                id,
+                id,
+                "cooperatively cancellable mutation",
+                json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}),
+            )
+            .with_risk(ToolRisk::High)
+            .with_allowed_callers([ToolCaller::Programmatic]),
+            calls: AtomicU32::new(0),
+            entered: Arc::new(Notify::new()),
+            observed_cancellation: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CancellationBarrierTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(
+        &self,
+        _: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, HarnessError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_waiters();
+        cancellation.cancelled().await;
+        self.observed_cancellation.store(true, Ordering::SeqCst);
+        Ok(ToolResult::success(json!({"cancelled": true})))
     }
 }
 
@@ -519,6 +591,95 @@ async fn fanout_rejects_unsafe_reads_and_provider_cap_excess_before_any_dispatch
 }
 
 #[tokio::test]
+async fn agent_programmatic_byte_limit_is_inclusive_and_wins_the_cap_intersection() {
+    let base = return_program_with_exact_serialized_bytes(160);
+    let source_n_minus_one = return_program_with_exact_serialized_bytes(base.len() - 1);
+    let source_n_plus_one = return_program_with_exact_serialized_bytes(base.len() + 1);
+
+    for (source, agent_cap, expected_model_calls) in [
+        (&source_n_minus_one, source_n_minus_one.len() as u64, 2),
+        (&base, base.len() as u64, 2),
+        (&source_n_plus_one, base.len() as u64, 3),
+    ] {
+        let provider = Arc::new(
+            MockModelProvider::scripted([
+                final_response(source.clone()),
+                final_response(return_program_with_exact_serialized_bytes(base.len() - 1)),
+                final_response("done"),
+            ])
+            .with_capabilities(capabilities().with_limits(
+                ProviderCapabilityLimits::new().with_max_program_bytes((base.len() + 1) as u64),
+            )),
+        );
+        let mut config = ProgrammaticHostConfig::default();
+        config.limits.max_program_bytes = base.len() + 1;
+        let mut run_request = request(&[]);
+        run_request.agent.limits.max_programmatic_program_bytes = agent_cap;
+        let result = AgentRunner::builder(provider.clone())
+            .programmatic(config)
+            .build()
+            .run_with_strategy(run_request, RunStrategy::Programmatic)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(provider.requests().len(), expected_model_calls);
+    }
+}
+
+#[tokio::test]
+async fn programmatic_fanout_uses_the_minimum_of_host_agent_and_provider_caps() {
+    let program = two_read_fanout_program();
+    for (host_cap, agent_cap, provider_cap, completes) in [
+        (2usize, 2u32, 2u32, true),
+        (1, 2, 2, false),
+        (2, 1, 2, false),
+        (2, 2, 1, false),
+    ] {
+        let provider = Arc::new(
+            MockModelProvider::scripted([final_response(program.clone()), final_response("done")])
+                .with_capabilities(
+                    capabilities().with_parallel_tool_calls(true).with_limits(
+                        ProviderCapabilityLimits::new()
+                            .with_max_program_bytes(64 * 1024)
+                            .with_max_parallel_tool_calls(provider_cap),
+                    ),
+                ),
+        );
+        let tool = Arc::new(CountingTool::new("read", true, true));
+        let mut registry = ToolRegistry::default();
+        registry.register(tool.clone()).unwrap();
+        let config = ProgrammaticHostConfig {
+            max_fanout_concurrency: host_cap,
+            ..ProgrammaticHostConfig::default()
+        };
+        let mut run_request = request(&["read"]);
+        run_request.agent.limits.max_programmatic_fanout_concurrency = agent_cap;
+        let result = AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .policy(Arc::new(AllowAllPolicy))
+            .programmatic(config)
+            .build()
+            .run_with_strategy(run_request, RunStrategy::Programmatic)
+            .await
+            .unwrap();
+
+        if completes {
+            assert_eq!(result.status, RunStatus::Completed);
+            assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(provider.requests().len(), 2);
+        } else {
+            assert!(matches!(
+                result.status,
+                RunStatus::Failed | RunStatus::LimitReached
+            ));
+            assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.requests().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
 async fn post_dispatch_mutation_failure_is_terminal_and_never_replayed_or_fallen_back() {
     let program = json!({"version":1,"body":[
         {"kind":"invoke","name":"result","tool_id":"write","arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"integer","value":7}}]}},
@@ -561,6 +722,62 @@ async fn post_dispatch_mutation_failure_is_terminal_and_never_replayed_or_fallen
 }
 
 #[tokio::test]
+async fn cancellation_during_an_active_mutation_is_terminal_uncertain_without_replay() {
+    let program = json!({"version":1,"body":[
+        {"kind":"invoke","name":"result","tool_id":"write","arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"integer","value":7}}]}},
+        {"kind":"return","value":{"kind":"variable","name":"result"}}
+    ]});
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(serde_json::to_string(&program).unwrap()),
+            final_response("must not synthesize"),
+            final_response("must not fall back"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let tool = Arc::new(CancellationBarrierTool::mutation("write"));
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let events = Arc::new(InMemoryEventSink::default());
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .policy(Arc::new(AllowAllPolicy))
+            .event_sink(events.clone())
+            .programmatic(ProgrammaticHostConfig::default())
+            .build(),
+    );
+    let run_request = request(&["write"]);
+    let cancellation = run_request.cancellation.clone();
+    let entered = tool.entered.clone();
+    let entered_wait = entered.notified();
+    let run = tokio::spawn(async move {
+        runner
+            .run_with_strategy(run_request, RunStrategy::Programmatic)
+            .await
+    });
+
+    entered_wait.await;
+    cancellation.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), run)
+        .await
+        .expect("cooperative tool cancellation must drain")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(tool.observed_cancellation.load(Ordering::SeqCst));
+    assert_eq!(provider.requests().len(), 1);
+    assert!(events.events().iter().all(|record| {
+        !matches!(
+            record.event,
+            RunEvent::StrategyFallback { .. } | RunEvent::ProgramExecutionCompleted { .. }
+        )
+    }));
+}
+
+#[tokio::test]
 async fn invalid_program_gets_exactly_one_repair_before_dispatch() {
     let repaired =
         json!({"version":1,"body":[{"kind":"return","value":{"kind":"string","value":"safe"}}]});
@@ -581,6 +798,36 @@ async fn invalid_program_gets_exactly_one_repair_before_dispatch() {
         .unwrap();
     assert!(matches!(result.status, RunStatus::Completed));
     assert_eq!(provider.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn programmatic_parser_canary_never_enters_public_result_or_events() {
+    const PARSER_CANARY: &str = "program-parser-canary";
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(PARSER_CANARY),
+            final_response(PARSER_CANARY),
+            final_response("direct fallback"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider)
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(request(&[]), RunStrategy::Programmatic)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(!serde_json::to_string(&result)
+        .unwrap()
+        .contains(PARSER_CANARY));
+    assert!(!format!("{result:?}").contains(PARSER_CANARY));
+    assert!(!serde_json::to_string(&events.events())
+        .unwrap()
+        .contains(PARSER_CANARY));
 }
 
 #[tokio::test]
