@@ -282,7 +282,12 @@ pub struct ProgrammaticHostConfig {
     pub limits: SandboxLimits,
     /// Finite programmatic run deadline in milliseconds.
     pub max_duration_ms: u64,
-    /// Maximum live VMs admitted by this runner.
+    /// Maximum concurrently retained sandbox VM states admitted by this runner.
+    ///
+    /// Admission begins before candidate parsing and compilation, remains held
+    /// while a VM is suspended on broker, policy, approval, or tool work, and
+    /// ends only after a terminal VM is dropped. This bounds aggregate retained
+    /// sandbox memory to this count times the effective per-VM live-byte cap.
     pub max_active_vms: usize,
     /// Maximum concurrent read-only, parallel-safe calls in a fan-out batch.
     pub max_fanout_concurrency: usize,
@@ -453,7 +458,7 @@ impl AgentRunner {
             ensure_transcript(&generation_messages, &request.agent.limits)?;
 
             let mut program_attempt = 0u32;
-            let verified = loop {
+            let (verified, live_vm_permit) = loop {
                 events.emit(RunEvent::ProgramLifecycle {
                     attempt: program_attempt.saturating_add(1),
                     outcome: ProgramLifecycleOutcome::Started,
@@ -475,6 +480,26 @@ impl AgentRunner {
                         &mut events,
                     )
                     .await?;
+                // This permit intentionally spans parsing, compilation, VM
+                // construction, and every later suspension. It is a retained
+                // VM-memory admission, not a per-slice compute permit.
+                let live_vm_permit = await_guarded(
+                    async {
+                        Arc::clone(&self.programmatic_admission)
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| {
+                                HarnessError::ResourceLimit(
+                                    "programmatic VM admission closed".into(),
+                                )
+                            })
+                    },
+                    &request.cancellation,
+                    deadline,
+                    "programmatic VM admission exceeded run deadline",
+                    None,
+                )
+                .await?;
                 let source = response.final_output.as_deref().ok_or_else(|| {
                     HarnessError::InvalidOutput("provider returned no program".into())
                 });
@@ -500,7 +525,7 @@ impl AgentRunner {
                             instruction_count: program.instruction_count().min(u32::MAX as usize)
                                 as u32,
                         });
-                        break program;
+                        break (program, live_vm_permit);
                     }
                     Err(_error)
                         if program_attempt == 0
@@ -511,6 +536,7 @@ impl AgentRunner {
                                 .saturating_sub(model_calls)
                                 > 1 =>
                     {
+                        drop(live_vm_permit);
                         events.emit(RunEvent::ProgramLifecycle {
                             attempt: program_attempt.saturating_add(1),
                             outcome: ProgramLifecycleOutcome::Invalid,
@@ -523,6 +549,7 @@ impl AgentRunner {
                         ensure_transcript(&generation_messages, &request.agent.limits)?;
                     }
                     Err(error) => {
+                        drop(live_vm_permit);
                         events.emit(RunEvent::ProgramLifecycle {
                             attempt: program_attempt.saturating_add(1),
                             outcome: ProgramLifecycleOutcome::Invalid,
@@ -547,28 +574,7 @@ impl AgentRunner {
                     deadline,
                     "programmatic run deadline reached",
                 )?;
-                // VM admission covers synchronous compute only. The permit is
-                // released before any provider, policy, approval, or tool await.
-                let step = {
-                    let _admission = await_guarded(
-                        async {
-                            Arc::clone(&self.programmatic_admission)
-                                .acquire_owned()
-                                .await
-                                .map_err(|_| {
-                                    HarnessError::ResourceLimit(
-                                        "programmatic VM admission closed".into(),
-                                    )
-                                })
-                        },
-                        &request.cancellation,
-                        deadline,
-                        "programmatic VM admission exceeded run deadline",
-                        None,
-                    )
-                    .await?;
-                    vm.step(limits.max_slice_fuel).map_err(sandbox_error)?
-                };
+                let step = vm.step(limits.max_slice_fuel).map_err(sandbox_error)?;
                 match step {
                     StepOutcome::Sliced => continue,
                     StepOutcome::Complete(value) => break value,
@@ -588,25 +594,6 @@ impl AgentRunner {
                                 &mut broker_transcript,
                             )
                             .await?;
-                        // Resuming may materialize and retain a bounded tool
-                        // response tree, so it is VM compute just like step.
-                        let _admission = await_guarded(
-                            async {
-                                Arc::clone(&self.programmatic_admission)
-                                    .acquire_owned()
-                                    .await
-                                    .map_err(|_| {
-                                        HarnessError::ResourceLimit(
-                                            "programmatic VM admission closed".into(),
-                                        )
-                                    })
-                            },
-                            &request.cancellation,
-                            deadline,
-                            "programmatic VM admission exceeded run deadline",
-                            None,
-                        )
-                        .await?;
                         vm.resume(resume, responses).map_err(sandbox_error)?;
                     }
                     _ => {
@@ -630,6 +617,8 @@ impl AgentRunner {
                 peak_accounted_bytes: metrics.retained_bytes as u64,
                 duration_ms: vm_started.elapsed().as_millis() as u64,
             });
+            drop(vm);
+            drop(live_vm_permit);
 
             let output_json = serialize_synthesis_input(&program_output, &broker_transcript)?;
             let mut synthesis_messages = initial_messages(&request);

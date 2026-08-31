@@ -11,7 +11,7 @@ use llama_harness_core::{
     ToolDefinition, ToolRegistry, ToolResult, ToolRisk, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
     HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
 };
-use llama_harness_programmatic_sandbox::HARD_LIMITS;
+use llama_harness_programmatic_sandbox::{SandboxLimits, HARD_LIMITS};
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
@@ -43,6 +43,11 @@ struct ConcurrentProgramProvider {
     program: String,
 }
 
+struct AdmissionProgramProvider {
+    program: String,
+    generated: Arc<Semaphore>,
+}
+
 #[async_trait]
 impl ModelProvider for ConcurrentProgramProvider {
     fn id(&self) -> &str {
@@ -69,6 +74,36 @@ impl ModelProvider for ConcurrentProgramProvider {
         } else {
             ModelResponse::new("mock-model").with_final_output(self.program.clone())
         })
+    }
+}
+
+#[async_trait]
+impl ModelProvider for AdmissionProgramProvider {
+    fn id(&self) -> &str {
+        "admission-program"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        capabilities()
+    }
+
+    async fn health(&self) -> Result<ProviderHealth, HarnessError> {
+        Ok(ProviderHealth::healthy())
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError> {
+        Ok(vec![
+            ModelInfo::new("mock-model").with_capabilities(capabilities())
+        ])
+    }
+
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError> {
+        if request.tools.is_empty() {
+            Ok(ModelResponse::new("mock-model").with_final_output("admission done"))
+        } else {
+            self.generated.add_permits(1);
+            Ok(ModelResponse::new("mock-model").with_final_output(self.program.clone()))
+        }
     }
 }
 
@@ -139,6 +174,56 @@ fn read_fanout_program(values: &[u64]) -> String {
 struct CountingTool {
     definition: ToolDefinition,
     calls: AtomicU32,
+}
+
+struct AdmissionBarrierTool {
+    definition: ToolDefinition,
+    calls: AtomicU32,
+    entered: Arc<Semaphore>,
+    releases: Arc<Semaphore>,
+}
+
+impl AdmissionBarrierTool {
+    fn new() -> Self {
+        Self {
+            definition: ToolDefinition::new(
+                "read",
+                "read",
+                "suspends programmatic VMs for admission tests",
+                json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}),
+            )
+            .with_risk(ToolRisk::Low)
+            .with_read_only(true)
+            .with_parallel_safe(true)
+            .with_allowed_callers([ToolCaller::Programmatic]),
+            calls: AtomicU32::new(0),
+            entered: Arc::new(Semaphore::new(0)),
+            releases: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for AdmissionBarrierTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(
+        &self,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, HarnessError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.add_permits(1);
+        tokio::select! {
+            _ = cancellation.cancelled() => Ok(ToolResult::success(json!({"cancelled": true}))),
+            permit = self.releases.acquire() => {
+                permit.expect("admission test release semaphore remains open").forget();
+                Ok(ToolResult::success(arguments))
+            }
+        }
+    }
 }
 
 impl CountingTool {
@@ -681,6 +766,226 @@ async fn concurrent_reused_public_run_ids_keep_full_execution_nonces_distinct() 
     for call_id in [&first.tool_calls[0].id, &second.tool_calls[0].id] {
         assert!(uuid::Uuid::parse_str(&call_id[15..51]).is_ok());
     }
+}
+
+#[tokio::test]
+async fn live_vm_admission_bounds_suspended_executions_and_aggregate_memory() {
+    const MAX_ACTIVE_VMS: usize = 2;
+    const PER_VM_LIVE_BYTES: usize = 4 * 1024 * 1024;
+    let program = json!({"version":1,"body":[
+        {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"integer","value":1}}]}},
+        {"kind":"return","value":{"kind":"variable","name":"result"}}
+    ]})
+    .to_string();
+    let generated = Arc::new(Semaphore::new(0));
+    let provider = Arc::new(AdmissionProgramProvider {
+        program,
+        generated: generated.clone(),
+    });
+    let tool = Arc::new(AdmissionBarrierTool::new());
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let events = Arc::new(InMemoryEventSink::default());
+    let config = ProgrammaticHostConfig {
+        limits: SandboxLimits {
+            max_live_bytes: PER_VM_LIVE_BYTES,
+            max_cumulative_bytes: 16 * 1024 * 1024,
+            ..SandboxLimits::default()
+        },
+        max_active_vms: MAX_ACTIVE_VMS,
+        ..ProgrammaticHostConfig::default()
+    };
+    let runner = Arc::new(
+        AgentRunner::builder(provider)
+            .tools(registry)
+            .event_sink(events.clone())
+            .programmatic(config)
+            .build(),
+    );
+
+    let first_runner = runner.clone();
+    let mut first = tokio::spawn(async move {
+        first_runner
+            .run_with_strategy(
+                request(&["read"]).with_run_id("live-vm-first"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+    let second_runner = runner.clone();
+    let mut second = tokio::spawn(async move {
+        second_runner
+            .run_with_strategy(
+                request(&["read"]).with_run_id("live-vm-second"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+    for _ in 0..MAX_ACTIVE_VMS {
+        tool.entered.acquire().await.unwrap().forget();
+        generated.acquire().await.unwrap().forget();
+    }
+
+    let third_runner = runner.clone();
+    let third = tokio::spawn(async move {
+        third_runner
+            .run_with_strategy(
+                request(&["read"]).with_run_id("live-vm-third"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+    generated.acquire().await.unwrap().forget();
+    tokio::task::yield_now().await;
+    assert_eq!(tool.calls.load(Ordering::SeqCst), MAX_ACTIVE_VMS as u32);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), tool.entered.acquire())
+            .await
+            .is_err(),
+        "the N+1 candidate must wait before constructing a retained VM"
+    );
+
+    tool.releases.add_permits(1);
+    let first_finished = tokio::select! {
+        result = &mut first => {
+            let result = result.unwrap();
+            assert_eq!(result.status, RunStatus::Completed, "{:?}", result.errors);
+            true
+        }
+        result = &mut second => {
+            let result = result.unwrap();
+            assert_eq!(result.status, RunStatus::Completed, "{:?}", result.errors);
+            false
+        }
+    };
+    tool.entered.acquire().await.unwrap().forget();
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 3);
+
+    tool.releases.add_permits(2);
+    if !first_finished {
+        assert_eq!(first.await.unwrap().status, RunStatus::Completed);
+    }
+    if first_finished {
+        assert_eq!(second.await.unwrap().status, RunStatus::Completed);
+    }
+    assert_eq!(third.await.unwrap().status, RunStatus::Completed);
+
+    let peaks = events
+        .events()
+        .into_iter()
+        .filter_map(|record| match record.event {
+            RunEvent::ProgramExecutionCompleted {
+                peak_accounted_bytes,
+                ..
+            } => Some(peak_accounted_bytes as usize),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(peaks.len(), 3);
+    assert!(peaks.iter().all(|peak| *peak <= PER_VM_LIVE_BYTES));
+    assert_eq!(
+        MAX_ACTIVE_VMS * PER_VM_LIVE_BYTES,
+        8 * 1024 * 1024,
+        "active slots bound aggregate retained sandbox memory"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_releases_live_vm_admission() {
+    let program = json!({"version":1,"body":[
+        {"kind":"invoke","name":"result","tool_id":"read","arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"integer","value":1}}]}},
+        {"kind":"return","value":{"kind":"variable","name":"result"}}
+    ]})
+    .to_string();
+    let provider = Arc::new(AdmissionProgramProvider {
+        program,
+        generated: Arc::new(Semaphore::new(0)),
+    });
+    let tool = Arc::new(AdmissionBarrierTool::new());
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let runner = Arc::new(
+        AgentRunner::builder(provider)
+            .tools(registry)
+            .programmatic(ProgrammaticHostConfig {
+                max_active_vms: 1,
+                ..ProgrammaticHostConfig::default()
+            })
+            .build(),
+    );
+    let first_request = request(&["read"]).with_run_id("cancelled-live-vm");
+    let cancellation = first_request.cancellation.clone();
+    let first_runner = runner.clone();
+    let first = tokio::spawn(async move {
+        first_runner
+            .run_with_strategy(first_request, RunStrategy::Programmatic)
+            .await
+            .unwrap()
+    });
+    tool.entered.acquire().await.unwrap().forget();
+    cancellation.cancel();
+    assert_eq!(first.await.unwrap().status, RunStatus::Failed);
+
+    let second_runner = runner.clone();
+    let second = tokio::spawn(async move {
+        second_runner
+            .run_with_strategy(
+                request(&["read"]).with_run_id("replacement-live-vm"),
+                RunStrategy::Programmatic,
+            )
+            .await
+            .unwrap()
+    });
+    tool.entered.acquire().await.unwrap().forget();
+    tool.releases.add_permits(1);
+    assert_eq!(second.await.unwrap().status, RunStatus::Completed);
+}
+
+#[tokio::test]
+async fn invalid_program_attempts_release_live_vm_admission_before_fallback() {
+    let valid = json!({"version":1,"body":[{
+        "kind":"return","value":{"kind":"string","value":"verified"}
+    }]})
+    .to_string();
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response("not json"),
+            final_response("still not json"),
+            final_response("direct fallback"),
+            final_response(valid),
+            final_response("final synthesis"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let runner = AgentRunner::builder(provider)
+        .programmatic(ProgrammaticHostConfig {
+            max_active_vms: 1,
+            ..ProgrammaticHostConfig::default()
+        })
+        .build();
+    let first = runner
+        .run_with_strategy(
+            request(&[]).with_run_id("invalid-live-vm"),
+            RunStrategy::Programmatic,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Completed);
+    let second = tokio::time::timeout(
+        Duration::from_secs(1),
+        runner.run_with_strategy(
+            request(&[]).with_run_id("replacement-after-invalid-live-vm"),
+            RunStrategy::Programmatic,
+        ),
+    )
+    .await
+    .expect("invalid parse and repair must release the live VM slot")
+    .unwrap();
+    assert_eq!(second.status, RunStatus::Completed);
+    assert_eq!(second.final_output.as_deref(), Some("final synthesis"));
 }
 
 #[tokio::test]
