@@ -1588,6 +1588,44 @@ async fn declarative_active_mutation_cancellation_drains_the_shared_broker_child
     assert_strategy_usage_reconciles(&events);
 }
 
+#[tokio::test(start_paused = true)]
+async fn declarative_active_mutation_deadline_drains_the_shared_broker_child_token() {
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "write", "tool_id": "write", "arguments": {}}]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(envelope.to_string())])
+            .with_capabilities(planning_capabilities(1)),
+    );
+    let tool = Arc::new(CooperativeCancellationTool::mutation("write"));
+    let mut run_request = request(&["write"]);
+    run_request.agent.limits.max_run_duration_ms = Some(1);
+    let entered = tool.entered.clone();
+    let entered_wait = entered.notified();
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry([tool.clone() as Arc<dyn Tool>]))
+            .policy(Arc::new(AllowAllPolicy))
+            .build(),
+    );
+    let run = tokio::spawn(async move {
+        runner
+            .run_with_strategy(run_request, RunStrategy::DeclarativePlan)
+            .await
+    });
+
+    entered_wait.await;
+    tokio::time::advance(Duration::from_millis(2)).await;
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(result.errors.last().unwrap().code, "timed_out");
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(tool.observed_cancellation.load(Ordering::SeqCst));
+    assert_eq!(provider.requests().len(), 1);
+}
+
 #[tokio::test]
 async fn post_dispatch_timeout_has_a_stable_node_outcome() {
     let envelope = json!({

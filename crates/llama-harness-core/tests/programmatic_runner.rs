@@ -1122,6 +1122,79 @@ async fn each_configurable_fanout_cap_winner_enforces_n_minus_one_n_and_n_plus_o
 }
 
 #[tokio::test]
+async fn immutable_fanout_cap_accepts_n_minus_one_and_n_but_rejects_n_plus_one_before_dispatch() {
+    for call_count in [
+        HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY as usize - 1,
+        HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY as usize,
+    ] {
+        let provider = Arc::new(
+            MockModelProvider::scripted([
+                final_response(read_fanout_program(
+                    &(1..=call_count as u64).collect::<Vec<_>>(),
+                )),
+                final_response("done"),
+            ])
+            .with_capabilities(
+                capabilities().with_parallel_tool_calls(true).with_limits(
+                    ProviderCapabilityLimits::new()
+                        .with_max_program_bytes(64 * 1024)
+                        .with_max_parallel_tool_calls(HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY),
+                ),
+            ),
+        );
+        let tool = Arc::new(CountingTool::new("read", true, true));
+        let mut registry = ToolRegistry::default();
+        registry.register(tool.clone()).unwrap();
+        let mut run_request = request(&["read"]);
+        run_request.agent.limits.max_programmatic_fanout_concurrency =
+            HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY;
+        let result = AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .policy(Arc::new(AllowAllPolicy))
+            .programmatic(ProgrammaticHostConfig::default())
+            .build()
+            .run_with_strategy(run_request, RunStrategy::Programmatic)
+            .await
+            .unwrap();
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(tool.calls.load(Ordering::SeqCst), call_count as u32);
+    }
+
+    let n_plus_one = HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY as usize + 1;
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(read_fanout_program(
+                &(1..=n_plus_one as u64).collect::<Vec<_>>(),
+            )),
+            final_response("still invalid"),
+            final_response("direct fallback"),
+        ])
+        .with_capabilities(
+            capabilities().with_parallel_tool_calls(true).with_limits(
+                ProviderCapabilityLimits::new()
+                    .with_max_program_bytes(64 * 1024)
+                    .with_max_parallel_tool_calls(HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY),
+            ),
+        ),
+    );
+    let tool = Arc::new(CountingTool::new("read", true, true));
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry)
+        .policy(Arc::new(AllowAllPolicy))
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(request(&["read"]), RunStrategy::Programmatic)
+        .await
+        .unwrap();
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.final_output.as_deref(), Some("direct fallback"));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.requests().len(), 3);
+}
+
+#[tokio::test]
 async fn post_dispatch_mutation_failure_is_terminal_and_never_replayed_or_fallen_back() {
     let program = json!({"version":1,"body":[
         {"kind":"invoke","name":"result","tool_id":"write","arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"integer","value":7}}]}},
