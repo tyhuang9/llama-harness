@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 struct CountingTool {
     definition: ToolDefinition,
     calls: AtomicU32,
+    result: ToolResult,
 }
 
 impl CountingTool {
@@ -32,7 +33,13 @@ impl CountingTool {
             .with_parallel_safe(true)
             .with_allowed_callers([ToolCaller::Direct, ToolCaller::DeclarativePlan]),
             calls: AtomicU32::new(0),
+            result: ToolResult::success(json!({"value": 42})),
         }
+    }
+
+    fn with_result(mut self, result: ToolResult) -> Self {
+        self.result = result;
+        self
     }
 }
 
@@ -44,17 +51,25 @@ impl Tool for CountingTool {
 
     async fn execute(&self, _: Value, _: CancellationToken) -> Result<ToolResult, HarnessError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ToolResult::success(json!({"value": 42})))
+        Ok(self.result.clone())
     }
 }
 
 fn capabilities(max_tools: u32, planning: bool) -> ModelCapabilities {
+    capabilities_with_schema_bytes(max_tools, planning, 64 * 1024)
+}
+
+fn capabilities_with_schema_bytes(
+    max_tools: u32,
+    planning: bool,
+    schema_bytes: u64,
+) -> ModelCapabilities {
     ModelCapabilities::new(true, false, true)
         .with_structured_plans(planning)
         .with_limits(
             ProviderCapabilityLimits::new()
                 .with_max_tools(max_tools)
-                .with_max_tool_schema_bytes(64 * 1024)
+                .with_max_tool_schema_bytes(schema_bytes)
                 .with_max_plan_nodes(16)
                 .with_max_plan_bytes(64 * 1024),
         )
@@ -192,6 +207,173 @@ async fn planner_repair_and_final_synthesis_reuse_selected_scopes() {
 }
 
 #[tokio::test]
+async fn execution_recovery_reuses_the_prepared_plan_scope() {
+    let failed_plan = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "failed", "tool_id": "recovery.fail", "arguments": {}}]}
+    })
+    .to_string();
+    let recovered_plan = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "recovered", "tool_id": "recovery.good", "arguments": {}}]}
+    })
+    .to_string();
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(failed_plan),
+            final_response(recovered_plan),
+            final_response("synthesized"),
+        ])
+        .with_capabilities(capabilities(2, true)),
+    );
+    let failed = Arc::new(
+        CountingTool::new("recovery.fail").with_result(ToolResult::failure("expected failure")),
+    );
+    let recovered = Arc::new(CountingTool::new("recovery.good"));
+    let mut registry = ToolRegistry::default();
+    let mut allowlist = vec!["recovery.fail".into(), "recovery.good".into()];
+    for tool in [&failed, &recovered] {
+        registry
+            .register_with_discovery(
+                tool.clone(),
+                ToolDiscoveryMetadata::deferred().with_namespace("recovery"),
+            )
+            .unwrap();
+    }
+    for index in 0..30 {
+        let id = format!("distractor.tool.{index:03}");
+        allowlist.push(id.clone());
+        registry
+            .register_with_discovery(
+                Arc::new(CountingTool::new(&id)),
+                ToolDiscoveryMetadata::deferred().with_namespace("distractor"),
+            )
+            .unwrap();
+    }
+    let mut agent = AgentDefinition::new("recovery", "Recovery", "1", "mock-model");
+    agent.tool_allowlist = allowlist;
+    let request = RunRequest::new(agent, "recovery");
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry)
+        .event_sink(events.clone())
+        .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(2))
+        .build()
+        .run(request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(failed.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(recovered.calls.load(Ordering::SeqCst), 1);
+    let expected = vec!["recovery.fail".to_owned(), "recovery.good".to_owned()];
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().all(|request| {
+        request
+            .tools
+            .iter()
+            .map(|tool| tool.id.clone())
+            .collect::<Vec<_>>()
+            == expected
+    }));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyFallback {
+            reason: llama_harness_core::StrategyFallbackReason::ExecutionRecovery,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn adaptive_invalid_plan_and_planner_failure_fallbacks_reuse_selected_scopes() {
+    let count = 30;
+    let target = "catalog.tool.011";
+    let invalid_events = Arc::new(InMemoryEventSink::default());
+    let invalid_provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response("not-json"),
+            final_response("still-not-json"),
+            final_response("fallback"),
+        ])
+        .with_capabilities(capabilities(1, true)),
+    );
+    let (invalid_registry, _) = registry(count);
+    let invalid = AgentRunner::builder(invalid_provider.clone())
+        .tools(invalid_registry)
+        .event_sink(invalid_events.clone())
+        .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
+        .build()
+        .run(request(count, target))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status, RunStatus::Completed);
+    let invalid_requests = invalid_provider.requests();
+    assert_eq!(invalid_requests.len(), 3);
+    assert!(invalid_requests
+        .iter()
+        .all(|request| { request.tools.len() == 1 && request.tools[0].id == target }));
+    let invalid_discovery = invalid_events
+        .events()
+        .into_iter()
+        .filter_map(|record| match record.event {
+            RunEvent::ToolDiscoveryCompleted {
+                caller, cache_hit, ..
+            } => Some((caller, cache_hit)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        invalid_discovery,
+        vec![
+            (ToolCaller::DeclarativePlan, false),
+            (ToolCaller::Direct, true)
+        ]
+    );
+
+    let failure_events = Arc::new(InMemoryEventSink::default());
+    let failure_provider = Arc::new(
+        MockModelProvider::scripted([
+            MockStep::Error(HarnessError::Provider("expected planner failure".into())),
+            final_response("fallback"),
+        ])
+        .with_capabilities(capabilities(1, true)),
+    );
+    let (failure_registry, _) = registry(count);
+    let failure = AgentRunner::builder(failure_provider.clone())
+        .tools(failure_registry)
+        .event_sink(failure_events.clone())
+        .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
+        .build()
+        .run(request(count, target))
+        .await
+        .unwrap();
+    assert_eq!(failure.status, RunStatus::Completed);
+    let failure_requests = failure_provider.requests();
+    assert_eq!(failure_requests.len(), 2);
+    assert!(failure_requests
+        .iter()
+        .all(|request| { request.tools.len() == 1 && request.tools[0].id == target }));
+    assert_eq!(
+        failure_events
+            .events()
+            .into_iter()
+            .filter_map(|record| match record.event {
+                RunEvent::ToolDiscoveryCompleted {
+                    caller, cache_hit, ..
+                } => Some((caller, cache_hit)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (ToolCaller::DeclarativePlan, false),
+            (ToolCaller::Direct, true)
+        ]
+    );
+}
+
+#[tokio::test]
 async fn known_unselected_and_unknown_calls_have_the_same_external_rejection() {
     async fn rejection(tool_id: &str) -> (String, u32) {
         let count = 30;
@@ -258,15 +440,33 @@ async fn hot_overflow_fails_before_model_use_and_zero_provider_capacity_is_no_to
         MockModelProvider::scripted([final_response("no tools")])
             .with_capabilities(capabilities(0, false)),
     );
-    let (registry, _) = registry(30);
+    let (zero_registry, _) = registry(30);
     let result = AgentRunner::builder(zero_provider.clone())
-        .tools(registry)
+        .tools(zero_registry)
         .build()
         .run_with_strategy(request(30, "catalog.tool.001"), RunStrategy::Direct)
         .await
         .unwrap();
     assert_eq!(result.status, RunStatus::Completed);
     assert!(zero_provider.requests()[0].tools.is_empty());
+
+    for schema_bytes in [0, 1] {
+        let provider = Arc::new(
+            MockModelProvider::scripted([final_response("no tools")])
+                .with_capabilities(capabilities_with_schema_bytes(8, true, schema_bytes)),
+        );
+        let (registry, _) = registry(30);
+        let result = AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .build()
+            .run(request(30, "catalog.tool.001"))
+            .await
+            .unwrap();
+        assert_eq!(result.status, RunStatus::Completed);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools.is_empty());
+    }
 }
 
 #[tokio::test]

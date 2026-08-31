@@ -82,11 +82,14 @@ fn discovery_events_persist_metadata_only() {
         .unwrap();
     let persisted = store.events_for_run("run-discovery", 10, 0).unwrap();
     assert!(matches!(
-        persisted[0].record.event,
+        &persisted[0].record.event,
         RunEvent::ToolDiscoveryCompleted {
+            caller: ToolCaller::Direct,
             candidate_count: 1_000,
             selected_count: 2,
-            ..
+            deferred_candidate_count: 999,
+            catalog_exceeded_budget: true,
+            cache_hit: true,
         }
     ));
     let export = store.export_run_json("run-discovery").unwrap().unwrap();

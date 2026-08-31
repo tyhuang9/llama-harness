@@ -1,5 +1,6 @@
 use crate::{
     broker::{BrokerState, FinalizeOutcome, PrepareOutcome, PreparedCall, ToolBroker},
+    discovery::{ToolDiscoveryStats, ToolScope},
     event::EventEmitter,
     limits::serialized_len,
     plan::{MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES},
@@ -11,7 +12,7 @@ use crate::{
     AgentRunner, ExecutionPlan, HarnessError, Message, ModelRequest, ModelResponse,
     PlanConcurrency, PlanLifecycleOutcome, PlanNode, PlanNodeOutcome, PlanPhase, RunError,
     RunEvent, RunRequest, RunResult, RunStatus, RunStrategy, StrategyFallbackReason,
-    StrategySelectionReason, ToolCall, ToolCaller, ToolDefinition, ToolResult, ToolScope,
+    StrategySelectionReason, ToolCall, ToolCaller, ToolDefinition, ToolResult,
 };
 use futures_util::future::join_all;
 use jsonschema::Validator;
@@ -66,6 +67,16 @@ struct StrategyRun<'a> {
     plan_attempt: u32,
     direct_scope: ToolScope,
     plan_scope: ToolScope,
+}
+
+struct PreparedPlanScope {
+    scope: ToolScope,
+    discovery: ToolDiscoveryStats,
+}
+
+enum PlanningReadiness {
+    Ready(PreparedPlanScope),
+    Downgrade(&'static str),
 }
 
 struct PreparedNode {
@@ -133,13 +144,17 @@ impl AgentRunner {
             RunStrategy::Programmatic => Err(HarnessError::UnsupportedCapability(
                 "programmatic execution requires the optional sandbox runtime".into(),
             )),
-            RunStrategy::DeclarativePlan => {
-                self.ensure_planning_capability(&request)?;
-                self.run_planned(request, RunStrategy::DeclarativePlan)
-                    .await
-            }
-            RunStrategy::Adaptive => {
-                if self.planning_downgrade_reason(&request)?.is_some() {
+            RunStrategy::DeclarativePlan => match self.prepare_plan_scope(&request)? {
+                PlanningReadiness::Ready(prepared) => {
+                    self.run_planned(request, RunStrategy::DeclarativePlan, prepared)
+                        .await
+                }
+                PlanningReadiness::Downgrade(reason) => {
+                    Err(HarnessError::UnsupportedCapability(reason.into()))
+                }
+            },
+            RunStrategy::Adaptive => match self.prepare_plan_scope(&request)? {
+                PlanningReadiness::Downgrade(_) => {
                     self.run_direct(
                         request,
                         Some(DirectStrategyEvents {
@@ -149,39 +164,35 @@ impl AgentRunner {
                         }),
                     )
                     .await
-                } else {
-                    self.run_planned(request, RunStrategy::Adaptive).await
                 }
-            }
+                PlanningReadiness::Ready(prepared) => {
+                    self.run_planned(request, RunStrategy::Adaptive, prepared)
+                        .await
+                }
+            },
         }
     }
 
-    fn ensure_planning_capability(&self, request: &RunRequest) -> Result<(), HarnessError> {
-        if let Some(reason) = self.planning_downgrade_reason(request)? {
-            return Err(HarnessError::UnsupportedCapability(reason.into()));
-        }
-        Ok(())
-    }
-
-    fn planning_downgrade_reason(
-        &self,
-        request: &RunRequest,
-    ) -> Result<Option<&'static str>, HarnessError> {
+    fn prepare_plan_scope(&self, request: &RunRequest) -> Result<PlanningReadiness, HarnessError> {
         let capabilities = self.provider.capabilities();
         if request.agent.limits.max_model_calls < 2 {
-            return Ok(Some(
+            return Ok(PlanningReadiness::Downgrade(
                 "run model-call budget cannot support planning and finalization",
             ));
         }
         if !capabilities.supports_tools || !capabilities.supports_structured_plans {
-            return Ok(Some("provider does not support structured plans"));
+            return Ok(PlanningReadiness::Downgrade(
+                "provider does not support structured plans",
+            ));
         }
         if capabilities.limits.max_plan_nodes == Some(0)
             || capabilities.limits.max_plan_bytes == Some(0)
         {
-            return Ok(Some("provider advertises no structured-plan capacity"));
+            return Ok(PlanningReadiness::Downgrade(
+                "provider advertises no structured-plan capacity",
+            ));
         }
-        let (scope, _) = self.tools.select_scope(
+        let (scope, discovery) = self.tools.select_scope(
             &request.input,
             &request.agent.tool_allowlist,
             ToolCaller::DeclarativePlan,
@@ -189,17 +200,23 @@ impl AgentRunner {
             &capabilities.limits,
         )?;
         if scope.is_empty() {
-            return Ok(Some("no allowed tools permit declarative plan calls"));
+            return Ok(PlanningReadiness::Downgrade(
+                "no allowed tools permit declarative plan calls",
+            ));
         }
-        Ok(None)
+        Ok(PlanningReadiness::Ready(PreparedPlanScope {
+            scope,
+            discovery,
+        }))
     }
 
     async fn run_planned(
         &self,
         request: RunRequest,
         requested: RunStrategy,
+        prepared_plan: PreparedPlanScope,
     ) -> Result<RunResult, HarnessError> {
-        let mut run = StrategyRun::new(self, &request, requested)?;
+        let mut run = StrategyRun::new(self, &request, requested, prepared_plan)?;
         if requested == RunStrategy::DeclarativePlan {
             run.events.emit(RunEvent::StrategySelected {
                 requested,
@@ -539,6 +556,7 @@ impl<'a> StrategyRun<'a> {
         runner: &'a AgentRunner,
         request: &'a RunRequest,
         requested: RunStrategy,
+        prepared_plan: PreparedPlanScope,
     ) -> Result<Self, HarnessError> {
         let output_validator = validate_request(request)?;
         let capabilities = runner.provider.capabilities();
@@ -546,13 +564,6 @@ impl<'a> StrategyRun<'a> {
             &request.input,
             &request.agent.tool_allowlist,
             ToolCaller::Direct,
-            runner.discovery_limits,
-            &capabilities.limits,
-        )?;
-        let (plan_scope, plan_discovery) = runner.tools.select_scope(
-            &request.input,
-            &request.agent.tool_allowlist,
-            ToolCaller::DeclarativePlan,
             runner.discovery_limits,
             &capabilities.limits,
         )?;
@@ -577,8 +588,12 @@ impl<'a> StrategyRun<'a> {
             run_id: run_id.clone(),
             trace_id: trace_id.clone(),
         });
+        emit_discovery(
+            &mut events,
+            ToolCaller::DeclarativePlan,
+            prepared_plan.discovery,
+        );
         emit_discovery(&mut events, ToolCaller::Direct, direct_discovery);
-        emit_discovery(&mut events, ToolCaller::DeclarativePlan, plan_discovery);
         Ok(Self {
             runner,
             request,
@@ -601,7 +616,7 @@ impl<'a> StrategyRun<'a> {
             terminal: false,
             plan_attempt: 0,
             direct_scope,
-            plan_scope,
+            plan_scope: prepared_plan.scope,
         })
     }
 
