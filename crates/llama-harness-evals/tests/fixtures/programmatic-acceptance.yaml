@@ -32,10 +32,10 @@ cases:
     input: Read then approve a write.
     expected: {status: completed, required_tools: [read, write], required_approval_tools: [write], max_model_calls: 2, max_tool_calls: 2}
   - id: partial-failure
-    strategy: direct
+    strategy: programmatic
     fixture: {id: partial-failure, data: {scenario: partial-failure, tools: [read, read], partial_failure: true}}
     input: Collect a bounded partial read failure.
-    expected: {status: completed, required_tools: [read], max_model_calls: 2, max_tool_calls: 2}
+    expected: {status: failed, required_tools: [read], max_model_calls: 1, max_tool_calls: 2}
   - id: repair
     strategy: programmatic
     fixture: {id: repair, data: {scenario: repair, tools: []}}

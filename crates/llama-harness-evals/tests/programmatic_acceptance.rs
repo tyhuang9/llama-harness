@@ -253,6 +253,21 @@ fn program(scenario: &str, tool_ids: &[String]) -> String {
             ),
             ret(scenario),
         ],
+        "partial-failure" => vec![
+            invoke(
+                "successful_read",
+                "read",
+                json!({"kind": "integer", "value": 1}),
+            ),
+            json!({
+                "kind": "invoke", "name": "failed_read", "tool_id": "read",
+                "arguments": {"kind": "object", "entries": [
+                    {"key": "value", "value": {"kind": "integer", "value": 2}},
+                    {"key": "fail", "value": {"kind": "boolean", "value": true}}
+                ]}
+            }),
+            ret(scenario),
+        ],
         _ => tool_ids
             .iter()
             .enumerate()
@@ -361,6 +376,12 @@ impl EvalExecutor for AcceptanceExecutor {
             )
             .await
             .map_err(|error| EvalError::Executor(error.to_string()))?;
+        let expected_status = request
+            .case
+            .expected
+            .status
+            .clone()
+            .expect("acceptance cases declare a terminal status");
         let state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -384,8 +405,8 @@ impl EvalExecutor for AcceptanceExecutor {
             unauthorized_effects: Some(0),
             duplicate_effects: Some((state.effects.len() - distinct.len()) as u32),
             unintended_effects: Some((!exact) as u32),
-            task_correct: Some(run.status == RunStatus::Completed && exact),
-            final_state_correct: Some(run.status == RunStatus::Completed && exact),
+            task_correct: Some(run.status == expected_status && exact),
+            final_state_correct: Some(run.status == expected_status && exact),
             recovery_success: Some(
                 !matches!(scenario, "repair" | "fallback") || run.status == RunStatus::Completed,
             ),
