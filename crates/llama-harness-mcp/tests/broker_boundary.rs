@@ -69,7 +69,7 @@ impl McpTransport for FakeTransport {
             }],
             next_cursor: None,
             ttl_ms: Some(1_000),
-            cache_scope: Some("server".into()),
+            cache_scope: Some("public".into()),
         })
     }
 
@@ -134,9 +134,8 @@ async fn imported_registry(
         .await
         .expect("catalog imports");
     let id = manager.active_tools()[0].definition().id.clone();
-    let mut registry = ToolRegistry::default();
-    manager
-        .register_active(&mut registry)
+    let registry = manager
+        .replace_registered(&ToolRegistry::default())
         .expect("catalog registers atomically");
     (manager, registry, id)
 }

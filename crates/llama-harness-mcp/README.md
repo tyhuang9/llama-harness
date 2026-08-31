@@ -21,12 +21,15 @@ policy, approval, call limits, cancellation, output validation, and the
 existing `ToolBroker`; there is no supported MCP execution bypass. Calls are
 never retried after dispatch because a remote effect may be uncertain.
 
-`McpCatalogManager` installs only a fully validated immutable snapshot. A
-modern snapshot requires consistent TTL and cache scope; a legacy snapshot uses
-the host-selected age. List-change invalidation and expiry fail closed unless a
-host deliberately configures a bounded stale allowance. Refresh never mutates
-an active runner, and old, invalidated, expired, or closed snapshots reject
-before dispatch.
+`McpCatalogManager` installs only a fully validated immutable snapshot. Modern
+`tools/list` pages use MCP's `ttlMs` hint (zero is immediately stale) and a
+consistent `cacheScope` of `public` or `private`; the manager uses the shortest
+page TTL for a complete catalog. A private catalog is rejected unless the host
+binds the manager to one authorization context, and that manager must not be
+shared with another context. A legacy snapshot uses the host-selected age.
+List-change invalidation and expiry fail closed unless a host deliberately
+configures a bounded stale allowance. Refresh never mutates an active runner,
+and old, invalidated, expired, or closed snapshots reject before dispatch.
 
 Lifecycle observation is metadata-only. It deliberately redacts endpoints,
 credentials, native names, arguments, results, schemas, raw frames, request
@@ -39,8 +42,8 @@ For long-lived integrations, use `McpCatalogManager`. It builds a complete
 validated immutable snapshot before replacing the active catalog, rejects tools
 from invalidated, expired, replaced, or closed generations before native
 dispatch, and only permits stale use when the host configures a bounded
-`McpCachePolicy::max_stale`. Modern catalogs require consistent `ttl_ms` and
-`cache_scope`; legacy catalogs use the host-assigned age policy.
+`McpCachePolicy::max_stale`. Modern catalogs require consistent `cacheScope`
+and honor per-page `ttlMs`; legacy catalogs use the host-assigned age policy.
 
 `McpObserver` receives metadata-only lifecycle events. Events include local
 duration, bounded counts and bytes, page/cache/stale/cancellation/dispatch

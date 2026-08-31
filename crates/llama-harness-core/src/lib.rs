@@ -69,6 +69,7 @@ pub use streaming::{
     ToolCallAssemblyLimits, ToolCallDelta, ValidatedModelStreamEvent,
 };
 pub use tool::{
-    CancellationSafety, ExecutionLocation, IssueSafety, NetworkEgress, SpeculationPolicy, Tool,
-    ToolCall, ToolCallContext, ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    CancellationSafety, ExecutionLocation, GroupToolRegistration, IssueSafety, NetworkEgress,
+    SpeculationPolicy, Tool, ToolCall, ToolCallContext, ToolCaller, ToolDefinition,
+    ToolRegistrationGroup, ToolRegistry, ToolResult, ToolRisk,
 };

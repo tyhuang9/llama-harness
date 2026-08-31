@@ -443,6 +443,7 @@ pub trait Tool: Send + Sync {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RegisteredTool {
     pub(crate) tool: Arc<dyn Tool>,
     pub(crate) definition: ToolDefinition,
@@ -452,6 +453,40 @@ pub(crate) struct RegisteredTool {
     pub(crate) serialized_definition: Arc<[u8]>,
     pub(crate) serialized_provider_tool: Arc<[u8]>,
     pub(crate) catalog_version: u64,
+    registration_group: Option<ToolRegistrationGroup>,
+}
+
+/// Application-owned identifier for a replaceable group of tool registrations.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ToolRegistrationGroup(String);
+
+impl ToolRegistrationGroup {
+    /// Creates a non-empty bounded group identifier.
+    pub fn new(value: impl Into<String>) -> Result<Self, HarnessError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 256
+            || value.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(HarnessError::InvalidTool(
+                "tool registration group is invalid".into(),
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+/// One tool staged for a transactional registration-group replacement.
+pub struct GroupToolRegistration {
+    tool: Arc<dyn Tool>,
+    discovery: ToolDiscoveryMetadata,
+}
+
+impl GroupToolRegistration {
+    /// Creates a strict deferred or indexed registration for a named group.
+    pub fn new(tool: Arc<dyn Tool>, discovery: ToolDiscoveryMetadata) -> Self {
+        Self { tool, discovery }
+    }
 }
 
 /// Registry of tools and their compiled argument validators.
@@ -537,11 +572,82 @@ impl ToolRegistry {
         self.register_inner(tool, discovery, true)
     }
 
+    /// Returns a new registry with exactly `registrations` owned by `group`.
+    ///
+    /// The original registry is not mutated. All new registrations are fully
+    /// validated against non-group entries before the new snapshot is returned,
+    /// so callers may keep existing runners on the prior immutable snapshot.
+    pub fn replace_group(
+        &self,
+        group: &ToolRegistrationGroup,
+        registrations: impl IntoIterator<Item = GroupToolRegistration>,
+    ) -> Result<Self, HarnessError> {
+        let mut replacement = self.snapshot_for_replacement();
+        replacement
+            .tools
+            .retain(|_, entry| entry.registration_group.as_ref() != Some(group));
+        replacement.rebuild_exact_tool_ids();
+        for registration in registrations {
+            replacement.register_group_inner(
+                registration.tool,
+                registration.discovery,
+                group.clone(),
+            )?;
+        }
+        Ok(replacement)
+    }
+
+    fn snapshot_for_replacement(&self) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            exact_tool_ids: self.exact_tool_ids.clone(),
+            catalog_generation: self.catalog_generation,
+            catalog_cache: RwLock::new(CatalogCache::default()),
+            prepared_catalog_cache: RwLock::new(PreparedCatalogCache::default()),
+            fingerprint_cache: RwLock::new(None),
+            catalog_build_count: AtomicU64::new(0),
+            prepared_catalog_build_count: AtomicU64::new(0),
+            #[cfg(test)]
+            discovery_checkpoint: None,
+            #[cfg(test)]
+            discovery_cache_assembly_checkpoint: None,
+            #[cfg(test)]
+            prepared_cache_read_checkpoint: None,
+        }
+    }
+
+    fn rebuild_exact_tool_ids(&mut self) {
+        self.exact_tool_ids = self
+            .tools
+            .iter()
+            .map(|(key, entry)| (entry.definition.id.clone(), key.clone()))
+            .collect();
+    }
+
+    fn register_group_inner(
+        &mut self,
+        tool: Arc<dyn Tool>,
+        discovery: ToolDiscoveryMetadata,
+        group: ToolRegistrationGroup,
+    ) -> Result<(), HarnessError> {
+        self.register_inner_with_group(tool, discovery, true, Some(group))
+    }
+
     fn register_inner(
+        &mut self,
+        tool: Arc<dyn Tool>,
+        discovery: ToolDiscoveryMetadata,
+        strict_discovery_metadata: bool,
+    ) -> Result<(), HarnessError> {
+        self.register_inner_with_group(tool, discovery, strict_discovery_metadata, None)
+    }
+
+    fn register_inner_with_group(
         &mut self,
         tool: Arc<dyn Tool>,
         mut discovery: ToolDiscoveryMetadata,
         strict_discovery_metadata: bool,
+        registration_group: Option<ToolRegistrationGroup>,
     ) -> Result<(), HarnessError> {
         let definition = tool.definition().clone();
         let id = if strict_discovery_metadata {
@@ -636,6 +742,7 @@ impl ToolRegistry {
                 serialized_definition,
                 serialized_provider_tool,
                 catalog_version: next_generation,
+                registration_group,
             },
         );
         self.catalog_generation = next_generation;

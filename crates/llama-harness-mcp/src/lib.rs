@@ -7,9 +7,9 @@
 
 use async_trait::async_trait;
 use llama_harness_core::{
-    CancellationSafety, ExecutionLocation, HarnessError, NetworkEgress, SpeculationPolicy, Tool,
-    ToolCallContext, ToolCaller, ToolDefinition, ToolDiscoveryMetadata, ToolRegistry, ToolResult,
-    ToolRisk,
+    CancellationSafety, ExecutionLocation, GroupToolRegistration, HarnessError, NetworkEgress,
+    SpeculationPolicy, Tool, ToolCallContext, ToolCaller, ToolDefinition, ToolDiscoveryMetadata,
+    ToolRegistrationGroup, ToolRegistry, ToolResult, ToolRisk,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -165,16 +165,6 @@ pub struct McpCallResult {
     /// Server-reported tool failure.
     pub is_error: bool,
 }
-/// Immutable provenance retained by each MCP adapter.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct McpToolProvenance {
-    /// Host canonical server identifier.
-    pub server_id: String,
-    /// Exact native name, not model-visible metadata.
-    pub native_name: String,
-    /// Negotiated era.
-    pub era: McpProtocolEra,
-}
 /// Conservative import bounds.
 #[derive(Clone, Debug)]
 pub struct McpLimits {
@@ -294,17 +284,17 @@ impl Default for McpCachePolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpCacheScope {
-    /// Cache entry is scoped to the negotiated server context.
-    Server,
-    /// Cache entry is scoped to one transport request context.
-    Request,
+    /// Cache entry can be shared across authorization contexts.
+    Public,
+    /// Cache entry is bound to one host-supplied authorization context.
+    Private,
 }
 
 impl McpCacheScope {
     fn parse(value: &str) -> Result<Self, McpError> {
         match value {
-            "server" => Ok(Self::Server),
-            "request" => Ok(Self::Request),
+            "public" => Ok(Self::Public),
+            "private" => Ok(Self::Private),
             _ => Err(McpError::InvalidCatalog("unsupported cache scope".into())),
         }
     }
@@ -452,6 +442,35 @@ struct ActiveCatalog {
     tools: Vec<Arc<ManagedMcpToolAdapter>>,
 }
 
+#[derive(Default)]
+struct InFlightCalls {
+    count: AtomicU64,
+    drained: tokio::sync::Notify,
+}
+
+struct InFlightLease(Arc<InFlightCalls>);
+
+impl Drop for InFlightLease {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.drained.notify_waiters();
+        }
+    }
+}
+
+async fn wait_for_drain(calls: &InFlightCalls) {
+    loop {
+        if calls.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let notified = calls.drained.notified();
+        if calls.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        notified.await;
+    }
+}
+
 struct CatalogState {
     active: Option<Arc<ActiveCatalog>>,
     closed: bool,
@@ -487,6 +506,9 @@ pub struct McpCatalogManager {
     state: Arc<Mutex<CatalogState>>,
     refresh_lock: tokio::sync::Mutex<()>,
     observer: Arc<ObserverHub>,
+    authorization_context: Option<Arc<str>>,
+    registration_group: ToolRegistrationGroup,
+    in_flight: Arc<InFlightCalls>,
 }
 
 impl McpCatalogManager {
@@ -517,13 +539,54 @@ impl McpCatalogManager {
         clock: Arc<dyn McpClock>,
         observer: Option<Arc<dyn McpObserver>>,
     ) -> Result<Self, McpError> {
+        Self::with_configuration_and_authorization_context(
+            transport,
+            server_id,
+            limits,
+            timeouts,
+            cache_policy,
+            clock,
+            observer,
+            None,
+        )
+    }
+
+    /// Creates a manager with an optional host-owned authorization cache binding.
+    ///
+    /// A modern `private` catalog is rejected unless this binding is present;
+    /// callers should use one manager per authorization context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_configuration_and_authorization_context(
+        transport: Arc<dyn McpTransport>,
+        server_id: impl Into<String>,
+        limits: McpLimits,
+        timeouts: McpTimeouts,
+        cache_policy: McpCachePolicy,
+        clock: Arc<dyn McpClock>,
+        observer: Option<Arc<dyn McpObserver>>,
+        authorization_context: Option<String>,
+    ) -> Result<Self, McpError> {
         let server_id = validate_server_id(server_id.into())?;
+        let authorization_context = authorization_context
+            .map(|value| {
+                if value.is_empty()
+                    || value.len() > 4096
+                    || value.bytes().any(|byte| byte.is_ascii_control())
+                {
+                    Err(McpError::InvalidCatalog(
+                        "invalid authorization cache context".into(),
+                    ))
+                } else {
+                    Ok(Arc::<str>::from(value))
+                }
+            })
+            .transpose()?;
         validate_duration(cache_policy.legacy_ttl)?;
         if let Some(max_stale) = cache_policy.max_stale {
             validate_duration(max_stale)?;
         }
         Ok(Self {
-            server_id,
+            server_id: server_id.clone(),
             transport,
             limits,
             timeouts,
@@ -535,6 +598,10 @@ impl McpCatalogManager {
                 observer,
                 ..ObserverHub::default()
             }),
+            authorization_context,
+            registration_group: ToolRegistrationGroup::new(format!("mcp:{server_id}"))
+                .map_err(McpError::Core)?,
+            in_flight: Arc::new(InFlightCalls::default()),
         })
     }
 
@@ -618,9 +685,17 @@ impl McpCatalogManager {
                     generation,
                     Arc::downgrade(&self.state),
                     Arc::clone(&self.clock),
+                    Arc::clone(&self.in_flight),
                 ))
             })
             .collect::<Vec<_>>();
+        let mut generated_ids = HashSet::with_capacity(managed.len());
+        if managed
+            .iter()
+            .any(|tool| !generated_ids.insert(tool.definition().id.clone()))
+        {
+            return Err(McpError::InvalidCatalog("generated ID collision".into()));
+        }
         let snapshot = Arc::new(ActiveCatalog {
             summary: McpCatalogSnapshot {
                 generation,
@@ -633,7 +708,12 @@ impl McpCatalogManager {
             stale_until_ms,
             tools: managed,
         });
-        {
+        if scope == Some(McpCacheScope::Private) && self.authorization_context.is_none() {
+            return Err(McpError::InvalidCatalog(
+                "private cache requires host authorization context".into(),
+            ));
+        }
+        let previous = {
             let mut state = self
                 .state
                 .lock()
@@ -641,8 +721,12 @@ impl McpCatalogManager {
             if state.closed {
                 return Err(McpError::CatalogUnavailable);
             }
-            state.active = Some(Arc::clone(&snapshot));
+            let previous = state.active.replace(Arc::clone(&snapshot));
             state.invalidated = false;
+            previous
+        };
+        if let Some(previous) = previous {
+            self.schedule_close_after_drain(previous.context.clone());
         }
         self.observer.emit(event(
             McpLifecycleOperation::Refresh,
@@ -694,25 +778,20 @@ impl McpCatalogManager {
             .unwrap_or_default()
     }
 
-    /// Registers the current complete snapshot. Existing old tools stay guarded and reject.
-    pub fn register_active(&self, registry: &mut ToolRegistry) -> Result<(), McpError> {
+    /// Returns a new registry with the active snapshot atomically replacing this manager's group.
+    pub fn replace_registered(&self, registry: &ToolRegistry) -> Result<ToolRegistry, McpError> {
         let tools = self.active_tools();
         if tools.is_empty() {
             return Err(McpError::CatalogUnavailable);
         }
-        for tool in &tools {
-            if registry.get(&tool.definition().id).is_some() {
-                return Err(McpError::InvalidCatalog("generated ID collision".into()));
-            }
-        }
-        let mut staged = ToolRegistry::default();
-        for tool in &tools {
-            staged.register_with_discovery(Arc::clone(tool), ToolDiscoveryMetadata::deferred())?;
-        }
-        for tool in tools {
-            registry.register_with_discovery(tool, ToolDiscoveryMetadata::deferred())?;
-        }
-        Ok(())
+        registry
+            .replace_group(
+                &self.registration_group,
+                tools.into_iter().map(|tool| {
+                    GroupToolRegistration::new(tool, ToolDiscoveryMetadata::deferred())
+                }),
+            )
+            .map_err(McpError::Core)
     }
 
     /// Closes the manager. The local state is closed before bounded transport shutdown.
@@ -731,14 +810,24 @@ impl McpCatalogManager {
         };
         let started = Instant::now();
         let result = match context {
-            Some(context) => close_context(
-                self.transport.as_ref(),
-                context,
-                cancellation.child_token(),
-                self.timeouts.close,
-            )
-            .await
-            .map_err(McpError::from),
+            Some(context) => {
+                tokio::time::timeout(self.timeouts.close, wait_for_drain(&self.in_flight))
+                    .await
+                    .map_err(|_| {
+                        McpError::Transport(McpTransportError {
+                            operation: McpOperation::Close,
+                            dispatch: McpDispatchState::PossiblyDispatched,
+                        })
+                    })?;
+                close_context(
+                    self.transport.as_ref(),
+                    context,
+                    cancellation.child_token(),
+                    self.timeouts.close,
+                )
+                .await
+                .map_err(McpError::from)
+            }
             None => Ok(()),
         };
         self.observer.emit(event(
@@ -766,6 +855,40 @@ impl McpCatalogManager {
 
     fn is_closed(&self) -> bool {
         self.state.lock().map(|state| state.closed).unwrap_or(true)
+    }
+
+    fn schedule_close_after_drain(&self, context: McpContext) {
+        let transport = Arc::clone(&self.transport);
+        let calls = Arc::clone(&self.in_flight);
+        let timeout = self.timeouts.close;
+        let observer = Arc::clone(&self.observer);
+        tokio::spawn(async move {
+            wait_for_drain(&calls).await;
+            let started = Instant::now();
+            let result = close_context(
+                transport.as_ref(),
+                context,
+                CancellationToken::new(),
+                timeout,
+            )
+            .await;
+            observer.emit(event(
+                McpLifecycleOperation::Close,
+                if result.is_ok() {
+                    McpLifecycleOutcome::Succeeded
+                } else {
+                    McpLifecycleOutcome::Failed
+                },
+                elapsed_ms(started),
+                0,
+                0,
+                0,
+                false,
+                false,
+                McpDispatchState::PossiblyDispatched,
+                None,
+            ));
+        });
     }
 
     fn checked_now(&self) -> Result<u64, McpError> {
@@ -814,7 +937,20 @@ impl McpCatalogManager {
             &self.limits,
             self.timeouts.list,
         )
-        .await?;
+        .await;
+        let fetched = match fetched {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                let _ = close_context(
+                    self.transport.as_ref(),
+                    context,
+                    CancellationToken::new(),
+                    self.timeouts.close,
+                )
+                .await;
+                return Err(error);
+            }
+        };
         let scope = fetched.cache_scope;
         let bytes = fetched.bytes;
         let pages = fetched.pages;
@@ -835,6 +971,7 @@ struct ManagedMcpToolAdapter {
     generation: u64,
     state: Weak<Mutex<CatalogState>>,
     clock: Arc<dyn McpClock>,
+    in_flight: Arc<InFlightCalls>,
 }
 
 impl ManagedMcpToolAdapter {
@@ -843,16 +980,18 @@ impl ManagedMcpToolAdapter {
         generation: u64,
         state: Weak<Mutex<CatalogState>>,
         clock: Arc<dyn McpClock>,
+        in_flight: Arc<InFlightCalls>,
     ) -> Self {
         Self {
             inner,
             generation,
             state,
             clock,
+            in_flight,
         }
     }
 
-    fn check_active(&self) -> Result<bool, HarnessError> {
+    fn check_active(&self) -> Result<(bool, InFlightLease), HarnessError> {
         let now = self.clock.now_ms();
         let state = self
             .state
@@ -876,11 +1015,13 @@ impl ManagedMcpToolAdapter {
                 "MCP catalog is no longer active".into(),
             ));
         }
-        if now <= snapshot.expires_at_ms {
-            return Ok(false);
+        if now < snapshot.expires_at_ms {
+            self.in_flight.count.fetch_add(1, Ordering::AcqRel);
+            return Ok((false, InFlightLease(Arc::clone(&self.in_flight))));
         }
-        if now <= snapshot.stale_until_ms {
-            return Ok(true);
+        if now < snapshot.stale_until_ms {
+            self.in_flight.count.fetch_add(1, Ordering::AcqRel);
+            return Ok((true, InFlightLease(Arc::clone(&self.in_flight))));
         }
         Err(HarnessError::InvalidTool("MCP catalog expired".into()))
     }
@@ -909,7 +1050,7 @@ impl Tool for ManagedMcpToolAdapter {
         arguments: Value,
         cancellation: CancellationToken,
     ) -> Result<ToolResult, HarnessError> {
-        let stale = self.check_active()?;
+        let (stale, _lease) = self.check_active()?;
         self.inner
             .execute_managed(call, arguments, cancellation, stale)
             .await
@@ -937,7 +1078,7 @@ async fn fetch_tools(
     let mut items = Vec::new();
     let mut bytes = 0usize;
     let mut pages = 0usize;
-    let mut cache_ttl = None;
+    let mut cache_ttl: Option<u64> = None;
     let mut cache_scope = None;
     for _ in 0..limits.max_pages {
         let page = tokio::select! {
@@ -965,12 +1106,10 @@ async fn fetch_tools(
             let scope = McpCacheScope::parse(page.cache_scope.as_deref().ok_or_else(|| {
                 McpError::InvalidCatalog("modern page omitted cache scope".into())
             })?)?;
-            if cache_ttl
-                .replace(ttl)
-                .is_some_and(|previous| previous != ttl)
-                || cache_scope
-                    .replace(scope)
-                    .is_some_and(|previous| previous != scope)
+            cache_ttl = Some(cache_ttl.map_or(ttl, |previous| previous.min(ttl)));
+            if cache_scope
+                .replace(scope)
+                .is_some_and(|previous| previous != scope)
             {
                 return Err(McpError::InvalidCatalog(
                     "inconsistent modern cache metadata".into(),
@@ -1066,114 +1205,8 @@ fn event(
     }
 }
 
-/// Retrieves and validates a complete catalog, then registers it atomically with respect to validation.
-pub async fn import_catalog(
-    registry: &mut ToolRegistry,
-    transport: Arc<dyn McpTransport>,
-    server_id: impl Into<String>,
-    cancellation: CancellationToken,
-    limits: McpLimits,
-) -> Result<Vec<McpToolProvenance>, McpError> {
-    let server_id = validate_server_id(server_id.into())?;
-    let timeouts = McpTimeouts::default();
-    let context = tokio::time::timeout(
-        timeouts.connect,
-        transport.connect(cancellation.child_token()),
-    )
-    .await
-    .map_err(|_| McpTransportError {
-        operation: McpOperation::Connect,
-        dispatch: McpDispatchState::PossiblyDispatched,
-    })??;
-    if !matches!(
-        (context.era, context.version.as_str()),
-        (McpProtocolEra::Modern20260728, "2026-07-28")
-            | (McpProtocolEra::Legacy20251125, "2025-11-25")
-    ) || !context.capabilities.contains("tools")
-    {
-        return Err(McpError::InvalidCatalog(
-            "unsupported version or missing tools capability".into(),
-        ));
-    }
-    let mut cursor = None;
-    let mut seen_cursors = HashSet::new();
-    let mut seen_names = HashSet::new();
-    let mut tools = Vec::new();
-    let mut bytes = 0usize;
-    for _ in 0..limits.max_pages {
-        let page = tokio::time::timeout(
-            timeouts.list,
-            transport.list_tools(&context, cursor.as_deref(), cancellation.child_token()),
-        )
-        .await
-        .map_err(|_| McpTransportError {
-            operation: McpOperation::ListTools,
-            dispatch: McpDispatchState::PossiblyDispatched,
-        })??;
-        bytes = bytes.saturating_add(
-            serde_json::to_vec(&page)
-                .map_err(|_| McpError::InvalidCatalog("unserializable page".into()))?
-                .len(),
-        );
-        if bytes > limits.max_catalog_bytes {
-            return Err(McpError::InvalidCatalog(
-                "catalog exceeds byte limit".into(),
-            ));
-        }
-        for tool in page.tools {
-            if !seen_names.insert(tool.name.clone()) {
-                return Err(McpError::InvalidCatalog(
-                    "duplicate native tool name".into(),
-                ));
-            }
-            validate_tool(&tool, &limits)?;
-            tools.push(tool);
-            if tools.len() > limits.max_tools {
-                return Err(McpError::InvalidCatalog("tool limit exceeded".into()));
-            }
-        }
-        cursor = page.next_cursor;
-        if let Some(next) = &cursor {
-            if !seen_cursors.insert(next.clone()) {
-                return Err(McpError::InvalidCatalog("cursor cycle".into()));
-            }
-        } else {
-            break;
-        }
-    }
-    if cursor.is_some() {
-        return Err(McpError::InvalidCatalog("page limit exceeded".into()));
-    }
-    let mut staged = ToolRegistry::default();
-    let mut adapters = Vec::new();
-    let mut ids = HashSet::new();
-    for tool in tools {
-        let id = generated_id(&server_id, &tool.name);
-        if !ids.insert(id.clone()) || registry.get(&id).is_some() {
-            return Err(McpError::InvalidCatalog("generated ID collision".into()));
-        }
-        let adapter = Arc::new(McpToolAdapter::new(
-            id,
-            server_id.clone(),
-            tool,
-            context.clone(),
-            Arc::clone(&transport),
-            timeouts.call,
-            limits.clone(),
-            Arc::new(ObserverHub::default()),
-        ));
-        staged.register_with_discovery(adapter.clone(), ToolDiscoveryMetadata::deferred())?;
-        adapters.push(adapter);
-    }
-    for adapter in &adapters {
-        registry.register_with_discovery(adapter.clone(), ToolDiscoveryMetadata::deferred())?;
-    }
-    Ok(adapters.into_iter().map(|a| a.provenance.clone()).collect())
-}
-
 struct McpToolAdapter {
     definition: ToolDefinition,
-    provenance: McpToolProvenance,
     transport: Arc<dyn McpTransport>,
     context: McpContext,
     native_name: String,
@@ -1210,11 +1243,6 @@ impl McpToolAdapter {
         }
         Self {
             definition: d,
-            provenance: McpToolProvenance {
-                server_id,
-                native_name: native_name.clone(),
-                era: context.era,
-            },
             transport,
             context,
             native_name,
@@ -1546,7 +1574,7 @@ mod tests {
                     tools,
                     next_cursor: None,
                     ttl_ms: Some(ttl_ms),
-                    cache_scope: Some("server".into()),
+                    cache_scope: Some("public".into()),
                 }]),
                 calls: AtomicU64::new(0),
                 hang_call: AtomicBool::new(false),
@@ -1691,6 +1719,49 @@ mod tests {
             Err(HarnessError::InvalidTool(_))
         ));
         assert_eq!(transport.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn modern_zero_ttl_is_immediately_stale() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(0, vec![tool("one")]));
+        let manager = manager(transport.clone(), clock, None, None);
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        assert!(matches!(
+            call_first(&manager).await,
+            Err(HarnessError::InvalidTool(_))
+        ));
+        assert_eq!(transport.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn private_catalog_requires_host_authorization_binding() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        transport.pages.lock().expect("test mutex")[0].cache_scope = Some("private".into());
+        let unbound = manager(transport.clone(), clock.clone(), None, None);
+        assert!(matches!(
+            unbound.refresh(CancellationToken::new()).await,
+            Err(McpError::InvalidCatalog(_))
+        ));
+        let bound = McpCatalogManager::with_configuration_and_authorization_context(
+            transport,
+            "server",
+            McpLimits::default(),
+            McpTimeouts::default(),
+            McpCachePolicy::default(),
+            clock,
+            None,
+            Some("host-auth-context-a".into()),
+        )
+        .expect("bound manager");
+        bound
+            .refresh(CancellationToken::new())
+            .await
+            .expect("bound private refresh");
     }
 
     #[tokio::test]
