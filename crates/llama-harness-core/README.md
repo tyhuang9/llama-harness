@@ -23,5 +23,11 @@ and every selected invocation still crosses the same core broker validation,
 policy, approval, cancellation, and resource-limit boundary. Existing
 `register` calls remain hot and preserve small-catalog behavior.
 
+Each completed caller-scope selection emits one metadata-only discovery event.
+Mandatory count or serialized-schema budget overflow becomes a zero-effect
+`LimitReached` run outcome; invalid requests and internal discovery errors
+remain errors. Queries, tool metadata, fingerprints, and cache state are never
+included in discovery events.
+
 The minimum supported Rust version is 1.88. This crate is licensed under the
 MIT License; see `LICENSE`.

@@ -1,4 +1,8 @@
-use llama_harness_core::{EventRecord, EventSink, RunEvent, RunStatus, ToolCaller};
+use llama_harness_core::{
+    mock::{final_response, MockModelProvider},
+    AgentDefinition, AgentRunner, EventRecord, EventSink, RunEvent, RunRequest, RunStatus,
+    RunStrategy, ToolCaller, ToolDiscoveryOutcome, ToolDiscoverySelection,
+};
 use llama_harness_observability::{
     AppendOutcome, RedactionConfig, RetentionPolicy, RunListQuery, SqliteEventSink,
     TraceStoreConfig, TraceStoreError, REDACTED_VALUE,
@@ -19,6 +23,134 @@ fn record(
     event: RunEvent,
 ) -> EventRecord {
     EventRecord::new(run_id, trace_id, sequence, timestamp_ms, event)
+}
+
+#[test]
+fn runner_discovery_events_reopen_with_additive_legacy_compatibility() {
+    let path = temporary_database("runner-discovery");
+    let store = SqliteEventSink::open(&path, TraceStoreConfig::default()).unwrap();
+    let provider = Arc::new(MockModelProvider::scripted([final_response("done")]));
+    let runner = AgentRunner::builder(provider)
+        .event_sink(Arc::new(store.clone()))
+        .build();
+    let request = RunRequest::new(
+        AgentDefinition::new("observability", "Observability", "1", "mock"),
+        "answer without tools",
+    )
+    .with_run_id("runner-discovery")
+    .with_trace_id("runner-discovery-trace");
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(runner.run_with_strategy(request, RunStrategy::Direct))
+        .unwrap();
+    assert_eq!(result.status, RunStatus::Completed);
+    drop(runner);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let kind: String = connection
+        .query_row(
+            "SELECT event_kind FROM trace_events WHERE run_id = ?1 AND event_kind = ?2",
+            ["runner-discovery", "tool.discovery.completed"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "tool.discovery.completed");
+    let legacy = json!({
+        "run_id": "legacy-discovery",
+        "trace_id": "legacy-discovery-trace",
+        "sequence": 1,
+        "timestamp_ms": 1,
+        "event": {
+            "type": "tool_discovery_completed",
+            "caller": "direct",
+            "candidate_count": 3,
+            "selected_count": 1,
+            "deferred_candidate_count": 3,
+            "catalog_exceeded_budget": true
+        }
+    })
+    .to_string();
+    connection
+        .execute(
+            "INSERT INTO trace_events
+             (run_id, trace_id, sequence, timestamp_ms, event_kind, status, event_json)
+             VALUES (?1, ?2, 1, 1, ?3, NULL, ?4)",
+            rusqlite::params![
+                "legacy-discovery",
+                "legacy-discovery-trace",
+                "tool.discovery.completed",
+                legacy
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteEventSink::open(&path, TraceStoreConfig::default()).unwrap();
+    let records = reopened.events_for_run("runner-discovery", 20, 0).unwrap();
+    let discovery = records
+        .iter()
+        .find_map(|persisted| match persisted.record.event {
+            RunEvent::ToolDiscoveryCompleted {
+                caller,
+                outcome,
+                selection,
+                candidate_count,
+                selected_count,
+                deferred_candidate_count,
+                effective_tool_count_budget,
+                effective_schema_byte_budget,
+                selected_schema_bytes,
+                expansion_count,
+                expansion_limit,
+                catalog_exceeded_budget,
+                duration_ms,
+            } => Some((
+                caller,
+                outcome,
+                selection,
+                candidate_count,
+                selected_count,
+                deferred_candidate_count,
+                effective_tool_count_budget,
+                effective_schema_byte_budget,
+                selected_schema_bytes,
+                expansion_count,
+                expansion_limit,
+                catalog_exceeded_budget,
+                duration_ms,
+            )),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(discovery.0, ToolCaller::Direct);
+    assert_eq!(discovery.1, ToolDiscoveryOutcome::Selected);
+    assert_eq!(discovery.2, ToolDiscoverySelection::EmptyCatalog);
+    assert_eq!(discovery.3, 0);
+    assert_eq!(discovery.4, 0);
+    assert_eq!(discovery.5, 0);
+    assert_eq!(discovery.8, 2);
+    assert!(!discovery.11);
+
+    let legacy = reopened.events_for_run("legacy-discovery", 10, 0).unwrap();
+    assert!(matches!(
+        legacy[0].record.event,
+        RunEvent::ToolDiscoveryCompleted {
+            outcome: ToolDiscoveryOutcome::Selected,
+            selection: ToolDiscoverySelection::FullCatalog,
+            effective_tool_count_budget: 0,
+            effective_schema_byte_budget: 0,
+            selected_schema_bytes: 0,
+            expansion_count: 0,
+            expansion_limit: 0,
+            duration_ms: 0,
+            ..
+        }
+    ));
+    drop(reopened);
+    fs::remove_file(path).unwrap();
 }
 
 fn started(run_id: &str, trace_id: &str, timestamp_ms: u64) -> EventRecord {
@@ -72,10 +204,18 @@ fn discovery_events_persist_metadata_only() {
             10,
             RunEvent::ToolDiscoveryCompleted {
                 caller: ToolCaller::Direct,
+                outcome: ToolDiscoveryOutcome::Selected,
+                selection: ToolDiscoverySelection::LexicalExpanded,
                 candidate_count: 1_000,
                 selected_count: 2,
                 deferred_candidate_count: 999,
+                effective_tool_count_budget: 4,
+                effective_schema_byte_budget: 16_384,
+                selected_schema_bytes: 512,
+                expansion_count: 2,
+                expansion_limit: 4,
                 catalog_exceeded_budget: true,
+                duration_ms: 3,
             },
         ))
         .unwrap();
@@ -84,21 +224,29 @@ fn discovery_events_persist_metadata_only() {
         &persisted[0].record.event,
         RunEvent::ToolDiscoveryCompleted {
             caller: ToolCaller::Direct,
+            outcome: ToolDiscoveryOutcome::Selected,
+            selection: ToolDiscoverySelection::LexicalExpanded,
             candidate_count: 1_000,
             selected_count: 2,
             deferred_candidate_count: 999,
+            effective_tool_count_budget: 4,
+            effective_schema_byte_budget: 16_384,
+            selected_schema_bytes: 512,
+            expansion_count: 2,
+            expansion_limit: 4,
             catalog_exceeded_budget: true,
+            duration_ms: 3,
         }
     ));
     let export = store.export_run_json("run-discovery").unwrap().unwrap();
     assert!(export.contains("tool_discovery_completed"));
     for forbidden in [
-        "query",
-        "tool_ids",
-        "aliases",
-        "schema",
-        "fingerprint",
-        "cache_hit",
+        "\"query\":",
+        "\"tool_ids\":",
+        "\"aliases\":",
+        "\"schema\":",
+        "\"fingerprint\":",
+        "\"cache_hit\":",
     ] {
         assert!(!export.contains(forbidden));
     }
