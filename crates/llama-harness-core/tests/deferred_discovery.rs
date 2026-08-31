@@ -157,9 +157,14 @@ async fn planner_repair_and_final_synthesis_reuse_selected_scopes() {
         "plan": {"nodes": [{"id": "node", "tool_id": target, "arguments": {}}]}
     })
     .to_string();
+    let bypass = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "bypass", "tool_id": "catalog.tool.018", "arguments": {}}]}
+    })
+    .to_string();
     let provider = Arc::new(
         MockModelProvider::scripted([
-            MockStep::Response(ModelResponse::new("mock-model").with_final_output("not-json")),
+            MockStep::Response(ModelResponse::new("mock-model").with_final_output(bypass)),
             MockStep::Response(ModelResponse::new("mock-model").with_final_output(repaired)),
             final_response("synthesized"),
         ])
@@ -178,6 +183,7 @@ async fn planner_repair_and_final_synthesis_reuse_selected_scopes() {
 
     assert_eq!(result.status, RunStatus::Completed);
     assert_eq!(tools[17].calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tools[18].calls.load(Ordering::SeqCst), 0);
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
     assert!(requests
@@ -261,4 +267,45 @@ async fn hot_overflow_fails_before_model_use_and_zero_provider_capacity_is_no_to
         .unwrap();
     assert_eq!(result.status, RunStatus::Completed);
     assert!(zero_provider.requests()[0].tools.is_empty());
+}
+
+#[tokio::test]
+async fn adaptive_capability_fallback_matches_forced_direct_discovery() {
+    let count = 100;
+    let target = "catalog.tool.042";
+    let direct_provider = Arc::new(
+        MockModelProvider::scripted([final_response("direct")])
+            .with_capabilities(capabilities(2, false)),
+    );
+    let adaptive_provider = Arc::new(
+        MockModelProvider::scripted([final_response("adaptive")])
+            .with_capabilities(capabilities(2, false)),
+    );
+    let (direct_registry, _) = registry(count);
+    let (adaptive_registry, _) = registry(count);
+    AgentRunner::builder(direct_provider.clone())
+        .tools(direct_registry)
+        .build()
+        .run_with_strategy(request(count, target), RunStrategy::Direct)
+        .await
+        .unwrap();
+    AgentRunner::builder(adaptive_provider.clone())
+        .tools(adaptive_registry)
+        .build()
+        .run(request(count, target))
+        .await
+        .unwrap();
+
+    let direct_ids = direct_provider.requests()[0]
+        .tools
+        .iter()
+        .map(|tool| tool.id.clone())
+        .collect::<Vec<_>>();
+    let adaptive_ids = adaptive_provider.requests()[0]
+        .tools
+        .iter()
+        .map(|tool| tool.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(direct_ids, adaptive_ids);
+    assert_eq!(direct_ids, vec![target]);
 }

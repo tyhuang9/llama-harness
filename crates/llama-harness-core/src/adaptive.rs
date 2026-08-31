@@ -832,18 +832,18 @@ impl<'a> StrategyRun<'a> {
 
         let mut identical = HashMap::<String, u32>::new();
         for node in &plan.nodes {
-            let Some(tool) = self.runner.tools.get(&node.tool_id) else {
-                return Err(HarnessError::InvalidTool(format!(
-                    "plan node '{}' selects an unknown tool",
-                    node.id
-                )));
-            };
             if !self.plan_scope.contains(&node.tool_id) {
                 return Err(HarnessError::InvalidTool(format!(
                     "plan node '{}' selects an unavailable tool",
                     node.id
                 )));
             }
+            let Some(tool) = self.runner.tools.get(&node.tool_id) else {
+                return Err(HarnessError::InvalidTool(format!(
+                    "plan node '{}' selects an unavailable tool",
+                    node.id
+                )));
+            };
             if !self
                 .request
                 .agent
@@ -894,9 +894,14 @@ impl<'a> StrategyRun<'a> {
                 }
                 let dependency_index = indexes[dependency_id.as_str()];
                 let dependency = &plan.nodes[dependency_index];
+                if !self.plan_scope.contains(&dependency.tool_id) {
+                    return Err(HarnessError::InvalidTool(
+                        "plan selects an unavailable tool".into(),
+                    ));
+                }
                 let dependency_tool =
                     self.runner.tools.get(&dependency.tool_id).ok_or_else(|| {
-                        HarnessError::InvalidTool("plan selects an unknown tool".into())
+                        HarnessError::InvalidTool("plan selects an unavailable tool".into())
                     })?;
                 if !dependency_tool.definition().read_only {
                     return Err(HarnessError::InvalidRequest(format!(

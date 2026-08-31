@@ -725,6 +725,10 @@ impl<'a> ToolBroker<'a> {
         caller: ToolCaller,
     ) -> ToolCall {
         let mut recorded = call.clone();
+        if !self.scope.contains(&call.tool_id) || self.scope.caller() != caller {
+            recorded.arguments_json = "{}".into();
+            return recorded;
+        }
         if !self.arguments_are_valid(request, call, caller) {
             recorded.arguments_json = "{}".into();
         }
@@ -737,6 +741,9 @@ impl<'a> ToolBroker<'a> {
         call: &ToolCall,
         caller: ToolCaller,
     ) -> bool {
+        if !self.scope.contains(&call.tool_id) || self.scope.caller() != caller {
+            return false;
+        }
         if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
             return false;
         }

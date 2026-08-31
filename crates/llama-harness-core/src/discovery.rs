@@ -1,7 +1,4 @@
-use crate::{
-    limits::serialized_len, HarnessError, ProviderCapabilityLimits, ToolCaller, ToolDefinition,
-    ToolRegistry,
-};
+use crate::{HarnessError, ProviderCapabilityLimits, ToolCaller, ToolDefinition, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -225,6 +222,12 @@ pub(crate) struct CatalogEntry {
     pub(crate) terms: BTreeMap<String, u32>,
 }
 
+pub(crate) struct AllowedCatalogEntry<'a> {
+    pub(crate) definition: &'a ToolDefinition,
+    pub(crate) metadata: &'a ToolDiscoveryMetadata,
+    pub(crate) serialized_bytes: u64,
+}
+
 pub(crate) struct CatalogIndex {
     entries: Vec<CatalogEntry>,
     document_frequency: BTreeMap<String, u32>,
@@ -292,7 +295,7 @@ impl ToolRegistry {
         let allowed = self.allowed_catalog(allowlist, caller);
         let deferred_count = allowed
             .iter()
-            .filter(|(_, metadata)| metadata.exposure == ToolExposure::Deferred)
+            .filter(|entry| entry.metadata.exposure == ToolExposure::Deferred)
             .count();
         let (index, cache_hit) = self.catalog_index();
         let base_stats = ToolDiscoveryStats {
@@ -308,63 +311,69 @@ impl ToolRegistry {
         }
         let all_definitions = allowed
             .iter()
-            .map(|(definition, _)| (*definition).clone())
+            .map(|entry| entry.definition.clone())
             .collect::<Vec<_>>();
-        if fits(&all_definitions, limits)? {
+        if fits(&allowed, limits)? {
             return Ok(scope_with_stats(caller, all_definitions, base_stats, false));
         }
 
         let allowed_by_id = allowed
             .iter()
-            .map(|(definition, metadata)| (definition.id.as_str(), (*definition, *metadata)))
+            .map(|entry| {
+                (
+                    entry.definition.id.as_str(),
+                    (entry.definition, entry.metadata),
+                )
+            })
             .collect::<HashMap<_, _>>();
         let mut required = allowed
             .iter()
-            .filter(|(_, metadata)| metadata.exposure == ToolExposure::Hot)
-            .map(|(definition, _)| definition.id.clone())
+            .filter(|entry| entry.metadata.exposure == ToolExposure::Hot)
+            .map(|entry| entry.definition.id.clone())
             .collect::<BTreeSet<_>>();
         let ranked = rank(&index, query, &allowed_by_id, limits.max_expansion as usize);
         let exact = matches!(ranked, RankedSelection::Exact(_));
-        required.extend(ranked.ids().iter().cloned());
-        let mut selected = allowed
+        let hot = allowed
             .iter()
-            .filter(|(definition, _)| required.contains(&definition.id))
-            .map(|(definition, _)| (*definition).clone())
+            .filter(|entry| required.contains(&entry.definition.id))
             .collect::<Vec<_>>();
-        if !fits(&selected, limits)? && exact {
+        if !fits_refs(&hot, limits)? {
             return Err(HarnessError::ResourceLimit(
-                "mandatory hot or exact-match tool scope exceeds discovery budget".into(),
+                "mandatory hot tool scope exceeds discovery budget".into(),
             ));
         }
-        if !fits(&selected, limits)? {
-            required = allowed
+        if exact {
+            required.extend(ranked.ids().iter().cloned());
+            let exact_entries = allowed
                 .iter()
-                .filter(|(_, metadata)| metadata.exposure == ToolExposure::Hot)
-                .map(|(definition, _)| definition.id.clone())
-                .collect();
-            selected = allowed
-                .iter()
-                .filter(|(definition, _)| required.contains(&definition.id))
-                .map(|(definition, _)| (*definition).clone())
-                .collect();
-            if !fits(&selected, limits)? {
+                .filter(|entry| required.contains(&entry.definition.id))
+                .collect::<Vec<_>>();
+            if !fits_refs(&exact_entries, limits)? {
                 return Err(HarnessError::ResourceLimit(
-                    "mandatory hot tool scope exceeds discovery budget".into(),
+                    "mandatory hot or exact-match tool scope exceeds discovery budget".into(),
                 ));
             }
+        } else {
             for id in ranked.ids() {
-                let Some((definition, _)) =
-                    allowed.iter().find(|(definition, _)| definition.id == *id)
-                else {
+                let Some(entry) = allowed.iter().find(|entry| entry.definition.id == *id) else {
                     continue;
                 };
-                let mut expanded = selected.clone();
-                expanded.push((*definition).clone());
-                if fits(&expanded, limits)? {
-                    selected = expanded;
+                let mut expanded = required.clone();
+                expanded.insert(entry.definition.id.clone());
+                let expanded_entries = allowed
+                    .iter()
+                    .filter(|entry| expanded.contains(&entry.definition.id))
+                    .collect::<Vec<_>>();
+                if fits_refs(&expanded_entries, limits)? {
+                    required = expanded;
                 }
             }
         }
+        let selected = allowed
+            .iter()
+            .filter(|entry| required.contains(&entry.definition.id))
+            .map(|entry| entry.definition.clone())
+            .collect::<Vec<_>>();
         Ok(scope_with_stats(caller, selected, base_stats, true))
     }
 }
@@ -388,9 +397,44 @@ fn scope_with_stats(
     )
 }
 
-fn fits(definitions: &[ToolDefinition], limits: EffectiveLimits) -> Result<bool, HarnessError> {
-    Ok(definitions.len() <= limits.max_tools as usize
-        && serialized_len(&definitions)? <= limits.max_bytes)
+fn fits(
+    entries: &[AllowedCatalogEntry<'_>],
+    limits: EffectiveLimits,
+) -> Result<bool, HarnessError> {
+    fits_lengths(
+        entries.len(),
+        entries.iter().map(|entry| entry.serialized_bytes),
+        limits,
+    )
+}
+
+fn fits_refs(
+    entries: &[&AllowedCatalogEntry<'_>],
+    limits: EffectiveLimits,
+) -> Result<bool, HarnessError> {
+    fits_lengths(
+        entries.len(),
+        entries.iter().map(|entry| entry.serialized_bytes),
+        limits,
+    )
+}
+
+fn fits_lengths(
+    count: usize,
+    mut lengths: impl Iterator<Item = u64>,
+    limits: EffectiveLimits,
+) -> Result<bool, HarnessError> {
+    let elements = lengths.try_fold(0u64, |total, length| total.checked_add(length));
+    let commas = u64::try_from(count.saturating_sub(1)).map_err(|_| {
+        HarnessError::ResourceLimit("tool catalog serialized byte accounting overflowed".into())
+    })?;
+    let bytes = elements
+        .and_then(|total| total.checked_add(commas))
+        .and_then(|total| total.checked_add(2))
+        .ok_or_else(|| {
+            HarnessError::ResourceLimit("tool catalog serialized byte accounting overflowed".into())
+        })?;
+    Ok(count <= limits.max_tools as usize && bytes <= limits.max_bytes)
 }
 
 enum RankedSelection {
@@ -412,11 +456,8 @@ fn rank(
     allowed: &HashMap<&str, (&ToolDefinition, &ToolDiscoveryMetadata)>,
     max_expansion: usize,
 ) -> RankedSelection {
-    if max_expansion == 0 {
-        return RankedSelection::Lexical(Vec::new());
-    }
     let normalized = normalize_phrase(query);
-    let query_terms = tokenize(&query[..query.len().min(MAX_DISCOVERY_QUERY_BYTES)]);
+    let query_terms = tokenize(query);
     let exact_id = index
         .entries
         .iter()
@@ -469,6 +510,9 @@ fn rank(
     if exact_alias.len() > 1 {
         return RankedSelection::Exact(Vec::new());
     }
+    if max_expansion == 0 {
+        return RankedSelection::Lexical(Vec::new());
+    }
     if query_terms.is_empty() {
         return RankedSelection::Lexical(Vec::new());
     }
@@ -519,8 +563,9 @@ fn indexed_terms(entry: &CatalogEntry) -> BTreeMap<String, u32> {
 
 fn tokenize(value: &str) -> Vec<String> {
     value
-        .chars()
-        .take(MAX_DISCOVERY_QUERY_BYTES)
+        .char_indices()
+        .take_while(|(index, _)| *index < MAX_DISCOVERY_QUERY_BYTES)
+        .map(|(_, character)| character)
         .map(|character| {
             if character.is_ascii_alphanumeric() {
                 character.to_ascii_lowercase()
@@ -538,8 +583,9 @@ fn tokenize(value: &str) -> Vec<String> {
 fn normalize_phrase(value: &str) -> String {
     value
         .trim()
-        .chars()
-        .take(MAX_DISCOVERY_QUERY_BYTES)
+        .char_indices()
+        .take_while(|(index, _)| *index < MAX_DISCOVERY_QUERY_BYTES)
+        .map(|(_, character)| character)
         .map(|character| character.to_ascii_lowercase())
         .collect()
 }
@@ -699,6 +745,50 @@ mod tests {
     }
 
     #[test]
+    fn exact_name_precedes_lexical_ranking_and_low_margin_expansion_is_bounded() {
+        let mut registry = ToolRegistry::default();
+        for index in 0..10 {
+            let id = format!("weather.tool.{index:02}");
+            register(
+                &mut registry,
+                &id,
+                "description",
+                ToolDiscoveryMetadata::deferred(),
+            );
+        }
+        let ids = (0..10)
+            .rev()
+            .map(|index| format!("weather.tool.{index:02}"))
+            .collect::<Vec<_>>();
+        let limits = ToolDiscoveryLimits::new()
+            .with_max_tools(4)
+            .with_max_expansion_tools(3);
+        let (exact_name, _) = scope(
+            &registry,
+            "weather tool 07",
+            &ids,
+            limits,
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert_eq!(exact_name.len(), 1);
+        assert!(exact_name.contains("weather.tool.07"));
+
+        let (expanded, _) = scope(
+            &registry,
+            "weather",
+            &ids,
+            limits,
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert_eq!(expanded.len(), 3);
+        assert!(expanded.contains("weather.tool.00"));
+        assert!(expanded.contains("weather.tool.01"));
+        assert!(expanded.contains("weather.tool.02"));
+    }
+
+    #[test]
     fn budgets_are_exact_and_zero_provider_capacity_is_a_no_tool_scope() {
         let mut registry = ToolRegistry::default();
         register(
@@ -709,10 +799,10 @@ mod tests {
         );
         let ids = vec!["weather.current".into()];
         let definitions = registry.allowed_catalog(&ids, ToolCaller::Direct);
-        let bytes = serialized_len(
+        let bytes = crate::limits::serialized_len(
             &definitions
                 .iter()
-                .map(|(definition, _)| (*definition).clone())
+                .map(|entry| entry.definition.clone())
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -814,5 +904,52 @@ mod tests {
                 ToolDiscoveryMetadata::deferred().with_aliases(["same", "same"]),
             )
             .is_err());
+    }
+
+    #[test]
+    fn bounded_malicious_unicode_query_is_safe_and_does_not_search_payload_metadata() {
+        let mut registry = ToolRegistry::default();
+        register(
+            &mut registry,
+            "weather.current",
+            "payload-secret schema-secret provider-secret",
+            ToolDiscoveryMetadata::deferred().with_aliases(["temperature"]),
+        );
+        let ids = vec!["weather.current".into()];
+        let query = format!("{}payload-secret", "🦙".repeat(8_000));
+        let (selected, _) = scope(
+            &registry,
+            &query,
+            &ids,
+            ToolDiscoveryLimits::new().with_max_tools(0),
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn exact_matches_are_not_disabled_by_lexical_expansion_limit() {
+        let mut registry = ToolRegistry::default();
+        for id in ["weather.current", "weather.future"] {
+            register(
+                &mut registry,
+                id,
+                "description",
+                ToolDiscoveryMetadata::deferred(),
+            );
+        }
+        let ids = vec!["weather.current".into(), "weather.future".into()];
+        let (selected, _) = scope(
+            &registry,
+            "weather.current",
+            &ids,
+            ToolDiscoveryLimits::new()
+                .with_max_tools(1)
+                .with_max_expansion_tools(0),
+            ProviderCapabilityLimits::new(),
+        )
+        .unwrap();
+        assert!(selected.contains("weather.current"));
     }
 }

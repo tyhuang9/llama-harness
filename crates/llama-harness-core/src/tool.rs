@@ -1,5 +1,5 @@
 use crate::{
-    discovery::{CatalogEntry, CatalogIndex, ToolDiscoveryMetadata},
+    discovery::{AllowedCatalogEntry, CatalogEntry, CatalogIndex, ToolDiscoveryMetadata},
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len},
     AgentLimits, HarnessError,
 };
@@ -406,6 +406,7 @@ pub(crate) struct RegisteredTool {
     validator: Arc<Validator>,
     output_validator: Option<Arc<Validator>>,
     pub(crate) discovery: ToolDiscoveryMetadata,
+    definition_serialized_bytes: u64,
 }
 
 /// Registry of tools and their compiled argument validators.
@@ -474,6 +475,7 @@ impl ToolRegistry {
         validate_scheduling_metadata(tool.definition(), &id)?;
         discovery.validate(&id)?;
         discovery.aliases.sort();
+        let definition_serialized_bytes = serialized_len(tool.definition())?;
         self.tools.insert(
             id,
             RegisteredTool {
@@ -481,6 +483,7 @@ impl ToolRegistry {
                 validator: Arc::new(validator),
                 output_validator,
                 discovery,
+                definition_serialized_bytes,
             },
         );
         *self
@@ -499,7 +502,7 @@ impl ToolRegistry {
         &self,
         allowlist: &[String],
         caller: ToolCaller,
-    ) -> Vec<(&ToolDefinition, &ToolDiscoveryMetadata)> {
+    ) -> Vec<AllowedCatalogEntry<'_>> {
         let mut seen = BTreeSet::new();
         allowlist
             .iter()
@@ -510,7 +513,11 @@ impl ToolRegistry {
                         .tool
                         .definition()
                         .allows_caller(caller)
-                        .then_some((entry.tool.definition(), &entry.discovery))
+                        .then_some(AllowedCatalogEntry {
+                            definition: entry.tool.definition(),
+                            metadata: &entry.discovery,
+                            serialized_bytes: entry.definition_serialized_bytes,
+                        })
                 })
             })
             .collect()
