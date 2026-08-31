@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
@@ -11,6 +12,10 @@ use std::{
 pub struct EventRecord {
     /// Identifier of the run that emitted the event.
     pub run_id: String,
+    /// Core-generated unique execution identity, independent of an optional
+    /// application-visible run ID.
+    #[serde(default = "new_execution_id")]
+    pub execution_id: String,
     /// Trace identifier associated with the run.
     pub trace_id: String,
     /// Monotonic within one run, starting at one.
@@ -32,6 +37,7 @@ impl EventRecord {
     ) -> Self {
         Self {
             run_id: run_id.into(),
+            execution_id: new_execution_id(),
             trace_id: trace_id.into(),
             sequence,
             timestamp_ms,
@@ -362,6 +368,10 @@ pub enum StrategyFallbackReason {
     PlannerFailure,
 }
 
+fn new_execution_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -483,6 +493,7 @@ impl EventSink for InMemoryEventSink {
 
 pub(crate) struct EventEmitter {
     run_id: String,
+    execution_id: String,
     trace_id: String,
     sequence: u64,
     last_timestamp_ms: u64,
@@ -493,6 +504,7 @@ impl EventEmitter {
     pub(crate) fn new(run_id: String, trace_id: String, sink: Arc<dyn EventSink>) -> Self {
         Self {
             run_id,
+            execution_id: new_execution_id(),
             trace_id,
             sequence: 0,
             last_timestamp_ms: 0,
@@ -509,6 +521,7 @@ impl EventEmitter {
         self.last_timestamp_ms = timestamp_ms;
         self.sink.emit(EventRecord {
             run_id: self.run_id.clone(),
+            execution_id: self.execution_id.clone(),
             trace_id: self.trace_id.clone(),
             sequence: self.sequence,
             timestamp_ms,

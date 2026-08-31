@@ -274,11 +274,12 @@ impl<'a> ToolBroker<'a> {
         call.arguments_json = canonical_arguments;
 
         if !defer_signature_checks {
-            let mut recorded_call = self.call_for_transcript(request, &call, caller);
-            if caller == ToolCaller::Programmatic {
-                recorded_call.arguments_json = "{}".into();
-            }
-            result.tool_calls.push(recorded_call);
+            // The public functional result is the canonical record of what the
+            // broker actually evaluated. Value-bearing parser/VM artifacts are
+            // never copied here, but valid tool arguments are preserved.
+            result
+                .tool_calls
+                .push(self.call_for_transcript(request, &call, caller));
         }
 
         if !self.scope.contains(&call.tool_id) || self.scope.caller() != caller {

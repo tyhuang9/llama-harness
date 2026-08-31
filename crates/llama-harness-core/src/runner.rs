@@ -77,6 +77,36 @@ impl AgentRunner {
         strategy_events: Option<DirectStrategyEvents>,
         preflight: RunPreflight,
     ) -> Result<RunResult, HarnessError> {
+        self.run_direct_internal(request, strategy_events, preflight, None)
+            .await
+    }
+
+    /// Continues a pre-effect strategy fallback in the existing run identity,
+    /// event sequence, deadline, model budget, and broker state.
+    #[cfg_attr(not(feature = "programmatic"), allow(dead_code))]
+    pub(crate) async fn run_direct_continuation(
+        &self,
+        request: RunRequest,
+        strategy_events: DirectStrategyEvents,
+        preflight: RunPreflight,
+        continuation: DirectContinuation,
+    ) -> Result<RunResult, HarnessError> {
+        self.run_direct_internal(
+            request,
+            Some(strategy_events),
+            preflight,
+            Some(continuation),
+        )
+        .await
+    }
+
+    async fn run_direct_internal(
+        &self,
+        request: RunRequest,
+        strategy_events: Option<DirectStrategyEvents>,
+        preflight: RunPreflight,
+        continuation: Option<DirectContinuation>,
+    ) -> Result<RunResult, HarnessError> {
         let selection = self.tools.select_scope_for_run(
             &request.input,
             &request.agent.tool_allowlist,
@@ -89,6 +119,16 @@ impl AgentRunner {
         let (tool_scope, discovery) = match selection {
             Ok(ToolScopeSelection::Selected(scope, stats)) => (scope, stats),
             Ok(ToolScopeSelection::LimitReached(stats)) => {
+                if let Some(mut continuation) = continuation {
+                    emit_discovery(&mut continuation.events, ToolCaller::Direct, stats);
+                    apply_terminal_error(
+                        &mut continuation.result,
+                        HarnessError::ResourceLimit("tool discovery budget reached".into()),
+                    );
+                    continuation.result.duration_ms =
+                        preflight.started.elapsed().as_millis() as u64;
+                    return Ok(finish_programmatic_continuation(continuation));
+                }
                 let mut completed_scopes = Vec::with_capacity(2);
                 if let Some((caller, prior)) =
                     strategy_events.and_then(|events| events.prior_discovery)
@@ -106,6 +146,12 @@ impl AgentRunner {
                 ));
             }
             Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
+                if let Some(mut continuation) = continuation {
+                    apply_terminal_error(&mut continuation.result, error);
+                    continuation.result.duration_ms =
+                        preflight.started.elapsed().as_millis() as u64;
+                    return Ok(finish_programmatic_continuation(continuation));
+                }
                 let prior = strategy_events
                     .and_then(|events| events.prior_discovery)
                     .into_iter()
@@ -123,60 +169,95 @@ impl AgentRunner {
         };
         let started = preflight.started;
         let deadline = preflight.deadline;
-        let run_id = request
-            .run_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let trace_id = request
-            .trace_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let model = request
-            .overrides
-            .model
-            .clone()
-            .unwrap_or_else(|| request.agent.default_model.clone());
-        let mut result = RunResult {
-            id: run_id.clone(),
-            status: RunStatus::Failed,
-            final_output: None,
-            model: model.clone(),
-            tool_calls: vec![],
-            policy_decisions: vec![],
-            approvals: vec![],
-            errors: vec![],
-            duration_ms: 0,
-            trace_id: trace_id.clone(),
-            model_call_limit_reached: false,
-            tool_call_limit_reached: false,
-            repeated_tool_call_limit_reached: false,
-            cancelled: false,
-        };
-        let mut events =
-            EventEmitter::new(run_id.clone(), trace_id.clone(), Arc::clone(&self.events));
-        events.emit(RunEvent::Started { run_id, trace_id });
-        if let Some((caller, prior)) = strategy_events.and_then(|events| events.prior_discovery) {
-            emit_discovery(&mut events, caller, prior);
-        }
-        emit_discovery(&mut events, ToolCaller::Direct, discovery);
-        if let Some(strategy_events) = strategy_events {
-            if let Some(reason) = strategy_events.fallback {
-                events.emit(RunEvent::StrategyFallback {
-                    from: strategy_events.requested,
-                    to: crate::RunStrategy::Direct,
-                    reason,
-                });
-            }
-            events.emit(RunEvent::StrategySelected {
-                requested: strategy_events.requested,
-                selected: crate::RunStrategy::Direct,
-                reason: strategy_events.reason,
-            });
-        }
+        let (mut result, mut events, mut model_calls, mut broker_state, continuation_usage) =
+            match continuation {
+                Some(continuation) => {
+                    let DirectContinuation {
+                        result,
+                        mut events,
+                        broker_state,
+                        model_calls,
+                        usage,
+                    } = continuation;
+                    emit_discovery(&mut events, ToolCaller::Direct, discovery);
+                    if let Some(strategy_events) = strategy_events {
+                        if let Some(reason) = strategy_events.fallback {
+                            events.emit(RunEvent::StrategyFallback {
+                                from: strategy_events.requested,
+                                to: crate::RunStrategy::Direct,
+                                reason,
+                            });
+                        }
+                        events.emit(RunEvent::StrategySelected {
+                            requested: strategy_events.requested,
+                            selected: crate::RunStrategy::Direct,
+                            reason: strategy_events.reason,
+                        });
+                    }
+                    (result, events, model_calls, broker_state, Some(usage))
+                }
+                None => {
+                    let run_id = request
+                        .run_id
+                        .clone()
+                        .unwrap_or_else(|| Uuid::new_v4().to_string());
+                    let trace_id = request
+                        .trace_id
+                        .clone()
+                        .unwrap_or_else(|| Uuid::new_v4().to_string());
+                    let model = request
+                        .overrides
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| request.agent.default_model.clone());
+                    let result = RunResult {
+                        id: run_id.clone(),
+                        status: RunStatus::Failed,
+                        final_output: None,
+                        model,
+                        tool_calls: vec![],
+                        policy_decisions: vec![],
+                        approvals: vec![],
+                        errors: vec![],
+                        duration_ms: 0,
+                        trace_id: trace_id.clone(),
+                        model_call_limit_reached: false,
+                        tool_call_limit_reached: false,
+                        repeated_tool_call_limit_reached: false,
+                        cancelled: false,
+                    };
+                    let mut events = EventEmitter::new(
+                        run_id.clone(),
+                        trace_id.clone(),
+                        Arc::clone(&self.events),
+                    );
+                    events.emit(RunEvent::Started { run_id, trace_id });
+                    if let Some((caller, prior)) =
+                        strategy_events.and_then(|events| events.prior_discovery)
+                    {
+                        emit_discovery(&mut events, caller, prior);
+                    }
+                    emit_discovery(&mut events, ToolCaller::Direct, discovery);
+                    if let Some(strategy_events) = strategy_events {
+                        if let Some(reason) = strategy_events.fallback {
+                            events.emit(RunEvent::StrategyFallback {
+                                from: strategy_events.requested,
+                                to: crate::RunStrategy::Direct,
+                                reason,
+                            });
+                        }
+                        events.emit(RunEvent::StrategySelected {
+                            requested: strategy_events.requested,
+                            selected: crate::RunStrategy::Direct,
+                            reason: strategy_events.reason,
+                        });
+                    }
+                    (result, events, 0, BrokerState::default(), None)
+                }
+            };
 
+        let model = result.model.clone();
         let mut messages = initial_messages(&request);
-        let mut model_calls = 0;
-        let mut broker_state = BrokerState::default();
         let mut output_repairs = 0;
         let broker = ToolBroker::new(
             &self.tools,
@@ -426,6 +507,16 @@ impl AgentRunner {
         }
 
         result.duration_ms = started.elapsed().as_millis() as u64;
+        if let Some(usage) = continuation_usage {
+            let continuation = DirectContinuation {
+                result,
+                events,
+                broker_state,
+                model_calls,
+                usage,
+            };
+            return Ok(finish_programmatic_continuation(continuation));
+        }
         if strategy_events.is_some() {
             broker_state.finalize_usage();
             events.emit(RunEvent::StrategyUsage {
@@ -606,6 +697,54 @@ pub(crate) struct DirectStrategyEvents {
     pub(crate) prior_discovery: Option<(ToolCaller, crate::discovery::ToolDiscoveryStats)>,
 }
 
+/// Programmatic counters retained while a pre-effect invalid program falls
+/// through to the direct compatibility path.
+pub(crate) struct ProgrammaticUsage {
+    pub(crate) planning_model_calls: u32,
+    pub(crate) repair_model_calls: u32,
+    pub(crate) final_synthesis_model_calls: u32,
+}
+
+/// Mutable state transferred to direct execution without starting another run.
+pub(crate) struct DirectContinuation {
+    pub(crate) result: RunResult,
+    pub(crate) events: EventEmitter,
+    pub(crate) broker_state: BrokerState,
+    pub(crate) model_calls: u32,
+    pub(crate) usage: ProgrammaticUsage,
+}
+
+fn finish_programmatic_continuation(mut continuation: DirectContinuation) -> RunResult {
+    continuation.broker_state.finalize_usage();
+    let usage = continuation.usage;
+    continuation.events.emit(RunEvent::StrategyUsage {
+        strategy: crate::RunStrategy::Programmatic,
+        model_calls: continuation.model_calls,
+        planning_model_calls: usage.planning_model_calls,
+        repair_model_calls: usage.repair_model_calls,
+        recovery_model_calls: 0,
+        final_synthesis_model_calls: usage.final_synthesis_model_calls,
+        reactive_model_calls: continuation
+            .model_calls
+            .saturating_sub(usage.planning_model_calls)
+            .saturating_sub(usage.repair_model_calls)
+            .saturating_sub(usage.final_synthesis_model_calls),
+        tool_calls: continuation.broker_state.tool_calls,
+        tool_issued: continuation.broker_state.tool_issued,
+        tool_reused: continuation.broker_state.tool_reused,
+        tool_rejected: continuation.broker_state.tool_rejected,
+        tool_pre_dispatch_aborted: continuation.broker_state.tool_pre_dispatch_aborted,
+        tool_completed: continuation.broker_state.tool_completed,
+        tool_failed: continuation.broker_state.tool_failed,
+        tool_cancelled: continuation.broker_state.tool_cancelled,
+        duration_ms: continuation.result.duration_ms,
+    });
+    continuation.events.emit(RunEvent::Completed {
+        status: continuation.result.status.clone(),
+    });
+    continuation.result
+}
+
 impl AgentRunnerBuilder {
     #[cfg(feature = "programmatic")]
     /// Explicitly opts this host into bounded programmatic execution.
@@ -649,7 +788,10 @@ impl AgentRunnerBuilder {
         let admission = Arc::new(tokio::sync::Semaphore::new(
             self.programmatic
                 .as_ref()
-                .map_or(1, |config| config.max_active_vms),
+                // Invalid host configuration is rejected when a run is started.
+                // Clamp the construction-time permit count so untrusted builder
+                // input (including zero or `usize::MAX`) cannot panic first.
+                .map_or(1, |config| config.max_active_vms.clamp(1, 16)),
         ));
         AgentRunner {
             provider: self.provider,

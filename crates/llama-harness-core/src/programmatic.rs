@@ -5,7 +5,7 @@ use crate::{
     runner::{
         apply_terminal_error, await_guarded, check_stopped, emit_discovery, ensure_transcript,
         initial_messages, merge_generation, provider_deadline, validate_model_response,
-        validate_output, DirectStrategyEvents, RunPreflight,
+        validate_output, DirectContinuation, DirectStrategyEvents, ProgrammaticUsage, RunPreflight,
     },
     AgentRunner, HarnessError, Message, ModelRequest, ModelResponse, ProgrammaticConformance,
     RunRequest, RunResult, RunStatus, RunStrategy, StrategyFallbackReason, ToolCall,
@@ -35,7 +35,7 @@ const PROGRAM_PROMPT: &str = r#"Return only a strict llama-harness program JSON 
 
 const REPAIR_PROMPT: &str = "The previous program failed strict structural verification. Return one corrected version-1 program JSON object only. Do not add markdown or prose.";
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ProgrammaticTranscriptEntry {
     tool_id: String,
     arguments: Value,
@@ -150,22 +150,6 @@ impl AgentRunner {
             deadline,
             "programmatic run deadline reached",
         )?;
-        let admission = await_guarded(
-            async {
-                Arc::clone(&self.programmatic_admission)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| {
-                        HarnessError::ResourceLimit("programmatic VM admission closed".into())
-                    })
-            },
-            &request.cancellation,
-            deadline,
-            "programmatic VM admission exceeded run deadline",
-            None,
-        )
-        .await?;
-
         let selection = self.tools.select_scope_for_run(
             &request.input,
             &request.agent.tool_allowlist,
@@ -294,6 +278,10 @@ impl AgentRunner {
                         if program_attempt == 0
                             && model_calls < request.agent.limits.max_model_calls =>
                     {
+                        events.emit(RunEvent::ProgramLifecycle {
+                            attempt: program_attempt.saturating_add(1),
+                            outcome: ProgramLifecycleOutcome::Invalid,
+                        });
                         program_attempt = 1;
                         generation_messages.push(Message::assistant(response.final_output.unwrap_or_default()));
                         generation_messages.push(Message::system(REPAIR_PROMPT));
@@ -310,13 +298,35 @@ impl AgentRunner {
                 }
             };
 
-            let execution_number = execution_id(&run_id);
+            let execution_number = execution_id();
             let mut vm = Execution::with_attempt(verified, ExecutionId(execution_number), program_attempt)
                 .map_err(sandbox_error)?;
             let vm_started = StdInstant::now();
             let program_output = loop {
                 check_stopped(&request.cancellation, deadline, "programmatic run deadline reached")?;
-                match vm.step(limits.max_slice_fuel).map_err(sandbox_error)? {
+                // VM admission covers synchronous compute only. The permit is
+                // released before any provider, policy, approval, or tool await.
+                let step = {
+                    let _admission = await_guarded(
+                        async {
+                            Arc::clone(&self.programmatic_admission)
+                                .acquire_owned()
+                                .await
+                                .map_err(|_| {
+                                    HarnessError::ResourceLimit(
+                                        "programmatic VM admission closed".into(),
+                                    )
+                                })
+                        },
+                        &request.cancellation,
+                        deadline,
+                        "programmatic VM admission exceeded run deadline",
+                        None,
+                    )
+                    .await?;
+                    vm.step(limits.max_slice_fuel).map_err(sandbox_error)?
+                };
+                match step {
                     StepOutcome::Sliced => continue,
                     StepOutcome::Complete(value) => break value,
                     StepOutcome::Yielded { batch, resume } => {
@@ -353,7 +363,10 @@ impl AgentRunner {
                 branches: metrics.branches,
                 loop_iterations: metrics.loop_iterations,
                 fanout_batches: metrics.fanout_batches,
-                partial_failures: broker_state.tool_failed.saturating_add(broker_state.tool_cancelled),
+                partial_failures: broker_state
+                    .tool_failed
+                    .saturating_add(broker_state.tool_cancelled)
+                    .saturating_add(broker_state.tool_rejected),
                 peak_accounted_bytes: metrics.retained_bytes as u64,
                 duration_ms: vm_started.elapsed().as_millis() as u64,
             });
@@ -400,26 +413,40 @@ impl AgentRunner {
         }
         .await;
 
-        drop(admission);
         if invalid_program_exhausted && !dispatched && broker_state.tool_issued == 0 {
             events.emit(RunEvent::ProgramLifecycle {
                 attempt: repair_calls.saturating_add(1),
                 outcome: ProgramLifecycleOutcome::Fallback,
             });
             return self
-                .run_direct(
+                .run_direct_continuation(
                     request,
-                    Some(DirectStrategyEvents {
+                    DirectStrategyEvents {
                         requested: RunStrategy::Programmatic,
                         reason: StrategySelectionReason::Forced,
                         fallback: Some(StrategyFallbackReason::InvalidProgram),
                         prior_discovery: None,
-                    }),
+                    },
                     preflight,
+                    DirectContinuation {
+                        result,
+                        events,
+                        broker_state,
+                        model_calls,
+                        usage: ProgrammaticUsage {
+                            planning_model_calls: planning_calls,
+                            repair_model_calls: repair_calls,
+                            final_synthesis_model_calls: synthesis_calls,
+                        },
+                    },
                 )
                 .await;
         }
         if let Err(error) = terminal {
+            events.emit(RunEvent::ProgramLifecycle {
+                attempt: repair_calls.saturating_add(1).max(1),
+                outcome: terminal_lifecycle_outcome(&error),
+            });
             if dispatched {
                 apply_terminal_error(
                     &mut result,
@@ -526,8 +553,61 @@ impl AgentRunner {
         dispatched: &mut bool,
         transcript: &mut Vec<ProgrammaticTranscriptEntry>,
     ) -> Result<Vec<ToolResponse>, HarnessError> {
+        // A fan-out is an all-or-nothing static admission decision. Check every
+        // requested call before the broker can consult policy or approval for
+        // any individual entry.
+        if batch.requests_read_only_fan_out() {
+            for request_call in batch.calls() {
+                let Some(tool) = self.tools.get(&request_call.tool_id) else {
+                    return Err(HarnessError::InvalidTool(
+                        "programmatic fan-out references an unavailable tool".into(),
+                    ));
+                };
+                if !request
+                    .agent
+                    .tool_allowlist
+                    .iter()
+                    .any(|id| id == &request_call.tool_id)
+                    || !tool.definition().allows_caller(ToolCaller::Programmatic)
+                    || !tool.definition().read_only
+                    || !tool.definition().parallel_safe
+                {
+                    return Err(HarnessError::InvalidTool(
+                        "programmatic fan-out requires allowed read-only, parallel-safe tools"
+                            .into(),
+                    ));
+                }
+            }
+            let capabilities = self.provider.capabilities();
+            let provider_parallel = capabilities
+                .supports_parallel_tool_calls
+                .then_some(capabilities.limits.max_parallel_tool_calls)
+                .flatten()
+                .filter(|limit| *limit > 0)
+                .ok_or_else(|| {
+                    HarnessError::UnsupportedCapability(
+                        "programmatic fan-out requires a nonzero provider parallel-call limit"
+                            .into(),
+                    )
+                })? as usize;
+            let effective = self
+                .programmatic
+                .as_ref()
+                .map_or(0, |config| config.max_fanout_concurrency)
+                .min(request.agent.limits.max_programmatic_fanout_concurrency as usize)
+                .min(provider_parallel)
+                .min(MAX_FANOUT_CONCURRENCY);
+            if batch.calls().len() > effective {
+                return Err(HarnessError::ResourceLimit(
+                    "programmatic fan-out exceeds the effective concurrency limit".into(),
+                ));
+            }
+        }
+
         let mut prepared: Vec<(usize, Box<PreparedCall>)> = Vec::new();
         let mut responses: Vec<Option<ToolResponse>> = vec![None; batch.calls().len()];
+        let mut transcript_slots: Vec<Option<ProgrammaticTranscriptEntry>> =
+            vec![None; batch.calls().len()];
         for (index, request_call) in batch.calls().iter().enumerate() {
             check_stopped(
                 &request.cancellation,
@@ -579,7 +659,7 @@ impl AgentRunner {
                 PrepareOutcome::Ready(call) => prepared.push((index, call)),
                 PrepareOutcome::Rejected(_) => {
                     responses[index] = Some(ToolResponse::failure(request_call));
-                    transcript.push(ProgrammaticTranscriptEntry {
+                    transcript_slots[index] = Some(ProgrammaticTranscriptEntry {
                         tool_id: request_call.tool_id.clone(),
                         arguments: request_call.arguments.clone(),
                         ok: false,
@@ -593,49 +673,13 @@ impl AgentRunner {
                 }
                 PrepareOutcome::Reused(value) => {
                     responses[index] = Some(tool_response(request_call, value.as_ref()));
-                    transcript.push(ProgrammaticTranscriptEntry {
+                    transcript_slots[index] = Some(ProgrammaticTranscriptEntry {
                         tool_id: request_call.tool_id.clone(),
                         arguments: request_call.arguments.clone(),
                         ok: value.ok,
                         output: value.output.clone(),
                     });
                 }
-            }
-        }
-
-        if batch.requests_read_only_fan_out()
-            && prepared.iter().any(|(_, call)| {
-                !call.tool.definition().read_only || !call.tool.definition().parallel_safe
-            })
-        {
-            return Err(HarnessError::InvalidTool(
-                "programmatic fan-out requires read-only, parallel-safe tools".into(),
-            ));
-        }
-        if batch.requests_read_only_fan_out() {
-            let capabilities = self.provider.capabilities();
-            let provider_parallel = capabilities
-                .supports_parallel_tool_calls
-                .then_some(capabilities.limits.max_parallel_tool_calls)
-                .flatten()
-                .filter(|limit| *limit > 0)
-                .ok_or_else(|| {
-                    HarnessError::UnsupportedCapability(
-                        "programmatic fan-out requires a nonzero provider parallel-call limit"
-                            .into(),
-                    )
-                })? as usize;
-            let effective = self
-                .programmatic
-                .as_ref()
-                .map_or(0, |config| config.max_fanout_concurrency)
-                .min(request.agent.limits.max_programmatic_fanout_concurrency as usize)
-                .min(provider_parallel)
-                .min(batch.calls().len().min(MAX_FANOUT_CONCURRENCY));
-            if prepared.len() > effective {
-                return Err(HarnessError::ResourceLimit(
-                    "programmatic fan-out exceeds the effective concurrency limit".into(),
-                ));
             }
         }
 
@@ -682,6 +726,12 @@ impl AgentRunner {
                             "programmatic tool returned a failed or invalid result".into(),
                         )
                     });
+                    transcript_slots[*index] = Some(ProgrammaticTranscriptEntry {
+                        tool_id: call.call.tool_id.clone(),
+                        arguments: call.arguments.clone(),
+                        ok: false,
+                        output: Value::Null,
+                    });
                     continue;
                 }
                 Err(error) => {
@@ -695,6 +745,12 @@ impl AgentRunner {
                     if first_execution_error.is_none() {
                         first_execution_error = Some(error);
                     }
+                    transcript_slots[*index] = Some(ProgrammaticTranscriptEntry {
+                        tool_id: call.call.tool_id.clone(),
+                        arguments: call.arguments.clone(),
+                        ok: false,
+                        output: Value::Null,
+                    });
                     continue;
                 }
             };
@@ -705,13 +761,14 @@ impl AgentRunner {
             });
             broker.record_execution(state, call, &execution);
             responses[*index] = Some(tool_response(request_call, execution.result.as_ref()));
-            transcript.push(ProgrammaticTranscriptEntry {
+            transcript_slots[*index] = Some(ProgrammaticTranscriptEntry {
                 tool_id: call.call.tool_id.clone(),
                 arguments: call.arguments.clone(),
                 ok: true,
                 output: execution.result.output.clone(),
             });
         }
+        transcript.extend(transcript_slots.into_iter().flatten());
         if let Some(error) = first_execution_error {
             return Err(error);
         }
@@ -743,11 +800,16 @@ fn sandbox_error(error: llama_harness_programmatic_sandbox::SandboxError) -> Har
     }
 }
 
-fn execution_id(run_id: &str) -> u64 {
-    let mut value = 0xcbf29ce484222325u64;
-    for byte in run_id.bytes() {
-        value ^= u64::from(byte);
-        value = value.wrapping_mul(0x100000001b3);
+fn terminal_lifecycle_outcome(error: &HarnessError) -> ProgramLifecycleOutcome {
+    match error {
+        HarnessError::Cancelled => ProgramLifecycleOutcome::Cancelled,
+        HarnessError::TimedOut(_) => ProgramLifecycleOutcome::TimedOut,
+        HarnessError::ResourceLimit(_) => ProgramLifecycleOutcome::LimitReached,
+        _ => ProgramLifecycleOutcome::Failed,
     }
-    value
+}
+
+fn execution_id() -> u64 {
+    let nonce = Uuid::new_v4().as_u128();
+    (nonce as u64) ^ ((nonce >> 64) as u64)
 }

@@ -428,7 +428,7 @@ async fn forced_programmatic_runs_model_program_broker_and_final_synthesis() {
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     assert_eq!(result.tool_calls.len(), 1);
     assert!(result.tool_calls[0].id.starts_with("programmatic-0-"));
-    assert_eq!(result.tool_calls[0].arguments_json, "{}");
+    assert_eq!(result.tool_calls[0].arguments_json, r#"{"value":7}"#);
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].tools.len(), 1);
@@ -494,6 +494,60 @@ async fn identical_mutations_are_distinct_program_occurrences() {
     assert!(matches!(result.status, RunStatus::Completed));
     assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
     assert_ne!(result.tool_calls[0].id, result.tool_calls[1].id);
+}
+
+#[tokio::test]
+async fn repeated_public_run_ids_still_receive_distinct_programmatic_effect_nonces() {
+    let program = json!({"version":1,"body":[
+        {"kind":"invoke","name":"write","tool_id":"write","arguments":{"kind":"object","entries":[{"key":"value","value":{"kind":"integer","value":7}}]}},
+        {"kind":"return","value":{"kind":"variable","name":"write"}}
+    ]})
+    .to_string();
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(program.clone()),
+            final_response("first"),
+            final_response(program),
+            final_response("second"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let tool = Arc::new(RecordingTool::new(
+        "write",
+        ToolResult::success(json!({"value": 7})),
+        false,
+        false,
+        [ToolCaller::Programmatic],
+    ));
+    let mut registry = ToolRegistry::default();
+    registry.register(tool.clone()).unwrap();
+    let runner = AgentRunner::builder(provider)
+        .tools(registry)
+        .policy(Arc::new(AllowAllPolicy))
+        .programmatic(ProgrammaticHostConfig::default())
+        .build();
+
+    let first = runner
+        .run_with_strategy(
+            request(&["write"]).with_run_id("reused-public-run-id"),
+            RunStrategy::Programmatic,
+        )
+        .await
+        .unwrap();
+    let second = runner
+        .run_with_strategy(
+            request(&["write"]).with_run_id("reused-public-run-id"),
+            RunStrategy::Programmatic,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    assert_ne!(first.tool_calls[0].id, second.tool_calls[0].id);
+    let contexts = tool.contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[0].run_id, contexts[1].run_id);
+    assert_ne!(contexts[0].effect_key, contexts[1].effect_key);
 }
 
 #[tokio::test]
@@ -713,9 +767,14 @@ async fn fanout_rejects_mutation_before_any_dispatch() {
     let tool = Arc::new(CountingTool::new("write", false, false));
     let mut registry = ToolRegistry::default();
     registry.register(tool.clone()).unwrap();
+    let approvals = Arc::new(ApprovalOnWrite {
+        seen_arguments: Mutex::new(Vec::new()),
+        granted: true,
+    });
     let runner = AgentRunner::builder(provider)
         .tools(registry)
-        .policy(Arc::new(AllowAllPolicy))
+        .policy(approvals.clone())
+        .approvals(approvals.clone())
         .programmatic(ProgrammaticHostConfig::default())
         .build();
     let result = runner
@@ -724,6 +783,7 @@ async fn fanout_rejects_mutation_before_any_dispatch() {
         .unwrap();
     assert!(matches!(result.status, RunStatus::Failed));
     assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert!(approvals.seen_arguments.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1445,10 +1505,17 @@ async fn invalid_repaired_program_falls_back_once_to_fresh_direct_scope_before_e
         .build();
 
     let result = runner
-        .run_with_strategy(request(&[]), RunStrategy::Programmatic)
+        .run_with_strategy(
+            request(&[])
+                .with_run_id("explicit-fallback-run")
+                .with_trace_id("explicit-fallback-trace"),
+            RunStrategy::Programmatic,
+        )
         .await
         .unwrap();
     assert!(matches!(result.status, RunStatus::Completed));
+    assert_eq!(result.id, "explicit-fallback-run");
+    assert_eq!(result.trace_id, "explicit-fallback-trace");
     assert_eq!(result.final_output.as_deref(), Some("direct fallback"));
     assert_eq!(provider.requests().len(), 3);
     assert!(events.events().iter().any(|record| {
@@ -1460,4 +1527,51 @@ async fn invalid_repaired_program_falls_back_once_to_fresh_direct_scope_before_e
             }
         )
     }));
+    let records = events.events();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.event, RunEvent::Started { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.event, RunEvent::Completed { .. }))
+            .count(),
+        1
+    );
+    assert!(records
+        .iter()
+        .enumerate()
+        .all(|(index, record)| record.sequence == (index + 1) as u64));
+}
+
+#[test]
+fn invalid_vm_admission_configuration_never_panics_while_building() {
+    for max_active_vms in [0, 17, usize::MAX] {
+        let mut config = ProgrammaticHostConfig::default();
+        config.max_active_vms = max_active_vms;
+        let provider = Arc::new(MockModelProvider::scripted([]).with_capabilities(capabilities()));
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            AgentRunner::builder(provider).programmatic(config).build()
+        }));
+        assert!(built.is_ok(), "builder panicked for {max_active_vms}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_vm_admission_configuration_fails_closed_when_run() {
+    for max_active_vms in [0, 17, usize::MAX] {
+        let mut config = ProgrammaticHostConfig::default();
+        config.max_active_vms = max_active_vms;
+        let provider = Arc::new(MockModelProvider::scripted([]).with_capabilities(capabilities()));
+        let result = AgentRunner::builder(provider)
+            .programmatic(config)
+            .build()
+            .run_with_strategy(request(&[]), RunStrategy::Programmatic)
+            .await;
+        assert!(matches!(result, Err(HarnessError::InvalidRequest(_))));
+    }
 }
