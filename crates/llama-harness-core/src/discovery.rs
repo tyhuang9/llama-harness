@@ -258,6 +258,8 @@ pub(crate) struct AllowedCatalogEntry<'a> {
 
 pub(crate) struct CatalogIndex {
     entries: Vec<CatalogEntry>,
+    document_frequency: BTreeMap<String, u32>,
+    total_document_len: u128,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,8 +364,24 @@ impl CatalogIndex {
                 .copied()
                 .fold(0u32, u32::saturating_add);
         }
+        let mut document_frequency = BTreeMap::<String, u32>::new();
+        let mut total_document_len = 0u128;
+        for (position, entry) in entries.iter().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            total_document_len = total_document_len.saturating_add(u128::from(entry.document_len));
+            for term in entry.terms.keys() {
+                let frequency = document_frequency.entry(term.clone()).or_default();
+                *frequency = frequency.saturating_add(1);
+            }
+        }
         guard()?;
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            document_frequency,
+            total_document_len,
+        })
     }
 }
 
@@ -507,15 +525,8 @@ impl ToolRegistry {
         }
         let (index, cache_hit) = self.catalog_index_for_scope(&allowed, caller, guard)?;
         base_stats.cache_hit = cache_hit;
-        let mut scope_entries = Vec::with_capacity(index.entries.len());
-        for (position, entry) in index.entries.iter().enumerate() {
-            if position % DISCOVERY_GUARD_INTERVAL == 0 {
-                guard()?;
-            }
-            scope_entries.push(entry);
-        }
-        guard()?;
-        let ranked = rank(&scope_entries, query, limits.max_expansion as usize, guard)?;
+        let selectable_deferred = limits.max_expansion.min(limits.max_tools) as usize;
+        let ranked = rank(&index, query, selectable_deferred, guard)?;
         let exact = matches!(ranked, RankedSelection::Exact(_));
         if exact {
             for (position, id) in ranked.ids().iter().enumerate() {
@@ -832,12 +843,36 @@ impl RankedSelection {
     }
 }
 
+#[derive(Default)]
+struct RankOperationCounts {
+    logarithm_evaluations: usize,
+    scored_documents: usize,
+    retained_candidates_high_water: usize,
+}
+
 fn rank(
-    entries: &[&CatalogEntry],
+    index: &CatalogIndex,
     query: &str,
     max_expansion: usize,
     guard: &mut impl FnMut() -> Result<(), HarnessError>,
 ) -> Result<RankedSelection, HarnessError> {
+    rank_with_counts(
+        index,
+        query,
+        max_expansion,
+        guard,
+        &mut RankOperationCounts::default(),
+    )
+}
+
+fn rank_with_counts(
+    index: &CatalogIndex,
+    query: &str,
+    max_expansion: usize,
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
+    counts: &mut RankOperationCounts,
+) -> Result<RankedSelection, HarnessError> {
+    let entries = &index.entries;
     let normalized = normalize_phrase(query);
     let query_terms = tokenize(query).into_iter().collect::<BTreeSet<_>>();
     guard()?;
@@ -899,29 +934,24 @@ fn rank(
         return Ok(RankedSelection::Lexical(Vec::new()));
     }
     let documents = entries.len() as u128;
-    let mut total_document_len = 0u128;
-    for (position, entry) in entries.iter().enumerate() {
-        if position % DISCOVERY_GUARD_INTERVAL == 0 {
-            guard()?;
-        }
-        total_document_len = total_document_len.saturating_add(u128::from(entry.document_len));
-    }
-    guard()?;
-    if total_document_len == 0 {
+    if index.total_document_len == 0 {
         guard()?;
         return Ok(RankedSelection::Lexical(Vec::new()));
     }
-    let mut document_frequency = BTreeMap::<&str, u128>::new();
-    for (position, entry) in entries.iter().enumerate() {
-        if position % DISCOVERY_GUARD_INTERVAL == 0 {
-            guard()?;
-        }
-        for term in entry.terms.keys() {
-            let frequency = document_frequency.entry(term).or_default();
-            *frequency = frequency.saturating_add(1);
-        }
+    let mut query_idf = BTreeMap::<&str, u128>::new();
+    for term in &query_terms {
+        let Some(document_frequency) = index.document_frequency.get(term).copied() else {
+            continue;
+        };
+        query_idf.insert(
+            term,
+            bm25_inverse_document_frequency(documents, u128::from(document_frequency)),
+        );
+        counts.logarithm_evaluations = counts.logarithm_evaluations.saturating_add(1);
     }
-    let mut scored = Vec::new();
+    guard()?;
+    let retained_limit = max_expansion.max(2).min(entries.len());
+    let mut scored: Vec<(u64, String)> = Vec::with_capacity(retained_limit);
     for (position, entry) in entries.iter().enumerate() {
         if position % DISCOVERY_GUARD_INTERVAL == 0 {
             guard()?;
@@ -930,21 +960,37 @@ fn rank(
             let Some(frequency) = entry.terms.get(term).copied().map(u128::from) else {
                 return total;
             };
-            let document_frequency = document_frequency.get(term.as_str()).copied().unwrap_or(0);
-            total.saturating_add(bm25_term_score(
+            let inverse_document_frequency = query_idf.get(term.as_str()).copied().unwrap_or(0);
+            total.saturating_add(bm25_term_score_with_idf(
                 documents,
-                document_frequency,
+                inverse_document_frequency,
                 frequency,
                 u128::from(entry.document_len),
-                total_document_len,
+                index.total_document_len,
             ))
         });
         if score > 0 {
-            scored.push((score, entry.id.clone()));
+            counts.scored_documents = counts.scored_documents.saturating_add(1);
+            let candidate = (score, entry.id.clone());
+            let insertion = scored
+                .binary_search_by(|existing| {
+                    existing
+                        .0
+                        .cmp(&candidate.0)
+                        .reverse()
+                        .then_with(|| existing.1.cmp(&candidate.1))
+                })
+                .unwrap_or_else(|position| position);
+            if insertion < retained_limit {
+                scored.insert(insertion, candidate);
+                if scored.len() > retained_limit {
+                    scored.pop();
+                }
+                counts.retained_candidates_high_water =
+                    counts.retained_candidates_high_water.max(scored.len());
+            }
         }
     }
-    guard()?;
-    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     guard()?;
     let Some((best, _)) = scored.first() else {
         return Ok(RankedSelection::Lexical(Vec::new()));
@@ -959,7 +1005,7 @@ fn rank(
 }
 
 fn collect_exact_ids(
-    entries: &[&CatalogEntry],
+    entries: &[CatalogEntry],
     mut predicate: impl FnMut(&CatalogEntry) -> bool,
     guard: &mut impl FnMut() -> Result<(), HarnessError>,
 ) -> Result<Vec<String>, HarnessError> {
@@ -976,6 +1022,7 @@ fn collect_exact_ids(
     Ok(matches)
 }
 
+#[cfg(test)]
 fn bm25_term_score(
     documents: u128,
     document_frequency: u128,
@@ -986,10 +1033,40 @@ fn bm25_term_score(
     if documents == 0 || document_frequency == 0 || term_frequency == 0 || total_document_len == 0 {
         return 0;
     }
+    let inverse_document_frequency = bm25_inverse_document_frequency(documents, document_frequency);
+    bm25_term_score_with_idf(
+        documents,
+        inverse_document_frequency,
+        term_frequency,
+        document_len,
+        total_document_len,
+    )
+}
+
+fn bm25_inverse_document_frequency(documents: u128, document_frequency: u128) -> u128 {
+    if documents == 0 || document_frequency == 0 {
+        return 0;
+    }
     let document_frequency = document_frequency.min(documents);
     let idf_numerator = documents.saturating_add(1).saturating_mul(2);
     let idf_denominator = document_frequency.saturating_mul(2).saturating_add(1);
-    let inverse_document_frequency = scaled_natural_log_ratio(idf_numerator, idf_denominator);
+    scaled_natural_log_ratio(idf_numerator, idf_denominator)
+}
+
+fn bm25_term_score_with_idf(
+    documents: u128,
+    inverse_document_frequency: u128,
+    term_frequency: u128,
+    document_len: u128,
+    total_document_len: u128,
+) -> u64 {
+    if documents == 0
+        || inverse_document_frequency == 0
+        || term_frequency == 0
+        || total_document_len == 0
+    {
+        return 0;
+    }
     let length_normalization = BM25_SCALE
         .saturating_sub(BM25_B)
         .saturating_add(rounded_divide(
@@ -1463,8 +1540,7 @@ mod tests {
         reversed.reverse();
         for candidate in [entries, reversed] {
             let index = CatalogIndex::build(candidate, &mut || Ok(())).unwrap();
-            let references = index.entries.iter().collect::<Vec<_>>();
-            let ranked = rank(&references, "needle request", 1, &mut || Ok(())).unwrap();
+            let ranked = rank(&index, "needle request", 1, &mut || Ok(())).unwrap();
             assert_eq!(ranked.ids(), &["rank.a"]);
         }
 
@@ -1473,9 +1549,43 @@ mod tests {
             &mut || Ok(()),
         )
         .unwrap();
-        let references = tied.entries.iter().collect::<Vec<_>>();
-        let ranked = rank(&references, "needle request", 1, &mut || Ok(())).unwrap();
+        let ranked = rank(&tied, "needle request", 1, &mut || Ok(())).unwrap();
         assert_eq!(ranked.ids(), &["tie.a"]);
+    }
+
+    #[test]
+    fn adversarial_rank_precomputes_idf_and_retains_only_bounded_top_candidates() {
+        let terms = (0..MAX_QUERY_TERMS)
+            .map(|index| format!("term{index:02}"))
+            .collect::<Vec<_>>();
+        let document = terms.join(" ");
+        let entries = (0..1_000)
+            .map(|index| CatalogEntry {
+                id: format!("adversarial.tool.{index:04}"),
+                name: document.clone(),
+                metadata: ToolDiscoveryMetadata::deferred(),
+                terms: BTreeMap::new(),
+                document_len: 0,
+            })
+            .collect::<Vec<_>>();
+        let index = CatalogIndex::build(entries, &mut || Ok(())).unwrap();
+        let mut counts = RankOperationCounts::default();
+        let query = format!("{document} request");
+        let ranked = rank_with_counts(&index, &query, 8, &mut || Ok(()), &mut counts).unwrap();
+
+        assert_eq!(counts.logarithm_evaluations, MAX_QUERY_TERMS);
+        assert!(counts.logarithm_evaluations <= tokenize(&query).len());
+        assert_eq!(counts.scored_documents, 1_000);
+        assert_eq!(counts.retained_candidates_high_water, 8);
+        assert_eq!(ranked.ids().len(), 8);
+        assert_eq!(
+            ranked.ids().first().map(String::as_str),
+            Some("adversarial.tool.0000")
+        );
+        assert_eq!(
+            ranked.ids().last().map(String::as_str),
+            Some("adversarial.tool.0007")
+        );
     }
 
     #[test]
@@ -1490,10 +1600,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let index = CatalogIndex::build(entries, &mut || Ok(())).unwrap();
-        let references = index.entries.iter().collect::<Vec<_>>();
-        let stop_before_exact_return = 1 + references.len().div_ceil(DISCOVERY_GUARD_INTERVAL) + 2;
+        let stop_before_exact_return =
+            1 + index.entries.len().div_ceil(DISCOVERY_GUARD_INTERVAL) + 2;
         let mut checkpoints = 0usize;
-        let result = rank(&references, "exact.tool.099", 1, &mut || {
+        let result = rank(&index, "exact.tool.099", 1, &mut || {
             checkpoints = checkpoints.saturating_add(1);
             if checkpoints >= stop_before_exact_return {
                 Err(HarnessError::Cancelled)
