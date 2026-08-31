@@ -596,24 +596,41 @@ impl McpCatalogManager {
                 return Err(error);
             }
         };
-        let now = self.checked_now()?;
-        let ttl = match context.era {
-            McpProtocolEra::Modern20260728 => tools
-                .cache_ttl
-                .ok_or_else(|| McpError::InvalidCatalog("modern catalog omitted ttl".into()))?,
-            McpProtocolEra::Legacy20251125 => duration_ms(self.cache_policy.legacy_ttl)?,
+        let now = match self.checked_now() {
+            Ok(now) => now,
+            Err(error) => return self.fail_refresh_context(context, error).await,
         };
-        let expires_at_ms = now.checked_add(ttl).ok_or(McpError::Clock)?;
-        let stale_until_ms = expires_at_ms
-            .checked_add(
-                self.cache_policy
-                    .max_stale
-                    .map(duration_ms)
-                    .transpose()?
-                    .unwrap_or(0),
-            )
-            .ok_or(McpError::Clock)?;
-        let generation = {
+        let ttl = match context.era {
+            McpProtocolEra::Modern20260728 => match tools.cache_ttl {
+                Some(ttl) => ttl,
+                None => {
+                    return self
+                        .fail_refresh_context(
+                            context,
+                            McpError::InvalidCatalog("modern catalog omitted ttl".into()),
+                        )
+                        .await
+                }
+            },
+            McpProtocolEra::Legacy20251125 => match duration_ms(self.cache_policy.legacy_ttl) {
+                Ok(ttl) => ttl,
+                Err(error) => return self.fail_refresh_context(context, error).await,
+            },
+        };
+        let expires_at_ms = match now.checked_add(ttl) {
+            Some(value) => value,
+            None => return self.fail_refresh_context(context, McpError::Clock).await,
+        };
+        let max_stale = match self.cache_policy.max_stale.map(duration_ms).transpose() {
+            Ok(value) => value.unwrap_or(0),
+            Err(error) => return self.fail_refresh_context(context, error).await,
+        };
+        let stale_until_ms = expires_at_ms.checked_add(max_stale).ok_or(McpError::Clock);
+        let stale_until_ms = match stale_until_ms {
+            Ok(value) => value,
+            Err(error) => return self.fail_refresh_context(context, error).await,
+        };
+        let generation = match (|| {
             let mut state = self
                 .state
                 .lock()
@@ -626,7 +643,10 @@ impl McpCatalogManager {
                 .next_generation
                 .checked_add(1)
                 .ok_or(McpError::Clock)?;
-            generation
+            Ok(generation)
+        })() {
+            Ok(generation) => generation,
+            Err(error) => return self.fail_refresh_context(context, error).await,
         };
         let managed = tools
             .items
@@ -655,8 +675,12 @@ impl McpCatalogManager {
             .iter()
             .any(|tool| !generated_ids.insert(tool.definition().id.clone()))
         {
-            self.discard_context(context).await;
-            return Err(McpError::InvalidCatalog("generated ID collision".into()));
+            return self
+                .fail_refresh_context(
+                    context,
+                    McpError::InvalidCatalog("generated ID collision".into()),
+                )
+                .await;
         }
         let snapshot = Arc::new(ActiveCatalog {
             summary: McpCatalogSnapshot {
@@ -676,7 +700,9 @@ impl McpCatalogManager {
                 .lock()
                 .map_err(|_| McpError::CatalogUnavailable)?;
             if state.closed {
-                return Err(McpError::CatalogUnavailable);
+                return self
+                    .fail_refresh_context(snapshot.context.clone(), McpError::CatalogUnavailable)
+                    .await;
             }
             let previous = state.active.replace(Arc::clone(&snapshot));
             state.invalidated = false;
@@ -825,6 +851,15 @@ impl McpCatalogManager {
             self.timeouts.close,
         )
         .await;
+    }
+
+    async fn fail_refresh_context<T>(
+        &self,
+        context: McpContext,
+        error: McpError,
+    ) -> Result<T, McpError> {
+        self.discard_context(context).await;
+        Err(error)
     }
 
     fn schedule_close_after_drain(&self, context: McpContext) {
