@@ -416,9 +416,15 @@ fn migration_append_query_reopen_and_conflict_are_deterministic() {
     let mut conflicting = first.clone();
     conflicting.timestamp_ms = 11;
     conflicting.event = RunEvent::ModelResponded { call_number: 1 };
+    let conflict = store.append(&conflicting).unwrap_err();
+    assert_eq!(
+        conflict.to_string(),
+        "conflicting event for execution test-execution:run-a:trace-a (run run-a) sequence 1"
+    );
     assert!(matches!(
-        store.append(&conflicting),
-        Err(TraceStoreError::Conflict { run_id, sequence }) if run_id == "run-a" && sequence == 1
+        conflict,
+        TraceStoreError::Conflict { execution_id, run_id, sequence }
+            if execution_id == "test-execution:run-a:trace-a" && run_id == "run-a" && sequence == 1
     ));
     let mut wrong_trace = first.clone();
     wrong_trace.trace_id = "trace-other".into();
@@ -439,6 +445,27 @@ fn migration_append_query_reopen_and_conflict_are_deterministic() {
     assert_eq!(reopened.events_for_run("run-a", 10, 0).unwrap().len(), 2);
     drop(reopened);
     fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn empty_execution_ids_are_rejected_before_single_and_batch_writes() {
+    let store = SqliteEventSink::open_in_memory(TraceStoreConfig::default()).unwrap();
+    let mut single = started("run-empty-single", "trace-empty-single", 1);
+    single.execution_id = " \t".into();
+    assert!(matches!(
+        store.append(&single),
+        Err(TraceStoreError::InvalidRecord(message)) if message == "execution ID must not be empty"
+    ));
+    assert!(store.list_runs(RunListQuery::default()).unwrap().is_empty());
+
+    let batch_first = started("run-empty-batch", "trace-empty-batch", 1);
+    let mut batch_empty = started("run-empty-batch", "trace-empty-batch", 2);
+    batch_empty.execution_id = "\n".into();
+    assert!(matches!(
+        store.append_batch(vec![(batch_first, None), (batch_empty, None)]),
+        Err(TraceStoreError::InvalidRecord(message)) if message == "execution ID must not be empty"
+    ));
+    assert!(store.list_runs(RunListQuery::default()).unwrap().is_empty());
 }
 
 #[test]

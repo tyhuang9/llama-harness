@@ -167,9 +167,11 @@ pub enum TraceStoreError {
     #[error("trace payload exceeds configured limit: {0}")]
     /// A serialized event or payload exceeds its configured size limit.
     ResourceLimit(String),
-    #[error("conflicting event for run {run_id} sequence {sequence}")]
+    #[error("conflicting event for execution {execution_id} (run {run_id}) sequence {sequence}")]
     /// An existing sequence contains different event data.
     Conflict {
+        /// Execution containing the conflicting event.
+        execution_id: String,
         /// Run containing the conflicting event.
         run_id: String,
         /// Sequence number occupied by different event data.
@@ -257,7 +259,7 @@ impl SqliteEventSink {
     }
 
     /// Appends a group of events in one transaction. Existing identical events remain
-    /// idempotent; conflicting `(run_id, sequence)` records roll the transaction back.
+    /// idempotent; conflicting `(execution_id, sequence)` records roll the transaction back.
     pub fn append_batch(
         &self,
         events: impl IntoIterator<Item = (EventRecord, Option<Value>)>,
@@ -542,6 +544,11 @@ impl SqliteEventSink {
         record: &EventRecord,
         raw_payload: Option<&Value>,
     ) -> Result<PreparedEvent, TraceStoreError> {
+        if record.execution_id.trim().is_empty() {
+            return Err(TraceStoreError::InvalidRecord(
+                "execution ID must not be empty".into(),
+            ));
+        }
         if record.run_id.trim().is_empty()
             || record.trace_id.trim().is_empty()
             || record.sequence == 0
@@ -665,6 +672,7 @@ fn append_prepared(
             Ok(AppendOutcome::Duplicate)
         }
         _ => Err(TraceStoreError::Conflict {
+            execution_id: event.record.execution_id.clone(),
             run_id: event.record.run_id.clone(),
             sequence: event.record.sequence,
         }),

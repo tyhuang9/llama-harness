@@ -4,7 +4,7 @@ Every `AgentRunner` run has a generated internal execution identity, a public `r
 
 ## Stored events
 
-The runtime records structured facts such as run start and completion, model requests and responses, tool rejection or completion, policy decisions, approval requests, retries, and terminal status. Events are ordered by `(run_id, sequence)` and inserts are idempotent, so a safe retry of a persistence write does not duplicate an event. A run is constrained to one trace ID to preserve causal queries.
+The runtime records structured facts such as run start and completion, model requests and responses, tool rejection or completion, policy decisions, approval requests, retries, and terminal status. Events are ordered and conflict-identified by `(execution_id, sequence)`; inserts are idempotent, so a safe retry of a persistence write does not duplicate an event. Conflict errors identify that execution ID unambiguously while retaining the application-visible run ID and sequence for compatibility. A run is constrained to one trace ID to preserve causal queries.
 
 The store supports run lookup, filterable summaries, paged event reads, redacted JSON export, retention by age or recent-run count, explicit run deletion, and SQLite compaction. Export refuses oversized traces instead of silently producing a partial file; callers can inspect large traces through the paged API.
 
