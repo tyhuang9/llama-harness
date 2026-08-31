@@ -43,6 +43,11 @@ pub struct AgentRunnerBuilder {
     discovery_limits: ToolDiscoveryLimits,
 }
 
+pub(crate) struct RunPreflight {
+    pub(crate) output_validator: Option<Validator>,
+    pub(crate) deadline: Option<Instant>,
+}
+
 impl AgentRunner {
     /// Starts building a runner with conservative policy and in-memory event defaults.
     pub fn builder(provider: Arc<dyn ModelProvider>) -> AgentRunnerBuilder {
@@ -61,17 +66,19 @@ impl AgentRunner {
         &self,
         request: RunRequest,
         strategy_events: Option<DirectStrategyEvents>,
+        preflight: RunPreflight,
     ) -> Result<RunResult, HarnessError> {
-        let output_validator = validate_request(&request)?;
-        let (tool_scope, discovery) = self.tools.select_scope(
+        let (tool_scope, discovery) = self.tools.select_scope_for_run(
             &request.input,
             &request.agent.tool_allowlist,
             ToolCaller::Direct,
             self.discovery_limits,
             &self.provider.capabilities().limits,
+            &request.cancellation,
+            preflight.deadline,
         )?;
         let started = StdInstant::now();
-        let deadline = absolute_deadline(request.agent.limits.max_run_duration_ms)?;
+        let deadline = preflight.deadline;
         let run_id = request
             .run_id
             .clone()
@@ -231,7 +238,7 @@ impl AgentRunner {
                     break;
                 }
                 match validate_output(
-                    output_validator.as_ref(),
+                    preflight.output_validator.as_ref(),
                     &output,
                     request.agent.limits.max_json_depth,
                 ) {
@@ -606,6 +613,35 @@ pub(crate) fn validate_request(request: &RunRequest) -> Result<Option<Validator>
             })
         })
         .transpose()
+}
+
+pub(crate) fn preflight_request(request: &RunRequest) -> Result<RunPreflight, HarnessError> {
+    let output_validator = validate_request(request)?;
+    let deadline = absolute_deadline(request.agent.limits.max_run_duration_ms)?;
+    check_stopped(&request.cancellation, deadline, "run deadline reached")?;
+    Ok(RunPreflight {
+        output_validator,
+        deadline,
+    })
+}
+
+pub(crate) fn preflight_terminal_result(request: &RunRequest, error: HarnessError) -> RunResult {
+    let run_id = request
+        .run_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let trace_id = request
+        .trace_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let model = request
+        .overrides
+        .model
+        .clone()
+        .unwrap_or_else(|| request.agent.default_model.clone());
+    let mut result = RunResult::new(run_id, RunStatus::Failed, model, trace_id);
+    apply_terminal_error(&mut result, error);
+    result
 }
 
 pub(crate) fn validate_model_response(

@@ -5,9 +5,10 @@ use crate::{
     limits::serialized_len,
     plan::{MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES},
     runner::{
-        absolute_deadline, apply_terminal_error, emit_discovery, ensure_transcript,
-        initial_messages, merge_generation, provider_deadline, push_tool_message,
-        validate_model_response, validate_output, validate_request, DirectStrategyEvents,
+        apply_terminal_error, emit_discovery, ensure_transcript, initial_messages,
+        merge_generation, preflight_request, preflight_terminal_result, provider_deadline,
+        push_tool_message, validate_model_response, validate_output, DirectStrategyEvents,
+        RunPreflight,
     },
     AgentRunner, ExecutionPlan, HarnessError, Message, ModelRequest, ModelResponse,
     PlanConcurrency, PlanLifecycleOutcome, PlanNode, PlanNodeOutcome, PlanPhase, RunError,
@@ -129,6 +130,18 @@ impl AgentRunner {
         request: RunRequest,
         strategy: RunStrategy,
     ) -> Result<RunResult, HarnessError> {
+        if strategy == RunStrategy::Programmatic {
+            return Err(HarnessError::UnsupportedCapability(
+                "programmatic execution requires the optional sandbox runtime".into(),
+            ));
+        }
+        let preflight = match preflight_request(&request) {
+            Ok(preflight) => preflight,
+            Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
+                return Ok(preflight_terminal_result(&request, error));
+            }
+            Err(error) => return Err(error),
+        };
         match strategy {
             RunStrategy::Direct => {
                 self.run_direct(
@@ -138,22 +151,23 @@ impl AgentRunner {
                         reason: StrategySelectionReason::Forced,
                         fallback: None,
                     }),
+                    preflight,
                 )
                 .await
             }
-            RunStrategy::Programmatic => Err(HarnessError::UnsupportedCapability(
-                "programmatic execution requires the optional sandbox runtime".into(),
-            )),
-            RunStrategy::DeclarativePlan => match self.prepare_plan_scope(&request)? {
-                PlanningReadiness::Ready(prepared) => {
-                    self.run_planned(request, RunStrategy::DeclarativePlan, prepared)
-                        .await
+            RunStrategy::Programmatic => unreachable!("programmatic strategy returned above"),
+            RunStrategy::DeclarativePlan => {
+                match self.prepare_plan_scope(&request, preflight.deadline)? {
+                    PlanningReadiness::Ready(prepared) => {
+                        self.run_planned(request, RunStrategy::DeclarativePlan, prepared, preflight)
+                            .await
+                    }
+                    PlanningReadiness::Downgrade(reason) => {
+                        Err(HarnessError::UnsupportedCapability(reason.into()))
+                    }
                 }
-                PlanningReadiness::Downgrade(reason) => {
-                    Err(HarnessError::UnsupportedCapability(reason.into()))
-                }
-            },
-            RunStrategy::Adaptive => match self.prepare_plan_scope(&request)? {
+            }
+            RunStrategy::Adaptive => match self.prepare_plan_scope(&request, preflight.deadline)? {
                 PlanningReadiness::Downgrade(_) => {
                     self.run_direct(
                         request,
@@ -162,18 +176,23 @@ impl AgentRunner {
                             reason: StrategySelectionReason::CapabilityDowngrade,
                             fallback: Some(StrategyFallbackReason::UnsupportedCapability),
                         }),
+                        preflight,
                     )
                     .await
                 }
                 PlanningReadiness::Ready(prepared) => {
-                    self.run_planned(request, RunStrategy::Adaptive, prepared)
+                    self.run_planned(request, RunStrategy::Adaptive, prepared, preflight)
                         .await
                 }
             },
         }
     }
 
-    fn prepare_plan_scope(&self, request: &RunRequest) -> Result<PlanningReadiness, HarnessError> {
+    fn prepare_plan_scope(
+        &self,
+        request: &RunRequest,
+        deadline: Option<Instant>,
+    ) -> Result<PlanningReadiness, HarnessError> {
         let capabilities = self.provider.capabilities();
         if request.agent.limits.max_model_calls < 2 {
             return Ok(PlanningReadiness::Downgrade(
@@ -192,12 +211,14 @@ impl AgentRunner {
                 "provider advertises no structured-plan capacity",
             ));
         }
-        let (scope, discovery) = self.tools.select_scope(
+        let (scope, discovery) = self.tools.select_scope_for_run(
             &request.input,
             &request.agent.tool_allowlist,
             ToolCaller::DeclarativePlan,
             self.discovery_limits,
             &capabilities.limits,
+            &request.cancellation,
+            deadline,
         )?;
         if scope.is_empty() {
             return Ok(PlanningReadiness::Downgrade(
@@ -215,8 +236,9 @@ impl AgentRunner {
         request: RunRequest,
         requested: RunStrategy,
         prepared_plan: PreparedPlanScope,
+        preflight: RunPreflight,
     ) -> Result<RunResult, HarnessError> {
-        let mut run = StrategyRun::new(self, &request, requested, prepared_plan)?;
+        let mut run = StrategyRun::new(self, &request, requested, prepared_plan, preflight)?;
         if requested == RunStrategy::DeclarativePlan {
             run.events.emit(RunEvent::StrategySelected {
                 requested,
@@ -557,18 +579,19 @@ impl<'a> StrategyRun<'a> {
         request: &'a RunRequest,
         requested: RunStrategy,
         prepared_plan: PreparedPlanScope,
+        preflight: RunPreflight,
     ) -> Result<Self, HarnessError> {
-        let output_validator = validate_request(request)?;
         let capabilities = runner.provider.capabilities();
-        let (direct_scope, direct_discovery) = runner.tools.select_scope(
+        let (direct_scope, direct_discovery) = runner.tools.select_scope_for_run(
             &request.input,
             &request.agent.tool_allowlist,
             ToolCaller::Direct,
             runner.discovery_limits,
             &capabilities.limits,
+            &request.cancellation,
+            preflight.deadline,
         )?;
         let started = StdInstant::now();
-        let deadline = absolute_deadline(request.agent.limits.max_run_duration_ms)?;
         let run_id = request
             .run_id
             .clone()
@@ -597,12 +620,12 @@ impl<'a> StrategyRun<'a> {
         Ok(Self {
             runner,
             request,
-            output_validator,
+            output_validator: preflight.output_validator,
             result: RunResult::new(run_id, RunStatus::Failed, model.clone(), trace_id),
             events,
             messages: initial_messages(request),
             model,
-            deadline,
+            deadline: preflight.deadline,
             started,
             model_calls: 0,
             planning_model_calls: 0,

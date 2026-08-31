@@ -1,14 +1,20 @@
-use crate::{HarnessError, ProviderCapabilityLimits, ToolCaller, ToolDefinition, ToolRegistry};
+use crate::{
+    runner::check_stopped, HarnessError, ProviderCapabilityLimits, ToolCaller, ToolDefinition,
+    ToolRegistry,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 /// Version of the canonical safe-metadata catalog fingerprint format.
 pub const CATALOG_FINGERPRINT_VERSION: u32 = 1;
 const MAX_DISCOVERY_QUERY_BYTES: usize = 4096;
 const MAX_QUERY_TERMS: usize = 64;
+pub(crate) const DISCOVERY_GUARD_INTERVAL: usize = 64;
 
 /// Whether a registered tool is always exposed or selected only when relevant.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -226,19 +232,31 @@ pub(crate) struct CatalogIndex {
 }
 
 impl CatalogIndex {
-    pub(crate) fn build(mut entries: Vec<CatalogEntry>) -> Self {
+    pub(crate) fn build(
+        mut entries: Vec<CatalogEntry>,
+        guard: &mut impl FnMut() -> Result<(), HarnessError>,
+    ) -> Result<Self, HarnessError> {
+        guard()?;
         entries.sort_by(|left, right| left.id.cmp(&right.id));
-        for entry in &mut entries {
+        for (position, entry) in entries.iter_mut().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
             entry.terms = indexed_terms(entry);
         }
-        let positions = entries
-            .iter()
-            .enumerate()
-            .map(|(position, entry)| (entry.id.clone(), position))
-            .collect();
+        let mut positions = HashMap::with_capacity(entries.len());
+        for (position, entry) in entries.iter().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            positions.insert(entry.id.clone(), position);
+        }
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"llama-harness-tool-catalog\0v1\0");
-        for entry in &entries {
+        for (position, entry) in entries.iter().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
             fingerprint_field(&mut hasher, &entry.id);
             fingerprint_field(&mut hasher, &entry.name);
             fingerprint_field(
@@ -254,14 +272,14 @@ impl CatalogIndex {
             }
             hasher.update(&[0xff]);
         }
-        Self {
+        Ok(Self {
             entries,
             positions,
             fingerprint: CatalogFingerprint {
                 version: CATALOG_FINGERPRINT_VERSION,
                 digest: hasher.finalize().to_hex().to_string(),
             },
-        }
+        })
     }
 
     pub(crate) fn fingerprint(&self) -> CatalogFingerprint {
@@ -281,6 +299,7 @@ impl ToolRegistry {
         self.catalog_index().0.fingerprint()
     }
 
+    #[cfg(test)]
     pub(crate) fn select_scope(
         &self,
         query: &str,
@@ -289,8 +308,49 @@ impl ToolRegistry {
         host_limits: ToolDiscoveryLimits,
         provider_limits: &ProviderCapabilityLimits,
     ) -> Result<(ToolScope, ToolDiscoveryStats), HarnessError> {
+        self.select_scope_guarded(
+            query,
+            allowlist,
+            caller,
+            host_limits,
+            provider_limits,
+            &mut || Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn select_scope_for_run(
+        &self,
+        query: &str,
+        allowlist: &[String],
+        caller: ToolCaller,
+        host_limits: ToolDiscoveryLimits,
+        provider_limits: &ProviderCapabilityLimits,
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> Result<(ToolScope, ToolDiscoveryStats), HarnessError> {
+        self.select_scope_guarded(
+            query,
+            allowlist,
+            caller,
+            host_limits,
+            provider_limits,
+            &mut || check_stopped(cancellation, deadline, "run deadline reached"),
+        )
+    }
+
+    fn select_scope_guarded(
+        &self,
+        query: &str,
+        allowlist: &[String],
+        caller: ToolCaller,
+        host_limits: ToolDiscoveryLimits,
+        provider_limits: &ProviderCapabilityLimits,
+        guard: &mut impl FnMut() -> Result<(), HarnessError>,
+    ) -> Result<(ToolScope, ToolDiscoveryStats), HarnessError> {
+        guard()?;
         let limits = host_limits.effective(provider_limits);
-        let allowed = self.allowed_catalog(allowlist, caller);
+        let allowed = self.allowed_catalog_guarded(allowlist, caller, guard)?;
         let deferred_count = allowed
             .iter()
             .filter(|entry| entry.metadata.exposure == ToolExposure::Deferred)
@@ -317,20 +377,25 @@ impl ToolRegistry {
             return Ok(scope_with_stats(caller, all_definitions, base_stats, false));
         }
 
-        let (index, cache_hit) = self.catalog_index();
+        let (index, cache_hit) = self.catalog_index_guarded(guard)?;
         base_stats.cache_hit = cache_hit;
 
-        let mut scope_entries = allowed
-            .iter()
-            .filter_map(|entry| index.entry(&entry.definition.id))
-            .collect::<Vec<_>>();
+        let mut scope_entries = Vec::with_capacity(allowed.len());
+        for (position, entry) in allowed.iter().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            if let Some(indexed) = index.entry(&entry.definition.id) {
+                scope_entries.push(indexed);
+            }
+        }
         scope_entries.sort_by(|left, right| left.id.cmp(&right.id));
         let mut required = allowed
             .iter()
             .filter(|entry| entry.metadata.exposure == ToolExposure::Hot)
             .map(|entry| entry.definition.id.clone())
             .collect::<BTreeSet<_>>();
-        let ranked = rank(&scope_entries, query, limits.max_expansion as usize);
+        let ranked = rank(&scope_entries, query, limits.max_expansion as usize, guard)?;
         let exact = matches!(ranked, RankedSelection::Exact(_));
         let hot = allowed
             .iter()
@@ -449,36 +514,45 @@ impl RankedSelection {
     }
 }
 
-fn rank(entries: &[&CatalogEntry], query: &str, max_expansion: usize) -> RankedSelection {
+fn rank(
+    entries: &[&CatalogEntry],
+    query: &str,
+    max_expansion: usize,
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
+) -> Result<RankedSelection, HarnessError> {
     let normalized = normalize_phrase(query);
     let query_terms = tokenize(query);
+    guard()?;
     let exact_id = entries
         .iter()
         .filter(|entry| entry.id == normalized)
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
     if exact_id.len() == 1 {
-        return RankedSelection::Exact(exact_id);
+        return Ok(RankedSelection::Exact(exact_id));
     }
+    guard()?;
     let exact_name = entries
         .iter()
         .filter(|entry| normalize_phrase(&entry.name) == normalized)
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
     if exact_name.len() == 1 {
-        return RankedSelection::Exact(exact_name);
+        return Ok(RankedSelection::Exact(exact_name));
     }
     if exact_name.len() > 1 {
-        return RankedSelection::Exact(Vec::new());
+        return Ok(RankedSelection::Exact(Vec::new()));
     }
+    guard()?;
     let exact_namespace = entries
         .iter()
         .filter(|entry| entry.metadata.namespace.as_deref() == Some(normalized.as_str()))
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
     if !exact_namespace.is_empty() {
-        return RankedSelection::Exact(exact_namespace);
+        return Ok(RankedSelection::Exact(exact_namespace));
     }
+    guard()?;
     let exact_alias = entries
         .iter()
         .filter(|entry| {
@@ -491,50 +565,60 @@ fn rank(entries: &[&CatalogEntry], query: &str, max_expansion: usize) -> RankedS
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
     if exact_alias.len() == 1 {
-        return RankedSelection::Exact(exact_alias);
+        return Ok(RankedSelection::Exact(exact_alias));
     }
     if exact_alias.len() > 1 {
-        return RankedSelection::Exact(Vec::new());
+        return Ok(RankedSelection::Exact(Vec::new()));
     }
     if max_expansion == 0 {
-        return RankedSelection::Lexical(Vec::new());
+        return Ok(RankedSelection::Lexical(Vec::new()));
     }
     if query_terms.is_empty() {
-        return RankedSelection::Lexical(Vec::new());
+        return Ok(RankedSelection::Lexical(Vec::new()));
     }
     let documents = entries.len() as u64;
     let mut document_frequency = BTreeMap::<&str, u64>::new();
-    for entry in entries {
+    for (position, entry) in entries.iter().enumerate() {
+        if position % DISCOVERY_GUARD_INTERVAL == 0 {
+            guard()?;
+        }
         for term in entry.terms.keys() {
             *document_frequency.entry(term).or_default() += 1;
         }
     }
-    let mut scored = entries
-        .iter()
-        .filter_map(|entry| {
-            let score = query_terms.iter().try_fold(0u64, |total, term| {
-                let Some(frequency) = entry.terms.get(term).copied().map(u64::from) else {
-                    return Some(total);
-                };
-                let document_frequency = *document_frequency.get(term.as_str())?;
-                let idf = documents
-                    .checked_add(1)?
-                    .checked_mul(1_000)?
-                    .checked_div(document_frequency.checked_add(1)?)?;
-                total.checked_add(idf.checked_mul(frequency.min(8))?)
-            })?;
-            (score > 0).then(|| (score, entry.id.clone()))
-        })
-        .collect::<Vec<_>>();
+    let mut scored = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        if position % DISCOVERY_GUARD_INTERVAL == 0 {
+            guard()?;
+        }
+        let Some(score) = query_terms.iter().try_fold(0u64, |total, term| {
+            let Some(frequency) = entry.terms.get(term).copied().map(u64::from) else {
+                return Some(total);
+            };
+            let document_frequency = *document_frequency.get(term.as_str())?;
+            let idf = documents
+                .checked_add(1)?
+                .checked_mul(1_000)?
+                .checked_div(document_frequency.checked_add(1)?)?;
+            total.checked_add(idf.checked_mul(frequency.min(8))?)
+        }) else {
+            continue;
+        };
+        if score > 0 {
+            scored.push((score, entry.id.clone()));
+        }
+    }
     scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     let Some((best, _)) = scored.first() else {
-        return RankedSelection::Lexical(Vec::new());
+        return Ok(RankedSelection::Lexical(Vec::new()));
     };
     let confident = scored
         .get(1)
         .is_none_or(|(second, _)| best.saturating_sub(*second) >= 500);
     let take = if confident { 1 } else { max_expansion };
-    RankedSelection::Lexical(scored.into_iter().take(take).map(|(_, id)| id).collect())
+    Ok(RankedSelection::Lexical(
+        scored.into_iter().take(take).map(|(_, id)| id).collect(),
+    ))
 }
 
 fn indexed_terms(entry: &CatalogEntry) -> BTreeMap<String, u32> {
@@ -690,6 +774,39 @@ mod tests {
             assert_eq!(stats.candidate_count, count as u32);
             assert!(stats.catalog_exceeded_budget);
         }
+    }
+
+    #[test]
+    fn guarded_large_catalog_traversal_cancels_without_warming_the_index() {
+        let count = 1_000;
+        let mut registry = ToolRegistry::default();
+        for id in allowlist(count) {
+            register(
+                &mut registry,
+                &id,
+                "description",
+                ToolDiscoveryMetadata::deferred(),
+            );
+        }
+        let mut checkpoints = 0;
+        let result = registry.select_scope_guarded(
+            "tool 0999",
+            &allowlist(count),
+            ToolCaller::Direct,
+            ToolDiscoveryLimits::new().with_max_tools(1),
+            &ProviderCapabilityLimits::new(),
+            &mut || {
+                checkpoints += 1;
+                if checkpoints == 20 {
+                    Err(HarnessError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(HarnessError::Cancelled)));
+        assert_eq!(checkpoints, 20);
+        assert!(!registry.catalog_index().1);
     }
 
     #[test]

@@ -1,5 +1,8 @@
 use crate::{
-    discovery::{AllowedCatalogEntry, CatalogEntry, CatalogIndex, ToolDiscoveryMetadata},
+    discovery::{
+        AllowedCatalogEntry, CatalogEntry, CatalogIndex, ToolDiscoveryMetadata,
+        DISCOVERY_GUARD_INTERVAL,
+    },
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len},
     AgentLimits, HarnessError,
 };
@@ -498,32 +501,56 @@ impl ToolRegistry {
         self.tools.get(id).map(|entry| Arc::clone(&entry.tool))
     }
 
+    #[cfg(test)]
     pub(crate) fn allowed_catalog(
         &self,
         allowlist: &[String],
         caller: ToolCaller,
     ) -> Vec<AllowedCatalogEntry<'_>> {
+        self.allowed_catalog_guarded(allowlist, caller, &mut || Ok(()))
+            .expect("the unguarded catalog traversal cannot fail")
+    }
+
+    pub(crate) fn allowed_catalog_guarded(
+        &self,
+        allowlist: &[String],
+        caller: ToolCaller,
+        guard: &mut impl FnMut() -> Result<(), HarnessError>,
+    ) -> Result<Vec<AllowedCatalogEntry<'_>>, HarnessError> {
         let mut seen = BTreeSet::new();
-        allowlist
-            .iter()
-            .filter(|id| seen.insert((*id).as_str()))
-            .filter_map(|id| {
-                self.tools.get(id).and_then(|entry| {
-                    entry
-                        .tool
-                        .definition()
-                        .allows_caller(caller)
-                        .then_some(AllowedCatalogEntry {
-                            definition: entry.tool.definition(),
-                            metadata: &entry.discovery,
-                            serialized_bytes: entry.definition_serialized_bytes,
-                        })
-                })
-            })
-            .collect()
+        let mut allowed = Vec::new();
+        for (position, id) in allowlist.iter().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            let Some(entry) = self.tools.get(id) else {
+                continue;
+            };
+            if entry.tool.definition().allows_caller(caller) {
+                allowed.push(AllowedCatalogEntry {
+                    definition: entry.tool.definition(),
+                    metadata: &entry.discovery,
+                    serialized_bytes: entry.definition_serialized_bytes,
+                });
+            }
+        }
+        guard()?;
+        Ok(allowed)
     }
 
     pub(crate) fn catalog_index(&self) -> (Arc<CatalogIndex>, bool) {
+        self.catalog_index_guarded(&mut || Ok(()))
+            .expect("the unguarded catalog index build cannot fail")
+    }
+
+    pub(crate) fn catalog_index_guarded(
+        &self,
+        guard: &mut impl FnMut() -> Result<(), HarnessError>,
+    ) -> Result<(Arc<CatalogIndex>, bool), HarnessError> {
+        guard()?;
         if let Some(index) = self
             .catalog_cache
             .read()
@@ -531,28 +558,31 @@ impl ToolRegistry {
             .as_ref()
             .cloned()
         {
-            return (index, true);
+            return Ok((index, true));
         }
-        let index = Arc::new(CatalogIndex::build(
-            self.tools
-                .values()
-                .map(|entry| CatalogEntry {
-                    id: entry.tool.definition().id.clone(),
-                    name: entry.tool.definition().name.clone(),
-                    metadata: entry.discovery.clone(),
-                    terms: Default::default(),
-                })
-                .collect(),
-        ));
+        let mut entries = Vec::with_capacity(self.tools.len());
+        for (position, entry) in self.tools.values().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            entries.push(CatalogEntry {
+                id: entry.tool.definition().id.clone(),
+                name: entry.tool.definition().name.clone(),
+                metadata: entry.discovery.clone(),
+                terms: Default::default(),
+            });
+        }
+        let index = Arc::new(CatalogIndex::build(entries, guard)?);
+        guard()?;
         let mut cache = self
             .catalog_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = cache.as_ref() {
-            return (Arc::clone(existing), true);
+            return Ok((Arc::clone(existing), true));
         }
         *cache = Some(Arc::clone(&index));
-        (index, false)
+        Ok((index, false))
     }
 
     pub(crate) fn validate(&self, tool_id: &str, arguments: &Value) -> Result<(), HarnessError> {

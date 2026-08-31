@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use llama_harness_core::{
     mock::{final_response, tool_response, MockModelProvider, MockStep},
-    AgentDefinition, AgentRunner, HarnessError, InMemoryEventSink, ModelCapabilities,
-    ModelResponse, ProviderCapabilityLimits, RunEvent, RunRequest, RunStatus, RunStrategy, Tool,
-    ToolCall, ToolCaller, ToolDefinition, ToolDiscoveryLimits, ToolDiscoveryMetadata, ToolRegistry,
-    ToolResult,
+    AgentDefinition, AgentRunner, HarnessError, InMemoryEventSink, ModelCapabilities, ModelInfo,
+    ModelProvider, ModelRequest, ModelResponse, ProviderCapabilityLimits, ProviderHealth, RunEvent,
+    RunRequest, RunStatus, RunStrategy, Tool, ToolCall, ToolCaller, ToolDefinition,
+    ToolDiscoveryLimits, ToolDiscoveryMetadata, ToolRegistry, ToolResult,
 };
 use serde_json::{json, Value};
 use std::sync::{
@@ -52,6 +52,37 @@ impl Tool for CountingTool {
     async fn execute(&self, _: Value, _: CancellationToken) -> Result<ToolResult, HarnessError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.result.clone())
+    }
+}
+
+struct ObservedProvider {
+    capabilities: ModelCapabilities,
+    capability_calls: AtomicU32,
+    completion_calls: AtomicU32,
+}
+
+#[async_trait]
+impl ModelProvider for ObservedProvider {
+    fn id(&self) -> &str {
+        "observed"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        self.capability_calls.fetch_add(1, Ordering::SeqCst);
+        self.capabilities.clone()
+    }
+
+    async fn health(&self) -> Result<ProviderHealth, HarnessError> {
+        Ok(ProviderHealth::healthy())
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn complete(&self, _: ModelRequest) -> Result<ModelResponse, HarnessError> {
+        self.completion_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ModelResponse::new("mock-model").with_final_output("done"))
     }
 }
 
@@ -508,4 +539,83 @@ async fn adaptive_capability_fallback_matches_forced_direct_discovery() {
         .collect::<Vec<_>>();
     assert_eq!(direct_ids, adaptive_ids);
     assert_eq!(direct_ids, vec![target]);
+}
+
+#[tokio::test]
+async fn direct_and_adaptive_preflight_rejects_before_large_catalog_discovery() {
+    let count = 1_000;
+    let target = "catalog.tool.733";
+    let provider = Arc::new(ObservedProvider {
+        capabilities: capabilities(1, true),
+        capability_calls: AtomicU32::new(0),
+        completion_calls: AtomicU32::new(0),
+    });
+    let (registry, tools) = registry(count);
+    let events = Arc::new(InMemoryEventSink::default());
+    let runner = AgentRunner::builder(provider.clone())
+        .tools(registry)
+        .event_sink(events.clone())
+        .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
+        .build();
+
+    for strategy in [RunStrategy::Direct, RunStrategy::Adaptive] {
+        let empty = request(count, "");
+        assert!(matches!(
+            runner.run_with_strategy(empty, strategy).await,
+            Err(HarnessError::InvalidRequest(_))
+        ));
+
+        let mut oversized = request(count, target);
+        oversized.agent.limits.max_input_bytes = 1;
+        assert!(matches!(
+            runner.run_with_strategy(oversized, strategy).await,
+            Err(HarnessError::InvalidRequest(_))
+        ));
+
+        let cancelled = request(count, target);
+        cancelled.cancellation.cancel();
+        let cancelled = runner.run_with_strategy(cancelled, strategy).await.unwrap();
+        assert_eq!(cancelled.status, RunStatus::Cancelled);
+        assert!(cancelled.cancelled);
+
+        let mut expired = request(count, target);
+        expired.agent.limits.max_run_duration_ms = Some(0);
+        let expired = runner.run_with_strategy(expired, strategy).await.unwrap();
+        assert_eq!(expired.status, RunStatus::Failed);
+        assert!(expired.errors.iter().any(|error| error.code == "timed_out"));
+
+        let mut exhausted = request(count, target);
+        exhausted.agent.limits.max_model_calls = 0;
+        assert!(matches!(
+            runner.run_with_strategy(exhausted, strategy).await,
+            Err(HarnessError::InvalidRequest(_))
+        ));
+    }
+
+    assert_eq!(provider.capability_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.completion_calls.load(Ordering::SeqCst), 0);
+    assert!(events.events().is_empty());
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.calls.load(Ordering::SeqCst))
+            .sum::<u32>(),
+        0
+    );
+
+    let result = runner
+        .run_with_strategy(request(count, target), RunStrategy::Direct)
+        .await
+        .unwrap();
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(provider.capability_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.completion_calls.load(Ordering::SeqCst), 1);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::ToolDiscoveryCompleted {
+            caller: ToolCaller::Direct,
+            cache_hit: false,
+            ..
+        }
+    )));
 }
