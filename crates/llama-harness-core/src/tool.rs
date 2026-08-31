@@ -430,6 +430,8 @@ pub struct ToolRegistry {
     pub(crate) catalog_cache: RwLock<CatalogCache>,
     pub(crate) fingerprint_cache: RwLock<Option<CatalogFingerprint>>,
     catalog_build_count: AtomicU64,
+    #[cfg(test)]
+    pub(crate) discovery_checkpoint: Option<Arc<dyn Fn(ToolCaller) + Send + Sync>>,
 }
 
 #[derive(Serialize)]
@@ -448,6 +450,8 @@ impl Default for ToolRegistry {
             catalog_cache: RwLock::new(CatalogCache::default()),
             fingerprint_cache: RwLock::new(None),
             catalog_build_count: AtomicU64::new(0),
+            #[cfg(test)]
+            discovery_checkpoint: None,
         }
     }
 }
@@ -625,19 +629,25 @@ impl ToolRegistry {
         guard: &mut impl FnMut() -> Result<(), HarnessError>,
     ) -> Result<(Arc<CatalogIndex>, bool), HarnessError> {
         guard()?;
-        let key = CatalogCacheKey::new(
-            caller,
-            allowed
-                .iter()
-                .map(|entry| (entry.definition.id.clone(), entry.version))
-                .collect(),
-        );
+        let mut versioned_ids = Vec::with_capacity(allowed.len());
+        for (position, entry) in allowed.iter().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            versioned_ids.push((entry.definition.id.clone(), entry.version));
+        }
+        guard()?;
+        let key = CatalogCacheKey::new(caller, versioned_ids);
+        // The standard-library sort inside the key constructor is bounded by
+        // the authorized catalog. Check immediately after that atomic step.
+        guard()?;
         if let Some(index) = self
             .catalog_cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
         {
+            guard()?;
             return Ok((index, true));
         }
         let mut entries = Vec::with_capacity(allowed.len());
@@ -711,6 +721,14 @@ impl ToolRegistry {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_discovery_checkpoint(
+        &mut self,
+        checkpoint: Arc<dyn Fn(ToolCaller) + Send + Sync>,
+    ) {
+        self.discovery_checkpoint = Some(checkpoint);
     }
 
     pub(crate) fn validate(&self, tool_id: &str, arguments: &Value) -> Result<(), HarnessError> {

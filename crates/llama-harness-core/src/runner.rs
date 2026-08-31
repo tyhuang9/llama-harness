@@ -68,7 +68,7 @@ impl AgentRunner {
         strategy_events: Option<DirectStrategyEvents>,
         preflight: RunPreflight,
     ) -> Result<RunResult, HarnessError> {
-        let (tool_scope, discovery) = self.tools.select_scope_for_run(
+        let selection = self.tools.select_scope_for_run(
             &request.input,
             &request.agent.tool_allowlist,
             ToolCaller::Direct,
@@ -76,7 +76,19 @@ impl AgentRunner {
             &self.provider.capabilities().limits,
             &request.cancellation,
             preflight.deadline,
-        )?;
+        );
+        let (tool_scope, discovery) = match selection {
+            Ok(selection) => selection,
+            Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
+                return Ok(pre_event_terminal_result(
+                    &request,
+                    error,
+                    &self.events,
+                    crate::RunStrategy::Direct,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let started = StdInstant::now();
         let deadline = preflight.deadline;
         let run_id = request
@@ -640,6 +652,50 @@ pub(crate) fn preflight_terminal_result(request: &RunRequest, error: HarnessErro
         .unwrap_or_else(|| request.agent.default_model.clone());
     let mut result = RunResult::new(run_id, RunStatus::Failed, model, trace_id);
     apply_terminal_error(&mut result, error);
+    result
+}
+
+pub(crate) fn pre_event_terminal_result(
+    request: &RunRequest,
+    error: HarnessError,
+    event_sink: &Arc<dyn EventSink>,
+    strategy: crate::RunStrategy,
+) -> RunResult {
+    debug_assert!(matches!(
+        error,
+        HarnessError::Cancelled | HarnessError::TimedOut(_)
+    ));
+    let result = preflight_terminal_result(request, error);
+    let mut events = EventEmitter::new(
+        result.id.clone(),
+        result.trace_id.clone(),
+        Arc::clone(event_sink),
+    );
+    events.emit(RunEvent::Started {
+        run_id: result.id.clone(),
+        trace_id: result.trace_id.clone(),
+    });
+    events.emit(RunEvent::StrategyUsage {
+        strategy,
+        model_calls: 0,
+        planning_model_calls: 0,
+        repair_model_calls: 0,
+        recovery_model_calls: 0,
+        final_synthesis_model_calls: 0,
+        reactive_model_calls: 0,
+        tool_calls: 0,
+        tool_issued: 0,
+        tool_reused: 0,
+        tool_rejected: 0,
+        tool_pre_dispatch_aborted: 0,
+        tool_completed: 0,
+        tool_failed: 0,
+        tool_cancelled: 0,
+        duration_ms: result.duration_ms,
+    });
+    events.emit(RunEvent::Completed {
+        status: result.status.clone(),
+    });
     result
 }
 

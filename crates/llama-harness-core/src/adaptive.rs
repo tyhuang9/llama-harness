@@ -6,9 +6,9 @@ use crate::{
     plan::{MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES},
     runner::{
         apply_terminal_error, emit_discovery, ensure_transcript, initial_messages,
-        merge_generation, preflight_request, preflight_terminal_result, provider_deadline,
-        push_tool_message, validate_model_response, validate_output, DirectStrategyEvents,
-        RunPreflight,
+        merge_generation, pre_event_terminal_result, preflight_request, preflight_terminal_result,
+        provider_deadline, push_tool_message, validate_model_response, validate_output,
+        DirectStrategyEvents, RunPreflight,
     },
     AgentRunner, ExecutionPlan, HarnessError, Message, ModelRequest, ModelResponse,
     PlanConcurrency, PlanLifecycleOutcome, PlanNode, PlanNodeOutcome, PlanPhase, RunError,
@@ -157,7 +157,19 @@ impl AgentRunner {
             }
             RunStrategy::Programmatic => unreachable!("programmatic strategy returned above"),
             RunStrategy::DeclarativePlan => {
-                match self.prepare_plan_scope(&request, preflight.deadline)? {
+                let readiness = match self.prepare_plan_scope(&request, preflight.deadline) {
+                    Ok(readiness) => readiness,
+                    Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
+                        return Ok(pre_event_terminal_result(
+                            &request,
+                            error,
+                            &self.events,
+                            RunStrategy::DeclarativePlan,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
+                match readiness {
                     PlanningReadiness::Ready(prepared) => {
                         self.run_planned(request, RunStrategy::DeclarativePlan, prepared, preflight)
                             .await
@@ -167,24 +179,38 @@ impl AgentRunner {
                     }
                 }
             }
-            RunStrategy::Adaptive => match self.prepare_plan_scope(&request, preflight.deadline)? {
-                PlanningReadiness::Downgrade(_) => {
-                    self.run_direct(
-                        request,
-                        Some(DirectStrategyEvents {
-                            requested: RunStrategy::Adaptive,
-                            reason: StrategySelectionReason::CapabilityDowngrade,
-                            fallback: Some(StrategyFallbackReason::UnsupportedCapability),
-                        }),
-                        preflight,
-                    )
-                    .await
-                }
-                PlanningReadiness::Ready(prepared) => {
-                    self.run_planned(request, RunStrategy::Adaptive, prepared, preflight)
+            RunStrategy::Adaptive => {
+                let readiness = match self.prepare_plan_scope(&request, preflight.deadline) {
+                    Ok(readiness) => readiness,
+                    Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
+                        return Ok(pre_event_terminal_result(
+                            &request,
+                            error,
+                            &self.events,
+                            RunStrategy::Adaptive,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
+                match readiness {
+                    PlanningReadiness::Downgrade(_) => {
+                        self.run_direct(
+                            request,
+                            Some(DirectStrategyEvents {
+                                requested: RunStrategy::Adaptive,
+                                reason: StrategySelectionReason::CapabilityDowngrade,
+                                fallback: Some(StrategyFallbackReason::UnsupportedCapability),
+                            }),
+                            preflight,
+                        )
                         .await
+                    }
+                    PlanningReadiness::Ready(prepared) => {
+                        self.run_planned(request, RunStrategy::Adaptive, prepared, preflight)
+                            .await
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -238,7 +264,18 @@ impl AgentRunner {
         prepared_plan: PreparedPlanScope,
         preflight: RunPreflight,
     ) -> Result<RunResult, HarnessError> {
-        let mut run = StrategyRun::new(self, &request, requested, prepared_plan, preflight)?;
+        let mut run = match StrategyRun::new(self, &request, requested, prepared_plan, preflight) {
+            Ok(run) => run,
+            Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
+                return Ok(pre_event_terminal_result(
+                    &request,
+                    error,
+                    &self.events,
+                    requested,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         if requested == RunStrategy::DeclarativePlan {
             run.events.emit(RunEvent::StrategySelected {
                 requested,
@@ -2161,4 +2198,317 @@ fn bind_arguments(
         *target = value;
     }
     Ok(arguments)
+}
+
+#[cfg(test)]
+mod discovery_terminal_tests {
+    use super::*;
+    use crate::{
+        mock::{final_response, MockModelProvider},
+        InMemoryEventSink, ModelCapabilities, ProviderCapabilityLimits, Tool, ToolDiscoveryLimits,
+        ToolDiscoveryMetadata, ToolRegistry,
+    };
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Arc, Barrier,
+    };
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    struct CountingTool {
+        definition: ToolDefinition,
+        calls: AtomicU32,
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn definition(&self) -> &ToolDefinition {
+            &self.definition
+        }
+
+        async fn execute(
+            &self,
+            _: Value,
+            _: CancellationToken,
+        ) -> Result<ToolResult, HarnessError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::success(json!({"ok": true})))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum StopKind {
+        Cancel,
+        Deadline,
+    }
+
+    fn planning_capabilities() -> ModelCapabilities {
+        ModelCapabilities::new(true, false, true)
+            .with_structured_plans(true)
+            .with_limits(
+                ProviderCapabilityLimits::new()
+                    .with_max_plan_nodes(64)
+                    .with_max_plan_bytes(256 * 1024),
+            )
+    }
+
+    fn registry_with_checkpoint(
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        paused_caller: ToolCaller,
+    ) -> (ToolRegistry, Vec<Arc<CountingTool>>) {
+        let mut registry = ToolRegistry::default();
+        let mut tools = Vec::new();
+        for index in 0..100 {
+            let id = format!("discovery.tool.{index:03}");
+            let tool = Arc::new(CountingTool {
+                definition: ToolDefinition::new(
+                    &id,
+                    id.replace('.', " "),
+                    "discovery terminal test tool",
+                    json!({"type": "object"}),
+                )
+                .with_allowed_callers([ToolCaller::Direct, ToolCaller::DeclarativePlan]),
+                calls: AtomicU32::new(0),
+            });
+            registry
+                .register_with_discovery(tool.clone(), ToolDiscoveryMetadata::deferred())
+                .unwrap();
+            tools.push(tool);
+        }
+        let checkpoints = Arc::new(AtomicUsize::new(0));
+        registry.set_discovery_checkpoint(Arc::new(move |caller| {
+            if caller == paused_caller && checkpoints.fetch_add(1, Ordering::SeqCst) == 1 {
+                entered.wait();
+                release.wait();
+            }
+        }));
+        (registry, tools)
+    }
+
+    fn assert_zero_usage(event: &RunEvent, strategy: RunStrategy) {
+        let RunEvent::StrategyUsage {
+            strategy: actual,
+            model_calls,
+            planning_model_calls,
+            repair_model_calls,
+            recovery_model_calls,
+            final_synthesis_model_calls,
+            reactive_model_calls,
+            tool_calls,
+            tool_issued,
+            tool_reused,
+            tool_rejected,
+            tool_pre_dispatch_aborted,
+            tool_completed,
+            tool_failed,
+            tool_cancelled,
+            duration_ms,
+        } = event
+        else {
+            panic!("expected strategy usage event");
+        };
+        assert_eq!(*actual, strategy);
+        assert_eq!(
+            [
+                u64::from(*model_calls),
+                u64::from(*planning_model_calls),
+                u64::from(*repair_model_calls),
+                u64::from(*recovery_model_calls),
+                u64::from(*final_synthesis_model_calls),
+                u64::from(*reactive_model_calls),
+                u64::from(*tool_calls),
+                u64::from(*tool_issued),
+                u64::from(*tool_reused),
+                u64::from(*tool_rejected),
+                u64::from(*tool_pre_dispatch_aborted),
+                u64::from(*tool_completed),
+                u64::from(*tool_failed),
+                u64::from(*tool_cancelled),
+                *duration_ms,
+            ],
+            [0; 15]
+        );
+        assert_eq!(
+            *model_calls,
+            *planning_model_calls
+                + *repair_model_calls
+                + *recovery_model_calls
+                + *final_synthesis_model_calls
+                + *reactive_model_calls
+        );
+        assert_eq!(
+            *tool_calls,
+            *tool_issued + *tool_reused + *tool_rejected + *tool_pre_dispatch_aborted
+        );
+        assert_eq!(
+            *tool_issued,
+            *tool_completed + *tool_failed + *tool_cancelled
+        );
+    }
+
+    fn run_stopped_discovery(
+        strategy: RunStrategy,
+        stop: StopKind,
+        paused_caller: ToolCaller,
+        capabilities: ModelCapabilities,
+        usage_strategy: RunStrategy,
+    ) {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (registry, tools) =
+            registry_with_checkpoint(entered.clone(), release.clone(), paused_caller);
+        let provider = Arc::new(
+            MockModelProvider::scripted([final_response("unused")]).with_capabilities(capabilities),
+        );
+        let events = Arc::new(InMemoryEventSink::default());
+        let runner = Arc::new(
+            AgentRunner::builder(provider.clone())
+                .tools(registry)
+                .event_sink(events.clone())
+                .discovery_limits(ToolDiscoveryLimits::new().with_max_tools(1))
+                .build(),
+        );
+        let mut agent = crate::AgentDefinition::new("discovery", "Discovery", "1", "mock");
+        agent.tool_allowlist = (0..100)
+            .map(|index| format!("discovery.tool.{index:03}"))
+            .collect();
+        if matches!(stop, StopKind::Deadline) {
+            agent.limits.max_run_duration_ms = Some(500);
+        }
+        let request = RunRequest::new(agent, "discovery.tool.099")
+            .with_run_id(format!("discovery-{strategy:?}"))
+            .with_trace_id(format!("trace-{strategy:?}"));
+        let cancellation = request.cancellation.clone();
+        let run = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(runner.run_with_strategy(request, strategy))
+        });
+
+        entered.wait();
+        match stop {
+            StopKind::Cancel => cancellation.cancel(),
+            StopKind::Deadline => std::thread::sleep(Duration::from_millis(550)),
+        }
+        release.wait();
+        let result = run.join().unwrap().unwrap();
+
+        match stop {
+            StopKind::Cancel => {
+                assert_eq!(result.status, RunStatus::Cancelled);
+                assert!(result.cancelled);
+                assert_eq!(result.errors.len(), 1);
+                assert_eq!(result.errors[0].code, "cancelled");
+            }
+            StopKind::Deadline => {
+                assert_eq!(result.status, RunStatus::Failed);
+                assert!(!result.cancelled);
+                assert_eq!(result.errors.len(), 1);
+                assert_eq!(result.errors[0].code, "timed_out");
+            }
+        }
+        assert!(result.tool_calls.is_empty());
+        assert!(result.policy_decisions.is_empty());
+        assert!(result.approvals.is_empty());
+        assert!(provider.requests().is_empty());
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.calls.load(Ordering::SeqCst))
+                .sum::<u32>(),
+            0
+        );
+
+        let records = events.events();
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(matches!(records[0].event, RunEvent::Started { .. }));
+        assert_zero_usage(&records[1].event, usage_strategy);
+        assert!(matches!(
+            records[2].event,
+            RunEvent::Completed { ref status } if status == &result.status
+        ));
+        assert!(!records.iter().any(|record| matches!(
+            record.event,
+            RunEvent::ToolDiscoveryCompleted { .. }
+                | RunEvent::ModelRequested { .. }
+                | RunEvent::PolicyDecided { .. }
+                | RunEvent::ApprovalRequested { .. }
+                | RunEvent::ToolEffectReused { .. }
+                | RunEvent::ToolCompleted { .. }
+        )));
+    }
+
+    #[test]
+    fn discovery_stop_is_a_terminal_result_for_every_runnable_strategy() {
+        for strategy in [
+            RunStrategy::Direct,
+            RunStrategy::Adaptive,
+            RunStrategy::DeclarativePlan,
+        ] {
+            let paused_caller = if strategy == RunStrategy::Direct {
+                ToolCaller::Direct
+            } else {
+                ToolCaller::DeclarativePlan
+            };
+            run_stopped_discovery(
+                strategy,
+                StopKind::Cancel,
+                paused_caller,
+                planning_capabilities(),
+                strategy,
+            );
+            run_stopped_discovery(
+                strategy,
+                StopKind::Deadline,
+                paused_caller,
+                planning_capabilities(),
+                strategy,
+            );
+        }
+    }
+
+    #[test]
+    fn planned_strategy_direct_scope_stop_has_the_same_terminal_contract() {
+        for strategy in [RunStrategy::Adaptive, RunStrategy::DeclarativePlan] {
+            run_stopped_discovery(
+                strategy,
+                StopKind::Cancel,
+                ToolCaller::Direct,
+                planning_capabilities(),
+                strategy,
+            );
+            run_stopped_discovery(
+                strategy,
+                StopKind::Deadline,
+                ToolCaller::Direct,
+                planning_capabilities(),
+                strategy,
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_downgrade_discovery_stop_reports_direct_zero_usage() {
+        for stop in [StopKind::Cancel, StopKind::Deadline] {
+            run_stopped_discovery(
+                RunStrategy::Adaptive,
+                stop,
+                ToolCaller::Direct,
+                ModelCapabilities::new(true, false, true),
+                RunStrategy::Direct,
+            );
+        }
+    }
 }

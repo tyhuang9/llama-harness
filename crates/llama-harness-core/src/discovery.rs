@@ -375,13 +375,20 @@ impl ToolRegistry {
         cancellation: &CancellationToken,
         deadline: Option<Instant>,
     ) -> Result<(ToolScope, ToolDiscoveryStats), HarnessError> {
+        let mut guard = || {
+            #[cfg(test)]
+            if let Some(checkpoint) = &self.discovery_checkpoint {
+                checkpoint(caller);
+            }
+            check_stopped(cancellation, deadline, "run deadline reached")
+        };
         self.select_scope_guarded(
             query,
             allowlist,
             caller,
             host_limits,
             provider_limits,
-            &mut || check_stopped(cancellation, deadline, "run deadline reached"),
+            &mut guard,
         )
     }
 
@@ -397,10 +404,16 @@ impl ToolRegistry {
         guard()?;
         let limits = host_limits.effective(provider_limits);
         let allowed = self.allowed_catalog_guarded(allowlist, caller, guard)?;
-        let deferred_count = allowed
-            .iter()
-            .filter(|entry| entry.metadata.exposure == ToolExposure::Deferred)
-            .count();
+        let mut deferred_count = 0usize;
+        for (position, entry) in allowed.iter().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            if entry.metadata.exposure == ToolExposure::Deferred {
+                deferred_count = deferred_count.saturating_add(1);
+            }
+        }
+        guard()?;
         let mut base_stats = ToolDiscoveryStats {
             candidate_count: allowed.len() as u32,
             selected_count: 0,
@@ -413,69 +426,122 @@ impl ToolRegistry {
         // that cannot carry even that representation as having no tool
         // capacity, without constructing or consulting the catalog index.
         if limits.max_tools == 0 || limits.max_bytes < 2 || allowed.is_empty() {
+            guard()?;
             return Ok((ToolScope::empty(caller), base_stats));
         }
-        if fits(&allowed, limits)? {
-            return Ok(scope_with_stats(
-                caller,
-                allowed.iter().collect(),
-                base_stats,
-                false,
-            ));
+        if fits(&allowed, limits, guard)? {
+            guard()?;
+            let selected = collect_all(&allowed, guard)?;
+            return scope_with_stats(caller, selected, base_stats, false, guard);
         }
 
-        let mut required = allowed
-            .iter()
-            .filter(|entry| entry.metadata.exposure == ToolExposure::Hot)
-            .map(|entry| entry.definition.id.clone())
-            .collect::<BTreeSet<_>>();
-        let hot = allowed
-            .iter()
-            .filter(|entry| required.contains(&entry.definition.id))
-            .collect::<Vec<_>>();
-        if !fits_refs(&hot, limits)? {
+        let mut required = BTreeSet::new();
+        for (position, entry) in allowed.iter().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            if entry.metadata.exposure == ToolExposure::Hot {
+                required.insert(entry.definition.id.clone());
+            }
+        }
+        guard()?;
+        let hot = collect_required(&allowed, &required, guard)?;
+        if !fits_refs(&hot, limits, guard)? {
             return Err(HarnessError::ResourceLimit(
                 "mandatory hot tool scope exceeds discovery budget".into(),
             ));
         }
         let (index, cache_hit) = self.catalog_index_for_scope(&allowed, caller, guard)?;
         base_stats.cache_hit = cache_hit;
-        let scope_entries = index.entries.iter().collect::<Vec<_>>();
+        let mut scope_entries = Vec::with_capacity(index.entries.len());
+        for (position, entry) in index.entries.iter().enumerate() {
+            if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                guard()?;
+            }
+            scope_entries.push(entry);
+        }
+        guard()?;
         let ranked = rank(&scope_entries, query, limits.max_expansion as usize, guard)?;
         let exact = matches!(ranked, RankedSelection::Exact(_));
         if exact {
-            required.extend(ranked.ids().iter().cloned());
-            let exact_entries = allowed
-                .iter()
-                .filter(|entry| required.contains(&entry.definition.id))
-                .collect::<Vec<_>>();
-            if !fits_refs(&exact_entries, limits)? {
+            for (position, id) in ranked.ids().iter().enumerate() {
+                if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                    guard()?;
+                }
+                required.insert(id.clone());
+            }
+            guard()?;
+            let exact_entries = collect_required(&allowed, &required, guard)?;
+            if !fits_refs(&exact_entries, limits, guard)? {
                 return Err(HarnessError::ResourceLimit(
                     "mandatory hot or exact-match tool scope exceeds discovery budget".into(),
                 ));
             }
         } else {
-            for id in ranked.ids() {
-                let Some(entry) = allowed.iter().find(|entry| entry.definition.id == *id) else {
+            for (ranked_position, id) in ranked.ids().iter().enumerate() {
+                if ranked_position % DISCOVERY_GUARD_INTERVAL == 0 {
+                    guard()?;
+                }
+                let mut found = None;
+                for (position, entry) in allowed.iter().enumerate() {
+                    if position % DISCOVERY_GUARD_INTERVAL == 0 {
+                        guard()?;
+                    }
+                    if entry.definition.id == *id {
+                        found = Some(entry);
+                        break;
+                    }
+                }
+                let Some(entry) = found else {
                     continue;
                 };
+                guard()?;
                 let mut expanded = required.clone();
+                guard()?;
                 expanded.insert(entry.definition.id.clone());
-                let expanded_entries = allowed
-                    .iter()
-                    .filter(|entry| expanded.contains(&entry.definition.id))
-                    .collect::<Vec<_>>();
-                if fits_refs(&expanded_entries, limits)? {
+                let expanded_entries = collect_required(&allowed, &expanded, guard)?;
+                if fits_refs(&expanded_entries, limits, guard)? {
                     required = expanded;
                 }
             }
         }
-        let selected = allowed
-            .iter()
-            .filter(|entry| required.contains(&entry.definition.id))
-            .collect::<Vec<_>>();
-        Ok(scope_with_stats(caller, selected, base_stats, true))
+        guard()?;
+        let selected = collect_required(&allowed, &required, guard)?;
+        scope_with_stats(caller, selected, base_stats, true, guard)
     }
+}
+
+fn collect_all<'a>(
+    entries: &'a [AllowedCatalogEntry<'a>],
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
+) -> Result<Vec<&'a AllowedCatalogEntry<'a>>, HarnessError> {
+    let mut selected = Vec::with_capacity(entries.len());
+    for (position, entry) in entries.iter().enumerate() {
+        if position % DISCOVERY_GUARD_INTERVAL == 0 {
+            guard()?;
+        }
+        selected.push(entry);
+    }
+    guard()?;
+    Ok(selected)
+}
+
+fn collect_required<'a>(
+    entries: &'a [AllowedCatalogEntry<'a>],
+    required: &BTreeSet<String>,
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
+) -> Result<Vec<&'a AllowedCatalogEntry<'a>>, HarnessError> {
+    let mut selected = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        if position % DISCOVERY_GUARD_INTERVAL == 0 {
+            guard()?;
+        }
+        if required.contains(&entry.definition.id) {
+            selected.push(entry);
+        }
+    }
+    guard()?;
+    Ok(selected)
 }
 
 fn scope_with_stats(
@@ -483,16 +549,23 @@ fn scope_with_stats(
     entries: Vec<&AllowedCatalogEntry<'_>>,
     mut stats: ToolDiscoveryStats,
     exceeded: bool,
-) -> (ToolScope, ToolDiscoveryStats) {
-    let definitions = entries
-        .iter()
-        .map(|entry| entry.definition.clone())
-        .collect::<Vec<_>>();
-    let serialized_definitions = serialize_definition_array(&entries);
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
+) -> Result<(ToolScope, ToolDiscoveryStats), HarnessError> {
+    let mut definitions = Vec::with_capacity(entries.len());
+    let mut tool_ids = BTreeSet::new();
+    for (position, entry) in entries.iter().enumerate() {
+        if position % DISCOVERY_GUARD_INTERVAL == 0 {
+            guard()?;
+        }
+        definitions.push(entry.definition.clone());
+        tool_ids.insert(entry.definition.id.clone());
+    }
+    guard()?;
+    let serialized_definitions = serialize_definition_array(&entries, guard)?;
     stats.selected_count = definitions.len() as u32;
     stats.catalog_exceeded_budget = exceeded;
-    let tool_ids = definitions.iter().map(|tool| tool.id.clone()).collect();
-    (
+    guard()?;
+    Ok((
         ToolScope {
             caller,
             tool_ids,
@@ -500,31 +573,41 @@ fn scope_with_stats(
             serialized_definitions,
         },
         stats,
-    )
+    ))
 }
 
-fn serialize_definition_array(entries: &[&AllowedCatalogEntry<'_>]) -> Arc<[u8]> {
-    let capacity = entries
-        .iter()
-        .map(|entry| entry.serialized_definition.len())
-        .sum::<usize>()
-        .saturating_add(entries.len().saturating_sub(1))
-        .saturating_add(2);
+fn serialize_definition_array(
+    entries: &[&AllowedCatalogEntry<'_>],
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
+) -> Result<Arc<[u8]>, HarnessError> {
+    let mut capacity = entries.len().saturating_sub(1).saturating_add(2);
+    for (position, entry) in entries.iter().enumerate() {
+        if position % DISCOVERY_GUARD_INTERVAL == 0 {
+            guard()?;
+        }
+        capacity = capacity.saturating_add(entry.serialized_definition.len());
+    }
+    guard()?;
     let mut serialized = Vec::with_capacity(capacity);
     serialized.push(b'[');
     for (position, entry) in entries.iter().enumerate() {
+        if position % DISCOVERY_GUARD_INTERVAL == 0 {
+            guard()?;
+        }
         if position > 0 {
             serialized.push(b',');
         }
         serialized.extend_from_slice(entry.serialized_definition);
     }
     serialized.push(b']');
-    Arc::from(serialized)
+    guard()?;
+    Ok(Arc::from(serialized))
 }
 
 fn fits(
     entries: &[AllowedCatalogEntry<'_>],
     limits: EffectiveLimits,
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
 ) -> Result<bool, HarnessError> {
     fits_lengths(
         entries.len(),
@@ -532,12 +615,14 @@ fn fits(
             .iter()
             .map(|entry| entry.serialized_definition.len() as u64),
         limits,
+        guard,
     )
 }
 
 fn fits_refs(
     entries: &[&AllowedCatalogEntry<'_>],
     limits: EffectiveLimits,
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
 ) -> Result<bool, HarnessError> {
     fits_lengths(
         entries.len(),
@@ -545,6 +630,7 @@ fn fits_refs(
             .iter()
             .map(|entry| entry.serialized_definition.len() as u64),
         limits,
+        guard,
     )
 }
 
@@ -552,8 +638,16 @@ fn fits_lengths(
     count: usize,
     mut lengths: impl Iterator<Item = u64>,
     limits: EffectiveLimits,
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
 ) -> Result<bool, HarnessError> {
-    let elements = lengths.try_fold(0u64, |total, length| total.checked_add(length));
+    let mut elements = Some(0u64);
+    for (position, length) in lengths.by_ref().enumerate() {
+        if position % DISCOVERY_GUARD_INTERVAL == 0 {
+            guard()?;
+        }
+        elements = elements.and_then(|total| total.checked_add(length));
+    }
+    guard()?;
     let commas = u64::try_from(count.saturating_sub(1)).map_err(|_| {
         HarnessError::ResourceLimit("tool catalog serialized byte accounting overflowed".into())
     })?;
@@ -588,64 +682,74 @@ fn rank(
     let normalized = normalize_phrase(query);
     let query_terms = tokenize(query).into_iter().collect::<BTreeSet<_>>();
     guard()?;
-    let exact_id = entries
-        .iter()
-        .filter(|entry| entry.id == normalized)
-        .map(|entry| entry.id.clone())
-        .collect::<Vec<_>>();
+    let exact_id = collect_exact_ids(entries, |entry| entry.id == normalized, guard)?;
     if exact_id.len() == 1 {
+        guard()?;
         return Ok(RankedSelection::Exact(exact_id));
     }
     guard()?;
-    let exact_name = entries
-        .iter()
-        .filter(|entry| normalize_phrase(&entry.name) == normalized)
-        .map(|entry| entry.id.clone())
-        .collect::<Vec<_>>();
+    let exact_name = collect_exact_ids(
+        entries,
+        |entry| normalize_phrase(&entry.name) == normalized,
+        guard,
+    )?;
     if exact_name.len() == 1 {
+        guard()?;
         return Ok(RankedSelection::Exact(exact_name));
     }
     if exact_name.len() > 1 {
+        guard()?;
         return Ok(RankedSelection::Exact(Vec::new()));
     }
     guard()?;
-    let exact_namespace = entries
-        .iter()
-        .filter(|entry| entry.metadata.namespace.as_deref() == Some(normalized.as_str()))
-        .map(|entry| entry.id.clone())
-        .collect::<Vec<_>>();
+    let exact_namespace = collect_exact_ids(
+        entries,
+        |entry| entry.metadata.namespace.as_deref() == Some(normalized.as_str()),
+        guard,
+    )?;
     if !exact_namespace.is_empty() {
+        guard()?;
         return Ok(RankedSelection::Exact(exact_namespace));
     }
     guard()?;
-    let exact_alias = entries
-        .iter()
-        .filter(|entry| {
+    let exact_alias = collect_exact_ids(
+        entries,
+        |entry| {
             entry
                 .metadata
                 .aliases
                 .iter()
                 .any(|alias| alias == &normalized)
-        })
-        .map(|entry| entry.id.clone())
-        .collect::<Vec<_>>();
+        },
+        guard,
+    )?;
     if exact_alias.len() == 1 {
+        guard()?;
         return Ok(RankedSelection::Exact(exact_alias));
     }
     if exact_alias.len() > 1 {
+        guard()?;
         return Ok(RankedSelection::Exact(Vec::new()));
     }
     if max_expansion == 0 {
+        guard()?;
         return Ok(RankedSelection::Lexical(Vec::new()));
     }
     if query_terms.is_empty() {
+        guard()?;
         return Ok(RankedSelection::Lexical(Vec::new()));
     }
     let documents = entries.len() as u128;
-    let total_document_len = entries.iter().fold(0u128, |total, entry| {
-        total.saturating_add(u128::from(entry.document_len))
-    });
+    let mut total_document_len = 0u128;
+    for (position, entry) in entries.iter().enumerate() {
+        if position % DISCOVERY_GUARD_INTERVAL == 0 {
+            guard()?;
+        }
+        total_document_len = total_document_len.saturating_add(u128::from(entry.document_len));
+    }
+    guard()?;
     if total_document_len == 0 {
+        guard()?;
         return Ok(RankedSelection::Lexical(Vec::new()));
     }
     let mut document_frequency = BTreeMap::<&str, u128>::new();
@@ -680,7 +784,9 @@ fn rank(
             scored.push((score, entry.id.clone()));
         }
     }
+    guard()?;
     scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    guard()?;
     let Some((best, _)) = scored.first() else {
         return Ok(RankedSelection::Lexical(Vec::new()));
     };
@@ -691,6 +797,24 @@ fn rank(
     Ok(RankedSelection::Lexical(
         scored.into_iter().take(take).map(|(_, id)| id).collect(),
     ))
+}
+
+fn collect_exact_ids(
+    entries: &[&CatalogEntry],
+    mut predicate: impl FnMut(&CatalogEntry) -> bool,
+    guard: &mut impl FnMut() -> Result<(), HarnessError>,
+) -> Result<Vec<String>, HarnessError> {
+    let mut matches = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        if position % DISCOVERY_GUARD_INTERVAL == 0 {
+            guard()?;
+        }
+        if predicate(entry) {
+            matches.push(entry.id.clone());
+        }
+    }
+    guard()?;
+    Ok(matches)
 }
 
 fn bm25_term_score(
@@ -1101,6 +1225,95 @@ mod tests {
         let references = tied.entries.iter().collect::<Vec<_>>();
         let ranked = rank(&references, "needle request", 1, &mut || Ok(())).unwrap();
         assert_eq!(ranked.ids(), &["tie.a"]);
+    }
+
+    #[test]
+    fn exact_scan_checks_stop_again_immediately_before_returning() {
+        let entries = (0..100)
+            .map(|index| CatalogEntry {
+                id: format!("exact.tool.{index:03}"),
+                name: format!("Exact tool {index:03}"),
+                metadata: ToolDiscoveryMetadata::deferred(),
+                terms: BTreeMap::new(),
+                document_len: 0,
+            })
+            .collect::<Vec<_>>();
+        let index = CatalogIndex::build(entries, &mut || Ok(())).unwrap();
+        let references = index.entries.iter().collect::<Vec<_>>();
+        let stop_before_exact_return = 1 + references.len().div_ceil(DISCOVERY_GUARD_INTERVAL) + 2;
+        let mut checkpoints = 0usize;
+        let result = rank(&references, "exact.tool.099", 1, &mut || {
+            checkpoints = checkpoints.saturating_add(1);
+            if checkpoints >= stop_before_exact_return {
+                Err(HarnessError::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(HarnessError::Cancelled)));
+        assert!(checkpoints >= stop_before_exact_return);
+    }
+
+    #[test]
+    fn successful_scope_output_is_independent_of_checkpoint_scheduling() {
+        fn registry() -> ToolRegistry {
+            let mut registry = ToolRegistry::default();
+            for index in 0..100 {
+                register(
+                    &mut registry,
+                    &format!("timing.tool.{index:03}"),
+                    "description",
+                    ToolDiscoveryMetadata::deferred(),
+                );
+            }
+            registry
+        }
+
+        let allowlist = (0..100)
+            .map(|index| format!("timing.tool.{index:03}"))
+            .collect::<Vec<_>>();
+        let select = |registry: &ToolRegistry, cadence: usize| {
+            let mut checkpoints = 0usize;
+            let selected = registry
+                .select_scope_guarded(
+                    "timing.tool.099",
+                    &allowlist,
+                    ToolCaller::Direct,
+                    ToolDiscoveryLimits::new().with_max_tools(1),
+                    &ProviderCapabilityLimits::new(),
+                    &mut || {
+                        checkpoints = checkpoints.saturating_add(1);
+                        if checkpoints.is_multiple_of(cadence) {
+                            std::thread::yield_now();
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            (selected, checkpoints)
+        };
+
+        let ((baseline, baseline_stats), baseline_checkpoints) = select(&registry(), usize::MAX);
+        for cadence in [1, 2, 7] {
+            let ((selected, stats), checkpoints) = select(&registry(), cadence);
+            assert_eq!(selected.definitions(), baseline.definitions());
+            assert_eq!(
+                selected.serialized_definitions(),
+                baseline.serialized_definitions()
+            );
+            assert_eq!(stats.candidate_count, baseline_stats.candidate_count);
+            assert_eq!(stats.selected_count, baseline_stats.selected_count);
+            assert_eq!(
+                stats.deferred_candidate_count,
+                baseline_stats.deferred_candidate_count
+            );
+            assert_eq!(
+                stats.catalog_exceeded_budget,
+                baseline_stats.catalog_exceeded_budget
+            );
+            assert!(checkpoints >= allowlist.len().div_ceil(DISCOVERY_GUARD_INTERVAL));
+        }
+        assert!(baseline_checkpoints >= allowlist.len().div_ceil(DISCOVERY_GUARD_INTERVAL));
     }
 
     #[test]

@@ -615,7 +615,11 @@ async fn hot_overflow_fails_before_model_use_and_zero_provider_capacity_is_no_to
 
 #[tokio::test]
 async fn exact_namespace_overflow_fails_before_provider_model_tool_or_events() {
-    for strategy in [RunStrategy::Direct, RunStrategy::DeclarativePlan] {
+    for strategy in [
+        RunStrategy::Direct,
+        RunStrategy::Adaptive,
+        RunStrategy::DeclarativePlan,
+    ] {
         let provider = Arc::new(
             MockModelProvider::scripted([final_response("unused")])
                 .with_capabilities(capabilities(1, true)),
