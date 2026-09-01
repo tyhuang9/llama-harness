@@ -2580,6 +2580,84 @@ mod tests {
         }
     }
 
+    struct BlockingLifecycleObserver {
+        operation: McpLifecycleOperation,
+        armed: AtomicBool,
+        blocked: AtomicBool,
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl BlockingLifecycleObserver {
+        fn arm(&self) {
+            self.armed.store(true, Ordering::Release);
+        }
+    }
+
+    impl McpObserver for BlockingLifecycleObserver {
+        fn observe(&self, event: &McpLifecycleEvent) -> Result<(), McpObserverError> {
+            if event.operation == self.operation
+                && self.armed.load(Ordering::Acquire)
+                && !self.blocked.swap(true, Ordering::AcqRel)
+            {
+                let _ = self.entered.send(());
+                let _ = self.release.lock().expect("test mutex").recv();
+            }
+            Ok(())
+        }
+    }
+
+    fn blocking_observer(
+        operation: McpLifecycleOperation,
+    ) -> (
+        Arc<BlockingLifecycleObserver>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release) = std::sync::mpsc::channel();
+        (
+            Arc::new(BlockingLifecycleObserver {
+                operation,
+                armed: AtomicBool::new(false),
+                blocked: AtomicBool::new(false),
+                entered,
+                release: Mutex::new(release),
+            }),
+            entered_receiver,
+            release_sender,
+        )
+    }
+
+    fn unique_test_server_id(prefix: &str) -> String {
+        static NEXT_TEST_SERVER: AtomicU64 = AtomicU64::new(1);
+        format!(
+            "{prefix}-{}",
+            NEXT_TEST_SERVER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn manager_for_server(
+        transport: Arc<dyn McpTransport>,
+        clock: Arc<dyn McpClock>,
+        server_id: String,
+        observer: Option<Arc<dyn McpObserver>>,
+    ) -> McpCatalogManager {
+        McpCatalogManager::with_configuration(
+            transport,
+            server_id,
+            McpLimits::default(),
+            McpTimeouts::default(),
+            McpCachePolicy {
+                legacy_ttl: Duration::from_millis(20),
+                max_stale: None,
+            },
+            clock,
+            observer,
+        )
+        .expect("valid manager")
+    }
+
     fn tool(name: &str) -> McpTool {
         McpTool {
             name: name.into(),
@@ -2948,6 +3026,173 @@ mod tests {
             .expect("refresh");
         assert!(observer.saw_snapshot.load(Ordering::Acquire));
         assert!(manager.observer_health().slow >= 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_call_observer_releases_lifecycle_and_admission_guards() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let (observer, entered, release) = blocking_observer(McpLifecycleOperation::Call);
+        let manager = Arc::new(manager_for_server(
+            transport.clone(),
+            clock,
+            unique_test_server_id("blocked-call-observer"),
+            Some(observer.clone()),
+        ));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("initial refresh");
+        observer.arm();
+
+        let tool = manager.active_tools().remove(0);
+        let call = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("test runtime")
+                .block_on(tool.execute(serde_json::json!({}), CancellationToken::new()))
+        });
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("call observer entered after outcome emission");
+
+        let initial = manager
+            .state
+            .lock()
+            .expect("test mutex")
+            .active
+            .as_ref()
+            .expect("active catalog")
+            .clone();
+        assert_eq!(initial.in_flight.count.load(Ordering::Acquire), 0);
+        assert_eq!(manager.server_call_gate.waiters.load(Ordering::Acquire), 0);
+        assert_eq!(manager.server_call_gate.permits.available_permits(), 1);
+
+        manager.invalidate_list_change();
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.refresh(CancellationToken::new()),
+        )
+        .await
+        .expect("refresh is not blocked by call observation")
+        .expect("refresh succeeds while observer is blocked");
+        assert_eq!(refreshed.generation, 2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transport.closes.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retired generation cleanup");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.close(CancellationToken::new()),
+        )
+        .await
+        .expect("close is not blocked by call observation")
+        .expect("close succeeds while observer is blocked");
+
+        assert!(observer.blocked.load(Ordering::Acquire));
+        release.send(()).expect("release call observer");
+        call.join()
+            .expect("call thread")
+            .expect("call result after observer release");
+        assert_eq!(transport.calls.load(Ordering::Acquire), 1);
+        assert_eq!(transport.closes.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn blocked_refresh_observer_releases_refresh_lock_before_callback() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let (observer, entered, release) = blocking_observer(McpLifecycleOperation::Refresh);
+        let manager = Arc::new(manager_for_server(
+            transport,
+            clock,
+            unique_test_server_id("blocked-refresh-observer"),
+            Some(observer.clone()),
+        ));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("initial refresh");
+        observer.arm();
+
+        let first_manager = Arc::clone(&manager);
+        let first = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("test runtime")
+                .block_on(first_manager.refresh(CancellationToken::new()))
+        });
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("refresh observer entered after lock release");
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.refresh(CancellationToken::new()),
+        )
+        .await
+        .expect("second refresh is not blocked by observer callback")
+        .expect("second refresh succeeds");
+        assert_eq!(second.generation, 3);
+
+        release.send(()).expect("release refresh observer");
+        assert_eq!(
+            first
+                .join()
+                .expect("refresh thread")
+                .expect("first refresh result")
+                .generation,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_close_observer_releases_close_lock_before_callback() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let (observer, entered, release) = blocking_observer(McpLifecycleOperation::Close);
+        let manager = Arc::new(manager_for_server(
+            transport,
+            clock,
+            unique_test_server_id("blocked-close-observer"),
+            Some(observer.clone()),
+        ));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("initial refresh");
+        observer.arm();
+
+        let first_manager = Arc::clone(&manager);
+        let first = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("test runtime")
+                .block_on(first_manager.close(CancellationToken::new()))
+        });
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("close observer entered after lock release");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.close(CancellationToken::new()),
+        )
+        .await
+        .expect("second close is not blocked by observer callback")
+        .expect("second close succeeds");
+
+        release.send(()).expect("release close observer");
+        first
+            .join()
+            .expect("close thread")
+            .expect("first close result");
     }
 
     #[tokio::test]
@@ -3635,6 +3880,59 @@ mod tests {
             Err(HarnessError::Cancelled)
         ));
         assert_eq!(transport.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_server_permit_before_dispatch_never_calls_transport() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let observer = Arc::new(RecordingObserver(Mutex::new(Vec::new()), false));
+        let manager = Arc::new(manager_for_server(
+            transport.clone(),
+            clock,
+            unique_test_server_id("permit-cancellation"),
+            Some(observer.clone()),
+        ));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        let (tool, dispatch_gate) = {
+            let state = manager.state.lock().expect("test mutex");
+            let active = state.active.as_ref().expect("active catalog");
+            (
+                Arc::clone(&active.tools[0]),
+                Arc::clone(&active.dispatch_gate),
+            )
+        };
+        let dispatch_barrier = dispatch_gate.write_owned().await;
+        let cancellation = CancellationToken::new();
+        let call_cancellation = cancellation.clone();
+        let call =
+            tokio::spawn(
+                async move { tool.execute(serde_json::json!({}), call_cancellation).await },
+            );
+        while manager.server_call_gate.permits.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), call)
+                .await
+                .expect("cancellation wins before dispatch")
+                .expect("call task"),
+            Err(HarnessError::Cancelled)
+        ));
+        assert_eq!(transport.calls.load(Ordering::Acquire), 0);
+        assert_eq!(manager.server_call_gate.waiters.load(Ordering::Acquire), 0);
+        assert_eq!(manager.server_call_gate.permits.available_permits(), 1);
+        assert!(observer.0.lock().expect("test mutex").iter().any(|event| {
+            event.operation == McpLifecycleOperation::Call
+                && event.outcome == McpLifecycleOutcome::Cancelled
+                && event.dispatch == McpDispatchState::NotDispatched
+        }));
+        drop(dispatch_barrier);
     }
 
     #[tokio::test]
