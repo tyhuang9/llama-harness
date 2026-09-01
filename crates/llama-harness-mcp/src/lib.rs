@@ -1509,11 +1509,16 @@ impl Tool for ManagedMcpToolAdapter {
         // This permit stays alive through the transport await. Retirement
         // obtains the write side before changing generation state, so a call
         // is either admitted before retirement or rejected before dispatch.
-        let _dispatch_permit = self.dispatch_gate.read().await;
-        let (stale, _lease) = self.check_active()?;
-        self.inner
+        let dispatch_permit = self.dispatch_gate.read().await;
+        let (stale, lease) = self.check_active()?;
+        let (result, lifecycle) = self
+            .inner
             .execute_managed(call, arguments, cancellation, stale)
-            .await
+            .await;
+        drop(lease);
+        drop(dispatch_permit);
+        self.inner.observer.emit(lifecycle);
+        result
     }
 }
 
@@ -1751,8 +1756,11 @@ impl Tool for McpToolAdapter {
         arguments: Value,
         cancellation: CancellationToken,
     ) -> Result<ToolResult, HarnessError> {
-        self.execute_managed(call, arguments, cancellation, false)
-            .await
+        let (result, lifecycle) = self
+            .execute_managed(call, arguments, cancellation, false)
+            .await;
+        self.observer.emit(lifecycle);
+        result
     }
 }
 
@@ -1763,76 +1771,89 @@ impl McpToolAdapter {
         arguments: Value,
         cancellation: CancellationToken,
         stale: bool,
-    ) -> Result<ToolResult, HarnessError> {
+    ) -> (Result<ToolResult, HarnessError>, McpLifecycleEvent) {
         if call.caller == Some(ToolCaller::Speculative) {
-            self.observer.emit(event(
-                McpLifecycleOperation::Call,
-                McpLifecycleOutcome::Rejected,
-                0,
-                0,
-                0,
-                0,
-                stale,
-                false,
-                McpDispatchState::NotDispatched,
-                Some(McpCallCorrelation::from(call)),
-            ));
-            return Err(HarnessError::InvalidTool(
-                "MCP tools cannot be speculative".into(),
-            ));
+            return (
+                Err(HarnessError::InvalidTool(
+                    "MCP tools cannot be speculative".into(),
+                )),
+                event(
+                    McpLifecycleOperation::Call,
+                    McpLifecycleOutcome::Rejected,
+                    0,
+                    0,
+                    0,
+                    0,
+                    stale,
+                    false,
+                    McpDispatchState::NotDispatched,
+                    Some(McpCallCorrelation::from(call)),
+                ),
+            );
         }
         if cancellation.is_cancelled() {
-            self.observer.emit(event(
-                McpLifecycleOperation::Call,
-                McpLifecycleOutcome::Cancelled,
-                0,
-                0,
-                0,
-                0,
-                stale,
-                true,
-                McpDispatchState::NotDispatched,
-                Some(McpCallCorrelation::from(call)),
-            ));
-            return Err(HarnessError::Cancelled);
+            return (
+                Err(HarnessError::Cancelled),
+                event(
+                    McpLifecycleOperation::Call,
+                    McpLifecycleOutcome::Cancelled,
+                    0,
+                    0,
+                    0,
+                    0,
+                    stale,
+                    true,
+                    McpDispatchState::NotDispatched,
+                    Some(McpCallCorrelation::from(call)),
+                ),
+            );
         }
         let started = Instant::now();
         let correlation = Some(McpCallCorrelation::from(call));
         let queued = self.server_call_gate.waiters.fetch_add(1, Ordering::AcqRel);
         if queued >= self.limits.max_server_waiters {
             self.server_call_gate.waiters.fetch_sub(1, Ordering::AcqRel);
-            self.observer.emit(event(
-                McpLifecycleOperation::Call,
-                McpLifecycleOutcome::Rejected,
-                elapsed_ms(started),
-                0,
-                0,
-                0,
-                stale,
-                false,
-                McpDispatchState::NotDispatched,
-                correlation,
-            ));
-            return Err(HarnessError::ResourceLimit(
-                "MCP server queue is full".into(),
-            ));
+            return (
+                Err(HarnessError::ResourceLimit(
+                    "MCP server queue is full".into(),
+                )),
+                event(
+                    McpLifecycleOperation::Call,
+                    McpLifecycleOutcome::Rejected,
+                    elapsed_ms(started),
+                    0,
+                    0,
+                    0,
+                    stale,
+                    false,
+                    McpDispatchState::NotDispatched,
+                    correlation,
+                ),
+            );
         }
         let waiter = ServerWaiter(&self.server_call_gate.waiters);
         let _server_permit = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
                 drop(waiter);
-                self.observer.emit(event(
+                return (Err(HarnessError::Cancelled), event(
                     McpLifecycleOperation::Call,
                     McpLifecycleOutcome::Cancelled,
                     elapsed_ms(started),
                     0, 0, 0, stale, true, McpDispatchState::NotDispatched, correlation.clone(),
                 ));
-                return Err(HarnessError::Cancelled);
             }
             permit = self.server_call_gate.permits.acquire() => {
                 drop(waiter);
-                permit.map_err(|_| HarnessError::InvalidTool("MCP server gate unavailable".into()))?
+                match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return (Err(HarnessError::InvalidTool("MCP server gate unavailable".into())), event(
+                        McpLifecycleOperation::Call,
+                        McpLifecycleOutcome::Rejected,
+                        elapsed_ms(started),
+                        0, 0, 0, stale, false, McpDispatchState::NotDispatched, correlation.clone(),
+                    )),
+                }
             },
         };
         enum CallFailure {
@@ -1911,8 +1932,7 @@ impl McpToolAdapter {
             }
         };
         drop(_server_permit);
-        self.observer.emit(lifecycle);
-        returned
+        (returned, lifecycle)
     }
 }
 
