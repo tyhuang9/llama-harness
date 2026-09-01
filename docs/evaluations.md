@@ -120,11 +120,13 @@ and metrics after execution; do not infer candidate behavior from `RunEvent`,
   observations and explicit activation, issues once as Speculative, commits
   the exact typed index-0 call once, and preserves task and final-state
   correctness.
-- **Invalid result, deadline, or terminal stream failure:** discards or cancels
-  the candidate, trips only that tool to Shadow, and uses safe sequential
-  Direct fallback when permitted. Invocation mismatch is a defensive internal
-  breaker: a conforming provider cannot change a call after the finalized
-  index-0 boundary.
+- **Invalid result or candidate deadline:** discards or cancels the candidate,
+  trips only that tool to Shadow, and uses safe sequential Direct fallback when
+  permitted. Invocation mismatch is a defensive internal breaker: a conforming
+  provider cannot change a call after the finalized index-0 boundary.
+- **Terminal stream failure:** trips only that tool to Shadow and terminates the
+  model turn after exactly one stream attempt; it never retries, replays, or
+  falls back to another model call.
 - **Saturated global slot or concurrency key:** does not wait or queue and
   immediately uses sequential Direct execution.
 - **Write, remote, egress-capable, or MCP import:** never enters Shadow or
