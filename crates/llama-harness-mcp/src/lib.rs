@@ -1089,6 +1089,7 @@ impl McpCatalogManager {
             for context in contexts {
                 self.schedule_close_after_drain(context.context, context.in_flight);
             }
+            drop(_close);
             self.observer.emit(event(
                 McpLifecycleOperation::Close,
                 McpLifecycleOutcome::Failed,
@@ -1130,6 +1131,7 @@ impl McpCatalogManager {
         } else {
             Ok(())
         };
+        drop(_close);
         self.observer.emit(event(
             McpLifecycleOperation::Close,
             result
