@@ -11,12 +11,13 @@ use llama_harness_core::{
 };
 use serde_json::{json, Value};
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::{
     collections::VecDeque,
     pin::Pin,
+    sync::Condvar,
     task::{Context, Poll},
     thread,
     time::Duration,
@@ -39,6 +40,7 @@ enum StreamBehavior {
     InvalidResponse,
     HugeArguments,
     CancellationAwareOversizedText,
+    PullDrivenDelayed,
 }
 
 struct StreamingProvider {
@@ -49,6 +51,9 @@ struct StreamingProvider {
     partial_emitted: Arc<Semaphore>,
     release_final: Arc<Semaphore>,
     stream_drop_saw_cancellation: Arc<AtomicBool>,
+    response_delay_ms: AtomicU64,
+    observe_tail: AtomicBool,
+    tail_polled: Arc<Semaphore>,
 }
 
 impl StreamingProvider {
@@ -61,6 +66,9 @@ impl StreamingProvider {
             partial_emitted: Arc::new(Semaphore::new(0)),
             release_final: Arc::new(Semaphore::new(0)),
             stream_drop_saw_cancellation: Arc::new(AtomicBool::new(false)),
+            response_delay_ms: AtomicU64::new(0),
+            observe_tail: AtomicBool::new(false),
+            tail_polled: Arc::new(Semaphore::new(0)),
         }
     }
 
@@ -82,6 +90,11 @@ impl StreamingProvider {
 
     fn set_behavior(&self, behavior: StreamBehavior) {
         *self.behavior.lock().expect("behavior lock") = behavior;
+    }
+
+    fn set_response_delay(&self, delay_ms: u64, observe_tail: bool) {
+        self.response_delay_ms.store(delay_ms, Ordering::SeqCst);
+        self.observe_tail.store(observe_tail, Ordering::SeqCst);
     }
 
     fn requests_tool(request: &ModelRequest) -> bool {
@@ -155,7 +168,14 @@ impl ModelProvider for StreamingProvider {
                 return Ok(ModelResponse::new(request.model).with_final_output(response));
             }
         }
-        Ok(if Self::requests_tool(&request) {
+        let requests_tool = Self::requests_tool(&request);
+        if requests_tool {
+            let delay_ms = self.response_delay_ms.load(Ordering::SeqCst);
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+        Ok(if requests_tool {
             Self::tool_response(request.model)
         } else {
             ModelResponse::new(request.model).with_final_output("done")
@@ -345,6 +365,51 @@ impl ModelProvider for StreamingProvider {
                         cancellation: model_cancellation,
                         observed: Arc::clone(&self.stream_drop_saw_cancellation),
                     }));
+                }
+                StreamBehavior::PullDrivenDelayed => {
+                    let delay_ms = self.response_delay_ms.load(Ordering::SeqCst);
+                    let observe_tail = self.observe_tail.load(Ordering::SeqCst);
+                    let tail_polled = Arc::clone(&self.tail_polled);
+                    let events =
+                        futures_util::stream::unfold((0_u8, model), move |(state, model)| {
+                            let tail_polled = Arc::clone(&tail_polled);
+                            async move {
+                                match state {
+                                    0 => Some((
+                                        Ok(ModelStreamEvent::ToolCallDelta(
+                                            ToolCallDelta::new(0, r#"{"query":"status"}"#, true)
+                                                .with_call_id("call-0")
+                                                .with_tool_id(TOOL_ID),
+                                        )),
+                                        (1, model),
+                                    )),
+                                    1 => {
+                                        if observe_tail {
+                                            tail_polled.add_permits(1);
+                                        }
+                                        if delay_ms > 0 {
+                                            tokio::time::sleep(Duration::from_millis(delay_ms))
+                                                .await;
+                                        }
+                                        Some((
+                                            Ok(ModelStreamEvent::TextDelta {
+                                                content: String::new(),
+                                            }),
+                                            (2, model),
+                                        ))
+                                    }
+                                    2 => Some((
+                                        Ok(ModelStreamEvent::Completed {
+                                            model: model.clone(),
+                                            usage: Usage::default(),
+                                        }),
+                                        (3, model),
+                                    )),
+                                    _ => None,
+                                }
+                            }
+                        });
+                    return Ok(Box::pin(events));
                 }
             }
         };
@@ -574,6 +639,54 @@ struct SlowEventSink {
     tool_completed_delay_ms: AtomicUsize,
 }
 
+struct BlockingFirstCompletionSink {
+    armed: AtomicBool,
+    completions: AtomicUsize,
+    entered: Arc<Semaphore>,
+    released: Mutex<bool>,
+    release_changed: Condvar,
+}
+
+impl BlockingFirstCompletionSink {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            completions: AtomicUsize::new(0),
+            entered: Arc::new(Semaphore::new(0)),
+            released: Mutex::new(false),
+            release_changed: Condvar::new(),
+        }
+    }
+
+    fn arm(&self) {
+        self.completions.store(0, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        *self.released.lock().expect("completion release lock") = true;
+        self.release_changed.notify_all();
+    }
+}
+
+impl EventSink for BlockingFirstCompletionSink {
+    fn emit(&self, record: EventRecord) {
+        if self.armed.load(Ordering::SeqCst)
+            && matches!(record.event, RunEvent::ToolCompleted { .. })
+            && self.completions.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            self.entered.add_permits(1);
+            let mut released = self.released.lock().expect("completion release lock");
+            while !*released {
+                released = self
+                    .release_changed
+                    .wait(released)
+                    .expect("completion release condition");
+            }
+        }
+    }
+}
+
 impl SlowEventSink {
     fn new() -> Self {
         Self {
@@ -794,6 +907,9 @@ struct CountingTool {
     definition: ToolDefinition,
     calls: AtomicUsize,
     callers: Mutex<Vec<ToolCaller>>,
+    delay_ms: AtomicU64,
+    observe_delay: AtomicBool,
+    delay_entered: Arc<Semaphore>,
 }
 
 impl CountingTool {
@@ -828,6 +944,9 @@ impl CountingTool {
             })),
             calls: AtomicUsize::new(0),
             callers: Mutex::new(Vec::new()),
+            delay_ms: AtomicU64::new(0),
+            observe_delay: AtomicBool::new(false),
+            delay_entered: Arc::new(Semaphore::new(0)),
         }
     }
 
@@ -847,6 +966,11 @@ impl CountingTool {
         ]
         .into();
         tool
+    }
+
+    fn set_delay(&self, delay_ms: u64, observe_delay: bool) {
+        self.delay_ms.store(delay_ms, Ordering::SeqCst);
+        self.observe_delay.store(observe_delay, Ordering::SeqCst);
     }
 }
 
@@ -875,6 +999,13 @@ impl Tool for CountingTool {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let caller = context.caller.unwrap_or(ToolCaller::Direct);
         self.callers.lock().expect("caller log lock").push(caller);
+        if self.observe_delay.load(Ordering::SeqCst) {
+            self.delay_entered.add_permits(1);
+        }
+        let delay_ms = self.delay_ms.load(Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
         Ok(ToolResult::success(json!({"value":"stable"})))
     }
 }
@@ -2274,6 +2405,246 @@ async fn post_issue_assembly_error_cancels_provider_stream_before_drop() {
     assert_eq!(metrics.discarded, 1);
     assert_eq!(metrics.committed, 0);
     assert_eq!(metrics.mode, SpeculationMode::Shadow);
+}
+
+#[tokio::test(start_paused = true)]
+async fn active_polls_pull_driven_tail_while_tool_is_pending_and_overlaps_latency() {
+    let active_provider = Arc::new(StreamingProvider::new(StreamBehavior::PullDrivenDelayed));
+    let active_tool = Arc::new(CountingTool::eligible());
+    let active_runner = Arc::new(
+        AgentRunner::builder(active_provider.clone())
+            .tools(registry(active_tool.clone()))
+            .policy(Arc::new(TestPolicy::new(true)))
+            .speculation(SpeculationConfig::default())
+            .build(),
+    );
+    train_and_activate(&active_runner).await;
+    active_provider.set_response_delay(10, true);
+    active_tool.set_delay(10, true);
+
+    let active_started = tokio::time::Instant::now();
+    let active_run = {
+        let runner = Arc::clone(&active_runner);
+        tokio::spawn(async move {
+            runner
+                .run_with_strategy(request(), RunStrategy::Direct)
+                .await
+        })
+    };
+    let tool_entered = active_tool
+        .delay_entered
+        .acquire()
+        .await
+        .expect("delayed tool entry semaphore open");
+    tool_entered.forget();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        active_provider.tail_polled.available_permits(),
+        1,
+        "the provider tail must be polled before the blocked tool completes"
+    );
+    let tail_polled = active_provider
+        .tail_polled
+        .try_acquire()
+        .expect("tail poll signal is available");
+    tail_polled.forget();
+    let in_flight = active_runner.speculation_metrics(TOOL_ID);
+    assert_eq!(in_flight.issued, 1);
+    assert_eq!(in_flight.in_flight, 1);
+    assert_eq!(
+        in_flight.issued,
+        in_flight.in_flight + in_flight.committed + in_flight.discarded + in_flight.cancelled
+    );
+
+    tokio::time::advance(Duration::from_millis(10)).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    let active_result = active_run
+        .await
+        .expect("active run task completes")
+        .expect("active overlap run succeeds");
+    let active_elapsed = tokio::time::Instant::now() - active_started;
+    assert_eq!(active_result.status, RunStatus::Completed);
+    assert_eq!(active_elapsed, Duration::from_millis(10));
+    let active_metrics = active_runner.speculation_metrics(TOOL_ID);
+    assert_eq!(active_metrics.in_flight, 0);
+    assert_eq!(active_metrics.committed, 1);
+    assert_eq!(active_metrics.execution_duration_ms.count, 1);
+    assert_eq!(active_metrics.publication_wait_ms.count, 1);
+
+    let shadow_provider = Arc::new(StreamingProvider::new(StreamBehavior::PullDrivenDelayed));
+    shadow_provider.set_response_delay(10, false);
+    let shadow_tool = Arc::new(CountingTool::eligible());
+    shadow_tool.set_delay(10, false);
+    let shadow_runner = Arc::new(
+        AgentRunner::builder(shadow_provider)
+            .tools(registry(shadow_tool))
+            .policy(Arc::new(TestPolicy::new(true)))
+            .speculation(SpeculationConfig::default())
+            .build(),
+    );
+    let shadow_started = tokio::time::Instant::now();
+    let shadow_run = {
+        let runner = Arc::clone(&shadow_runner);
+        tokio::spawn(async move {
+            runner
+                .run_with_strategy(request(), RunStrategy::Direct)
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(10)).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!shadow_run.is_finished());
+    tokio::time::advance(Duration::from_millis(10)).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        shadow_run
+            .await
+            .expect("shadow run task completes")
+            .expect("shadow run succeeds")
+            .status,
+        RunStatus::Completed
+    );
+    let shadow_elapsed = tokio::time::Instant::now() - shadow_started;
+
+    let disabled_provider = Arc::new(StreamingProvider::new(StreamBehavior::PullDrivenDelayed));
+    disabled_provider.set_response_delay(10, false);
+    let disabled_tool = Arc::new(CountingTool::eligible());
+    disabled_tool.set_delay(10, false);
+    let disabled_runner = Arc::new(
+        AgentRunner::builder(disabled_provider)
+            .tools(registry(disabled_tool))
+            .policy(Arc::new(TestPolicy::new(true)))
+            .build(),
+    );
+    let disabled_started = tokio::time::Instant::now();
+    let disabled_run = {
+        let runner = Arc::clone(&disabled_runner);
+        tokio::spawn(async move {
+            runner
+                .run_with_strategy(request(), RunStrategy::Direct)
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(10)).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!disabled_run.is_finished());
+    tokio::time::advance(Duration::from_millis(10)).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        disabled_run
+            .await
+            .expect("disabled run task completes")
+            .expect("disabled run succeeds")
+            .status,
+        RunStatus::Completed
+    );
+    let disabled_elapsed = tokio::time::Instant::now() - disabled_started;
+
+    assert_eq!(shadow_elapsed, Duration::from_millis(20));
+    assert_eq!(disabled_elapsed, Duration::from_millis(20));
+    assert!(active_elapsed < shadow_elapsed);
+    assert!(active_elapsed < disabled_elapsed);
+}
+
+#[tokio::test]
+async fn terminal_stream_error_cancels_and_drains_a_pending_attempt() {
+    let provider = Arc::new(StreamingProvider::new(StreamBehavior::Normal));
+    let tool = Arc::new(CancellationAwareTool::new());
+    let runner = AgentRunner::builder(provider.clone())
+        .tools(registry(tool.clone()))
+        .policy(Arc::new(TestPolicy::new(true)))
+        .speculation(SpeculationConfig::default())
+        .build();
+    train_and_activate(&runner).await;
+    provider.set_behavior(StreamBehavior::FailAfterCandidate);
+
+    let result = runner
+        .run_with_strategy(request(), RunStrategy::Direct)
+        .await
+        .expect("terminal stream error is represented");
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2_001);
+    assert_eq!(tool.observed_cancellation.load(Ordering::SeqCst), 1);
+    let metrics = runner.speculation_metrics(TOOL_ID);
+    assert_eq!(metrics.issued, 1);
+    assert_eq!(metrics.in_flight, 0);
+    assert_eq!(metrics.cancelled, 1);
+    assert_eq!(metrics.terminal_stream_failures, 1);
+    assert_eq!(metrics.mode, SpeculationMode::Shadow);
+}
+
+#[tokio::test]
+async fn committed_candidate_releases_key_before_slow_tool_completed_sink() {
+    let provider = Arc::new(StreamingProvider::new(StreamBehavior::Normal));
+    let mut keyed = CountingTool::eligible();
+    keyed.definition.concurrency_key = Some("publication-key".into());
+    let tool = Arc::new(keyed);
+    let events = Arc::new(BlockingFirstCompletionSink::new());
+    let runner = Arc::new(
+        AgentRunner::builder(provider)
+            .tools(registry(tool.clone()))
+            .policy(Arc::new(TestPolicy::new(true)))
+            .event_sink(events.clone())
+            .speculation(SpeculationConfig::default())
+            .build(),
+    );
+    train_and_activate(&runner).await;
+    events.arm();
+
+    let first = {
+        let runner = Arc::clone(&runner);
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("first-run test runtime builds")
+                .block_on(runner.run_with_strategy(request(), RunStrategy::Direct))
+        })
+    };
+    let entered = events
+        .entered
+        .acquire()
+        .await
+        .expect("first completion sink entry semaphore open");
+    entered.forget();
+
+    let second_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        runner.run_with_strategy(request(), RunStrategy::Direct),
+    )
+    .await
+    .expect("second same-key run must not wait for first event sink")
+    .expect("second same-key run succeeds");
+    assert_eq!(second_result.status, RunStatus::Completed);
+    assert!(!first.is_finished());
+
+    events.release();
+    assert_eq!(
+        first
+            .join()
+            .expect("first run thread completes")
+            .expect("first same-key run succeeds")
+            .status,
+        RunStatus::Completed
+    );
+    let metrics = runner.speculation_metrics(TOOL_ID);
+    assert_eq!(metrics.issued, 2);
+    assert_eq!(metrics.committed, 2);
+    assert_eq!(metrics.in_flight, 0);
+    assert_eq!(metrics.key_saturated, 0);
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use crate::speculation::{SpeculationController, SpeculativeResolution};
+use crate::speculation::{PreIssueSkipReason, SpeculationController, SpeculativeResolution};
 use crate::{
     discovery::ToolScope,
     limits::{ensure_json_depth, serialized_len},
@@ -1010,7 +1010,10 @@ struct SpeculativeLease {
     controller: Arc<SpeculationController>,
     tool_id: String,
     cancellation: tokio_util::sync::CancellationToken,
-    _slot: Option<OwnedSemaphorePermit>,
+    slot: Option<OwnedSemaphorePermit>,
+    started_at: Instant,
+    execution_finished_at: Option<Instant>,
+    execution_duration_recorded: bool,
     drop_resolution: SpeculativeResolution,
     settled: bool,
 }
@@ -1022,24 +1025,48 @@ impl SpeculativeLease {
         cancellation: tokio_util::sync::CancellationToken,
         slot: OwnedSemaphorePermit,
     ) -> Self {
+        let started_at = Instant::now();
+        controller.record_issue_started(tool_id, started_at);
         Self {
             controller: Arc::clone(controller),
             tool_id: tool_id.to_owned(),
             cancellation,
-            _slot: Some(slot),
+            slot: Some(slot),
+            started_at,
+            execution_finished_at: None,
+            execution_duration_recorded: false,
             drop_resolution: SpeculativeResolution::Cancelled,
             settled: false,
         }
     }
 
     fn execution_finished(&mut self) {
+        self.record_execution_duration();
+        self.execution_finished_at = Some(Instant::now());
         self.drop_resolution = SpeculativeResolution::Discarded;
+    }
+
+    fn record_execution_duration(&mut self) {
+        if !self.execution_duration_recorded {
+            self.controller
+                .record_execution_duration(&self.tool_id, elapsed_ms(self.started_at));
+            self.execution_duration_recorded = true;
+        }
+    }
+
+    fn publication_wait_ms(&self) -> Option<u64> {
+        self.execution_finished_at.map(elapsed_ms)
     }
 
     fn settle(&mut self, resolution: SpeculativeResolution) {
         if !self.settled {
             self.cancellation.cancel();
-            self.controller.record_resolution(&self.tool_id, resolution);
+            self.record_execution_duration();
+            self.controller.record_resolution(
+                &self.tool_id,
+                resolution,
+                self.publication_wait_ms(),
+            );
             self.settled = true;
         }
     }
@@ -1056,11 +1083,13 @@ impl SpeculativeLease {
                 candidate_deadline,
                 run_deadline,
                 cancellation,
+                self.publication_wait_ms(),
             )
         {
             return false;
         }
         self.cancellation.cancel();
+        self.slot.take();
         self.settled = true;
         true
     }
@@ -1070,8 +1099,12 @@ impl Drop for SpeculativeLease {
     fn drop(&mut self) {
         if !self.settled {
             self.cancellation.cancel();
-            self.controller
-                .record_resolution(&self.tool_id, self.drop_resolution);
+            self.record_execution_duration();
+            self.controller.record_resolution(
+                &self.tool_id,
+                self.drop_resolution,
+                self.publication_wait_ms(),
+            );
             self.settled = true;
         }
     }
@@ -1088,9 +1121,60 @@ impl SpeculativeExecution {
         run_deadline: Option<Instant>,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> bool {
-        self.lease
+        if !self
+            .lease
             .try_commit(candidate_deadline, run_deadline, cancellation)
+        {
+            return false;
+        }
+        self.prepared._concurrency_permit.take();
+        true
     }
+}
+
+struct PreIssueGuard {
+    controller: Arc<SpeculationController>,
+    tool_id: String,
+    reason: PreIssueSkipReason,
+    settled: bool,
+}
+
+impl PreIssueGuard {
+    fn new(controller: &Arc<SpeculationController>, tool_id: &str) -> Self {
+        Self {
+            controller: Arc::clone(controller),
+            tool_id: tool_id.to_owned(),
+            reason: PreIssueSkipReason::Aborted,
+            settled: false,
+        }
+    }
+
+    fn skip(&mut self, reason: PreIssueSkipReason) {
+        self.reason = reason;
+    }
+
+    fn issued(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for PreIssueGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.controller
+                .record_pre_issue_skip(&self.tool_id, self.reason);
+            self.settled = true;
+        }
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(
+        Instant::now()
+            .saturating_duration_since(started)
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Broker outcome after revalidating a completed candidate at the normal
@@ -1165,7 +1249,9 @@ impl<'a> ToolBroker<'a> {
         trace_id: &str,
         deadline: Option<Instant>,
         slot: OwnedSemaphorePermit,
+        candidate_cancellation: tokio_util::sync::CancellationToken,
     ) -> SpeculativeAttempt {
+        let mut pre_issue = PreIssueGuard::new(controller, &call.tool_id);
         let prepared = match self
             .prepare_speculative(
                 controller,
@@ -1175,30 +1261,52 @@ impl<'a> ToolBroker<'a> {
                 run_id,
                 trace_id,
                 deadline,
+                &candidate_cancellation,
+                &mut pre_issue,
             )
             .await
         {
             Ok(Some(prepared)) => prepared,
-            Ok(None) | Err(_) => return SpeculativeAttempt::NotIssued,
+            Ok(None) => return SpeculativeAttempt::NotIssued,
+            Err(error) => {
+                pre_issue.skip(
+                    if matches!(error, HarnessError::Cancelled | HarnessError::TimedOut(_)) {
+                        PreIssueSkipReason::Aborted
+                    } else {
+                        PreIssueSkipReason::Failed
+                    },
+                );
+                return SpeculativeAttempt::NotIssued;
+            }
         };
         if check_stopped(
-            &request.cancellation,
+            &candidate_cancellation,
             deadline,
             "speculative execution deadline reached before tool invocation",
         )
         .is_err()
         {
+            pre_issue.skip(PreIssueSkipReason::Aborted);
             return SpeculativeAttempt::NotIssued;
         }
         if !controller.is_active(&prepared.call.tool_id)
             || !self.speculative_prepared_is_live(request, &prepared)
         {
+            pre_issue.skip(PreIssueSkipReason::Invalidated);
             return SpeculativeAttempt::NotIssued;
         }
+        pre_issue.issued();
         SpeculativeAttempt::Issued(
-            self.execute_speculative(prepared, controller, request, deadline, slot)
-                .await
-                .map(Box::new),
+            self.execute_speculative(
+                prepared,
+                controller,
+                request,
+                &candidate_cancellation,
+                deadline,
+                slot,
+            )
+            .await
+            .map(Box::new),
         )
     }
 
@@ -1212,16 +1320,22 @@ impl<'a> ToolBroker<'a> {
         run_id: &str,
         trace_id: &str,
         deadline: Option<Instant>,
+        candidate_cancellation: &tokio_util::sync::CancellationToken,
+        pre_issue: &mut PreIssueGuard,
     ) -> Result<Option<SpeculativePreparedCall>, HarnessError> {
         controller.config().validate()?;
         if !controller.is_active(&call.tool_id)
             || call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes
         {
+            pre_issue.skip(PreIssueSkipReason::Validation);
             return Ok(None);
         }
         let arguments: Value = match serde_json::from_str(&call.arguments_json) {
             Ok(arguments) => arguments,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                pre_issue.skip(PreIssueSkipReason::Validation);
+                return Ok(None);
+            }
         };
         if ensure_json_depth(
             "speculative tool arguments",
@@ -1231,6 +1345,7 @@ impl<'a> ToolBroker<'a> {
         .is_err()
             || self.tools.validate(&call.tool_id, &arguments).is_err()
         {
+            pre_issue.skip(PreIssueSkipReason::Validation);
             return Ok(None);
         }
         call.arguments_json = serde_json::to_string(&arguments).map_err(|_| {
@@ -1239,13 +1354,16 @@ impl<'a> ToolBroker<'a> {
             )
         })?;
         if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
+            pre_issue.skip(PreIssueSkipReason::Validation);
             return Ok(None);
         }
         let key = InvocationKey::new(&call.tool_id, &arguments);
         let Some((tool, catalog_version)) = self.tools.get_versioned(&call.tool_id) else {
+            pre_issue.skip(PreIssueSkipReason::Invalidated);
             return Ok(None);
         };
         if !self.speculative_metadata_is_live(request, &call.tool_id, tool.as_ref()) {
+            pre_issue.skip(PreIssueSkipReason::Invalidated);
             return Ok(None);
         }
         let mut context =
@@ -1253,49 +1371,91 @@ impl<'a> ToolBroker<'a> {
         context.caller = Some(ToolCaller::Speculative);
         let mut direct_context = context.clone();
         direct_context.caller = Some(ToolCaller::Direct);
-        let ordinary = await_guarded(
+        let ordinary = match await_guarded(
             self.policy.decide_with_context(
                 &direct_context,
                 tool.definition(),
                 &arguments,
                 request,
             ),
-            &request.cancellation,
+            candidate_cancellation,
             deadline,
             "ordinary policy decision exceeded candidate deadline",
             None,
         )
-        .await?;
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                pre_issue.skip(
+                    if matches!(error, HarnessError::Cancelled | HarnessError::TimedOut(_)) {
+                        PreIssueSkipReason::Aborted
+                    } else {
+                        PreIssueSkipReason::Failed
+                    },
+                );
+                return Err(error);
+            }
+        };
         // Approval is never requested before hidden issue. A visible
         // authoritative Direct call handles RequireApproval later.
         if !matches!(ordinary, PolicyDecision::Allow { .. }) {
+            pre_issue.skip(PreIssueSkipReason::Policy);
             return Ok(None);
         }
-        let decision = await_guarded(
+        let decision = match await_guarded(
             self.policy
                 .decide_speculative(&context, tool.definition(), &arguments, request),
-            &request.cancellation,
+            candidate_cancellation,
             deadline,
             "speculative policy decision exceeded candidate deadline",
             None,
         )
-        .await?;
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                pre_issue.skip(
+                    if matches!(error, HarnessError::Cancelled | HarnessError::TimedOut(_)) {
+                        PreIssueSkipReason::Aborted
+                    } else {
+                        PreIssueSkipReason::Failed
+                    },
+                );
+                return Err(error);
+            }
+        };
         if !matches!(decision, PolicyDecision::Allow { .. }) || !controller.is_active(&call.tool_id)
         {
+            pre_issue.skip(if matches!(decision, PolicyDecision::Allow { .. }) {
+                PreIssueSkipReason::Invalidated
+            } else {
+                PreIssueSkipReason::Policy
+            });
             return Ok(None);
         }
         let Some((current, current_version)) = self.tools.get_versioned(&call.tool_id) else {
+            pre_issue.skip(PreIssueSkipReason::Invalidated);
             return Ok(None);
         };
         if current_version != catalog_version
             || !Arc::ptr_eq(&current, &tool)
             || !self.speculative_metadata_is_live(request, &call.tool_id, current.as_ref())
         {
+            pre_issue.skip(PreIssueSkipReason::Invalidated);
             return Ok(None);
         }
         let concurrency_permit = if let Some(key) = &tool.definition().concurrency_key {
-            let Some(permit) = self.concurrency.try_acquire(key)? else {
-                return Ok(None);
+            let permit = match self.concurrency.try_acquire(key) {
+                Ok(Some(permit)) => permit,
+                Ok(None) => {
+                    pre_issue.skip(PreIssueSkipReason::KeySaturated);
+                    return Ok(None);
+                }
+                Err(error) => {
+                    pre_issue.skip(PreIssueSkipReason::Failed);
+                    return Err(error);
+                }
             };
             Some(permit)
         } else {
@@ -1304,6 +1464,7 @@ impl<'a> ToolBroker<'a> {
         if !controller.is_active(&call.tool_id)
             || !self.speculative_metadata_is_live(request, &call.tool_id, tool.as_ref())
         {
+            pre_issue.skip(PreIssueSkipReason::Invalidated);
             return Ok(None);
         }
         Ok(Some(SpeculativePreparedCall {
@@ -1323,12 +1484,13 @@ impl<'a> ToolBroker<'a> {
         prepared: SpeculativePreparedCall,
         controller: &Arc<SpeculationController>,
         request: &RunRequest,
+        candidate_cancellation: &tokio_util::sync::CancellationToken,
         deadline: Option<Instant>,
         slot: OwnedSemaphorePermit,
     ) -> Result<SpeculativeExecution, HarnessError> {
         // The explicit tool policy attests that Direct and Speculative caller
         // contexts have caller-invariant successful-result semantics.
-        let tool_cancellation = request.cancellation.child_token();
+        let tool_cancellation = candidate_cancellation.child_token();
         let mut lease = SpeculativeLease::new(
             controller,
             &prepared.call.tool_id,
@@ -1342,7 +1504,7 @@ impl<'a> ToolBroker<'a> {
         );
         let tool_result = match await_dispatched_tool(
             execution,
-            &request.cancellation,
+            candidate_cancellation,
             deadline,
             "speculative tool execution exceeded candidate deadline",
             &tool_cancellation,

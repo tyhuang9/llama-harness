@@ -66,8 +66,8 @@ pub use policy::{
 pub use programmatic::ProgrammaticHostConfig;
 pub use runner::{AgentRunner, AgentRunnerBuilder};
 pub use speculation::{
-    SpeculationConfig, SpeculationMetrics, SpeculationMode, SpeculationReadiness,
-    HARD_MAX_SPECULATION_DURATION_MS, HARD_MAX_SPECULATION_STREAM_EVENTS,
+    SpeculationConfig, SpeculationLatencyHistogram, SpeculationMetrics, SpeculationMode,
+    SpeculationReadiness, HARD_MAX_SPECULATION_DURATION_MS, HARD_MAX_SPECULATION_STREAM_EVENTS,
     MIN_SPECULATION_SHADOW_OBSERVATIONS,
 };
 pub use streaming::{
