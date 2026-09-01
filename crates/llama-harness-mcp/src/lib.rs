@@ -3277,6 +3277,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_old_generation_call_is_rejected_after_refresh_wins() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let manager = Arc::new(manager(transport.clone(), clock, None, None));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        transport.block_call.store(true, Ordering::Release);
+        let old = manager.active_tools().remove(0);
+        let admitted = Arc::clone(&old);
+        let admitted_call = tokio::spawn(async move {
+            admitted
+                .execute(serde_json::json!({}), CancellationToken::new())
+                .await
+        });
+        while transport.call_started.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let queued = Arc::clone(&old);
+        let queued_call = tokio::spawn(async move {
+            queued
+                .execute(serde_json::json!({}), CancellationToken::new())
+                .await
+        });
+        let refresh_manager = Arc::clone(&manager);
+        let refresh =
+            tokio::spawn(async move { refresh_manager.refresh(CancellationToken::new()).await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        transport.block_call.store(false, Ordering::Release);
+        transport.call_release.notify_waiters();
+        admitted_call
+            .await
+            .expect("admitted task")
+            .expect("admitted result");
+        refresh
+            .await
+            .expect("refresh task")
+            .expect("refresh result");
+        assert!(matches!(
+            queued_call.await.expect("queued task"),
+            Err(HarnessError::InvalidTool(_))
+        ));
+        assert_eq!(transport.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
     async fn generated_id_collision_rejects_the_complete_snapshot_and_releases_context() {
         let clock = Arc::new(FakeClock::default());
         let transport = Arc::new(FakeTransport::modern(
