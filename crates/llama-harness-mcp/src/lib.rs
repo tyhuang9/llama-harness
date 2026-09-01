@@ -17,7 +17,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, Weak,
     },
     time::{Duration, Instant},
@@ -25,18 +25,46 @@ use std::{
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-static SERVER_CALL_GATES: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>> =
-    OnceLock::new();
+const MAX_SERVER_GATES: usize = 256;
 
-fn server_call_gate(server_id: &str) -> Arc<tokio::sync::Semaphore> {
+struct ServerCallGate {
+    permits: tokio::sync::Semaphore,
+    waiters: AtomicUsize,
+}
+
+struct ServerWaiter<'a>(&'a AtomicUsize);
+
+impl Drop for ServerWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+static SERVER_CALL_GATES: OnceLock<Mutex<HashMap<String, Weak<ServerCallGate>>>> = OnceLock::new();
+
+fn server_call_gate_with_limit(
+    server_id: &str,
+    max_gates: usize,
+) -> Result<Arc<ServerCallGate>, McpError> {
     let gates = SERVER_CALL_GATES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut gates = gates.lock().expect("MCP server gate mutex");
+    gates.retain(|_, gate| gate.strong_count() != 0);
     if let Some(gate) = gates.get(server_id).and_then(Weak::upgrade) {
-        return gate;
+        return Ok(gate);
     }
-    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    if gates.len() >= max_gates {
+        return Err(McpError::ResourceLimit);
+    }
+    let gate = Arc::new(ServerCallGate {
+        permits: tokio::sync::Semaphore::new(1),
+        waiters: AtomicUsize::new(0),
+    });
     gates.insert(server_id.to_owned(), Arc::downgrade(&gate));
-    gate
+    Ok(gate)
+}
+
+fn server_call_gate(server_id: &str) -> Result<Arc<ServerCallGate>, McpError> {
+    server_call_gate_with_limit(server_id, MAX_SERVER_GATES)
 }
 
 /// Explicit MCP protocol era negotiated with a server.
@@ -234,6 +262,8 @@ pub struct McpLimits {
     /// by this manager. Refresh fails before connecting when this bound is
     /// exhausted.
     pub max_retired_generations: usize,
+    /// Maximum queued local calls for one server before calls fail closed.
+    pub max_server_waiters: usize,
 }
 
 /// Bounded lifecycle deadlines. Calls are never retried after a timeout.
@@ -273,6 +303,7 @@ impl Default for McpLimits {
             max_string_bytes: 64 * 1024,
             max_context_capabilities: 128,
             max_retired_generations: 8,
+            max_server_waiters: 32,
         }
     }
 }
@@ -294,6 +325,9 @@ pub enum McpError {
     /// Shutdown cleanup is still owned by an in-progress drain worker.
     #[error("MCP shutdown cleanup pending")]
     CleanupPending,
+    /// A local admission bound was exhausted before transport dispatch.
+    #[error("MCP resource limit exceeded")]
+    ResourceLimit,
     /// The configured clock was non-monotonic or overflowed a deadline.
     #[error("MCP catalog clock failure")]
     Clock,
@@ -642,7 +676,7 @@ pub struct McpCatalogManager {
     close_lock: tokio::sync::Mutex<()>,
     observer: Arc<ObserverHub>,
     registration_group: ToolRegistrationGroup,
-    server_call_gate: Arc<tokio::sync::Semaphore>,
+    server_call_gate: Arc<ServerCallGate>,
     id_deriver: Arc<McpIdDeriver>,
 }
 
@@ -695,7 +729,7 @@ impl McpCatalogManager {
             }),
             registration_group: ToolRegistrationGroup::new(format!("mcp:{server_id}"))
                 .map_err(McpError::Core)?,
-            server_call_gate: server_call_gate(&server_id),
+            server_call_gate: server_call_gate(&server_id)?,
             id_deriver: Arc::new(generated_id),
         })
     }
@@ -716,6 +750,7 @@ impl McpCatalogManager {
             Ok(value) => value,
             Err(error) => {
                 let cancelled = cancellation.is_cancelled();
+                drop(_refresh);
                 self.observer.emit(event(
                     McpLifecycleOperation::Refresh,
                     if cancelled {
@@ -942,6 +977,7 @@ impl McpCatalogManager {
                 Arc::clone(&previous.in_flight),
             );
         }
+        drop(_refresh);
         self.observer.emit(event(
             McpLifecycleOperation::Refresh,
             McpLifecycleOutcome::Succeeded,
@@ -1595,7 +1631,8 @@ fn outcome_for_error(error: &McpError) -> McpLifecycleOutcome {
         McpError::CatalogUnavailable
         | McpError::CleanupPending
         | McpError::Clock
-        | McpError::InvalidCatalog(_) => McpLifecycleOutcome::Rejected,
+        | McpError::InvalidCatalog(_)
+        | McpError::ResourceLimit => McpLifecycleOutcome::Rejected,
         McpError::Core(_) => McpLifecycleOutcome::Failed,
     }
 }
@@ -1607,6 +1644,7 @@ fn dispatch_for_error(error: &McpError) -> McpDispatchState {
         | McpError::CleanupPending
         | McpError::Clock
         | McpError::InvalidCatalog(_)
+        | McpError::ResourceLimit
         | McpError::Core(_) => McpDispatchState::NotDispatched,
     }
 }
@@ -1646,7 +1684,7 @@ struct McpToolAdapter {
     call_timeout: Duration,
     limits: McpLimits,
     observer: Arc<ObserverHub>,
-    server_call_gate: Arc<tokio::sync::Semaphore>,
+    server_call_gate: Arc<ServerCallGate>,
 }
 impl McpToolAdapter {
     #[allow(clippy::too_many_arguments)]
@@ -1659,7 +1697,7 @@ impl McpToolAdapter {
         call_timeout: Duration,
         limits: McpLimits,
         observer: Arc<ObserverHub>,
-        server_call_gate: Arc<tokio::sync::Semaphore>,
+        server_call_gate: Arc<ServerCallGate>,
     ) -> Self {
         let native_name = tool.name.clone();
         let mut d = ToolDefinition::new(id, tool.name, tool.description, tool.input_schema)
@@ -1758,8 +1796,30 @@ impl McpToolAdapter {
         }
         let started = Instant::now();
         let correlation = Some(McpCallCorrelation::from(call));
+        let queued = self.server_call_gate.waiters.fetch_add(1, Ordering::AcqRel);
+        if queued >= self.limits.max_server_waiters {
+            self.server_call_gate.waiters.fetch_sub(1, Ordering::AcqRel);
+            self.observer.emit(event(
+                McpLifecycleOperation::Call,
+                McpLifecycleOutcome::Rejected,
+                elapsed_ms(started),
+                0,
+                0,
+                0,
+                stale,
+                false,
+                McpDispatchState::NotDispatched,
+                correlation,
+            ));
+            return Err(HarnessError::ResourceLimit(
+                "MCP server queue is full".into(),
+            ));
+        }
+        let waiter = ServerWaiter(&self.server_call_gate.waiters);
         let _server_permit = tokio::select! {
+            biased;
             _ = cancellation.cancelled() => {
+                drop(waiter);
                 self.observer.emit(event(
                     McpLifecycleOperation::Call,
                     McpLifecycleOutcome::Cancelled,
@@ -1768,8 +1828,10 @@ impl McpToolAdapter {
                 ));
                 return Err(HarnessError::Cancelled);
             }
-            permit = Arc::clone(&self.server_call_gate).acquire_owned() => permit
-                .map_err(|_| HarnessError::InvalidTool("MCP server gate unavailable".into()))?,
+            permit = self.server_call_gate.permits.acquire() => {
+                drop(waiter);
+                permit.map_err(|_| HarnessError::InvalidTool("MCP server gate unavailable".into()))?
+            },
         };
         enum CallFailure {
             Cancelled,
@@ -1785,7 +1847,7 @@ impl McpToolAdapter {
             },
         };
         let elapsed = elapsed_ms(started);
-        match result {
+        let (returned, lifecycle) = match result {
             Ok(result) => {
                 let normalized = normalize_result(
                     result,
@@ -1796,7 +1858,7 @@ impl McpToolAdapter {
                     Ok((_, bytes, count)) => (McpLifecycleOutcome::Succeeded, *count, *bytes),
                     Err(_) => (McpLifecycleOutcome::Rejected, 0, 0),
                 };
-                self.observer.emit(event(
+                let lifecycle = event(
                     McpLifecycleOperation::Call,
                     outcome,
                     elapsed,
@@ -1807,8 +1869,8 @@ impl McpToolAdapter {
                     false,
                     McpDispatchState::Responded,
                     correlation,
-                ));
-                normalized.map(|(result, _, _)| result)
+                );
+                (normalized.map(|(result, _, _)| result), lifecycle)
             }
             Err(error) => {
                 let (outcome, cancelled, dispatch, returned) = match error {
@@ -1831,7 +1893,7 @@ impl McpToolAdapter {
                         HarnessError::Tool("MCP transport failure".into()),
                     ),
                 };
-                self.observer.emit(event(
+                let lifecycle = event(
                     McpLifecycleOperation::Call,
                     outcome,
                     elapsed,
@@ -1842,10 +1904,13 @@ impl McpToolAdapter {
                     cancelled,
                     dispatch,
                     correlation,
-                ));
-                Err(returned)
+                );
+                (Err(returned), lifecycle)
             }
-        }
+        };
+        drop(_server_permit);
+        self.observer.emit(lifecycle);
+        returned
     }
 }
 
@@ -2719,6 +2784,60 @@ mod tests {
             .expect("second call")
             .expect("second result");
         assert_eq!(transport.max_active_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn server_queue_limit_rejects_before_transport_dispatch() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let manager = McpCatalogManager::with_configuration(
+            transport.clone(),
+            "bounded-queue-server",
+            McpLimits {
+                max_server_waiters: 1,
+                ..McpLimits::default()
+            },
+            McpTimeouts::default(),
+            McpCachePolicy::default(),
+            clock,
+            None,
+        )
+        .expect("manager");
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        transport.block_call.store(true, Ordering::Release);
+        let tool = manager.active_tools().remove(0);
+        let first_tool = Arc::clone(&tool);
+        let first = tokio::spawn(async move {
+            first_tool
+                .execute(serde_json::json!({}), CancellationToken::new())
+                .await
+        });
+        while transport.call_started.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let second_tool = Arc::clone(&tool);
+        let second = tokio::spawn(async move {
+            second_tool
+                .execute(serde_json::json!({}), CancellationToken::new())
+                .await
+        });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            tool.execute(serde_json::json!({}), CancellationToken::new())
+                .await,
+            Err(HarnessError::ResourceLimit(_))
+        ));
+        assert_eq!(transport.calls.load(Ordering::Acquire), 1);
+        transport.block_call.store(false, Ordering::Release);
+        transport.call_release.notify_waiters();
+        first.await.expect("first task").expect("first result");
+        second.await.expect("second task").expect("second result");
+        assert_eq!(transport.calls.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test]
