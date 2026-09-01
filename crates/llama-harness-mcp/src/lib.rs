@@ -1506,14 +1506,56 @@ impl Tool for ManagedMcpToolAdapter {
         arguments: Value,
         cancellation: CancellationToken,
     ) -> Result<ToolResult, HarnessError> {
+        let server_permit = match self.inner.acquire_server(&cancellation).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                let (outcome, cancelled) = match error {
+                    HarnessError::Cancelled => (McpLifecycleOutcome::Cancelled, true),
+                    _ => (McpLifecycleOutcome::Rejected, false),
+                };
+                self.inner.observer.emit(event(
+                    McpLifecycleOperation::Call,
+                    outcome,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    cancelled,
+                    McpDispatchState::NotDispatched,
+                    Some(McpCallCorrelation::from(call)),
+                ));
+                return Err(error);
+            }
+        };
         // This permit stays alive through the transport await. Retirement
         // obtains the write side before changing generation state, so a call
         // is either admitted before retirement or rejected before dispatch.
-        let dispatch_permit = self.dispatch_gate.read().await;
+        let dispatch_permit = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                drop(server_permit);
+                self.inner.observer.emit(event(
+                    McpLifecycleOperation::Call,
+                    McpLifecycleOutcome::Cancelled,
+                    0, 0, 0, 0, false, true,
+                    McpDispatchState::NotDispatched,
+                    Some(McpCallCorrelation::from(call)),
+                ));
+                return Err(HarnessError::Cancelled);
+            },
+            permit = self.dispatch_gate.read() => permit,
+        };
         let (stale, lease) = self.check_active()?;
+        if cancellation.is_cancelled() {
+            drop(lease);
+            drop(dispatch_permit);
+            drop(server_permit);
+            return Err(HarnessError::Cancelled);
+        }
         let (result, lifecycle) = self
             .inner
-            .execute_managed(call, arguments, cancellation, stale)
+            .execute_managed(call, arguments, cancellation, stale, Some(server_permit))
             .await;
         drop(lease);
         drop(dispatch_permit);
@@ -1757,7 +1799,7 @@ impl Tool for McpToolAdapter {
         cancellation: CancellationToken,
     ) -> Result<ToolResult, HarnessError> {
         let (result, lifecycle) = self
-            .execute_managed(call, arguments, cancellation, false)
+            .execute_managed(call, arguments, cancellation, false, None)
             .await;
         self.observer.emit(lifecycle);
         result
@@ -1765,12 +1807,38 @@ impl Tool for McpToolAdapter {
 }
 
 impl McpToolAdapter {
+    async fn acquire_server(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, HarnessError> {
+        let queued = self.server_call_gate.waiters.fetch_add(1, Ordering::AcqRel);
+        if queued >= self.limits.max_server_waiters {
+            self.server_call_gate.waiters.fetch_sub(1, Ordering::AcqRel);
+            return Err(HarnessError::ResourceLimit(
+                "MCP server queue is full".into(),
+            ));
+        }
+        let waiter = ServerWaiter(&self.server_call_gate.waiters);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                drop(waiter);
+                Err(HarnessError::Cancelled)
+            }
+            permit = self.server_call_gate.permits.acquire() => {
+                drop(waiter);
+                permit.map_err(|_| HarnessError::InvalidTool("MCP server gate unavailable".into()))
+            }
+        }
+    }
+
     async fn execute_managed(
         &self,
         call: &ToolCallContext,
         arguments: Value,
         cancellation: CancellationToken,
         stale: bool,
+        preacquired: Option<tokio::sync::SemaphorePermit<'_>>,
     ) -> (Result<ToolResult, HarnessError>, McpLifecycleEvent) {
         if call.caller == Some(ToolCaller::Speculative) {
             return (
@@ -1810,49 +1878,30 @@ impl McpToolAdapter {
         }
         let started = Instant::now();
         let correlation = Some(McpCallCorrelation::from(call));
-        let queued = self.server_call_gate.waiters.fetch_add(1, Ordering::AcqRel);
-        if queued >= self.limits.max_server_waiters {
-            self.server_call_gate.waiters.fetch_sub(1, Ordering::AcqRel);
-            return (
-                Err(HarnessError::ResourceLimit(
-                    "MCP server queue is full".into(),
-                )),
-                event(
-                    McpLifecycleOperation::Call,
-                    McpLifecycleOutcome::Rejected,
-                    elapsed_ms(started),
-                    0,
-                    0,
-                    0,
-                    stale,
-                    false,
-                    McpDispatchState::NotDispatched,
-                    correlation,
-                ),
-            );
-        }
-        let waiter = ServerWaiter(&self.server_call_gate.waiters);
-        let _server_permit = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                drop(waiter);
-                return (Err(HarnessError::Cancelled), event(
-                    McpLifecycleOperation::Call,
-                    McpLifecycleOutcome::Cancelled,
-                    elapsed_ms(started),
-                    0, 0, 0, stale, true, McpDispatchState::NotDispatched, correlation.clone(),
-                ));
-            }
-            permit = self.server_call_gate.permits.acquire() => {
-                drop(waiter);
-                match permit {
-                    Ok(permit) => permit,
-                    Err(_) => return (Err(HarnessError::InvalidTool("MCP server gate unavailable".into())), event(
-                        McpLifecycleOperation::Call,
-                        McpLifecycleOutcome::Rejected,
-                        elapsed_ms(started),
-                        0, 0, 0, stale, false, McpDispatchState::NotDispatched, correlation.clone(),
-                    )),
+        let _server_permit = match preacquired {
+            Some(permit) => permit,
+            None => match self.acquire_server(&cancellation).await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let (outcome, cancelled) = match error {
+                        HarnessError::Cancelled => (McpLifecycleOutcome::Cancelled, true),
+                        _ => (McpLifecycleOutcome::Rejected, false),
+                    };
+                    return (
+                        Err(error),
+                        event(
+                            McpLifecycleOperation::Call,
+                            outcome,
+                            elapsed_ms(started),
+                            0,
+                            0,
+                            0,
+                            stale,
+                            cancelled,
+                            McpDispatchState::NotDispatched,
+                            correlation,
+                        ),
+                    );
                 }
             },
         };
@@ -3466,7 +3515,9 @@ mod tests {
             tokio::spawn(
                 async move { tool.execute(serde_json::json!({}), task_cancellation).await },
             );
-        tokio::task::yield_now().await;
+        while transport.calls.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
         assert!(matches!(
             manager.close(CancellationToken::new()).await,
             Err(McpError::CleanupPending)
