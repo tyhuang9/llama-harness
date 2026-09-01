@@ -1612,6 +1612,9 @@ impl<'a> ToolBroker<'a> {
             return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
         }
         let tool_result = Arc::clone(&candidate.result);
+        // The result is now committed and independently retained. Release the
+        // speculative runner/keyed permits before invoking synchronous sinks.
+        drop(candidate);
         self.mark_dispatched(state, &prepared);
         let committed = BrokerExecution {
             result: Arc::clone(&tool_result),
