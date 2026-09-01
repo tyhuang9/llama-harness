@@ -2027,7 +2027,7 @@ impl<'a> StrategyRun<'a> {
                                 &mut self.result,
                                 &mut self.events,
                                 &mut self.broker_state,
-                                &ready.execution,
+                                &mut ready.execution,
                                 &call,
                                 self.model_calls,
                                 ready.deadline,
@@ -2036,7 +2036,6 @@ impl<'a> StrategyRun<'a> {
                             .await
                         {
                             Ok(SpeculativeCommitOutcome::Committed(tool_result)) => {
-                                ready.settle(crate::speculation::SpeculativeResolution::Committed);
                                 if let Err(error) = push_tool_message(
                                     &mut self.messages,
                                     &call,

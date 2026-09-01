@@ -493,7 +493,7 @@ impl AgentRunner {
                                 &mut result,
                                 &mut events,
                                 &mut broker_state,
-                                &ready.execution,
+                                &mut ready.execution,
                                 &call,
                                 model_calls,
                                 ready.deadline,
@@ -502,7 +502,6 @@ impl AgentRunner {
                             .await
                         {
                             Ok(SpeculativeCommitOutcome::Committed(tool_result)) => {
-                                ready.settle(crate::speculation::SpeculativeResolution::Committed);
                                 if let Err(error) = push_tool_message(
                                     &mut messages,
                                     &call,

@@ -1,4 +1,4 @@
-use crate::speculation::SpeculationController;
+use crate::speculation::{SpeculationController, SpeculativeResolution};
 use crate::{
     discovery::ToolScope,
     limits::{ensure_json_depth, serialized_len},
@@ -923,6 +923,19 @@ async fn await_dispatched_tool<T, F>(
 where
     F: Future<Output = Result<T, HarnessError>>,
 {
+    struct CancellationOnDrop {
+        cancellation: tokio_util::sync::CancellationToken,
+        armed: bool,
+    }
+
+    impl Drop for CancellationOnDrop {
+        fn drop(&mut self) {
+            if self.armed {
+                self.cancellation.cancel();
+            }
+        }
+    }
+
     enum AwaitOutcome<T> {
         Completed(Result<T, HarnessError>),
         Cancelled,
@@ -930,6 +943,12 @@ where
     }
 
     tokio::pin!(future);
+    // This guard is declared after the pinned tool future so task/future drop
+    // signals cancellation before the tool future itself is destroyed.
+    let mut cancellation_on_drop = CancellationOnDrop {
+        cancellation: child_cancellation.clone(),
+        armed: true,
+    };
     let outcome = if let Some(deadline) = deadline {
         tokio::select! {
             biased;
@@ -948,7 +967,10 @@ where
     };
 
     match outcome {
-        AwaitOutcome::Completed(result) => result,
+        AwaitOutcome::Completed(result) => {
+            cancellation_on_drop.armed = false;
+            result
+        }
         AwaitOutcome::Cancelled => {
             child_cancellation.cancel();
             let _ = tokio::time::timeout(TOOL_CLEANUP_GRACE, &mut future).await;
@@ -981,6 +1003,94 @@ pub(crate) enum SpeculativeAttempt {
 pub(crate) struct SpeculativeExecution {
     prepared: SpeculativePreparedCall,
     result: Arc<ToolResult>,
+    lease: SpeculativeLease,
+}
+
+struct SpeculativeLease {
+    controller: Arc<SpeculationController>,
+    tool_id: String,
+    cancellation: tokio_util::sync::CancellationToken,
+    _slot: Option<OwnedSemaphorePermit>,
+    drop_resolution: SpeculativeResolution,
+    settled: bool,
+}
+
+impl SpeculativeLease {
+    fn new(
+        controller: &Arc<SpeculationController>,
+        tool_id: &str,
+        cancellation: tokio_util::sync::CancellationToken,
+        slot: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            controller: Arc::clone(controller),
+            tool_id: tool_id.to_owned(),
+            cancellation,
+            _slot: Some(slot),
+            drop_resolution: SpeculativeResolution::Cancelled,
+            settled: false,
+        }
+    }
+
+    fn execution_finished(&mut self) {
+        self.drop_resolution = SpeculativeResolution::Discarded;
+    }
+
+    fn settle(&mut self, resolution: SpeculativeResolution) {
+        if !self.settled {
+            self.cancellation.cancel();
+            self.controller.record_resolution(&self.tool_id, resolution);
+            self.settled = true;
+        }
+    }
+
+    fn try_commit(
+        &mut self,
+        candidate_deadline: Instant,
+        run_deadline: Option<Instant>,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        if self.settled
+            || !self.controller.record_commit_if_active(
+                &self.tool_id,
+                candidate_deadline,
+                run_deadline,
+                cancellation,
+            )
+        {
+            return false;
+        }
+        self.cancellation.cancel();
+        self.settled = true;
+        true
+    }
+}
+
+impl Drop for SpeculativeLease {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.cancellation.cancel();
+            self.controller
+                .record_resolution(&self.tool_id, self.drop_resolution);
+            self.settled = true;
+        }
+    }
+}
+
+impl SpeculativeExecution {
+    pub(crate) fn settle(&mut self, resolution: SpeculativeResolution) {
+        self.lease.settle(resolution);
+    }
+
+    fn try_commit(
+        &mut self,
+        candidate_deadline: Instant,
+        run_deadline: Option<Instant>,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        self.lease
+            .try_commit(candidate_deadline, run_deadline, cancellation)
+    }
 }
 
 /// Broker outcome after revalidating a completed candidate at the normal
@@ -1047,13 +1157,14 @@ impl<'a> ToolBroker<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn speculate(
         &self,
-        controller: &SpeculationController,
+        controller: &Arc<SpeculationController>,
         request: &RunRequest,
         mut call: ToolCall,
         model_call_number: u32,
         run_id: &str,
         trace_id: &str,
         deadline: Option<Instant>,
+        slot: OwnedSemaphorePermit,
     ) -> SpeculativeAttempt {
         let prepared = match self
             .prepare_speculative(
@@ -1079,8 +1190,13 @@ impl<'a> ToolBroker<'a> {
         {
             return SpeculativeAttempt::NotIssued;
         }
+        if !controller.is_active(&prepared.call.tool_id)
+            || !self.speculative_prepared_is_live(request, &prepared)
+        {
+            return SpeculativeAttempt::NotIssued;
+        }
         SpeculativeAttempt::Issued(
-            self.execute_speculative(prepared, controller, request, deadline)
+            self.execute_speculative(prepared, controller, request, deadline, slot)
                 .await
                 .map(Box::new),
         )
@@ -1205,33 +1321,49 @@ impl<'a> ToolBroker<'a> {
     async fn execute_speculative(
         &self,
         prepared: SpeculativePreparedCall,
-        controller: &SpeculationController,
+        controller: &Arc<SpeculationController>,
         request: &RunRequest,
         deadline: Option<Instant>,
+        slot: OwnedSemaphorePermit,
     ) -> Result<SpeculativeExecution, HarnessError> {
-        if !controller.is_active(&prepared.call.tool_id)
-            || !self.speculative_prepared_is_live(request, &prepared)
-        {
-            return Err(HarnessError::Policy(
-                "speculative authorization changed before invocation".into(),
-            ));
-        }
         // The explicit tool policy attests that Direct and Speculative caller
         // contexts have caller-invariant successful-result semantics.
         let tool_cancellation = request.cancellation.child_token();
+        let mut lease = SpeculativeLease::new(
+            controller,
+            &prepared.call.tool_id,
+            tool_cancellation.clone(),
+            slot,
+        );
         let execution = prepared.tool.execute_with_context(
             &prepared.context,
             prepared.arguments.clone(),
             tool_cancellation.clone(),
         );
-        let tool_result = await_dispatched_tool(
+        let tool_result = match await_dispatched_tool(
             execution,
             &request.cancellation,
             deadline,
             "speculative tool execution exceeded candidate deadline",
             &tool_cancellation,
         )
-        .await?;
+        .await
+        {
+            Ok(result) => {
+                lease.execution_finished();
+                result
+            }
+            Err(error) => {
+                let resolution =
+                    if matches!(error, HarnessError::Cancelled | HarnessError::TimedOut(_)) {
+                        SpeculativeResolution::Cancelled
+                    } else {
+                        SpeculativeResolution::Discarded
+                    };
+                lease.settle(resolution);
+                return Err(error);
+            }
+        };
         if !tool_result.ok {
             return Err(HarnessError::Tool(
                 "speculative tool returned a failure result".into(),
@@ -1252,6 +1384,7 @@ impl<'a> ToolBroker<'a> {
         Ok(SpeculativeExecution {
             prepared,
             result: Arc::new(tool_result),
+            lease,
         })
     }
 
@@ -1263,7 +1396,7 @@ impl<'a> ToolBroker<'a> {
         result: &mut RunResult,
         events: &mut EventEmitter,
         state: &mut BrokerState,
-        execution: &SpeculativeExecution,
+        execution: &mut Option<Box<SpeculativeExecution>>,
         authoritative_call: &ToolCall,
         model_call_number: u32,
         candidate_deadline: Instant,
@@ -1282,20 +1415,28 @@ impl<'a> ToolBroker<'a> {
             {
                 return Err(error);
             }
+            execution.take();
             return Ok(SpeculativeCommitOutcome::NotCommitted);
         }
-        if !controller.is_active(&execution.prepared.call.tool_id)
-            || execution.prepared.model_call_number != model_call_number
-            || execution.prepared.call.id != authoritative_call.id
+        let Some(candidate) = execution.as_deref() else {
+            return Ok(SpeculativeCommitOutcome::NotCommitted);
+        };
+        if !controller.is_active(&candidate.prepared.call.tool_id)
+            || candidate.prepared.model_call_number != model_call_number
+            || candidate.prepared.call.id != authoritative_call.id
             || authoritative_call.arguments_json.len() as u64
                 > request.agent.limits.max_tool_arguments_bytes
         {
+            execution.take();
             return Ok(SpeculativeCommitOutcome::NotCommitted);
         }
         let authoritative_arguments: Value =
             match serde_json::from_str(&authoritative_call.arguments_json) {
                 Ok(arguments) => arguments,
-                Err(_) => return Ok(SpeculativeCommitOutcome::NotCommitted),
+                Err(_) => {
+                    execution.take();
+                    return Ok(SpeculativeCommitOutcome::NotCommitted);
+                }
             };
         if ensure_json_depth(
             "authoritative speculative tool arguments",
@@ -1304,29 +1445,31 @@ impl<'a> ToolBroker<'a> {
         )
         .is_err()
         {
+            execution.take();
             return Ok(SpeculativeCommitOutcome::NotCommitted);
         }
         let authoritative_key =
             InvocationKey::new(&authoritative_call.tool_id, &authoritative_arguments);
-        if authoritative_key != execution.prepared.key
-            || !self.speculative_prepared_is_live(request, &execution.prepared)
+        if authoritative_key != candidate.prepared.key
+            || !self.speculative_prepared_is_live(request, &candidate.prepared)
             || self
                 .tools
                 .validate(&authoritative_call.tool_id, &authoritative_arguments)
                 .is_err()
-            || serialized_len(execution.result.as_ref())?
+            || serialized_len(candidate.result.as_ref())?
                 > request.agent.limits.max_tool_result_bytes
             || ensure_json_depth(
                 "committed speculative tool result",
-                &execution.result.output,
+                &candidate.result.output,
                 request.agent.limits.max_json_depth,
             )
             .is_err()
             || self
                 .tools
-                .validate_output(&authoritative_call.tool_id, &execution.result.output)
+                .validate_output(&authoritative_call.tool_id, &candidate.result.output)
                 .is_err()
         {
+            execution.take();
             return Ok(SpeculativeCommitOutcome::NotCommitted);
         }
         // Cross the ordinary Direct authorization and approval boundary exactly
@@ -1334,8 +1477,8 @@ impl<'a> ToolBroker<'a> {
         // executed normally without re-running policy or approval.
         let attempts_before = state.tool_calls;
         let classified_before = state.classified_tool_calls();
-        let prepared = match self
-            .prepare(
+        let ordinary = {
+            let ordinary_prepare = self.prepare(
                 request,
                 result,
                 events,
@@ -1346,9 +1489,29 @@ impl<'a> ToolBroker<'a> {
                 false,
                 None,
                 run_deadline,
-            )
-            .await
-        {
+            );
+            tokio::pin!(ordinary_prepare);
+            if Instant::now() >= candidate_deadline {
+                execution.take();
+                ordinary_prepare.await
+            } else {
+                tokio::select! {
+                    biased;
+                    outcome = &mut ordinary_prepare => outcome,
+                    _ = tokio::time::sleep_until(candidate_deadline) => {
+                        // Expiry owns and synchronously drops the completed cache,
+                        // runner slot, keyed permit, and settlement lease without
+                        // cancelling or restarting canonical Direct preparation.
+                        execution.take();
+                        ordinary_prepare.await
+                    }
+                }
+            }
+        };
+        if Instant::now() >= candidate_deadline {
+            execution.take();
+        }
+        let prepared = match ordinary {
             Ok(outcome) => outcome,
             Err(error) => {
                 if state.tool_calls > attempts_before
@@ -1362,36 +1525,38 @@ impl<'a> ToolBroker<'a> {
         let prepared = match prepared {
             PrepareOutcome::Ready(prepared) => prepared,
             PrepareOutcome::Rejected(result) => {
+                execution.take();
                 return Ok(SpeculativeCommitOutcome::Resolved(Arc::new(result)));
             }
             PrepareOutcome::Reused(result) => {
+                execution.take();
                 return Ok(SpeculativeCommitOutcome::Resolved(result));
             }
-            PrepareOutcome::Stop => return Ok(SpeculativeCommitOutcome::Stop),
+            PrepareOutcome::Stop => {
+                execution.take();
+                return Ok(SpeculativeCommitOutcome::Stop);
+            }
         };
 
-        if let Err(error) = check_stopped(
-            &request.cancellation,
-            commit_deadline,
-            "speculative candidate expired after ordinary authorization",
-        ) {
-            if matches!(error, HarnessError::Cancelled)
-                || run_deadline.is_some_and(|run| run <= candidate_deadline)
-            {
-                return Err(error);
-            }
+        if execution.is_none() {
             return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
         }
-        if !controller.is_active(&execution.prepared.call.tool_id)
-            || !self.speculative_prepared_is_live(request, &execution.prepared)
+        let Some(candidate) = execution.as_deref() else {
+            return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
+        };
+        if !controller.is_active(&candidate.prepared.call.tool_id)
+            || !self.speculative_prepared_is_live(request, &candidate.prepared)
         {
+            execution.take();
             return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
         }
+        let speculative_context = candidate.prepared.context.clone();
+        let speculative_tool = Arc::clone(&candidate.prepared.tool);
 
         let decision = match await_guarded(
             self.policy.decide_speculative(
-                &execution.prepared.context,
-                execution.prepared.tool.definition(),
+                &speculative_context,
+                speculative_tool.definition(),
                 &authoritative_arguments,
                 request,
             ),
@@ -1403,35 +1568,53 @@ impl<'a> ToolBroker<'a> {
         .await
         {
             Ok(decision) => decision,
-            Err(HarnessError::TimedOut(_))
-                if run_deadline.is_none_or(|run| candidate_deadline < run) =>
-            {
+            Err(error) => {
+                if request.cancellation.is_cancelled()
+                    || run_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(error);
+                }
+                // A dedicated-policy failure cannot invalidate the already
+                // completed ordinary Direct authorization or cause it to run
+                // twice. Discard the cache and execute this same preparation.
+                execution.take();
                 return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
             }
-            Err(error) => return Err(error),
         };
-        if !matches!(decision, PolicyDecision::Allow { .. })
-            || !controller.is_active(&execution.prepared.call.tool_id)
-            || !self.speculative_prepared_is_live(request, &execution.prepared)
-        {
+        if !matches!(decision, PolicyDecision::Allow { .. }) {
+            execution.take();
             return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
         }
-        if let Err(error) = check_stopped(
-            &request.cancellation,
-            commit_deadline,
-            "speculative candidate expired after commit policy",
-        ) {
-            if matches!(error, HarnessError::Cancelled)
-                || run_deadline.is_some_and(|run| run <= candidate_deadline)
-            {
-                return Err(error);
-            }
+        let candidate_is_live = execution.as_deref().is_some_and(|candidate| {
+            controller.is_active(&candidate.prepared.call.tool_id)
+                && candidate.prepared.model_call_number == model_call_number
+                && candidate.prepared.call.id == authoritative_call.id
+                && candidate.prepared.key == authoritative_key
+                && self.speculative_prepared_is_live(request, &candidate.prepared)
+                && self
+                    .tools
+                    .validate_output(&authoritative_call.tool_id, &candidate.result.output)
+                    .is_ok()
+        });
+        if !candidate_is_live {
+            execution.take();
             return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
         }
 
+        // This is the atomic cache-publication boundary. The controller lock
+        // rechecks activation, cancellation, and both absolute deadlines while
+        // converting the live lease to Committed. After it succeeds, later
+        // synchronous event-sink latency cannot make the authorized result stale.
+        let mut candidate = execution
+            .take()
+            .expect("candidate liveness was checked immediately before take");
+        if !candidate.try_commit(candidate_deadline, run_deadline, &request.cancellation) {
+            return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
+        }
+        let tool_result = Arc::clone(&candidate.result);
         self.mark_dispatched(state, &prepared);
         let committed = BrokerExecution {
-            result: Arc::clone(&execution.result),
+            result: Arc::clone(&tool_result),
             validation_error: None,
             duration_ms: 0,
         };
@@ -1441,9 +1624,7 @@ impl<'a> ToolBroker<'a> {
             tool_id: prepared.call.tool_id.clone(),
             ok: true,
         });
-        Ok(SpeculativeCommitOutcome::Committed(Arc::clone(
-            &execution.result,
-        )))
+        Ok(SpeculativeCommitOutcome::Committed(tool_result))
     }
 
     pub(crate) fn validate_shadow_candidate(

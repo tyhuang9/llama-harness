@@ -3,7 +3,10 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError},
+    time::Instant,
+};
 
 /// Minimum exact same-runner shadow observations required before activation.
 pub const MIN_SPECULATION_SHADOW_OBSERVATIONS: u64 = 1_000;
@@ -357,9 +360,6 @@ impl SpeculationController {
         };
         state.metrics.issued = state.metrics.issued.saturating_add(1);
         match resolution {
-            SpeculativeResolution::Committed => {
-                state.metrics.committed = state.metrics.committed.saturating_add(1);
-            }
             SpeculativeResolution::Discarded => {
                 state.metrics.discarded = state.metrics.discarded.saturating_add(1);
                 trip(state);
@@ -373,6 +373,37 @@ impl SpeculationController {
             state.metrics.issued,
             state.metrics.committed + state.metrics.discarded + state.metrics.cancelled
         );
+    }
+
+    pub(crate) fn record_commit_if_active(
+        &self,
+        tool_id: &str,
+        candidate_deadline: Instant,
+        run_deadline: Option<Instant>,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        let mut tools = self
+            .tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(state) = tools.get_mut(tool_id) else {
+            return false;
+        };
+        let now = Instant::now();
+        if state.mode != SpeculationMode::Active
+            || cancellation.is_cancelled()
+            || now >= candidate_deadline
+            || run_deadline.is_some_and(|deadline| now >= deadline)
+        {
+            return false;
+        }
+        state.metrics.issued = state.metrics.issued.saturating_add(1);
+        state.metrics.committed = state.metrics.committed.saturating_add(1);
+        debug_assert_eq!(
+            state.metrics.issued,
+            state.metrics.committed + state.metrics.discarded + state.metrics.cancelled
+        );
+        true
     }
 }
 
@@ -393,7 +424,6 @@ fn state_is_ready(state: &ToolState, config: &SpeculationConfig) -> bool {
 
 #[derive(Clone, Copy)]
 pub(crate) enum SpeculativeResolution {
-    Committed,
     Discarded,
     Cancelled,
 }
@@ -407,7 +437,6 @@ use crate::{
 };
 use futures_util::StreamExt;
 use std::{collections::BTreeMap, time::Duration};
-use tokio::time::Instant;
 
 const MAX_PARTIAL_PROBES: u8 = 8;
 
@@ -417,16 +446,8 @@ pub(crate) struct StreamedReactiveResponse {
 }
 
 pub(crate) struct ReadySpeculativeCommit {
-    pub(crate) execution: Box<SpeculativeExecution>,
+    pub(crate) execution: Option<Box<SpeculativeExecution>>,
     pub(crate) deadline: Instant,
-    _slot: OwnedSemaphorePermit,
-    guard: IssuedCandidateGuard,
-}
-
-impl ReadySpeculativeCommit {
-    pub(crate) fn settle(&mut self, resolution: SpeculativeResolution) {
-        self.guard.settle(resolution);
-    }
 }
 
 pub(crate) fn discard_ready_commit(
@@ -434,39 +455,10 @@ pub(crate) fn discard_ready_commit(
     mut ready: ReadySpeculativeCommit,
     cancelled: bool,
 ) {
-    ready.settle(if cancelled {
-        SpeculativeResolution::Cancelled
-    } else {
-        SpeculativeResolution::Discarded
-    });
-}
-
-struct IssuedCandidateGuard {
-    controller: Arc<SpeculationController>,
-    tool_id: String,
-    settled: bool,
-}
-
-impl IssuedCandidateGuard {
-    fn new(controller: &Arc<SpeculationController>, tool_id: &str) -> Self {
-        Self {
-            controller: Arc::clone(controller),
-            tool_id: tool_id.to_owned(),
-            settled: false,
+    if cancelled {
+        if let Some(execution) = ready.execution.as_mut() {
+            execution.settle(SpeculativeResolution::Cancelled);
         }
-    }
-
-    fn settle(&mut self, resolution: SpeculativeResolution) {
-        if !self.settled {
-            self.controller.record_resolution(&self.tool_id, resolution);
-            self.settled = true;
-        }
-    }
-}
-
-impl Drop for IssuedCandidateGuard {
-    fn drop(&mut self) {
-        self.settle(SpeculativeResolution::Discarded);
     }
 }
 
@@ -480,8 +472,6 @@ enum CandidateState {
         key: InvocationKey,
         execution: Box<SpeculativeExecution>,
         deadline: Instant,
-        slot: OwnedSemaphorePermit,
-        guard: IssuedCandidateGuard,
     },
 }
 
@@ -648,6 +638,7 @@ pub(crate) async fn stream_reactive_response(
 
         let Some(item) = next else {
             if let Err(error) = stream_controller.finish_eof() {
+                model_cancellation.cancel();
                 fail_candidate_stream(controller, candidate.take());
                 return Err(error);
             }
@@ -689,11 +680,21 @@ pub(crate) async fn stream_reactive_response(
         }
 
         match validated.event {
-            ModelStreamEvent::TextDelta { content } => response.text(content)?,
+            ModelStreamEvent::TextDelta { content } => {
+                if let Err(error) = response.text(content) {
+                    model_cancellation.cancel();
+                    fail_candidate_stream(controller, candidate.take());
+                    return Err(error);
+                }
+            }
             ModelStreamEvent::ToolCallDelta(delta) => {
                 if let Some(call) = validated.completed_tool_call {
                     let index = delta.index;
-                    response.call(index, call.clone())?;
+                    if let Err(error) = response.call(index, call.clone()) {
+                        model_cancellation.cancel();
+                        fail_candidate_stream(controller, candidate.take());
+                        return Err(error);
+                    }
                     if index == 0 && !candidate_considered {
                         candidate_considered = true;
                         if let Some(key) =
@@ -706,7 +707,14 @@ pub(crate) async fn stream_reactive_response(
                                 SpeculationMode::Active => match controller.try_acquire_slot() {
                                     Ok(slot) => {
                                         let deadline =
-                                            candidate_deadline_for(controller, call_deadline)?;
+                                            match candidate_deadline_for(controller, call_deadline)
+                                            {
+                                                Ok(deadline) => deadline,
+                                                Err(error) => {
+                                                    model_cancellation.cancel();
+                                                    return Err(error);
+                                                }
+                                            };
                                         match broker
                                             .speculate(
                                                 controller,
@@ -716,38 +724,20 @@ pub(crate) async fn stream_reactive_response(
                                                 run_id,
                                                 trace_id,
                                                 Some(deadline),
+                                                slot,
                                             )
                                             .await
                                         {
                                             SpeculativeAttempt::NotIssued => None,
                                             SpeculativeAttempt::Issued(Ok(execution)) => {
-                                                let guard = IssuedCandidateGuard::new(
-                                                    controller,
-                                                    &call.tool_id,
-                                                );
                                                 Some(CandidateState::Active {
                                                     call,
                                                     key,
                                                     execution,
                                                     deadline,
-                                                    slot,
-                                                    guard,
                                                 })
                                             }
-                                            SpeculativeAttempt::Issued(Err(error)) => {
-                                                let resolution = if matches!(
-                                                    error,
-                                                    HarnessError::Cancelled
-                                                        | HarnessError::TimedOut(_)
-                                                ) {
-                                                    SpeculativeResolution::Cancelled
-                                                } else {
-                                                    SpeculativeResolution::Discarded
-                                                };
-                                                controller
-                                                    .record_resolution(&call.tool_id, resolution);
-                                                None
-                                            }
+                                            SpeculativeAttempt::Issued(Err(_)) => None,
                                         }
                                     }
                                     Err(_) => {
@@ -762,13 +752,24 @@ pub(crate) async fn stream_reactive_response(
                 }
             }
             ModelStreamEvent::Completed { model, usage } => {
-                response.complete(model, usage)?;
+                if let Err(error) = response.complete(model, usage) {
+                    model_cancellation.cancel();
+                    fail_candidate_stream(controller, candidate.take());
+                    return Err(error);
+                }
                 break;
             }
         }
     }
 
-    let response = response.finish()?;
+    let response = match response.finish() {
+        Ok(response) => response,
+        Err(error) => {
+            model_cancellation.cancel();
+            fail_candidate_stream(controller, candidate.take());
+            return Err(error);
+        }
+    };
     let authoritative = response.tool_calls.first();
     let speculative = match candidate {
         Some(CandidateState::Shadow { call, key }) => {
@@ -784,17 +785,13 @@ pub(crate) async fn stream_reactive_response(
             key,
             execution,
             deadline,
-            slot,
-            guard,
         }) => {
             if Instant::now() >= deadline {
                 None
             } else if invocation_matches(&call, &key, authoritative) {
                 Some(ReadySpeculativeCommit {
-                    execution,
+                    execution: Some(execution),
                     deadline,
-                    _slot: slot,
-                    guard,
                 })
             } else {
                 controller.record_mismatch_and_trip(&call.tool_id);
@@ -870,12 +867,10 @@ fn discard_candidate(
     candidate: Option<CandidateState>,
     cancelled: bool,
 ) {
-    if let Some(CandidateState::Active { mut guard, .. }) = candidate {
-        guard.settle(if cancelled {
-            SpeculativeResolution::Cancelled
-        } else {
-            SpeculativeResolution::Discarded
-        });
+    if let Some(CandidateState::Active { mut execution, .. }) = candidate {
+        if cancelled {
+            execution.settle(SpeculativeResolution::Cancelled);
+        }
     }
 }
 
@@ -885,10 +880,12 @@ fn fail_candidate_stream(controller: &SpeculationController, candidate: Option<C
             controller.record_terminal_stream_failure_and_trip(&call.tool_id);
         }
         Some(CandidateState::Active {
-            call, mut guard, ..
+            call,
+            mut execution,
+            ..
         }) => {
             controller.record_terminal_stream_failure_and_trip(&call.tool_id);
-            guard.settle(SpeculativeResolution::Discarded);
+            execution.settle(SpeculativeResolution::Discarded);
         }
         None => {}
     }
@@ -898,10 +895,57 @@ fn fail_candidate_stream(controller: &SpeculationController, candidate: Option<C
 mod tests {
     use super::{
         invocation_matches, SpeculationConfig, SpeculationController, SpeculationMode,
-        SpeculativeResolution,
+        HARD_MAX_SPECULATION_DURATION_MS, HARD_MAX_SPECULATION_STREAM_EVENTS,
+        MIN_SPECULATION_SHADOW_OBSERVATIONS,
     };
     use crate::{broker::InvocationKey, ToolCall};
     use serde_json::json;
+    use tokio::time::Instant;
+
+    #[test]
+    fn speculation_config_boundaries_are_exact() {
+        let valid = [
+            SpeculationConfig {
+                max_execution_duration_ms: 1,
+                required_shadow_observations: MIN_SPECULATION_SHADOW_OBSERVATIONS,
+                max_stream_events: 1,
+            },
+            SpeculationConfig {
+                max_execution_duration_ms: HARD_MAX_SPECULATION_DURATION_MS,
+                required_shadow_observations: u64::MAX,
+                max_stream_events: HARD_MAX_SPECULATION_STREAM_EVENTS,
+            },
+        ];
+        for config in valid {
+            assert!(config.validate().is_ok());
+        }
+
+        let invalid = [
+            SpeculationConfig {
+                max_execution_duration_ms: 0,
+                ..SpeculationConfig::default()
+            },
+            SpeculationConfig {
+                max_execution_duration_ms: HARD_MAX_SPECULATION_DURATION_MS + 1,
+                ..SpeculationConfig::default()
+            },
+            SpeculationConfig {
+                required_shadow_observations: MIN_SPECULATION_SHADOW_OBSERVATIONS - 1,
+                ..SpeculationConfig::default()
+            },
+            SpeculationConfig {
+                max_stream_events: 0,
+                ..SpeculationConfig::default()
+            },
+            SpeculationConfig {
+                max_stream_events: HARD_MAX_SPECULATION_STREAM_EVENTS + 1,
+                ..SpeculationConfig::default()
+            },
+        ];
+        for config in invalid {
+            assert!(config.validate().is_err());
+        }
+    }
 
     #[test]
     fn activation_and_incidents_are_scoped_per_tool() {
@@ -925,7 +969,12 @@ mod tests {
         assert!(!controller.readiness("first").ready_to_activate);
         assert_eq!(controller.activate("first").mode, SpeculationMode::Shadow);
 
-        controller.record_resolution("second", SpeculativeResolution::Committed);
+        assert!(controller.record_commit_if_active(
+            "second",
+            Instant::now() + std::time::Duration::from_secs(1),
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        ));
         let metrics = controller.metrics("second");
         assert_eq!(metrics.issued, 1);
         assert_eq!(metrics.committed, 1);
