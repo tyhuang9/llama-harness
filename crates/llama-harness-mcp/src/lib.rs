@@ -359,9 +359,10 @@ pub enum McpError {
     Clock,
 }
 
-/// Source of monotonically increasing milliseconds for catalog cache decisions.
+/// Source of monotonically increasing milliseconds for catalog cache and
+/// lifecycle-duration decisions.
 pub trait McpClock: Send + Sync {
-    /// Returns the current monotonic millisecond tick.
+    /// Returns the current monotonic millisecond tick used for local decisions.
     fn now_ms(&self) -> u64;
 }
 
@@ -527,9 +528,10 @@ pub struct McpObserverHealth {
 /// Local shutdown cleanup health without transport details.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct McpShutdownHealth {
-    /// Contexts retained for a later independent shutdown retry.
+    /// Total contexts still owned for cleanup, including pending refresh,
+    /// retained retry, and in-progress deferred-drain contexts.
     pub pending_contexts: u64,
-    /// Contexts owned by deferred drain workers.
+    /// Subset of `pending_contexts` currently owned by deferred drain workers.
     pub in_progress_contexts: u64,
     /// Bounded close attempts that did not complete.
     pub close_failures: u64,
@@ -630,6 +632,8 @@ struct CatalogState {
     registry_bound: bool,
     closed: bool,
     invalidated: bool,
+    list_change_epoch: u64,
+    list_change_epoch_exhausted: bool,
     last_now_ms: u64,
     next_generation: u64,
     pending_refresh_contexts: Vec<PendingRefreshContext>,
@@ -649,6 +653,8 @@ impl Default for CatalogState {
             registry_bound: false,
             closed: false,
             invalidated: false,
+            list_change_epoch: 0,
+            list_change_epoch_exhausted: false,
             last_now_ms: 0,
             next_generation: 1,
             pending_refresh_contexts: Vec::new(),
@@ -669,6 +675,7 @@ struct PendingRefreshContext {
 struct RefreshOwnership {
     state: Arc<Mutex<CatalogState>>,
     token: u64,
+    list_change_epoch: u64,
 }
 
 impl Drop for RefreshOwnership {
@@ -806,7 +813,7 @@ impl McpCatalogManager {
         let mut lifecycle_events = Vec::with_capacity(2);
         let result = self
             .refresh_locked(
-                ownership.token,
+                &ownership,
                 registry,
                 registry_transaction,
                 cancellation,
@@ -824,13 +831,15 @@ impl McpCatalogManager {
 
     async fn refresh_locked(
         &self,
-        token: u64,
+        ownership: &RefreshOwnership,
         registry: &ToolRegistry,
         registry_transaction: bool,
         cancellation: CancellationToken,
         started: Instant,
         lifecycle_events: &mut Vec<McpLifecycleEvent>,
     ) -> Result<(McpCatalogSnapshot, ToolRegistry), McpError> {
+        let token = ownership.token;
+        let list_change_epoch = ownership.list_change_epoch;
         let built = self
             .fetch_complete(token, cancellation.child_token(), lifecycle_events)
             .await;
@@ -956,12 +965,12 @@ impl McpCatalogManager {
                         Arc::clone(&self.transport),
                         self.timeouts.call,
                         self.limits.clone(),
+                        Arc::clone(&self.clock),
                         Arc::clone(&self.observer),
                         Arc::clone(&self.server_call_gate),
                     )),
                     generation,
                     Arc::downgrade(&self.state),
-                    Arc::clone(&self.clock),
                     Arc::clone(&in_flight),
                     Arc::clone(&dispatch_gate),
                 ))
@@ -1030,6 +1039,9 @@ impl McpCatalogManager {
             if state.closed {
                 return Err(McpError::CatalogUnavailable);
             }
+            if state.list_change_epoch_exhausted || state.list_change_epoch != list_change_epoch {
+                return Err(McpError::CatalogUnavailable);
+            }
             if !registry_transaction && state.registry_bound {
                 return Err(McpError::CatalogUnavailable);
             }
@@ -1094,6 +1106,10 @@ impl McpCatalogManager {
         // is rejected before it reaches the transport.
         if let Ok(mut state) = self.state.lock() {
             state.invalidated = true;
+            match state.list_change_epoch.checked_add(1) {
+                Some(epoch) => state.list_change_epoch = epoch,
+                None => state.list_change_epoch_exhausted = true,
+            }
         }
     }
 
@@ -1347,6 +1363,10 @@ impl McpCatalogManager {
         {
             return Err(McpError::CatalogUnavailable);
         }
+        if state.list_change_epoch_exhausted {
+            return Err(McpError::Clock);
+        }
+        let list_change_epoch = state.list_change_epoch;
         let token = state.next_refresh_token;
         state.next_refresh_token = state
             .next_refresh_token
@@ -1358,6 +1378,7 @@ impl McpCatalogManager {
         Ok(RefreshOwnership {
             state: Arc::clone(&self.state),
             token,
+            list_change_epoch,
         })
     }
 
@@ -1536,7 +1557,6 @@ struct ManagedMcpToolAdapter {
     inner: Arc<McpToolAdapter>,
     generation: u64,
     state: Weak<Mutex<CatalogState>>,
-    clock: Arc<dyn McpClock>,
     in_flight: Arc<InFlightCalls>,
     dispatch_gate: Arc<tokio::sync::RwLock<()>>,
 }
@@ -1546,7 +1566,6 @@ impl ManagedMcpToolAdapter {
         inner: Arc<McpToolAdapter>,
         generation: u64,
         state: Weak<Mutex<CatalogState>>,
-        clock: Arc<dyn McpClock>,
         in_flight: Arc<InFlightCalls>,
         dispatch_gate: Arc<tokio::sync::RwLock<()>>,
     ) -> Self {
@@ -1554,14 +1573,13 @@ impl ManagedMcpToolAdapter {
             inner,
             generation,
             state,
-            clock,
             in_flight,
             dispatch_gate,
         }
     }
 
     fn check_active(&self) -> Result<(bool, InFlightLease), HarnessError> {
-        let now = self.clock.now_ms();
+        let now = self.inner.clock.now_ms();
         let state = self
             .state
             .upgrade()
@@ -1619,6 +1637,7 @@ impl Tool for ManagedMcpToolAdapter {
         arguments: Value,
         cancellation: CancellationToken,
     ) -> Result<ToolResult, HarnessError> {
+        let started_ms = self.inner.clock.now_ms();
         let server_permit = match self.inner.acquire_server(&cancellation).await {
             Ok(permit) => permit,
             Err(error) => {
@@ -1629,7 +1648,7 @@ impl Tool for ManagedMcpToolAdapter {
                 self.inner.observer.emit(event(
                     McpLifecycleOperation::Call,
                     outcome,
-                    0,
+                    self.inner.elapsed_call_ms(started_ms),
                     0,
                     0,
                     0,
@@ -1651,7 +1670,7 @@ impl Tool for ManagedMcpToolAdapter {
                 self.inner.observer.emit(event(
                     McpLifecycleOperation::Call,
                     McpLifecycleOutcome::Cancelled,
-                    0, 0, 0, 0, false, true,
+                    self.inner.elapsed_call_ms(started_ms), 0, 0, 0, false, true,
                     McpDispatchState::NotDispatched,
                     Some(McpCallCorrelation::from(call)),
                 ));
@@ -1667,7 +1686,7 @@ impl Tool for ManagedMcpToolAdapter {
                 self.inner.observer.emit(event(
                     McpLifecycleOperation::Call,
                     McpLifecycleOutcome::Rejected,
-                    0,
+                    self.inner.elapsed_call_ms(started_ms),
                     0,
                     0,
                     0,
@@ -1686,7 +1705,7 @@ impl Tool for ManagedMcpToolAdapter {
             self.inner.observer.emit(event(
                 McpLifecycleOperation::Call,
                 McpLifecycleOutcome::Cancelled,
-                0,
+                self.inner.elapsed_call_ms(started_ms),
                 0,
                 0,
                 0,
@@ -1699,7 +1718,14 @@ impl Tool for ManagedMcpToolAdapter {
         }
         let (result, lifecycle) = self
             .inner
-            .execute_managed(call, arguments, cancellation, stale, Some(server_permit))
+            .execute_managed(
+                call,
+                arguments,
+                cancellation,
+                stale,
+                Some(server_permit),
+                started_ms,
+            )
             .await;
         drop(lease);
         drop(dispatch_permit);
@@ -1888,6 +1914,7 @@ struct McpToolAdapter {
     native_name: String,
     call_timeout: Duration,
     limits: McpLimits,
+    clock: Arc<dyn McpClock>,
     observer: Arc<ObserverHub>,
     server_call_gate: Arc<ServerCallGate>,
 }
@@ -1901,6 +1928,7 @@ impl McpToolAdapter {
         transport: Arc<dyn McpTransport>,
         call_timeout: Duration,
         limits: McpLimits,
+        clock: Arc<dyn McpClock>,
         observer: Arc<ObserverHub>,
         server_call_gate: Arc<ServerCallGate>,
     ) -> Self {
@@ -1926,6 +1954,7 @@ impl McpToolAdapter {
             native_name,
             call_timeout,
             limits,
+            clock,
             observer,
             server_call_gate,
         }
@@ -1954,8 +1983,9 @@ impl Tool for McpToolAdapter {
         arguments: Value,
         cancellation: CancellationToken,
     ) -> Result<ToolResult, HarnessError> {
+        let started_ms = self.clock.now_ms();
         let (result, lifecycle) = self
-            .execute_managed(call, arguments, cancellation, false, None)
+            .execute_managed(call, arguments, cancellation, false, None, started_ms)
             .await;
         self.observer.emit(lifecycle);
         result
@@ -1963,6 +1993,10 @@ impl Tool for McpToolAdapter {
 }
 
 impl McpToolAdapter {
+    fn elapsed_call_ms(&self, started_ms: u64) -> u64 {
+        self.clock.now_ms().saturating_sub(started_ms)
+    }
+
     async fn acquire_server(
         &self,
         cancellation: &CancellationToken,
@@ -1995,6 +2029,7 @@ impl McpToolAdapter {
         cancellation: CancellationToken,
         stale: bool,
         preacquired: Option<tokio::sync::SemaphorePermit<'_>>,
+        started_ms: u64,
     ) -> (Result<ToolResult, HarnessError>, McpLifecycleEvent) {
         if call.caller == Some(ToolCaller::Speculative) {
             return (
@@ -2004,7 +2039,7 @@ impl McpToolAdapter {
                 event(
                     McpLifecycleOperation::Call,
                     McpLifecycleOutcome::Rejected,
-                    0,
+                    self.elapsed_call_ms(started_ms),
                     0,
                     0,
                     0,
@@ -2021,7 +2056,7 @@ impl McpToolAdapter {
                 event(
                     McpLifecycleOperation::Call,
                     McpLifecycleOutcome::Cancelled,
-                    0,
+                    self.elapsed_call_ms(started_ms),
                     0,
                     0,
                     0,
@@ -2032,7 +2067,6 @@ impl McpToolAdapter {
                 ),
             );
         }
-        let started = Instant::now();
         let correlation = Some(McpCallCorrelation::from(call));
         let _server_permit = match preacquired {
             Some(permit) => permit,
@@ -2048,7 +2082,7 @@ impl McpToolAdapter {
                         event(
                             McpLifecycleOperation::Call,
                             outcome,
-                            elapsed_ms(started),
+                            self.elapsed_call_ms(started_ms),
                             0,
                             0,
                             0,
@@ -2075,8 +2109,7 @@ impl McpToolAdapter {
                 Err(_) => Err(CallFailure::TimedOut),
             },
         };
-        let elapsed = elapsed_ms(started);
-        let (returned, lifecycle) = match result {
+        let (returned, mut lifecycle) = match result {
             Ok(result) => {
                 let normalized = normalize_result(
                     result,
@@ -2090,7 +2123,7 @@ impl McpToolAdapter {
                 let lifecycle = event(
                     McpLifecycleOperation::Call,
                     outcome,
-                    elapsed,
+                    0,
                     count,
                     bytes,
                     0,
@@ -2125,7 +2158,7 @@ impl McpToolAdapter {
                 let lifecycle = event(
                     McpLifecycleOperation::Call,
                     outcome,
-                    elapsed,
+                    0,
                     0,
                     0,
                     0,
@@ -2138,6 +2171,7 @@ impl McpToolAdapter {
             }
         };
         drop(_server_permit);
+        lifecycle.duration_ms = self.elapsed_call_ms(started_ms);
         (returned, lifecycle)
     }
 }
@@ -2523,7 +2557,7 @@ mod tests {
 
     struct CancellingClock {
         now: AtomicU64,
-        armed: AtomicBool,
+        observations_until_cancel: AtomicU64,
         cancellation: CancellationToken,
     }
 
@@ -2531,9 +2565,51 @@ mod tests {
         fn new(cancellation: CancellationToken) -> Self {
             Self {
                 now: AtomicU64::new(0),
-                armed: AtomicBool::new(false),
+                observations_until_cancel: AtomicU64::new(0),
                 cancellation,
             }
+        }
+
+        fn cancel_on_second_observation(&self) {
+            self.observations_until_cancel.store(2, Ordering::Release);
+        }
+    }
+
+    impl McpClock for CancellingClock {
+        fn now_ms(&self) -> u64 {
+            if self.observations_until_cancel.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            ) == Ok(1)
+            {
+                self.cancellation.cancel();
+            }
+            self.now.load(Ordering::Relaxed)
+        }
+    }
+
+    struct PostListBarrierClock {
+        now: AtomicU64,
+        armed: AtomicBool,
+        reached: std::sync::mpsc::SyncSender<()>,
+        release: Arc<std::sync::Barrier>,
+    }
+
+    impl PostListBarrierClock {
+        fn new() -> (Self, std::sync::mpsc::Receiver<()>, Arc<std::sync::Barrier>) {
+            let (reached, receiver) = std::sync::mpsc::sync_channel(1);
+            let release = Arc::new(std::sync::Barrier::new(2));
+            (
+                Self {
+                    now: AtomicU64::new(0),
+                    armed: AtomicBool::new(false),
+                    reached,
+                    release: Arc::clone(&release),
+                },
+                receiver,
+                release,
+            )
         }
 
         fn arm(&self) {
@@ -2541,10 +2617,11 @@ mod tests {
         }
     }
 
-    impl McpClock for CancellingClock {
+    impl McpClock for PostListBarrierClock {
         fn now_ms(&self) -> u64 {
             if self.armed.swap(false, Ordering::AcqRel) {
-                self.cancellation.cancel();
+                self.reached.send(()).expect("barrier receiver");
+                self.release.wait();
             }
             self.now.load(Ordering::Relaxed)
         }
@@ -3268,6 +3345,210 @@ mod tests {
         first.await.expect("first task").expect("first result");
         second.await.expect("second task").expect("second result");
         assert_eq!(transport.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn managed_call_duration_includes_server_queue_success_and_cancellation() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let observer = Arc::new(RecordingObserver(Mutex::new(Vec::new()), false));
+        let manager = Arc::new(manager_for_server(
+            transport.clone(),
+            clock.clone(),
+            unique_test_server_id("call-queue-duration"),
+            Some(observer.clone()),
+        ));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        observer.0.lock().expect("test mutex").clear();
+        let tool = manager.active_tools().remove(0);
+        let tool_id = tool.definition().id.clone();
+
+        transport.block_call.store(true, Ordering::Release);
+        clock.set(10);
+        let holder_tool = Arc::clone(&tool);
+        let holder_id = tool_id.clone();
+        let holder = tokio::spawn(async move {
+            holder_tool
+                .execute_with_context(
+                    &ToolCallContext::new("run", "trace", "holder-success", holder_id),
+                    serde_json::json!({}),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        while transport.call_started.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+
+        clock.set(20);
+        let queued_tool = Arc::clone(&tool);
+        let queued_id = tool_id.clone();
+        let queued = tokio::spawn(async move {
+            queued_tool
+                .execute_with_context(
+                    &ToolCallContext::new("run", "trace", "queued-success", queued_id),
+                    serde_json::json!({}),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        while manager.server_call_gate.waiters.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+        clock.set(35);
+        transport.block_call.store(false, Ordering::Release);
+        transport.call_release.notify_one();
+        holder.await.expect("holder task").expect("holder call");
+        queued.await.expect("queued task").expect("queued call");
+
+        transport.block_call.store(true, Ordering::Release);
+        clock.set(40);
+        let cancel_holder_tool = Arc::clone(&tool);
+        let cancel_holder_id = tool_id.clone();
+        let cancel_holder = tokio::spawn(async move {
+            cancel_holder_tool
+                .execute_with_context(
+                    &ToolCallContext::new("run", "trace", "holder-cancellation", cancel_holder_id),
+                    serde_json::json!({}),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        while transport.call_started.load(Ordering::Acquire) != 2 {
+            tokio::task::yield_now().await;
+        }
+
+        clock.set(50);
+        let cancellation = CancellationToken::new();
+        let cancelled_tool = Arc::clone(&tool);
+        let cancelled_id = tool_id;
+        let call_cancellation = cancellation.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_tool
+                .execute_with_context(
+                    &ToolCallContext::new("run", "trace", "queued-cancellation", cancelled_id),
+                    serde_json::json!({}),
+                    call_cancellation,
+                )
+                .await
+        });
+        while manager.server_call_gate.waiters.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+        clock.set(67);
+        cancellation.cancel();
+        assert!(matches!(
+            cancelled.await.expect("cancelled task"),
+            Err(HarnessError::Cancelled)
+        ));
+        transport.block_call.store(false, Ordering::Release);
+        transport.call_release.notify_one();
+        cancel_holder
+            .await
+            .expect("cancel holder task")
+            .expect("cancel holder call");
+
+        let events = observer.0.lock().expect("test mutex");
+        let queued_success = events
+            .iter()
+            .filter(|event| {
+                event
+                    .correlation
+                    .as_ref()
+                    .is_some_and(|correlation| correlation.call_id == "queued-success")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(queued_success.len(), 1);
+        assert_eq!(queued_success[0].duration_ms, 15);
+        assert_eq!(queued_success[0].outcome, McpLifecycleOutcome::Succeeded);
+        assert_eq!(queued_success[0].dispatch, McpDispatchState::Responded);
+        let queued_cancellation = events
+            .iter()
+            .filter(|event| {
+                event
+                    .correlation
+                    .as_ref()
+                    .is_some_and(|correlation| correlation.call_id == "queued-cancellation")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(queued_cancellation.len(), 1);
+        assert_eq!(queued_cancellation[0].duration_ms, 17);
+        assert_eq!(
+            queued_cancellation[0].outcome,
+            McpLifecycleOutcome::Cancelled
+        );
+        assert_eq!(
+            queued_cancellation[0].dispatch,
+            McpDispatchState::NotDispatched
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_call_duration_includes_dispatch_admission_before_rejection() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let observer = Arc::new(RecordingObserver(Mutex::new(Vec::new()), false));
+        let manager = Arc::new(manager_for_server(
+            transport.clone(),
+            clock.clone(),
+            unique_test_server_id("dispatch-rejection-duration"),
+            Some(observer.clone()),
+        ));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        observer.0.lock().expect("test mutex").clear();
+        let tool = manager.active_tools().remove(0);
+        let dispatch_gate = manager
+            .state
+            .lock()
+            .expect("test mutex")
+            .active
+            .as_ref()
+            .expect("active catalog")
+            .dispatch_gate
+            .clone();
+        let dispatch_barrier = dispatch_gate.write_owned().await;
+
+        clock.set(20);
+        let call = tokio::spawn(async move {
+            tool.execute_with_context(
+                &ToolCallContext::new("run", "trace", "dispatch-rejection", "tool"),
+                serde_json::json!({}),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        while manager.server_call_gate.permits.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+        clock.set(39);
+        manager.invalidate_list_change();
+        drop(dispatch_barrier);
+        assert!(matches!(
+            call.await.expect("call task"),
+            Err(HarnessError::InvalidTool(_))
+        ));
+        assert_eq!(transport.calls.load(Ordering::Acquire), 0);
+
+        let events = observer.0.lock().expect("test mutex");
+        let rejected = events
+            .iter()
+            .filter(|event| {
+                event
+                    .correlation
+                    .as_ref()
+                    .is_some_and(|correlation| correlation.call_id == "dispatch-rejection")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].duration_ms, 19);
+        assert_eq!(rejected[0].outcome, McpLifecycleOutcome::Rejected);
+        assert_eq!(rejected[0].dispatch, McpDispatchState::NotDispatched);
     }
 
     #[tokio::test]
@@ -4134,6 +4415,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_change_after_fetch_rejects_candidate_and_preserves_invalidation() {
+        let (barrier_clock, reached, release) = PostListBarrierClock::new();
+        let clock = Arc::new(barrier_clock);
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("old")]));
+        let manager = Arc::new(manager_for_server(
+            transport.clone(),
+            clock.clone(),
+            unique_test_server_id("post-fetch-list-change"),
+            None,
+        ));
+        let (prior, registry) = manager
+            .refresh_registered(&ToolRegistry::default(), CancellationToken::new())
+            .await
+            .expect("initial registered refresh");
+        let prior_id = manager.active_tools()[0].definition().id.clone();
+        let prior_tool = registry.get(&prior_id).expect("installed prior tool");
+
+        transport.replace_tools(vec![tool("candidate")]);
+        clock.arm();
+        let refresh_manager = Arc::clone(&manager);
+        let refresh = std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("test runtime")
+                .block_on(refresh_manager.refresh_registered(&registry, CancellationToken::new()));
+            (result, registry)
+        });
+        reached
+            .recv_timeout(Duration::from_secs(1))
+            .expect("refresh reached the first post-list operation");
+
+        manager.invalidate_list_change();
+        assert!(matches!(
+            prior_tool
+                .execute(serde_json::json!({}), CancellationToken::new())
+                .await,
+            Err(HarnessError::InvalidTool(_))
+        ));
+        release.wait();
+
+        let (result, registry) = refresh.join().expect("refresh thread");
+        assert!(matches!(result, Err(McpError::CatalogUnavailable)));
+        assert_eq!(manager.active_snapshot(), Some(prior.clone()));
+        assert_eq!(manager.active_tools()[0].definition().id, prior_id);
+        assert_eq!(transport.calls.load(Ordering::Acquire), 0);
+        assert_eq!(transport.closes.load(Ordering::Acquire), 1);
+        assert_eq!(manager.shutdown_health().pending_contexts, 0);
+        assert!(matches!(
+            prior_tool
+                .execute(serde_json::json!({}), CancellationToken::new())
+                .await,
+            Err(HarnessError::InvalidTool(_))
+        ));
+
+        let (recovered, recovered_registry) = manager
+            .refresh_registered(&registry, CancellationToken::new())
+            .await
+            .expect("a refresh begun after invalidation recovers");
+        assert_eq!(recovered.generation, prior.generation + 1);
+        let recovered_id = manager.active_tools()[0].definition().id.clone();
+        recovered_registry
+            .get(&recovered_id)
+            .expect("recovered candidate is installed")
+            .execute(serde_json::json!({}), CancellationToken::new())
+            .await
+            .expect("recovered generation is callable");
+        assert_eq!(transport.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn exhausted_list_change_epoch_fails_closed_before_connect() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let manager = manager(transport.clone(), clock, None, None);
+        manager.state.lock().expect("test mutex").list_change_epoch = u64::MAX;
+
+        manager.invalidate_list_change();
+        {
+            let state = manager.state.lock().expect("test mutex");
+            assert!(state.invalidated);
+            assert!(state.list_change_epoch_exhausted);
+        }
+        assert!(matches!(
+            manager.refresh(CancellationToken::new()).await,
+            Err(McpError::Clock)
+        ));
+        assert_eq!(transport.connects.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
     async fn failed_refresh_preserves_prior_immutable_snapshot() {
         let clock = Arc::new(FakeClock::default());
         let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
@@ -4308,7 +4680,10 @@ mod tests {
             .await
             .expect("refresh");
         observer.0.lock().expect("test mutex").clear();
-        clock.arm();
+        // The first observation starts lifecycle timing; the second occurs in
+        // active-generation admission and deterministically arms cancellation
+        // for the immediately following pre-dispatch check.
+        clock.cancel_on_second_observation();
 
         assert!(matches!(
             manager.active_tools()[0]

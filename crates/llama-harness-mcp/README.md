@@ -27,9 +27,11 @@ consistent public `cacheScope`; the manager uses the shortest page TTL for a
 complete catalog. Private cache scope is deliberately rejected in this release:
 the core call context does not yet carry an enforceable execution-time
 authorization capability. A legacy snapshot uses the host-selected age.
-List-change invalidation and expiry fail closed unless a host deliberately
-configures a bounded stale allowance. Refresh never mutates an active runner,
-and old, invalidated, expired, or closed snapshots reject before dispatch.
+Expiry fails closed unless a host deliberately configures a bounded stale
+allowance. List-change invalidation always fails closed: a notice arriving
+during refresh prevents that candidate from replacing or clearing the
+invalidated generation. Refresh never mutates an active runner, and old,
+invalidated, expired, or closed snapshots reject before dispatch.
 
 Lifecycle observation is metadata-only. It deliberately redacts endpoints,
 credentials, native names, arguments, results, schemas, raw frames, request
@@ -67,6 +69,14 @@ Negotiation event and terminal Refresh event in that order, then delivers them
 only after refresh ownership, lifecycle locks, and dispatch permits have been
 released. Observer callbacks must still be nonblocking because delivery remains
 synchronous for the caller receiving the outcome.
+
+After shutdown, hosts can inspect `shutdown_health`. `pending_contexts` is the
+total cleanup work still owned by the manager, while `in_progress_contexts` is
+the subset handled by deferred drain workers. `CleanupPending` means the manager
+retained ownership: poll while work is in progress and retry `close` with a
+fresh cancellation token for retained work. Alert on failed cleanup or on
+pending/in-progress work that remains elevated, using deployment-specific
+thresholds rather than assuming a library-defined SLO.
 
 Calls to one canonical server ID share a process-global `ServerCallGate`, so
 serialization and queue admission apply across manager instances. The first
