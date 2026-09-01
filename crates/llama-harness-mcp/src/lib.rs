@@ -47,6 +47,14 @@ fn server_call_gate_with_limit(
     max_gates: usize,
 ) -> Result<Arc<ServerCallGate>, McpError> {
     let gates = SERVER_CALL_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    server_call_gate_from(gates, server_id, max_gates)
+}
+
+fn server_call_gate_from(
+    gates: &Mutex<HashMap<String, Weak<ServerCallGate>>>,
+    server_id: &str,
+    max_gates: usize,
+) -> Result<Arc<ServerCallGate>, McpError> {
     let mut gates = gates.lock().expect("MCP server gate mutex");
     gates.retain(|_, gate| gate.strong_count() != 0);
     if let Some(gate) = gates.get(server_id).and_then(Weak::upgrade) {
@@ -2810,6 +2818,19 @@ mod tests {
             &first.server_call_gate,
             &second.server_call_gate
         ));
+    }
+
+    #[test]
+    fn server_gate_prunes_dead_keys_and_enforces_live_bound() {
+        let gates = Mutex::new(HashMap::new());
+        let first = server_call_gate_from(&gates, "one", 1).expect("first gate");
+        assert!(matches!(
+            server_call_gate_from(&gates, "two", 1),
+            Err(McpError::ResourceLimit)
+        ));
+        drop(first);
+        let second = server_call_gate_from(&gates, "two", 1).expect("pruned gate");
+        assert_eq!(second.waiters.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
