@@ -40,6 +40,7 @@ enum StreamBehavior {
     InvalidResponse,
     HugeArguments,
     CancellationAwareOversizedText,
+    AbortAwarePendingStart,
     AbortAwarePendingTail,
     PullDrivenDelayed,
 }
@@ -52,6 +53,8 @@ struct StreamingProvider {
     partial_emitted: Arc<Semaphore>,
     release_final: Arc<Semaphore>,
     stream_drop_saw_cancellation: Arc<AtomicBool>,
+    stream_start_entered: Arc<Semaphore>,
+    stream_start_cancellation: Mutex<Option<CancellationToken>>,
     response_delay_ms: AtomicU64,
     observe_tail: AtomicBool,
     tail_polled: Arc<Semaphore>,
@@ -67,6 +70,8 @@ impl StreamingProvider {
             partial_emitted: Arc::new(Semaphore::new(0)),
             release_final: Arc::new(Semaphore::new(0)),
             stream_drop_saw_cancellation: Arc::new(AtomicBool::new(false)),
+            stream_start_entered: Arc::new(Semaphore::new(0)),
+            stream_start_cancellation: Mutex::new(None),
             response_delay_ms: AtomicU64::new(0),
             observe_tail: AtomicBool::new(false),
             tail_polled: Arc::new(Semaphore::new(0)),
@@ -217,6 +222,19 @@ impl ModelProvider for StreamingProvider {
         self.stream_calls.fetch_add(1, Ordering::SeqCst);
         let requests_tool = Self::requests_tool(&request);
         let model_cancellation = request.cancellation.clone();
+        let pending_start = matches!(
+            *self.behavior.lock().expect("behavior lock"),
+            StreamBehavior::AbortAwarePendingStart
+        );
+        if pending_start {
+            *self
+                .stream_start_cancellation
+                .lock()
+                .expect("stream start cancellation lock") = Some(model_cancellation.clone());
+            self.stream_start_entered.add_permits(1);
+            std::future::pending::<()>().await;
+            unreachable!("pending stream startup cannot complete");
+        }
         let model = request.model;
         let events = if !requests_tool {
             vec![
@@ -396,6 +414,9 @@ impl ModelProvider for StreamingProvider {
                         cancellation: model_cancellation,
                         observed: Arc::clone(&self.stream_drop_saw_cancellation),
                     }));
+                }
+                StreamBehavior::AbortAwarePendingStart => {
+                    unreachable!("pending stream startup is handled before response assembly")
                 }
                 StreamBehavior::AbortAwarePendingTail => {
                     return Ok(Box::pin(AbortCheckingPendingStream {
@@ -2418,6 +2439,55 @@ async fn aborted_reactive_stream_cancels_model_before_provider_drop_for_direct_a
             metrics.issued,
             metrics.in_flight + metrics.committed + metrics.discarded + metrics.cancelled
         );
+    }
+}
+
+#[tokio::test]
+async fn aborted_reactive_stream_start_cancels_model_for_direct_and_adaptive() {
+    for strategy in [RunStrategy::Direct, RunStrategy::Adaptive] {
+        let provider = Arc::new(match strategy {
+            RunStrategy::Direct => StreamingProvider::new(StreamBehavior::Normal),
+            RunStrategy::Adaptive => StreamingProvider::adaptive_direct(),
+            _ => unreachable!("test covers reactive strategies only"),
+        });
+        let tool = Arc::new(CountingTool::eligible());
+        let runner = Arc::new(
+            AgentRunner::builder(provider.clone())
+                .tools(registry(tool))
+                .policy(Arc::new(TestPolicy::new(true)))
+                .speculation(SpeculationConfig::default())
+                .build(),
+        );
+        train_and_activate(&runner).await;
+        provider.set_behavior(StreamBehavior::AbortAwarePendingStart);
+
+        let active_runner = Arc::clone(&runner);
+        let run =
+            tokio::spawn(async move { active_runner.run_with_strategy(request(), strategy).await });
+        let entered = provider
+            .stream_start_entered
+            .acquire()
+            .await
+            .expect("pending stream startup semaphore open");
+        entered.forget();
+
+        run.abort();
+        assert!(run
+            .await
+            .expect_err("aborted task must not complete")
+            .is_cancelled());
+        assert!(provider
+            .stream_start_cancellation
+            .lock()
+            .expect("stream start cancellation lock")
+            .as_ref()
+            .expect("provider observed model cancellation token")
+            .is_cancelled());
+
+        let metrics = runner.speculation_metrics(TOOL_ID);
+        assert_eq!(metrics.mode, SpeculationMode::Active);
+        assert_eq!(metrics.issued, 0);
+        assert_eq!(metrics.in_flight, 0);
     }
 }
 

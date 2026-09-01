@@ -100,9 +100,9 @@ event sink therefore cannot keep speculative permits occupied or make the
 already-authorized cached result stale. `ToolCompleted` still precedes the
 result's transcript insertion in normal Direct event order; sink latency is
 ordinary publication latency, not speculative execution or publication-wait
-latency. The pull-only `publication_wait_ms` metric instead measures from a
-successful speculative tool result becoming ready to its terminal settlement,
-whether commit, discard, or cancellation wins.
+latency. The pull-only `publication_wait_ms` metric instead measures from any
+speculative tool result becoming ready, including a failed or invalid result,
+to its terminal settlement, whether commit, discard, or cancellation wins.
 
 Once a streamed item has been accepted, a terminal stream failure is terminal
 for that model turn. The runner does not retry or replay the stream: a retry
@@ -130,11 +130,11 @@ cancelled`. `issued` increments only at the actual broker dispatch boundary.
 Value-free pre-issue counters distinguish validation, policy, unexpected
 failure, invalidation, cancellation/deadline, global-slot saturation, and
 concurrency-key saturation. `oldest_in_flight_ms` supports stuck-work alerts.
-Execution duration and result-ready-to-terminal-settlement wait use cumulative
-fixed buckets at 1, 5, 10, 25, 50, 100, 250, 500, 1,000, 2,500, and 5,000 ms,
-plus an overflow count; each also reports count, saturating sum, and maximum.
-These bounded aggregates are sufficient to derive P50/P95 without retaining
-per-call timestamps or values.
+Execution duration and speculative-result-ready-to-terminal-settlement wait use
+cumulative fixed buckets at 1, 5, 10, 25, 50, 100, 250, 500, 1,000, 2,500, and
+5,000 ms, plus an overflow count; each also reports count, saturating sum, and
+maximum. These bounded aggregates are sufficient to derive P50/P95 without
+retaining per-call timestamps or values.
 
 ## Evaluation and rollout
 

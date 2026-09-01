@@ -158,7 +158,7 @@ pub struct SpeculationMetrics {
     pub oldest_in_flight_ms: u64,
     /// Dispatch-to-tool-resolution latency using a fixed-memory histogram.
     pub execution_duration_ms: SpeculationLatencyHistogram,
-    /// Tool-result-ready-to-terminal-settlement latency histogram.
+    /// Result-ready-to-terminal-settlement latency for any speculative tool result.
     pub publication_wait_ms: SpeculationLatencyHistogram,
 }
 
@@ -827,6 +827,8 @@ pub(crate) async fn stream_reactive_response(
     let assembler = ToolCallAssembler::new(model_request.tools.clone(), limits)?;
     let mut stream_controller = ModelStreamController::new(assembler);
     let model_cancellation = model_request.cancellation.clone();
+    let mut stream_start_cancellation_on_drop =
+        ModelCancellationOnDrop::new(model_cancellation.clone());
     let stream = await_guarded(
         provider.stream(model_request),
         &request.cancellation,
@@ -839,6 +841,7 @@ pub(crate) async fn stream_reactive_response(
     // Declared after the pinned stream so task cancellation drops this guard
     // first and cancels the provider token before dropping the stream itself.
     let mut model_cancellation_on_drop = ModelCancellationOnDrop::new(model_cancellation.clone());
+    stream_start_cancellation_on_drop.disarm();
 
     let mut response = StreamResponseAssembler::new(request.agent.limits.max_model_response_bytes);
     let mut candidate = None;
