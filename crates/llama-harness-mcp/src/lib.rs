@@ -14,16 +14,30 @@ use llama_harness_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
     },
     time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+
+static SERVER_CALL_GATES: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>> =
+    OnceLock::new();
+
+fn server_call_gate(server_id: &str) -> Arc<tokio::sync::Semaphore> {
+    let gates = SERVER_CALL_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut gates = gates.lock().expect("MCP server gate mutex");
+    if let Some(gate) = gates.get(server_id).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    gates.insert(server_id.to_owned(), Arc::downgrade(&gate));
+    gate
+}
 
 /// Explicit MCP protocol era negotiated with a server.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -429,6 +443,11 @@ pub struct McpLifecycleEvent {
 pub struct McpObserverError;
 
 /// Receives metadata-only MCP lifecycle events.
+///
+/// Implementations must be nonblocking and complete in constant time. The
+/// manager invokes this callback after releasing lifecycle and dispatch
+/// ownership; slow observers still delay their own caller and are therefore
+/// treated as a host integration fault rather than a flow-control mechanism.
 pub trait McpObserver: Send + Sync {
     /// Observes one lifecycle event. Errors never affect MCP execution.
     fn observe(&self, event: &McpLifecycleEvent) -> Result<(), McpObserverError>;
@@ -543,7 +562,9 @@ struct CatalogState {
     invalidated: bool,
     last_now_ms: u64,
     next_generation: u64,
-    pending_refresh_contexts: Vec<McpContext>,
+    pending_refresh_contexts: Vec<PendingRefreshContext>,
+    refresh_tokens: HashSet<u64>,
+    next_refresh_token: u64,
     retired_contexts: Vec<RetiredContext>,
     close_failures: u64,
     draining_contexts: u64,
@@ -560,9 +581,29 @@ impl Default for CatalogState {
             last_now_ms: 0,
             next_generation: 1,
             pending_refresh_contexts: Vec::new(),
+            refresh_tokens: HashSet::new(),
+            next_refresh_token: 1,
             retired_contexts: Vec::new(),
             close_failures: 0,
             draining_contexts: 0,
+        }
+    }
+}
+
+struct PendingRefreshContext {
+    token: u64,
+    context: McpContext,
+}
+
+struct RefreshOwnership {
+    state: Arc<Mutex<CatalogState>>,
+    token: u64,
+}
+
+impl Drop for RefreshOwnership {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.refresh_tokens.remove(&self.token);
         }
     }
 }
@@ -592,6 +633,7 @@ pub struct McpCatalogManager {
     close_lock: tokio::sync::Mutex<()>,
     observer: Arc<ObserverHub>,
     registration_group: ToolRegistrationGroup,
+    server_call_gate: Arc<tokio::sync::Semaphore>,
     id_deriver: Arc<McpIdDeriver>,
 }
 
@@ -644,6 +686,7 @@ impl McpCatalogManager {
             }),
             registration_group: ToolRegistrationGroup::new(format!("mcp:{server_id}"))
                 .map_err(McpError::Core)?,
+            server_call_gate: server_call_gate(&server_id),
             id_deriver: Arc::new(generated_id),
         })
     }
@@ -654,17 +697,11 @@ impl McpCatalogManager {
         cancellation: CancellationToken,
     ) -> Result<McpCatalogSnapshot, McpError> {
         let _refresh = self.refresh_lock.lock().await;
-        if self.is_closed() {
-            return Err(McpError::CatalogUnavailable);
-        }
-        if self.state.lock().map_or(true, |state| {
-            owned_context_count(&state)
-                .is_none_or(|count| count >= self.limits.max_retired_generations)
-        }) {
-            return Err(McpError::CatalogUnavailable);
-        }
+        let ownership = self.begin_refresh()?;
         let started = Instant::now();
-        let built = self.fetch_complete(cancellation.child_token()).await;
+        let built = self
+            .fetch_complete(ownership.token, cancellation.child_token())
+            .await;
         let elapsed = elapsed_ms(started);
         let (context, tools, scope, bytes, pages) = match built {
             Ok(value) => value,
@@ -693,7 +730,7 @@ impl McpCatalogManager {
             Ok(now) => now,
             Err(error) => {
                 return self
-                    .fail_refresh_context(context, error, started, bytes, pages)
+                    .fail_refresh_context(ownership.token, context, error, started, bytes, pages)
                     .await
             }
         };
@@ -703,6 +740,7 @@ impl McpCatalogManager {
                 None => {
                     return self
                         .fail_refresh_context(
+                            ownership.token,
                             context,
                             McpError::InvalidCatalog("modern catalog omitted ttl".into()),
                             started,
@@ -716,7 +754,14 @@ impl McpCatalogManager {
                 Ok(ttl) => ttl,
                 Err(error) => {
                     return self
-                        .fail_refresh_context(context, error, started, bytes, pages)
+                        .fail_refresh_context(
+                            ownership.token,
+                            context,
+                            error,
+                            started,
+                            bytes,
+                            pages,
+                        )
                         .await
                 }
             },
@@ -725,7 +770,14 @@ impl McpCatalogManager {
             Some(value) => value,
             None => {
                 return self
-                    .fail_refresh_context(context, McpError::Clock, started, bytes, pages)
+                    .fail_refresh_context(
+                        ownership.token,
+                        context,
+                        McpError::Clock,
+                        started,
+                        bytes,
+                        pages,
+                    )
                     .await
             }
         };
@@ -733,7 +785,7 @@ impl McpCatalogManager {
             Ok(value) => value.unwrap_or(0),
             Err(error) => {
                 return self
-                    .fail_refresh_context(context, error, started, bytes, pages)
+                    .fail_refresh_context(ownership.token, context, error, started, bytes, pages)
                     .await
             }
         };
@@ -742,7 +794,7 @@ impl McpCatalogManager {
             Ok(value) => value,
             Err(error) => {
                 return self
-                    .fail_refresh_context(context, error, started, bytes, pages)
+                    .fail_refresh_context(ownership.token, context, error, started, bytes, pages)
                     .await
             }
         };
@@ -764,7 +816,7 @@ impl McpCatalogManager {
             Ok(generation) => generation,
             Err(error) => {
                 return self
-                    .fail_refresh_context(context, error, started, bytes, pages)
+                    .fail_refresh_context(ownership.token, context, error, started, bytes, pages)
                     .await
             }
         };
@@ -784,6 +836,7 @@ impl McpCatalogManager {
                         self.timeouts.call,
                         self.limits.clone(),
                         Arc::clone(&self.observer),
+                        Arc::clone(&self.server_call_gate),
                     )),
                     generation,
                     Arc::downgrade(&self.state),
@@ -799,6 +852,7 @@ impl McpCatalogManager {
         {
             return self
                 .fail_refresh_context(
+                    ownership.token,
                     (*context).clone(),
                     McpError::InvalidCatalog("generated ID collision".into()),
                     started,
@@ -831,7 +885,7 @@ impl McpCatalogManager {
             if let Some(index) = state
                 .pending_refresh_contexts
                 .iter()
-                .rposition(|candidate| candidate == context.as_ref())
+                .rposition(|candidate| candidate.token == ownership.token)
             {
                 state.pending_refresh_contexts.remove(index);
             } else {
@@ -844,7 +898,14 @@ impl McpCatalogManager {
             Ok(previous) => previous,
             Err(error) => {
                 return self
-                    .fail_refresh_context((*snapshot.context).clone(), error, started, bytes, pages)
+                    .fail_refresh_context(
+                        ownership.token,
+                        (*snapshot.context).clone(),
+                        error,
+                        started,
+                        bytes,
+                        pages,
+                    )
                     .await
             }
         };
@@ -937,9 +998,9 @@ impl McpCatalogManager {
                         in_flight: Arc::clone(&snapshot.in_flight),
                     });
                 }
-                for context in std::mem::take(&mut state.pending_refresh_contexts) {
+                for pending in std::mem::take(&mut state.pending_refresh_contexts) {
                     state.retired_contexts.push(RetiredContext {
-                        context: Arc::new(context),
+                        context: Arc::new(pending.context),
                         in_flight: Arc::new(InFlightCalls::default()),
                     });
                 }
@@ -954,6 +1015,24 @@ impl McpCatalogManager {
                 .collect::<Vec<_>>()
         };
         let started = Instant::now();
+        if contexts.len() > 1 {
+            for context in contexts {
+                self.schedule_close_after_drain(context.context, context.in_flight);
+            }
+            self.observer.emit(event(
+                McpLifecycleOperation::Close,
+                McpLifecycleOutcome::Failed,
+                elapsed_ms(started),
+                0,
+                0,
+                0,
+                false,
+                cancellation.is_cancelled(),
+                McpDispatchState::PossiblyDispatched,
+                None,
+            ));
+            return Err(McpError::CleanupPending);
+        }
         let mut failed = false;
         for context in contexts {
             if tokio::time::timeout(self.timeouts.close, wait_for_drain(&context.in_flight))
@@ -968,10 +1047,9 @@ impl McpCatalogManager {
                 failed = true;
             }
         }
-        let unresolved = self
-            .state
-            .lock()
-            .map_or(true, |state| owned_context_count(&state) != Some(0));
+        let unresolved = self.state.lock().map_or(true, |state| {
+            owned_context_count(&state) != Some(0) || !state.refresh_tokens.is_empty()
+        });
         let result = if unresolved {
             Err(McpError::CleanupPending)
         } else if failed {
@@ -1022,10 +1100,6 @@ impl McpCatalogManager {
         )
     }
 
-    fn is_closed(&self) -> bool {
-        self.state.lock().map(|state| state.closed).unwrap_or(true)
-    }
-
     /// Attempts a context already retained in manager ownership. Keeping the
     /// original entry in state until transport close succeeds makes a dropped
     /// caller future unable to lose a connected context.
@@ -1055,13 +1129,14 @@ impl McpCatalogManager {
 
     async fn fail_refresh_context<T>(
         &self,
-        context: McpContext,
+        token: u64,
+        _context: McpContext,
         error: McpError,
         started: Instant,
         bytes: u64,
         pages: u64,
     ) -> Result<T, McpError> {
-        self.cleanup_pending_context(context).await;
+        self.cleanup_pending_context(token).await;
         self.observer.emit(event(
             McpLifecycleOperation::Refresh,
             outcome_for_error(&error),
@@ -1077,25 +1152,57 @@ impl McpCatalogManager {
         Err(error)
     }
 
-    fn retain_pending_context(&self, context: McpContext) {
+    fn begin_refresh(&self) -> Result<RefreshOwnership, McpError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| McpError::CatalogUnavailable)?;
+        if state.closed
+            || owned_context_count(&state)
+                .is_none_or(|count| count >= self.limits.max_retired_generations)
+        {
+            return Err(McpError::CatalogUnavailable);
+        }
+        let token = state.next_refresh_token;
+        state.next_refresh_token = state
+            .next_refresh_token
+            .checked_add(1)
+            .ok_or(McpError::Clock)?;
+        if !state.refresh_tokens.insert(token) {
+            return Err(McpError::Clock);
+        }
+        Ok(RefreshOwnership {
+            state: Arc::clone(&self.state),
+            token,
+        })
+    }
+
+    fn retain_pending_context(&self, token: u64, context: McpContext) {
         if let Ok(mut state) = self.state.lock() {
-            state.pending_refresh_contexts.push(context);
+            if state.refresh_tokens.contains(&token) {
+                state
+                    .pending_refresh_contexts
+                    .push(PendingRefreshContext { token, context });
+            }
         }
     }
 
-    fn take_pending_context(&self, context: &McpContext) -> Option<McpContext> {
+    fn take_pending_context(&self, token: u64) -> Option<McpContext> {
         self.state.lock().ok().and_then(|mut state| {
             state
                 .pending_refresh_contexts
                 .iter()
-                .rposition(|candidate| candidate == context)
-                .map(|index| state.pending_refresh_contexts.remove(index))
+                .rposition(|candidate| candidate.token == token)
+                .map(|index| state.pending_refresh_contexts.remove(index).context)
         })
     }
 
-    async fn cleanup_pending_context(&self, context: McpContext) {
+    async fn cleanup_pending_context(&self, token: u64) {
+        let Some(context) = self.take_pending_context(token) else {
+            return;
+        };
         let retained = RetiredContext {
-            context: Arc::new(self.take_pending_context(&context).unwrap_or(context)),
+            context: Arc::new(context),
             in_flight: Arc::new(InFlightCalls::default()),
         };
         if let Ok(mut state) = self.state.lock() {
@@ -1174,6 +1281,7 @@ impl McpCatalogManager {
 
     async fn fetch_complete(
         &self,
+        token: u64,
         cancellation: CancellationToken,
     ) -> Result<(McpContext, FetchedTools, Option<McpCacheScope>, u64, u64), McpError> {
         let negotiation_started = Instant::now();
@@ -1184,15 +1292,15 @@ impl McpCatalogManager {
         // Record ownership before the first post-connect await. If the
         // refresh future is abandoned during validation/listing, close() can
         // still reclaim this handle.
-        self.retain_pending_context(context.clone());
+        self.retain_pending_context(token, context.clone());
         if let Err(error) = validate_context(&context, &self.limits) {
-            self.cleanup_pending_context(context).await;
+            self.cleanup_pending_context(token).await;
             return Err(error);
         }
         if !supported_context(&context) {
             // Once connected, this function owns the context until it is
             // transferred in its successful return value.
-            self.cleanup_pending_context(context).await;
+            self.cleanup_pending_context(token).await;
             return Err(McpError::InvalidCatalog(
                 "unsupported version or missing tools capability".into(),
             ));
@@ -1220,7 +1328,7 @@ impl McpCatalogManager {
         let fetched = match fetched {
             Ok(fetched) => fetched,
             Err(error) => {
-                self.cleanup_pending_context(context).await;
+                self.cleanup_pending_context(token).await;
                 return Err(error);
             }
         };
@@ -1497,6 +1605,7 @@ struct McpToolAdapter {
     call_timeout: Duration,
     limits: McpLimits,
     observer: Arc<ObserverHub>,
+    server_call_gate: Arc<tokio::sync::Semaphore>,
 }
 impl McpToolAdapter {
     #[allow(clippy::too_many_arguments)]
@@ -1509,6 +1618,7 @@ impl McpToolAdapter {
         call_timeout: Duration,
         limits: McpLimits,
         observer: Arc<ObserverHub>,
+        server_call_gate: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         let native_name = tool.name.clone();
         let mut d = ToolDefinition::new(id, tool.name, tool.description, tool.input_schema)
@@ -1533,6 +1643,7 @@ impl McpToolAdapter {
             call_timeout,
             limits,
             observer,
+            server_call_gate,
         }
     }
 }
@@ -1606,6 +1717,19 @@ impl McpToolAdapter {
         }
         let started = Instant::now();
         let correlation = Some(McpCallCorrelation::from(call));
+        let _server_permit = tokio::select! {
+            _ = cancellation.cancelled() => {
+                self.observer.emit(event(
+                    McpLifecycleOperation::Call,
+                    McpLifecycleOutcome::Cancelled,
+                    elapsed_ms(started),
+                    0, 0, 0, stale, true, McpDispatchState::NotDispatched, correlation.clone(),
+                ));
+                return Err(HarnessError::Cancelled);
+            }
+            permit = Arc::clone(&self.server_call_gate).acquire_owned() => permit
+                .map_err(|_| HarnessError::InvalidTool("MCP server gate unavailable".into()))?,
+        };
         enum CallFailure {
             Cancelled,
             TimedOut,
@@ -2443,6 +2567,42 @@ mod tests {
         assert!(Arc::ptr_eq(&active.context, &active.tools[1].inner.context));
     }
 
+    #[test]
+    fn same_server_managers_share_a_process_wide_call_gate() {
+        let clock = Arc::new(FakeClock::default());
+        let first = manager(
+            Arc::new(FakeTransport::modern(100, vec![tool("one")])),
+            clock.clone(),
+            None,
+            None,
+        );
+        let second = manager(
+            Arc::new(FakeTransport::modern(100, vec![tool("two")])),
+            clock,
+            None,
+            None,
+        );
+        assert!(Arc::ptr_eq(
+            &first.server_call_gate,
+            &second.server_call_gate
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_catalog_limit_accepts_exactly_256_tools_in_one_pass() {
+        let clock = Arc::new(FakeClock::default());
+        let tools = (0..256)
+            .map(|index| tool(&format!("tool-{index}")))
+            .collect::<Vec<_>>();
+        let transport = Arc::new(FakeTransport::modern(100, tools));
+        let manager = manager(transport, clock, None, None);
+        let snapshot = manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("catalog");
+        assert_eq!(snapshot.tool_count, 256);
+    }
+
     #[tokio::test]
     async fn retired_generation_bound_fails_before_connect() {
         let clock = Arc::new(FakeClock::default());
@@ -2589,14 +2749,39 @@ mod tests {
             while !transport.connect_started.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             }
-            manager
-                .close(CancellationToken::new())
-                .await
-                .expect("close");
+            assert!(matches!(
+                manager.close(CancellationToken::new()).await,
+                Err(McpError::CleanupPending)
+            ));
             transport.connect_release.notify_waiters();
         };
         let (refreshed, ()) = tokio::join!(refresh, close);
         assert!(matches!(refreshed, Err(McpError::CatalogUnavailable)));
+        assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn close_after_connect_before_listing_takes_refresh_context_once() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        transport.block_list.store(true, Ordering::Relaxed);
+        let manager = Arc::new(manager(transport.clone(), clock, None, None));
+        let refresh_manager = Arc::clone(&manager);
+        let refresh =
+            tokio::spawn(async move { refresh_manager.refresh(CancellationToken::new()).await });
+        while !transport.list_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            manager.close(CancellationToken::new()).await,
+            Err(McpError::CleanupPending)
+        ));
+        refresh.abort();
+        assert!(refresh.await.expect_err("aborted refresh").is_cancelled());
+        manager
+            .close(CancellationToken::new())
+            .await
+            .expect("retry closes retained context");
         assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
     }
 
@@ -2641,10 +2826,21 @@ mod tests {
         ));
         assert_eq!(transport.connects.load(Ordering::Relaxed), 2);
         transport.block_list.store(false, Ordering::Relaxed);
+        assert!(matches!(
+            manager.close(CancellationToken::new()).await,
+            Err(McpError::CleanupPending)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while manager.shutdown_health().pending_contexts != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain retained contexts");
         manager
             .close(CancellationToken::new())
             .await
-            .expect("drain retained contexts");
+            .expect("closed");
         assert_eq!(manager.shutdown_health().pending_contexts, 0);
         assert_eq!(transport.closes.load(Ordering::Relaxed), 2);
     }
@@ -2669,7 +2865,10 @@ mod tests {
         let context = transport.context.clone();
         {
             let mut state = manager.state.lock().expect("test mutex");
-            state.pending_refresh_contexts.push(context.clone());
+            state.pending_refresh_contexts.push(PendingRefreshContext {
+                token: 1,
+                context: context.clone(),
+            });
             state.retired_contexts.push(RetiredContext {
                 context: Arc::new(context),
                 in_flight: Arc::new(InFlightCalls::default()),
