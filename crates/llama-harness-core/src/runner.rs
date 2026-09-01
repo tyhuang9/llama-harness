@@ -30,6 +30,7 @@ pub struct AgentRunner {
     pub(crate) events: Arc<dyn EventSink>,
     pub(crate) concurrency: Arc<ToolConcurrencyLimiter>,
     pub(crate) discovery_limits: ToolDiscoveryLimits,
+    pub(crate) speculation: Option<Arc<crate::speculation::SpeculationController>>,
     #[cfg(feature = "programmatic")]
     pub(crate) programmatic: Option<crate::ProgrammaticHostConfig>,
     #[cfg(feature = "programmatic")]
@@ -45,6 +46,7 @@ pub struct AgentRunnerBuilder {
     events: Arc<dyn EventSink>,
     concurrency: Arc<ToolConcurrencyLimiter>,
     discovery_limits: ToolDiscoveryLimits,
+    speculation: Option<crate::SpeculationConfig>,
     #[cfg(feature = "programmatic")]
     programmatic: Option<crate::ProgrammaticHostConfig>,
 }
@@ -66,9 +68,42 @@ impl AgentRunner {
             events: Arc::new(InMemoryEventSink::default()),
             concurrency: Arc::new(ToolConcurrencyLimiter::default()),
             discovery_limits: ToolDiscoveryLimits::default(),
+            speculation: None,
             #[cfg(feature = "programmatic")]
             programmatic: None,
         }
+    }
+
+    /// Returns pull-only readiness evidence for one registered tool.
+    pub fn speculation_readiness(&self, tool_id: &str) -> crate::SpeculationReadiness {
+        self.speculation.as_ref().map_or_else(
+            || crate::SpeculationReadiness::disabled(tool_id),
+            |controller| controller.readiness(tool_id),
+        )
+    }
+
+    /// Returns pull-only metadata counters for one registered tool.
+    pub fn speculation_metrics(&self, tool_id: &str) -> crate::SpeculationMetrics {
+        self.speculation.as_ref().map_or_else(
+            || crate::SpeculationMetrics::disabled(tool_id),
+            |controller| controller.metrics(tool_id),
+        )
+    }
+
+    /// Explicitly activates one ready tool without affecting other tools.
+    pub fn activate_speculation(&self, tool_id: &str) -> crate::SpeculationReadiness {
+        self.speculation.as_ref().map_or_else(
+            || crate::SpeculationReadiness::disabled(tool_id),
+            |controller| controller.activate(tool_id),
+        )
+    }
+
+    /// Immediately returns one tool to Shadow and clears its readiness streak.
+    pub fn return_speculation_to_shadow(&self, tool_id: &str) -> crate::SpeculationReadiness {
+        self.speculation.as_ref().map_or_else(
+            || crate::SpeculationReadiness::disabled(tool_id),
+            |controller| controller.return_to_shadow(tool_id),
+        )
     }
 
     pub(crate) async fn run_direct(
@@ -276,7 +311,7 @@ impl AgentRunner {
             }
 
             let mut provider_retries = 0;
-            let response = loop {
+            let (response, mut speculative) = loop {
                 if model_calls >= request.agent.limits.max_model_calls {
                     result.status = RunStatus::LimitReached;
                     result.model_call_limit_reached = true;
@@ -309,7 +344,7 @@ impl AgentRunner {
                         break 'run;
                     }
                 };
-                let completion = self.provider.complete(ModelRequest {
+                let model_request = ModelRequest {
                     model: model.clone(),
                     messages: messages.clone(),
                     tools: tool_scope.definitions().to_vec(),
@@ -320,17 +355,36 @@ impl AgentRunner {
                     ),
                     metadata: request.metadata.clone(),
                     cancellation: call_cancellation.clone(),
-                });
+                };
+                let completion = if let Some(controller) = self.speculation.as_ref().filter(|_| {
+                    continuation_usage.is_none() && self.provider.capabilities().supports_streaming
+                }) {
+                    crate::speculation::stream_reactive_response(
+                        &self.provider,
+                        &broker,
+                        controller,
+                        &request,
+                        model_request,
+                        &result.id,
+                        &result.trace_id,
+                        model_calls,
+                        call_deadline,
+                    )
+                    .await
+                    .map(|streamed| (streamed.response, streamed.speculative))
+                } else {
+                    await_guarded(
+                        self.provider.complete(model_request),
+                        &request.cancellation,
+                        call_deadline,
+                        "provider call deadline reached",
+                        Some(&call_cancellation),
+                    )
+                    .await
+                    .map(|response| (response, None))
+                };
 
-                match await_guarded(
-                    completion,
-                    &request.cancellation,
-                    call_deadline,
-                    "provider call deadline reached",
-                    Some(&call_cancellation),
-                )
-                .await
-                {
+                match completion {
                     Ok(response) => {
                         events.emit(RunEvent::ModelResponded {
                             call_number: model_calls,
@@ -354,11 +408,21 @@ impl AgentRunner {
             };
 
             if let Err(error) = validate_model_response(&response, &request.agent.limits) {
+                if let (Some(controller), Some(ready)) =
+                    (self.speculation.as_ref(), speculative.take())
+                {
+                    crate::speculation::discard_ready_commit(controller, ready, false);
+                }
                 apply_terminal_error(&mut result, error);
                 break;
             }
 
             if let Some(output) = response.final_output {
+                if let (Some(controller), Some(ready)) =
+                    (self.speculation.as_ref(), speculative.take())
+                {
+                    crate::speculation::discard_ready_commit(controller, ready, false);
+                }
                 if output.trim().is_empty() {
                     result.errors.push(RunError {
                         code: "empty_model_response".into(),
@@ -415,7 +479,61 @@ impl AgentRunner {
                 break;
             }
 
-            for call in response.tool_calls {
+            for (call_index, call) in response.tool_calls.into_iter().enumerate() {
+                if call_index == 0 {
+                    if let (Some(controller), Some(ready)) =
+                        (self.speculation.as_ref(), speculative.take())
+                    {
+                        let tool_id = ready.tool_id.clone();
+                        match broker
+                            .commit_speculative(
+                                controller,
+                                &request,
+                                &mut result,
+                                &mut events,
+                                &mut broker_state,
+                                &ready.execution,
+                                &call,
+                                model_calls,
+                                deadline,
+                            )
+                            .await
+                        {
+                            Ok(Some(tool_result)) => {
+                                controller.record_resolution(
+                                    &tool_id,
+                                    crate::speculation::SpeculativeResolution::Committed,
+                                );
+                                if let Err(error) = push_tool_message(
+                                    &mut messages,
+                                    &call,
+                                    &tool_result,
+                                    &request.agent.limits,
+                                ) {
+                                    apply_terminal_error(&mut result, error);
+                                    break 'run;
+                                }
+                                continue;
+                            }
+                            Ok(None) => {
+                                crate::speculation::discard_ready_commit(controller, ready, false);
+                            }
+                            Err(error) => {
+                                let cancelled = matches!(
+                                    error,
+                                    HarnessError::Cancelled | HarnessError::TimedOut(_)
+                                );
+                                crate::speculation::discard_ready_commit(
+                                    controller, ready, cancelled,
+                                );
+                                if cancelled {
+                                    apply_terminal_error(&mut result, error);
+                                    break 'run;
+                                }
+                            }
+                        }
+                    }
+                }
                 let attempts_before = broker_state.tool_calls;
                 let classified_before = broker_state.classified_tool_calls();
                 let outcome = match broker
@@ -764,6 +882,12 @@ impl AgentRunnerBuilder {
         self
     }
 
+    /// Explicitly opts this runner into guarded shadow-first speculation.
+    pub fn speculation(mut self, config: crate::SpeculationConfig) -> Self {
+        self.speculation = Some(config);
+        self
+    }
+
     /// Replaces the policy engine used for tool decisions.
     pub fn policy(mut self, policy: Arc<dyn PolicyEngine>) -> Self {
         self.policy = policy;
@@ -801,6 +925,10 @@ impl AgentRunnerBuilder {
             events: self.events,
             concurrency: self.concurrency,
             discovery_limits: self.discovery_limits,
+            speculation: self
+                .speculation
+                .map(crate::speculation::SpeculationController::new)
+                .map(Arc::new),
             #[cfg(feature = "programmatic")]
             programmatic: self.programmatic,
             #[cfg(feature = "programmatic")]

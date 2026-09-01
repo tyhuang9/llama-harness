@@ -70,6 +70,7 @@ struct StrategyRun<'a> {
     plan_attempt: u32,
     direct_scope: ToolScope,
     plan_scope: ToolScope,
+    pending_speculative: Option<crate::speculation::ReadySpeculativeCommit>,
 }
 
 struct PreparedPlanScope {
@@ -134,6 +135,9 @@ impl AgentRunner {
         request: RunRequest,
         strategy: RunStrategy,
     ) -> Result<RunResult, HarnessError> {
+        if let Some(speculation) = &self.speculation {
+            speculation.config().validate()?;
+        }
         #[cfg(not(feature = "programmatic"))]
         if strategy == RunStrategy::Programmatic {
             return Err(HarnessError::UnsupportedCapability(
@@ -408,6 +412,7 @@ impl AgentRunner {
                     plan_scope.clone(),
                     model_phase,
                     true,
+                    false,
                 )
                 .await
             {
@@ -633,6 +638,7 @@ impl AgentRunner {
                                 plan_scope.clone(),
                                 ModelCallPhase::Recovery,
                                 true,
+                                false,
                             )
                             .await
                         {
@@ -772,6 +778,7 @@ impl<'a> StrategyRun<'a> {
             plan_attempt: 0,
             direct_scope,
             plan_scope: prepared_plan.scope,
+            pending_speculative: None,
         }
     }
 
@@ -835,6 +842,7 @@ impl<'a> StrategyRun<'a> {
         scope: ToolScope,
         phase: ModelCallPhase,
         reserve_final_synthesis: bool,
+        allow_speculation: bool,
     ) -> Result<Option<ModelResponse>, HarnessError> {
         let mut provider_retries = 0;
         loop {
@@ -865,7 +873,7 @@ impl<'a> StrategyRun<'a> {
                 self.deadline,
                 self.request.agent.limits.max_model_call_duration_ms,
             )?;
-            let completion = self.runner.provider.complete(ModelRequest {
+            let model_request = ModelRequest {
                 model: self.model.clone(),
                 messages: messages.clone(),
                 tools: scope.definitions().to_vec(),
@@ -876,18 +884,60 @@ impl<'a> StrategyRun<'a> {
                 ),
                 metadata: self.request.metadata.clone(),
                 cancellation: call_cancellation.clone(),
-            });
-            match crate::runner::await_guarded(
-                completion,
-                &self.request.cancellation,
-                call_deadline,
-                "provider call deadline reached",
-                Some(&call_cancellation),
-            )
-            .await
-            {
-                Ok(response) => {
+            };
+            let completion = if allow_speculation {
+                if let Some(controller) = self
+                    .runner
+                    .speculation
+                    .as_ref()
+                    .filter(|_| self.runner.provider.capabilities().supports_streaming)
+                {
+                    let broker = ToolBroker::new(
+                        &self.runner.tools,
+                        &scope,
+                        &self.runner.policy,
+                        &self.runner.approvals,
+                        &self.runner.concurrency,
+                    );
+                    crate::speculation::stream_reactive_response(
+                        &self.runner.provider,
+                        &broker,
+                        controller,
+                        self.request,
+                        model_request,
+                        &self.result.id,
+                        &self.result.trace_id,
+                        self.model_calls,
+                        call_deadline,
+                    )
+                    .await
+                    .map(|streamed| (streamed.response, streamed.speculative))
+                } else {
+                    crate::runner::await_guarded(
+                        self.runner.provider.complete(model_request),
+                        &self.request.cancellation,
+                        call_deadline,
+                        "provider call deadline reached",
+                        Some(&call_cancellation),
+                    )
+                    .await
+                    .map(|response| (response, None))
+                }
+            } else {
+                crate::runner::await_guarded(
+                    self.runner.provider.complete(model_request),
+                    &self.request.cancellation,
+                    call_deadline,
+                    "provider call deadline reached",
+                    Some(&call_cancellation),
+                )
+                .await
+                .map(|response| (response, None))
+            };
+            match completion {
+                Ok((response, speculative)) => {
                     validate_model_response(&response, &self.request.agent.limits)?;
+                    self.pending_speculative = speculative;
                     self.events.emit(RunEvent::ModelResponded {
                         call_number: self.model_calls,
                     });
@@ -1001,7 +1051,7 @@ impl<'a> StrategyRun<'a> {
             ));
         }
 
-        let mut identical = HashMap::<String, u32>::new();
+        let mut identical = HashMap::<crate::broker::InvocationKey, u32>::new();
         for node in &plan.nodes {
             if !self.plan_scope.contains(&node.tool_id) {
                 return Err(HarnessError::InvalidTool(format!(
@@ -1030,7 +1080,7 @@ impl<'a> StrategyRun<'a> {
             }
             self.runner.tools.validate(&node.tool_id, &node.arguments)?;
             if node.result_bindings.is_empty() {
-                let signature = crate::broker::canonical_signature(&node.tool_id, &node.arguments);
+                let signature = crate::broker::InvocationKey::new(&node.tool_id, &node.arguments);
                 let count = identical.entry(signature).or_default();
                 *count += 1;
                 if *count > self.request.agent.limits.max_identical_tool_calls {
@@ -1869,6 +1919,7 @@ impl<'a> StrategyRun<'a> {
                     self.direct_scope.clone(),
                     phase,
                     false,
+                    self.selected == RunStrategy::Direct,
                 )
                 .await
             {
@@ -1879,9 +1930,15 @@ impl<'a> StrategyRun<'a> {
                     return;
                 }
             };
+            let mut speculative = self.pending_speculative.take();
             phase = ModelCallPhase::Reactive;
 
             if let Some(output) = response.final_output {
+                if let (Some(controller), Some(ready)) =
+                    (self.runner.speculation.as_ref(), speculative.take())
+                {
+                    crate::speculation::discard_ready_commit(controller, ready, false);
+                }
                 if output.trim().is_empty() {
                     self.result.errors.push(RunError::new(
                         "empty_model_response",
@@ -1927,6 +1984,11 @@ impl<'a> StrategyRun<'a> {
             }
 
             if response.tool_calls.is_empty() {
+                if let (Some(controller), Some(ready)) =
+                    (self.runner.speculation.as_ref(), speculative.take())
+                {
+                    crate::speculation::discard_ready_commit(controller, ready, false);
+                }
                 self.result.errors.push(RunError::new(
                     "empty_model_response",
                     "model returned neither final output nor tool calls",
@@ -1941,11 +2003,70 @@ impl<'a> StrategyRun<'a> {
             self.messages
                 .push(Message::assistant_tool_calls(recorded_calls));
             if let Err(error) = ensure_transcript(&self.messages, &self.request.agent.limits) {
+                if let (Some(controller), Some(ready)) =
+                    (self.runner.speculation.as_ref(), speculative.take())
+                {
+                    crate::speculation::discard_ready_commit(controller, ready, false);
+                }
                 self.terminate(error);
                 return;
             }
 
-            for call in response.tool_calls {
+            for (call_index, call) in response.tool_calls.into_iter().enumerate() {
+                if call_index == 0 {
+                    if let (Some(controller), Some(ready)) =
+                        (self.runner.speculation.as_ref(), speculative.take())
+                    {
+                        let tool_id = ready.tool_id.clone();
+                        match broker
+                            .commit_speculative(
+                                controller,
+                                self.request,
+                                &mut self.result,
+                                &mut self.events,
+                                &mut self.broker_state,
+                                &ready.execution,
+                                &call,
+                                self.model_calls,
+                                self.deadline,
+                            )
+                            .await
+                        {
+                            Ok(Some(tool_result)) => {
+                                controller.record_resolution(
+                                    &tool_id,
+                                    crate::speculation::SpeculativeResolution::Committed,
+                                );
+                                if let Err(error) = push_tool_message(
+                                    &mut self.messages,
+                                    &call,
+                                    &tool_result,
+                                    &self.request.agent.limits,
+                                ) {
+                                    self.terminate(error);
+                                    return;
+                                }
+                                continue;
+                            }
+                            Ok(None) => {
+                                crate::speculation::discard_ready_commit(controller, ready, false);
+                            }
+                            Err(error) => {
+                                let cancelled = matches!(
+                                    error,
+                                    HarnessError::Cancelled | HarnessError::TimedOut(_)
+                                );
+                                crate::speculation::discard_ready_commit(
+                                    controller, ready, cancelled,
+                                );
+                                if cancelled {
+                                    self.terminate(error);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 let attempts_before = self.broker_state.tool_calls;
                 let classified_before = self.broker_state.classified_tool_calls();
                 let outcome = match broker

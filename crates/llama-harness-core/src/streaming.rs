@@ -59,6 +59,10 @@ pub struct ToolCallDelta {
     /// JSON argument bytes appended by this fragment.
     pub arguments_fragment: String,
     /// Whether this is the final fragment for the indexed call.
+    ///
+    /// Guarded speculation only considers a call after this boundary. Providers
+    /// that cannot surface a per-call final boundary still stream normally but
+    /// cannot create useful overlap before the response completes.
     pub is_final: bool,
 }
 
@@ -526,6 +530,10 @@ impl ModelStreamController {
             assembler,
             state: ModelStreamState::Active,
         }
+    }
+
+    pub(crate) fn partial_call(&self, index: usize) -> Option<PartialToolCall> {
+        self.assembler.partial_call(index)
     }
 
     /// Validates one stream item and permanently fuses the controller on terminal state.

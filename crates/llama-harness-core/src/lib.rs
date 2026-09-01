@@ -20,6 +20,7 @@ mod policy;
 #[cfg(feature = "programmatic")]
 mod programmatic;
 mod runner;
+mod speculation;
 mod streaming;
 mod tool;
 
@@ -64,6 +65,11 @@ pub use policy::{
 #[cfg(feature = "programmatic")]
 pub use programmatic::ProgrammaticHostConfig;
 pub use runner::{AgentRunner, AgentRunnerBuilder};
+pub use speculation::{
+    SpeculationConfig, SpeculationMetrics, SpeculationMode, SpeculationReadiness,
+    HARD_MAX_SPECULATION_DURATION_MS, HARD_MAX_SPECULATION_STREAM_EVENTS,
+    MIN_SPECULATION_SHADOW_OBSERVATIONS,
+};
 pub use streaming::{
     ModelEventStream, ModelStreamController, ModelStreamEvent, PartialToolCall, ToolCallAssembler,
     ToolCallAssemblyLimits, ToolCallDelta, ValidatedModelStreamEvent,

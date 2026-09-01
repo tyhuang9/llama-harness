@@ -1,15 +1,18 @@
+use crate::speculation::SpeculationController;
 use crate::{
     discovery::ToolScope,
     limits::{ensure_json_depth, serialized_len},
     runner::{await_guarded, check_stopped},
-    ApprovalHandler, ApprovalRecord, HarnessError, PolicyDecision, PolicyEngine, RunError,
-    RunEvent, RunRequest, RunResult, RunStatus, Tool, ToolCall, ToolCallContext, ToolCaller,
+    ApprovalHandler, ApprovalRecord, CancellationSafety, ExecutionLocation, HarnessError,
+    IssueSafety, NetworkEgress, PolicyDecision, PolicyEngine, RunError, RunEvent, RunRequest,
+    RunResult, RunStatus, SpeculationPolicy, Tool, ToolCall, ToolCallContext, ToolCaller,
     ToolRegistry, ToolResult,
 };
 use serde_json::Value;
 use std::{
     collections::HashMap,
     future::Future,
+    hash::{Hash, Hasher},
     sync::{Arc, Weak},
     time::Instant as StdInstant,
 };
@@ -49,6 +52,28 @@ impl ToolConcurrencyLimiter {
             .await
             .map_err(|_| HarnessError::Tool("tool concurrency permit closed".into()))
     }
+
+    fn try_acquire(&self, key: &str) -> Result<Option<OwnedSemaphorePermit>, HarnessError> {
+        let Some(mut keyed) = self.keyed.try_lock().ok() else {
+            return Ok(None);
+        };
+        keyed.retain(|_, semaphore| semaphore.strong_count() > 0);
+        let semaphore = if let Some(semaphore) = keyed.get(key).and_then(Weak::upgrade) {
+            semaphore
+        } else {
+            let semaphore = Arc::new(Semaphore::new(1));
+            keyed.insert(key.to_owned(), Arc::downgrade(&semaphore));
+            semaphore
+        };
+        drop(keyed);
+        match semaphore.try_acquire_owned() {
+            Ok(permit) => Ok(Some(permit)),
+            Err(tokio::sync::TryAcquireError::NoPermits) => Ok(None),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                Err(HarnessError::Tool("tool concurrency permit closed".into()))
+            }
+        }
+    }
 }
 
 /// Per-run counters and effect records shared by every tool-calling strategy.
@@ -63,8 +88,8 @@ pub(crate) struct BrokerState {
     pub(crate) tool_completed: u32,
     pub(crate) tool_failed: u32,
     pub(crate) tool_cancelled: u32,
-    identical_calls: HashMap<String, u32>,
-    effects: HashMap<String, EffectRecord>,
+    identical_calls: HashMap<InvocationKey, u32>,
+    effects: HashMap<InvocationKey, EffectRecord>,
     reuse_committed_effects: bool,
 }
 
@@ -130,10 +155,10 @@ pub(crate) struct PreparedCall {
     pub(crate) arguments: Value,
     pub(crate) tool: Arc<dyn Tool>,
     pub(crate) context: ToolCallContext,
-    signature: Option<String>,
-    effect_key: Option<String>,
+    signature: Option<InvocationKey>,
+    effect_key: Option<InvocationKey>,
     caller: ToolCaller,
-    authorized_signature: Option<String>,
+    authorized_signature: Option<InvocationKey>,
     signature_accounted: bool,
     approval_barrier: bool,
 }
@@ -368,7 +393,7 @@ impl<'a> ToolBroker<'a> {
         }
 
         let signature =
-            (!defer_signature_checks).then(|| canonical_signature(&call.tool_id, &arguments));
+            (!defer_signature_checks).then(|| InvocationKey::new(&call.tool_id, &arguments));
         if let Some(signature) = &signature {
             if let Some(recorded) = self.reusable_effect(
                 state,
@@ -406,7 +431,11 @@ impl<'a> ToolBroker<'a> {
         let effect_key = if tool.definition().read_only {
             None
         } else if caller == ToolCaller::Programmatic {
-            context.effect_key.clone()
+            Some(InvocationKey::programmatic(
+                &call.tool_id,
+                &arguments,
+                context.effect_key.as_deref().unwrap_or_default(),
+            ))
         } else {
             signature.clone()
         };
@@ -472,7 +501,7 @@ impl<'a> ToolBroker<'a> {
         }
         self.tools.validate(&prepared.call.tool_id, &arguments)?;
 
-        let signature = canonical_signature(&prepared.call.tool_id, &arguments);
+        let signature = InvocationKey::new(&prepared.call.tool_id, &arguments);
         if !prepared.signature_accounted {
             prepared.call.arguments_json = arguments_json.clone();
             result.tool_calls.push(prepared.call.clone());
@@ -494,7 +523,7 @@ impl<'a> ToolBroker<'a> {
             prepared.signature_accounted = true;
         }
 
-        if prepared.authorized_signature.as_deref() != Some(signature.as_str()) {
+        if prepared.authorized_signature.as_ref() != Some(&signature) {
             if self
                 .authorize(
                     request,
@@ -530,12 +559,9 @@ impl<'a> ToolBroker<'a> {
         request: &RunRequest,
         result: &mut RunResult,
         state: &mut BrokerState,
-        signature: &str,
+        signature: &InvocationKey,
     ) -> bool {
-        let count = state
-            .identical_calls
-            .entry(signature.to_owned())
-            .or_default();
+        let count = state.identical_calls.entry(signature.clone()).or_default();
         *count += 1;
         if *count <= request.agent.limits.max_identical_tool_calls {
             return true;
@@ -557,7 +583,7 @@ impl<'a> ToolBroker<'a> {
         call: &ToolCall,
         caller: ToolCaller,
         read_only: bool,
-        signature: &str,
+        signature: &InvocationKey,
     ) -> Result<Option<Arc<ToolResult>>, HarnessError> {
         if !state.reuse_committed_effects || read_only || caller == ToolCaller::Programmatic {
             return Ok(None);
@@ -688,14 +714,14 @@ impl<'a> ToolBroker<'a> {
                 "prepared tool arguments could not be canonicalized".into(),
             )
         })?;
-        let current_signature = canonical_signature(&prepared.call.tool_id, &prepared.arguments);
+        let current_signature = InvocationKey::new(&prepared.call.tool_id, &prepared.arguments);
         if !Arc::ptr_eq(&current, &prepared.tool)
             || !self.scope.contains(&prepared.call.tool_id)
             || self.scope.caller() != prepared.caller
             || !prepared.tool.definition().allows_caller(prepared.caller)
             || prepared.call.arguments_json != canonical_arguments
-            || prepared.signature.as_deref() != Some(current_signature.as_str())
-            || prepared.authorized_signature.as_deref() != Some(current_signature.as_str())
+            || prepared.signature.as_ref() != Some(&current_signature)
+            || prepared.authorized_signature.as_ref() != Some(&current_signature)
         {
             return Err(HarnessError::Policy(
                 "tool identity or bound authorization changed before invocation".into(),
@@ -937,10 +963,469 @@ where
     }
 }
 
-pub(crate) fn canonical_signature(tool_id: &str, arguments: &Value) -> String {
-    format!(
-        "{}:{}",
-        tool_id,
-        serde_json::to_string(arguments).unwrap_or_default()
-    )
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InvocationKey {
+    pub(crate) tool_id: String,
+    pub(crate) arguments: Value,
+    programmatic_occurrence: Option<String>,
+}
+
+/// Broker-owned result of one nonblocking speculative issue attempt.
+pub(crate) enum SpeculativeAttempt {
+    /// The candidate failed closed before crossing the tool issue boundary.
+    NotIssued,
+    /// The tool crossed the issue boundary and either produced a reusable result or failed.
+    Issued(Result<Box<SpeculativeExecution>, HarnessError>),
+}
+
+/// Successful bounded speculative execution retained until exact commit or discard.
+pub(crate) struct SpeculativeExecution {
+    prepared: SpeculativePreparedCall,
+    result: Arc<ToolResult>,
+}
+
+struct SpeculativePreparedCall {
+    call: ToolCall,
+    arguments: Value,
+    key: InvocationKey,
+    tool: Arc<dyn Tool>,
+    context: ToolCallContext,
+    catalog_version: u64,
+    model_call_number: u32,
+    _concurrency_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl InvocationKey {
+    pub(crate) fn new(tool_id: &str, arguments: &Value) -> Self {
+        Self {
+            tool_id: tool_id.to_owned(),
+            arguments: arguments.clone(),
+            programmatic_occurrence: None,
+        }
+    }
+}
+
+impl<'a> ToolBroker<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn speculate(
+        &self,
+        controller: &SpeculationController,
+        request: &RunRequest,
+        mut call: ToolCall,
+        model_call_number: u32,
+        run_id: &str,
+        trace_id: &str,
+        deadline: Option<Instant>,
+    ) -> SpeculativeAttempt {
+        let prepared = match self
+            .prepare_speculative(
+                controller,
+                request,
+                &mut call,
+                model_call_number,
+                run_id,
+                trace_id,
+                deadline,
+            )
+            .await
+        {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) | Err(_) => return SpeculativeAttempt::NotIssued,
+        };
+        if check_stopped(
+            &request.cancellation,
+            deadline,
+            "speculative execution deadline reached before tool invocation",
+        )
+        .is_err()
+        {
+            return SpeculativeAttempt::NotIssued;
+        }
+        SpeculativeAttempt::Issued(
+            self.execute_speculative(prepared, controller, request, deadline)
+                .await
+                .map(Box::new),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_speculative(
+        &self,
+        controller: &SpeculationController,
+        request: &RunRequest,
+        call: &mut ToolCall,
+        model_call_number: u32,
+        run_id: &str,
+        trace_id: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Option<SpeculativePreparedCall>, HarnessError> {
+        controller.config().validate()?;
+        if !controller.is_active(&call.tool_id)
+            || call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes
+        {
+            return Ok(None);
+        }
+        let arguments: Value = match serde_json::from_str(&call.arguments_json) {
+            Ok(arguments) => arguments,
+            Err(_) => return Ok(None),
+        };
+        if ensure_json_depth(
+            "speculative tool arguments",
+            &arguments,
+            request.agent.limits.max_json_depth,
+        )
+        .is_err()
+            || self.tools.validate(&call.tool_id, &arguments).is_err()
+        {
+            return Ok(None);
+        }
+        call.arguments_json = serde_json::to_string(&arguments).map_err(|_| {
+            HarnessError::InvalidArguments(
+                "speculative tool arguments could not be canonicalized".into(),
+            )
+        })?;
+        if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
+            return Ok(None);
+        }
+        let key = InvocationKey::new(&call.tool_id, &arguments);
+        let Some((tool, catalog_version)) = self.tools.get_versioned(&call.tool_id) else {
+            return Ok(None);
+        };
+        if !self.speculative_metadata_is_live(request, &call.tool_id, tool.as_ref()) {
+            return Ok(None);
+        }
+        let mut context =
+            ToolCallContext::new(run_id, trace_id, call.id.clone(), call.tool_id.clone());
+        context.caller = Some(ToolCaller::Speculative);
+        let decision = await_guarded(
+            self.policy
+                .decide_speculative(&context, tool.definition(), &arguments, request),
+            &request.cancellation,
+            deadline,
+            "speculative policy decision exceeded candidate deadline",
+            None,
+        )
+        .await?;
+        if !matches!(decision, PolicyDecision::Allow { .. }) || !controller.is_active(&call.tool_id)
+        {
+            return Ok(None);
+        }
+        let Some((current, current_version)) = self.tools.get_versioned(&call.tool_id) else {
+            return Ok(None);
+        };
+        if current_version != catalog_version
+            || !Arc::ptr_eq(&current, &tool)
+            || !self.speculative_metadata_is_live(request, &call.tool_id, current.as_ref())
+        {
+            return Ok(None);
+        }
+        let concurrency_permit = if let Some(key) = &tool.definition().concurrency_key {
+            let Some(permit) = self.concurrency.try_acquire(key)? else {
+                return Ok(None);
+            };
+            Some(permit)
+        } else {
+            None
+        };
+        if !controller.is_active(&call.tool_id)
+            || !self.speculative_metadata_is_live(request, &call.tool_id, tool.as_ref())
+        {
+            return Ok(None);
+        }
+        Ok(Some(SpeculativePreparedCall {
+            call: call.clone(),
+            arguments,
+            key,
+            tool,
+            context,
+            catalog_version,
+            model_call_number,
+            _concurrency_permit: concurrency_permit,
+        }))
+    }
+
+    async fn execute_speculative(
+        &self,
+        prepared: SpeculativePreparedCall,
+        controller: &SpeculationController,
+        request: &RunRequest,
+        deadline: Option<Instant>,
+    ) -> Result<SpeculativeExecution, HarnessError> {
+        if !controller.is_active(&prepared.call.tool_id)
+            || !self.speculative_prepared_is_live(request, &prepared)
+        {
+            return Err(HarnessError::Policy(
+                "speculative authorization changed before invocation".into(),
+            ));
+        }
+        // The explicit tool policy attests that Direct and Speculative caller
+        // contexts have caller-invariant successful-result semantics.
+        let tool_cancellation = request.cancellation.child_token();
+        let execution = prepared.tool.execute_with_context(
+            &prepared.context,
+            prepared.arguments.clone(),
+            tool_cancellation.clone(),
+        );
+        let tool_result = await_dispatched_tool(
+            execution,
+            &request.cancellation,
+            deadline,
+            "speculative tool execution exceeded candidate deadline",
+            &tool_cancellation,
+        )
+        .await?;
+        if !tool_result.ok {
+            return Err(HarnessError::Tool(
+                "speculative tool returned a failure result".into(),
+            ));
+        }
+        if serialized_len(&tool_result)? > request.agent.limits.max_tool_result_bytes {
+            return Err(HarnessError::ResourceLimit(
+                "speculative tool result exceeded its byte limit".into(),
+            ));
+        }
+        ensure_json_depth(
+            "speculative tool result",
+            &tool_result.output,
+            request.agent.limits.max_json_depth,
+        )?;
+        self.tools
+            .validate_output(&prepared.call.tool_id, &tool_result.output)?;
+        Ok(SpeculativeExecution {
+            prepared,
+            result: Arc::new(tool_result),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn commit_speculative(
+        &self,
+        controller: &SpeculationController,
+        request: &RunRequest,
+        result: &mut RunResult,
+        events: &mut EventEmitter,
+        state: &mut BrokerState,
+        execution: &SpeculativeExecution,
+        authoritative_call: &ToolCall,
+        model_call_number: u32,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Arc<ToolResult>>, HarnessError> {
+        controller.config().validate()?;
+        if !controller.is_active(&execution.prepared.call.tool_id)
+            || execution.prepared.model_call_number != model_call_number
+            || execution.prepared.call.id != authoritative_call.id
+            || authoritative_call.arguments_json.len() as u64
+                > request.agent.limits.max_tool_arguments_bytes
+        {
+            return Ok(None);
+        }
+        let authoritative_arguments: Value =
+            match serde_json::from_str(&authoritative_call.arguments_json) {
+                Ok(arguments) => arguments,
+                Err(_) => return Ok(None),
+            };
+        if ensure_json_depth(
+            "authoritative speculative tool arguments",
+            &authoritative_arguments,
+            request.agent.limits.max_json_depth,
+        )
+        .is_err()
+        {
+            return Ok(None);
+        }
+        let authoritative_key =
+            InvocationKey::new(&authoritative_call.tool_id, &authoritative_arguments);
+        if authoritative_key != execution.prepared.key
+            || !self.speculative_prepared_is_live(request, &execution.prepared)
+            || self
+                .tools
+                .validate(&authoritative_call.tool_id, &authoritative_arguments)
+                .is_err()
+            || serialized_len(execution.result.as_ref())?
+                > request.agent.limits.max_tool_result_bytes
+            || ensure_json_depth(
+                "committed speculative tool result",
+                &execution.result.output,
+                request.agent.limits.max_json_depth,
+            )
+            .is_err()
+            || self
+                .tools
+                .validate_output(&authoritative_call.tool_id, &execution.result.output)
+                .is_err()
+        {
+            return Ok(None);
+        }
+        let decision = await_guarded(
+            self.policy.decide_speculative(
+                &execution.prepared.context,
+                execution.prepared.tool.definition(),
+                &authoritative_arguments,
+                request,
+            ),
+            &request.cancellation,
+            deadline,
+            "speculative commit policy decision exceeded run deadline",
+            None,
+        )
+        .await?;
+        if !matches!(decision, PolicyDecision::Allow { .. })
+            || !controller.is_active(&execution.prepared.call.tool_id)
+            || !self.speculative_prepared_is_live(request, &execution.prepared)
+        {
+            return Ok(None);
+        }
+        if state.tool_calls >= request.agent.limits.max_tool_calls {
+            return Ok(None);
+        }
+        let repeated = state
+            .identical_calls
+            .get(&authoritative_key)
+            .copied()
+            .unwrap_or_default();
+        if repeated >= request.agent.limits.max_identical_tool_calls {
+            return Ok(None);
+        }
+
+        let mut canonical_call = authoritative_call.clone();
+        canonical_call.arguments_json = authoritative_key.canonical_arguments();
+        state.tool_calls += 1;
+        *state.identical_calls.entry(authoritative_key).or_default() += 1;
+        state.tool_issued += 1;
+        state.tool_completed += 1;
+        result.tool_calls.push(canonical_call.clone());
+        let public_decision = PolicyDecision::Allow {
+            reason: "policy allowed the call".into(),
+        };
+        result.policy_decisions.push(public_decision.clone());
+        events.emit(RunEvent::PolicyDecided {
+            call_id: canonical_call.id.clone(),
+            decision: public_decision,
+        });
+        events.emit(RunEvent::ToolCompleted {
+            call_id: canonical_call.id,
+            tool_id: canonical_call.tool_id,
+            ok: true,
+        });
+        Ok(Some(Arc::clone(&execution.result)))
+    }
+
+    pub(crate) fn validate_shadow_candidate(
+        &self,
+        controller: &SpeculationController,
+        request: &RunRequest,
+        call: &ToolCall,
+    ) -> Option<InvocationKey> {
+        if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
+            return None;
+        }
+        let arguments: Value = serde_json::from_str(&call.arguments_json).ok()?;
+        ensure_json_depth(
+            "shadow tool arguments",
+            &arguments,
+            request.agent.limits.max_json_depth,
+        )
+        .ok()?;
+        self.tools.validate(&call.tool_id, &arguments).ok()?;
+        let (tool, _) = self.tools.get_versioned(&call.tool_id)?;
+        self.speculative_metadata_is_live(request, &call.tool_id, tool.as_ref())
+            .then(|| {
+                controller.register_tool(&call.tool_id);
+                InvocationKey::new(&call.tool_id, &arguments)
+            })
+    }
+
+    pub(crate) fn validate_partial_probe(
+        &self,
+        request: &RunRequest,
+        tool_id: &str,
+        arguments_json: &str,
+    ) -> bool {
+        if arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
+            return false;
+        }
+        let Ok(arguments) = serde_json::from_str(arguments_json) else {
+            return false;
+        };
+        ensure_json_depth(
+            "partial speculative tool arguments",
+            &arguments,
+            request.agent.limits.max_json_depth,
+        )
+        .is_ok()
+            && self.tools.validate(tool_id, &arguments).is_ok()
+    }
+
+    fn speculative_prepared_is_live(
+        &self,
+        request: &RunRequest,
+        prepared: &SpeculativePreparedCall,
+    ) -> bool {
+        let Some((current, version)) = self.tools.get_versioned(&prepared.call.tool_id) else {
+            return false;
+        };
+        version == prepared.catalog_version
+            && Arc::ptr_eq(&current, &prepared.tool)
+            && InvocationKey::new(&prepared.call.tool_id, &prepared.arguments) == prepared.key
+            && self.speculative_metadata_is_live(request, &prepared.call.tool_id, current.as_ref())
+    }
+
+    fn speculative_metadata_is_live(
+        &self,
+        request: &RunRequest,
+        tool_id: &str,
+        tool: &dyn Tool,
+    ) -> bool {
+        let definition = tool.definition();
+        self.scope.caller() == ToolCaller::Direct
+            && self.scope.contains(tool_id)
+            && request.agent.tool_allowlist.iter().any(|id| id == tool_id)
+            && definition.id == tool_id
+            && definition.allows_caller(ToolCaller::Direct)
+            && definition.allows_caller(ToolCaller::Speculative)
+            && definition.speculation_policy == SpeculationPolicy::Enabled
+            && definition.read_only
+            && definition.idempotent
+            && definition.parallel_safe
+            && definition.cancellation_safety == CancellationSafety::Guaranteed
+            && definition.issue_safety == IssueSafety::Guaranteed
+            && definition.execution_location == ExecutionLocation::LocalPrivate
+            && definition.network_egress == NetworkEgress::Prohibited
+    }
+}
+
+impl InvocationKey {
+    fn programmatic(tool_id: &str, arguments: &Value, occurrence: &str) -> Self {
+        Self {
+            tool_id: tool_id.to_owned(),
+            arguments: arguments.clone(),
+            programmatic_occurrence: Some(occurrence.to_owned()),
+        }
+    }
+
+    pub(crate) fn canonical_arguments(&self) -> String {
+        serde_json::to_string(&self.arguments).unwrap_or_else(|_| "null".into())
+    }
+}
+
+impl Hash for InvocationKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.tool_id.hash(state);
+        self.canonical_arguments().hash(state);
+        self.programmatic_occurrence.hash(state);
+    }
+}
+
+#[cfg(test)]
+mod speculation_tests {
+    use super::ToolConcurrencyLimiter;
+
+    #[tokio::test]
+    async fn speculative_keyed_admission_is_nonblocking_and_never_queues() {
+        let limiter = ToolConcurrencyLimiter::default();
+        let held = limiter.acquire("resource").await.unwrap();
+        assert!(limiter.try_acquire("resource").unwrap().is_none());
+        drop(held);
+        assert!(limiter.try_acquire("resource").unwrap().is_some());
+    }
 }

@@ -165,6 +165,14 @@ pub enum SpeculationPolicy {
     #[default]
     Disabled,
     /// Speculative execution is permitted when all registry safety gates pass.
+    ///
+    /// This is an application attestation that, for identical canonical
+    /// arguments and the bound run context, a successful result remains
+    /// authorization-stable and safe to reuse throughout the configured
+    /// speculative duration, and that Direct and Speculative caller contexts
+    /// have identical successful-result semantics. Volatile, ACL-sensitive,
+    /// identity-sensitive, caller-sensitive, or otherwise freshness-sensitive
+    /// reads must leave speculation disabled.
     Enabled,
 }
 
@@ -979,6 +987,11 @@ impl ToolRegistry {
             })?;
         }
         Ok(())
+    }
+
+    pub(crate) fn get_versioned(&self, id: &str) -> Option<(Arc<dyn Tool>, u64)> {
+        self.registered(id)
+            .map(|entry| (Arc::clone(&entry.tool), entry.catalog_version))
     }
 
     fn registered(&self, id: &str) -> Option<&RegisteredTool> {
