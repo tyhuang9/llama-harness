@@ -7,9 +7,9 @@ use llama_harness_core::{
     InMemoryEventSink, ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
     PolicyDecision, PolicyEngine, ProgramLifecycleOutcome, ProgrammaticConformance,
     ProgrammaticHostConfig, ProviderCapabilityLimits, ProviderHealth, RunEvent, RunRequest,
-    RunResult, RunStatus, RunStrategy, StrategyFallbackReason, Tool, ToolCallContext, ToolCaller,
-    ToolDefinition, ToolRegistry, ToolResult, ToolRisk, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
-    HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
+    RunResult, RunStatus, RunStrategy, SpeculationConfig, SpeculationMode, StrategyFallbackReason,
+    Tool, ToolCallContext, ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY, HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
 };
 use llama_harness_programmatic_sandbox::{SandboxLimits, HARD_LIMITS};
 use serde_json::{json, Value};
@@ -716,15 +716,22 @@ async fn programmatic_generation_uses_bounded_completion_even_when_streaming_is_
                 .with_limits(ProviderCapabilityLimits::new().with_max_program_bytes(64 * 1024)),
         ),
     );
-    let result = AgentRunner::builder(provider.clone())
+    let runner = AgentRunner::builder(provider.clone())
+        .speculation(SpeculationConfig::default())
         .programmatic(ProgrammaticHostConfig::default())
-        .build()
+        .build();
+    let result = runner
         .run_with_strategy(request(&[]), RunStrategy::Programmatic)
         .await
         .unwrap();
 
     assert_eq!(result.status, RunStatus::Completed);
     assert_eq!(provider.requests().len(), 2);
+    assert_eq!(
+        runner.speculation_readiness("read").mode,
+        SpeculationMode::Disabled
+    );
+    assert_eq!(runner.speculation_metrics("read").issued, 0);
 }
 
 #[tokio::test]
