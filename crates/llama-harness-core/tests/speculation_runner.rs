@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures_util::stream;
+use futures_util::{stream, Stream};
 use llama_harness_core::{
     AgentDefinition, AgentRunner, AllowAllPolicy, ApprovalHandler, ApprovalRecord,
     CancellationSafety, EventRecord, EventSink, ExecutionLocation, HarnessError, InMemoryEventSink,
@@ -14,7 +14,13 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use std::{thread, time::Duration};
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    task::{Context, Poll},
+    thread,
+    time::Duration,
+};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +38,7 @@ enum StreamBehavior {
     OversizedModel,
     InvalidResponse,
     HugeArguments,
+    CancellationAwareOversizedText,
 }
 
 struct StreamingProvider {
@@ -41,6 +48,7 @@ struct StreamingProvider {
     planner_response: Option<&'static str>,
     partial_emitted: Arc<Semaphore>,
     release_final: Arc<Semaphore>,
+    stream_drop_saw_cancellation: Arc<AtomicBool>,
 }
 
 impl StreamingProvider {
@@ -52,6 +60,7 @@ impl StreamingProvider {
             planner_response: None,
             partial_emitted: Arc::new(Semaphore::new(0)),
             release_final: Arc::new(Semaphore::new(0)),
+            stream_drop_saw_cancellation: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -88,6 +97,27 @@ impl StreamingProvider {
             TOOL_ID,
             r#"{"query":"status"}"#,
         )])
+    }
+}
+
+struct CancellationCheckingStream {
+    events: VecDeque<Result<ModelStreamEvent, HarnessError>>,
+    cancellation: CancellationToken,
+    observed: Arc<AtomicBool>,
+}
+
+impl Stream for CancellationCheckingStream {
+    type Item = Result<ModelStreamEvent, HarnessError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.events.pop_front())
+    }
+}
+
+impl Drop for CancellationCheckingStream {
+    fn drop(&mut self) {
+        self.observed
+            .store(self.cancellation.is_cancelled(), Ordering::SeqCst);
     }
 }
 
@@ -135,6 +165,7 @@ impl ModelProvider for StreamingProvider {
     async fn stream(&self, request: ModelRequest) -> Result<ModelEventStream, HarnessError> {
         self.stream_calls.fetch_add(1, Ordering::SeqCst);
         let requests_tool = Self::requests_tool(&request);
+        let model_cancellation = request.cancellation.clone();
         let model = request.model;
         let events = if !requests_tool {
             vec![
@@ -299,6 +330,22 @@ impl ModelProvider for StreamingProvider {
                         usage: Usage::default(),
                     }),
                 ],
+                StreamBehavior::CancellationAwareOversizedText => {
+                    return Ok(Box::pin(CancellationCheckingStream {
+                        events: VecDeque::from([
+                            Ok(ModelStreamEvent::ToolCallDelta(
+                                ToolCallDelta::new(0, r#"{"query":"status"}"#, true)
+                                    .with_call_id("call-0")
+                                    .with_tool_id(TOOL_ID),
+                            )),
+                            Ok(ModelStreamEvent::TextDelta {
+                                content: "x".repeat(256),
+                            }),
+                        ]),
+                        cancellation: model_cancellation,
+                        observed: Arc::clone(&self.stream_drop_saw_cancellation),
+                    }));
+                }
             }
         };
         Ok(Box::pin(stream::iter(events)))
@@ -524,6 +571,7 @@ struct BlockingCommitPolicy {
 struct SlowEventSink {
     records: Mutex<Vec<EventRecord>>,
     slow_policy_events: AtomicBool,
+    tool_completed_delay_ms: AtomicUsize,
 }
 
 impl SlowEventSink {
@@ -531,6 +579,7 @@ impl SlowEventSink {
         Self {
             records: Mutex::new(Vec::new()),
             slow_policy_events: AtomicBool::new(false),
+            tool_completed_delay_ms: AtomicUsize::new(0),
         }
     }
 }
@@ -541,6 +590,10 @@ impl EventSink for SlowEventSink {
             && matches!(record.event, RunEvent::PolicyDecided { .. })
         {
             thread::sleep(Duration::from_millis(20));
+        }
+        let tool_completed_delay_ms = self.tool_completed_delay_ms.load(Ordering::SeqCst);
+        if tool_completed_delay_ms > 0 && matches!(record.event, RunEvent::ToolCompleted { .. }) {
+            thread::sleep(Duration::from_millis(tool_completed_delay_ms as u64));
         }
         self.records
             .lock()
@@ -592,6 +645,106 @@ impl PolicyEngine for BlockingCommitPolicy {
         Ok(PolicyDecision::Allow {
             reason: "dedicated speculative allow".into(),
         })
+    }
+}
+
+struct BlockingOrdinaryCommitPolicy {
+    ordinary_calls: AtomicUsize,
+    speculative_calls: AtomicUsize,
+    commit_entered: Arc<Semaphore>,
+    release_commit: Arc<Semaphore>,
+}
+
+impl BlockingOrdinaryCommitPolicy {
+    fn new() -> Self {
+        Self {
+            ordinary_calls: AtomicUsize::new(0),
+            speculative_calls: AtomicUsize::new(0),
+            commit_entered: Arc::new(Semaphore::new(0)),
+            release_commit: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl PolicyEngine for BlockingOrdinaryCommitPolicy {
+    async fn decide(
+        &self,
+        _: &ToolDefinition,
+        _: &Value,
+        _: &RunRequest,
+    ) -> Result<PolicyDecision, HarnessError> {
+        let ordinal = self.ordinary_calls.fetch_add(1, Ordering::SeqCst);
+        if ordinal == 1_001 {
+            self.commit_entered.add_permits(1);
+            let permit = self
+                .release_commit
+                .acquire()
+                .await
+                .expect("ordinary commit release semaphore open");
+            permit.forget();
+        }
+        Ok(PolicyDecision::Allow {
+            reason: "ordinary allow".into(),
+        })
+    }
+
+    async fn decide_speculative(
+        &self,
+        _: &ToolCallContext,
+        _: &ToolDefinition,
+        _: &Value,
+        _: &RunRequest,
+    ) -> Result<PolicyDecision, HarnessError> {
+        self.speculative_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(PolicyDecision::Allow {
+            reason: "dedicated speculative allow".into(),
+        })
+    }
+}
+
+struct FailingDedicatedCommitPolicy {
+    ordinary_calls: AtomicUsize,
+    speculative_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl PolicyEngine for FailingDedicatedCommitPolicy {
+    async fn decide(
+        &self,
+        _: &ToolDefinition,
+        _: &Value,
+        _: &RunRequest,
+    ) -> Result<PolicyDecision, HarnessError> {
+        let ordinal = self.ordinary_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(if ordinal >= 1_001 {
+            PolicyDecision::RequireApproval {
+                reason: "commit approval".into(),
+            }
+        } else {
+            PolicyDecision::Allow {
+                reason: "ordinary allow".into(),
+            }
+        })
+    }
+
+    async fn decide_speculative(
+        &self,
+        _: &ToolCallContext,
+        _: &ToolDefinition,
+        _: &Value,
+        _: &RunRequest,
+    ) -> Result<PolicyDecision, HarnessError> {
+        let ordinal = self.speculative_calls.fetch_add(1, Ordering::SeqCst);
+        if ordinal == 1 {
+            Err(HarnessError::Policy(
+                "dedicated commit policy failed".into(),
+            ))
+        } else {
+            Ok(PolicyDecision::Allow {
+                reason: "dedicated speculative allow".into(),
+            })
+        }
     }
 }
 
@@ -845,6 +998,67 @@ impl Tool for CancellationAwareTool {
         cancellation.cancelled().await;
         self.observed_cancellation.fetch_add(1, Ordering::SeqCst);
         Ok(ToolResult::success(json!({"value":"direct"})))
+    }
+}
+
+struct ToolFutureDropProbe {
+    cancellation: CancellationToken,
+    saw_cancellation: Arc<AtomicBool>,
+}
+
+impl Drop for ToolFutureDropProbe {
+    fn drop(&mut self) {
+        self.saw_cancellation
+            .store(self.cancellation.is_cancelled(), Ordering::SeqCst);
+    }
+}
+
+struct AbortAwareSpeculativeTool {
+    definition: ToolDefinition,
+    calls: AtomicUsize,
+    entered: Arc<Semaphore>,
+    future_drop_saw_cancellation: Arc<AtomicBool>,
+}
+
+impl AbortAwareSpeculativeTool {
+    fn new() -> Self {
+        Self {
+            definition: CountingTool::eligible().definition,
+            calls: AtomicUsize::new(0),
+            entered: Arc::new(Semaphore::new(0)),
+            future_drop_saw_cancellation: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for AbortAwareSpeculativeTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(&self, _: Value, _: CancellationToken) -> Result<ToolResult, HarnessError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolResult::success(json!({"value":"stable"})))
+    }
+
+    async fn execute_with_context(
+        &self,
+        context: &ToolCallContext,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, HarnessError> {
+        if context.caller != Some(ToolCaller::Speculative) {
+            return self.execute(arguments, cancellation).await;
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let _drop_probe = ToolFutureDropProbe {
+            cancellation,
+            saw_cancellation: Arc::clone(&self.future_drop_saw_cancellation),
+        };
+        self.entered.add_permits(1);
+        std::future::pending::<()>().await;
+        unreachable!("pending speculative test tool cannot complete")
     }
 }
 
@@ -1824,6 +2038,242 @@ async fn candidate_deadline_blocks_reuse_after_a_slow_normal_event_sink() {
     let metrics = runner.speculation_metrics(TOOL_ID);
     assert_eq!(metrics.committed, 0);
     assert_eq!(metrics.discarded, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn candidate_lease_expires_while_canonical_prepare_continues_once() {
+    let provider = Arc::new(StreamingProvider::new(StreamBehavior::Normal));
+    let mut keyed_tool = CountingTool::eligible();
+    keyed_tool.definition.concurrency_key = Some("lease-key".into());
+    let tool = Arc::new(keyed_tool);
+    let policy = Arc::new(BlockingOrdinaryCommitPolicy::new());
+    let runner = Arc::new(
+        AgentRunner::builder(provider)
+            .tools(registry(tool.clone()))
+            .policy(policy.clone())
+            .speculation(SpeculationConfig {
+                max_execution_duration_ms: 5,
+                ..SpeculationConfig::default()
+            })
+            .build(),
+    );
+    train_and_activate(&runner).await;
+
+    let active_runner = Arc::clone(&runner);
+    let run = tokio::spawn(async move {
+        active_runner
+            .run_with_strategy(request(), RunStrategy::Direct)
+            .await
+    });
+    let entered = policy
+        .commit_entered
+        .acquire()
+        .await
+        .expect("ordinary policy entry semaphore open");
+    entered.forget();
+    tokio::time::advance(Duration::from_millis(6)).await;
+    tokio::task::yield_now().await;
+
+    let expired = runner.speculation_metrics(TOOL_ID);
+    assert_eq!(expired.issued, 1);
+    assert_eq!(expired.discarded, 1);
+    assert_eq!(expired.committed, 0);
+    assert_eq!(expired.cancelled, 0);
+    assert_eq!(expired.mode, SpeculationMode::Shadow);
+    assert!(
+        !run.is_finished(),
+        "canonical policy future remains in flight"
+    );
+    assert_eq!(
+        runner.activate_speculation(TOOL_ID).mode,
+        SpeculationMode::Shadow
+    );
+
+    policy.release_commit.add_permits(1);
+    let result = run
+        .await
+        .unwrap()
+        .expect("canonical Direct prepare completes");
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(policy.ordinary_calls.load(Ordering::SeqCst), 1_002);
+    assert_eq!(policy.speculative_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1_002);
+    assert_eq!(
+        tool.callers.lock().unwrap()[1_000..],
+        [ToolCaller::Speculative, ToolCaller::Direct]
+    );
+}
+
+#[tokio::test]
+async fn atomic_live_take_precedes_slow_tool_completed_publication() {
+    let provider = Arc::new(StreamingProvider::new(StreamBehavior::Normal));
+    let tool = Arc::new(CountingTool::eligible());
+    let events = Arc::new(SlowEventSink::new());
+    let runner = AgentRunner::builder(provider)
+        .tools(registry(tool.clone()))
+        .policy(Arc::new(TestPolicy::new(true)))
+        .event_sink(events.clone())
+        .speculation(SpeculationConfig {
+            max_execution_duration_ms: 50,
+            ..SpeculationConfig::default()
+        })
+        .build();
+    train_and_activate(&runner).await;
+    events.tool_completed_delay_ms.store(100, Ordering::SeqCst);
+
+    let started = std::time::Instant::now();
+    let result = runner
+        .run_with_strategy(request(), RunStrategy::Direct)
+        .await
+        .expect("committed publication completes");
+
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1_001);
+    let metrics = runner.speculation_metrics(TOOL_ID);
+    assert_eq!(metrics.issued, 1);
+    assert_eq!(metrics.committed, 1);
+    assert_eq!(metrics.discarded, 0);
+    assert_eq!(metrics.cancelled, 0);
+}
+
+#[tokio::test]
+async fn aborted_run_cancels_tool_future_before_drop_and_settles_once() {
+    let provider = Arc::new(StreamingProvider::new(StreamBehavior::Normal));
+    let tool = Arc::new(AbortAwareSpeculativeTool::new());
+    let runner = Arc::new(
+        AgentRunner::builder(provider)
+            .tools(registry(tool.clone()))
+            .policy(Arc::new(TestPolicy::new(true)))
+            .speculation(SpeculationConfig::default())
+            .build(),
+    );
+    train_and_activate(&runner).await;
+
+    let active_runner = Arc::clone(&runner);
+    let run = tokio::spawn(async move {
+        active_runner
+            .run_with_strategy(request(), RunStrategy::Direct)
+            .await
+    });
+    let entered = tool
+        .entered
+        .acquire()
+        .await
+        .expect("abort tool entry semaphore open");
+    entered.forget();
+    run.abort();
+    assert!(run
+        .await
+        .expect_err("aborted task must not complete")
+        .is_cancelled());
+
+    assert!(tool.future_drop_saw_cancellation.load(Ordering::SeqCst));
+    let metrics = runner.speculation_metrics(TOOL_ID);
+    assert_eq!(metrics.issued, 1);
+    assert_eq!(metrics.cancelled, 1);
+    assert_eq!(metrics.committed, 0);
+    assert_eq!(metrics.discarded, 0);
+    assert_eq!(metrics.mode, SpeculationMode::Shadow);
+    assert_eq!(
+        runner.activate_speculation(TOOL_ID).mode,
+        SpeculationMode::Shadow
+    );
+
+    let fallback = runner
+        .run_with_strategy(request(), RunStrategy::Direct)
+        .await
+        .expect("subsequent call remains sequential Direct");
+    assert_eq!(fallback.status, RunStatus::Completed);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1_002);
+    assert_eq!(runner.speculation_metrics(TOOL_ID).issued, 1);
+}
+
+#[tokio::test]
+async fn dedicated_commit_policy_error_executes_same_authorized_prepare_once() {
+    let provider = Arc::new(StreamingProvider::new(StreamBehavior::Normal));
+    let tool = Arc::new(CountingTool::eligible());
+    let policy = Arc::new(FailingDedicatedCommitPolicy {
+        ordinary_calls: AtomicUsize::new(0),
+        speculative_calls: AtomicUsize::new(0),
+    });
+    let approvals = Arc::new(CountingApproval::new(true));
+    let events = Arc::new(InMemoryEventSink::default());
+    let runner = AgentRunner::builder(provider)
+        .tools(registry(tool.clone()))
+        .policy(policy.clone())
+        .approvals(approvals.clone())
+        .event_sink(events.clone())
+        .speculation(SpeculationConfig::default())
+        .build();
+    train_and_activate(&runner).await;
+    let event_start = events.events().len();
+
+    let result = runner
+        .run_with_strategy(request(), RunStrategy::Direct)
+        .await
+        .expect("dedicated failure falls back without re-prepare");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.tool_calls.len(), 1);
+    assert_eq!(policy.ordinary_calls.load(Ordering::SeqCst), 1_002);
+    assert_eq!(policy.speculative_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(approvals.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1_002);
+    let active_events = events.events()[event_start..].to_vec();
+    assert_eq!(
+        active_events
+            .iter()
+            .filter(|record| matches!(record.event, RunEvent::PolicyDecided { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        active_events
+            .iter()
+            .filter(|record| matches!(record.event, RunEvent::ApprovalRequested { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        active_events
+            .iter()
+            .filter(|record| matches!(record.event, RunEvent::ToolCompleted { .. }))
+            .count(),
+        1
+    );
+    let metrics = runner.speculation_metrics(TOOL_ID);
+    assert_eq!(metrics.issued, 1);
+    assert_eq!(metrics.discarded, 1);
+    assert_eq!(metrics.mode, SpeculationMode::Shadow);
+}
+
+#[tokio::test]
+async fn post_issue_assembly_error_cancels_provider_stream_before_drop() {
+    let provider = Arc::new(StreamingProvider::new(StreamBehavior::Normal));
+    let tool = Arc::new(CountingTool::eligible());
+    let runner = AgentRunner::builder(provider.clone())
+        .tools(registry(tool.clone()))
+        .policy(Arc::new(TestPolicy::new(true)))
+        .speculation(SpeculationConfig::default())
+        .build();
+    train_and_activate(&runner).await;
+    provider.set_behavior(StreamBehavior::CancellationAwareOversizedText);
+    let mut active_request = request();
+    active_request.agent.limits.max_model_response_bytes = 128;
+
+    let result = runner
+        .run_with_strategy(active_request, RunStrategy::Direct)
+        .await
+        .expect("assembly failure is represented");
+
+    assert_eq!(result.status, RunStatus::LimitReached);
+    assert!(provider.stream_drop_saw_cancellation.load(Ordering::SeqCst));
+    let metrics = runner.speculation_metrics(TOOL_ID);
+    assert_eq!(metrics.issued, 1);
+    assert_eq!(metrics.discarded, 1);
+    assert_eq!(metrics.committed, 0);
+    assert_eq!(metrics.mode, SpeculationMode::Shadow);
 }
 
 #[tokio::test]
