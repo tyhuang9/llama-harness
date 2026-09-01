@@ -139,6 +139,14 @@ Disabled baseline and report Shadow, exact Active, discard fallback, and
 saturated fallback separately. The repository's ignored release evaluation is
 informational rather than a wall-clock CI gate.
 
+The ignored release evaluation applies the same nonzero controlled provider-tail
+and tool delays to Disabled, Shadow, and Active cohorts. It reports observed
+wall-clock duration and bounded pull-only histogram counts, but asserts only
+task/final-state correctness, exact effect cardinality, zero safety violations,
+and speculative accounting. Scheduler-dependent latency is never a CI pass/fail
+condition. Use matched cohorts and the alert, promotion, and rollback thresholds
+in [Guarded speculative tool calling](speculative-tool-calling.md).
+
 Add privacy canaries that prove canonical events, serialized results, SQLite
 exports, and protocol projections contain no candidate arguments, results, raw
 provider or tool errors, readiness streaks, modes, or counters. A terminal

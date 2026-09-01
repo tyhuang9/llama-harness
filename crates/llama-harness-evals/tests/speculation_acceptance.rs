@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures_util::stream;
+use futures_util::{stream, StreamExt};
 use llama_harness_core::{
     AgentDefinition, AgentRunner, CancellationSafety, EventRecord, ExecutionLocation, HarnessError,
     InMemoryEventSink, IssueSafety, MessageRole, ModelCapabilities, ModelEventStream, ModelInfo,
@@ -16,9 +16,10 @@ use llama_harness_evals::{
 use llama_harness_observability::{SqliteEventSink, TraceStoreConfig};
 use serde_json::{json, Value};
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -55,6 +56,7 @@ struct EvaluationTool {
     callers: Mutex<Vec<ToolCaller>>,
     entered: Arc<Semaphore>,
     release: Arc<Semaphore>,
+    delay_ms: AtomicU64,
 }
 
 impl EvaluationTool {
@@ -115,6 +117,7 @@ impl EvaluationTool {
             callers: Mutex::new(Vec::new()),
             entered: Arc::new(Semaphore::new(0)),
             release: Arc::new(Semaphore::new(0)),
+            delay_ms: AtomicU64::new(0),
         }
     }
 }
@@ -147,6 +150,10 @@ impl Tool for EvaluationTool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(caller);
+        let delay_ms = self.delay_ms.load(Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
         if caller == ToolCaller::Speculative {
             if self.behavior == ToolBehavior::InvalidSpeculativeResult {
                 return Ok(ToolResult::success(json!({
@@ -172,6 +179,7 @@ struct EvaluationProvider {
     complete_calls: AtomicUsize,
     stream_calls: AtomicUsize,
     fail_next_tool_stream: AtomicBool,
+    response_delay_ms: AtomicU64,
 }
 
 impl EvaluationProvider {
@@ -181,6 +189,7 @@ impl EvaluationProvider {
             complete_calls: AtomicUsize::new(0),
             stream_calls: AtomicUsize::new(0),
             fail_next_tool_stream: AtomicBool::new(false),
+            response_delay_ms: AtomicU64::new(0),
         }
     }
 
@@ -220,7 +229,14 @@ impl ModelProvider for EvaluationProvider {
 
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError> {
         self.complete_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(if Self::requests_tool(&request) {
+        let requests_tool = Self::requests_tool(&request);
+        if requests_tool {
+            let delay_ms = self.response_delay_ms.load(Ordering::SeqCst);
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+        Ok(if requests_tool {
             self.tool_response(request.model)
         } else {
             ModelResponse::new(request.model).with_final_output("done")
@@ -229,34 +245,43 @@ impl ModelProvider for EvaluationProvider {
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelEventStream, HarnessError> {
         self.stream_calls.fetch_add(1, Ordering::SeqCst);
-        let events = if Self::requests_tool(&request) {
-            let mut events = vec![Ok(ModelStreamEvent::ToolCallDelta(
+        if Self::requests_tool(&request) {
+            let candidate = Ok(ModelStreamEvent::ToolCallDelta(
                 ToolCallDelta::new(0, r#"{"query":"stable"}"#, true)
                     .with_call_id("call-0")
                     .with_tool_id(self.tool_id.clone()),
-            ))];
-            if self.fail_next_tool_stream.swap(false, Ordering::SeqCst) {
-                events.push(Err(HarnessError::RetryableProvider(
-                    PRIVATE_STREAM_ERROR_CANARY.into(),
-                )));
-            } else {
-                events.push(Ok(ModelStreamEvent::Completed {
-                    model: request.model,
-                    usage: Usage::default(),
-                }));
-            }
-            events
-        } else {
-            vec![
-                Ok(ModelStreamEvent::TextDelta {
-                    content: "done".into(),
-                }),
-                Ok(ModelStreamEvent::Completed {
-                    model: request.model,
-                    usage: Usage::default(),
-                }),
-            ]
-        };
+            ));
+            let fail = self.fail_next_tool_stream.swap(false, Ordering::SeqCst);
+            let delay_ms = self.response_delay_ms.load(Ordering::SeqCst);
+            let model = request.model;
+            let tail = async move {
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                if fail {
+                    Err(HarnessError::RetryableProvider(
+                        PRIVATE_STREAM_ERROR_CANARY.into(),
+                    ))
+                } else {
+                    Ok(ModelStreamEvent::Completed {
+                        model,
+                        usage: Usage::default(),
+                    })
+                }
+            };
+            return Ok(Box::pin(
+                stream::iter([candidate]).chain(stream::once(tail)),
+            ));
+        }
+        let events = vec![
+            Ok(ModelStreamEvent::TextDelta {
+                content: "done".into(),
+            }),
+            Ok(ModelStreamEvent::Completed {
+                model: request.model,
+                usage: Usage::default(),
+            }),
+        ];
         Ok(Box::pin(stream::iter(events)))
     }
 }
@@ -549,6 +574,17 @@ fn assert_private_diagnostics_absent(evidence: &Evidence) {
         "exact_shadow_observations",
         "ready_to_activate",
         "slot_saturated",
+        "active_candidates_considered",
+        "pre_issue_validation_skipped",
+        "pre_issue_policy_skipped",
+        "pre_issue_failed",
+        "pre_issue_invalidated",
+        "pre_issue_aborted",
+        "key_saturated",
+        "in_flight",
+        "oldest_in_flight_ms",
+        "execution_duration_ms",
+        "publication_wait_ms",
         "candidate_result",
         "candidate_error",
     ] {
@@ -595,10 +631,14 @@ async fn forced_speculation_matrix_uses_real_runner_boundaries_and_private_metri
     let exact = executor.evidence("active-exact");
     assert_eq!(exact.readiness.mode, SpeculationMode::Active);
     assert_eq!(exact.metrics.issued, 1);
+    assert_eq!(exact.metrics.active_candidates_considered, 1);
+    assert_eq!(exact.metrics.in_flight, 0);
     assert_eq!(exact.metrics.committed, 1);
     assert_eq!(exact.metrics.discarded, 0);
     assert_eq!(exact.tool_calls, 1_001);
     assert_eq!(exact.callers.last(), Some(&ToolCaller::Speculative));
+    assert_eq!(exact.metrics.execution_duration_ms.count, 1);
+    assert_eq!(exact.metrics.publication_wait_ms.count, 1);
 
     let discard = executor.evidence("active-discard");
     assert_eq!(discard.readiness.mode, SpeculationMode::Shadow);
@@ -612,6 +652,7 @@ async fn forced_speculation_matrix_uses_real_runner_boundaries_and_private_metri
 
     let saturated = executor.evidence("saturated-fallback");
     assert_eq!(saturated.metrics.slot_saturated, 1);
+    assert_eq!(saturated.metrics.active_candidates_considered, 2);
     assert_eq!(saturated.metrics.issued, 1);
     assert_eq!(saturated.metrics.committed, 1);
     assert!(saturated
@@ -633,6 +674,16 @@ async fn forced_speculation_matrix_uses_real_runner_boundaries_and_private_metri
     assert_eq!(terminal.metrics.terminal_stream_failures, 1);
     assert_eq!(terminal.stream_calls, 1, "accepted streams are not retried");
     assert_eq!(terminal.complete_calls, 0);
+
+    for evidence in [&exact, &discard, &saturated, &terminal] {
+        assert_eq!(
+            evidence.metrics.issued,
+            evidence.metrics.in_flight
+                + evidence.metrics.committed
+                + evidence.metrics.discarded
+                + evidence.metrics.cancelled
+        );
+    }
 
     for case_id in [
         "disabled",
@@ -718,6 +769,77 @@ async fn release_speculation_mode_evaluation() {
             evidence.metrics.committed,
             evidence.metrics.discarded,
             evidence.metrics.slot_saturated,
+        );
+    }
+
+    const CONTROLLED_DELAY_MS: u64 = 25;
+    for (label, configured, activate) in [
+        ("controlled-disabled", false, false),
+        ("controlled-shadow", true, false),
+        ("controlled-active", true, true),
+    ] {
+        let tool = Arc::new(EvaluationTool::new(ToolBehavior::Eligible));
+        let tool_id = tool.definition.id.clone();
+        let mut registry = ToolRegistry::default();
+        registry.register(tool.clone()).unwrap();
+        let provider = Arc::new(EvaluationProvider::new(&tool_id));
+        let policy = Arc::new(EvaluationPolicy {
+            speculative_decisions: AtomicUsize::new(0),
+        });
+        let builder = AgentRunner::builder(provider.clone())
+            .tools(registry)
+            .policy(policy);
+        let runner = if configured {
+            builder.speculation(SpeculationConfig::default()).build()
+        } else {
+            builder.build()
+        };
+        if activate {
+            train_and_activate(&runner, &tool_id, label).await.unwrap();
+        }
+        tool.delay_ms.store(CONTROLLED_DELAY_MS, Ordering::SeqCst);
+        provider
+            .response_delay_ms
+            .store(CONTROLLED_DELAY_MS, Ordering::SeqCst);
+        let calls_before = tool.calls.load(Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let result = runner
+            .run_with_strategy(run_request(&tool_id, label), RunStrategy::Direct)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let metrics = runner.speculation_metrics(&tool_id);
+
+        // Correctness, exact effect cardinality, and accounting are the only
+        // gates. Wall-clock measurements are printed for release comparison,
+        // never asserted because scheduler noise is platform-dependent.
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(tool.calls.load(Ordering::SeqCst) - calls_before, 1);
+        assert_eq!(
+            metrics.issued,
+            metrics.in_flight + metrics.committed + metrics.discarded + metrics.cancelled
+        );
+        if activate {
+            assert_eq!(metrics.committed, 1);
+            assert_eq!(
+                tool.callers.lock().unwrap().last(),
+                Some(&ToolCaller::Speculative)
+            );
+        } else {
+            assert_eq!(metrics.issued, 0);
+            assert_eq!(
+                tool.callers.lock().unwrap().last(),
+                Some(&ToolCaller::Direct)
+            );
+        }
+        eprintln!(
+            "{label}: controlled_delay_ms={CONTROLLED_DELAY_MS} observed_ms={} issued={} committed={} execution_p95_source_count={} publication_p95_source_count={}",
+            elapsed.as_millis(),
+            metrics.issued,
+            metrics.committed,
+            metrics.execution_duration_ms.count,
+            metrics.publication_wait_ms.count,
         );
     }
 }
