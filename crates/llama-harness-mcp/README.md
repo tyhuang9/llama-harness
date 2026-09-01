@@ -50,4 +50,17 @@ duration, bounded counts and bytes, page/cache/stale/cancellation/dispatch
 state, and core run/trace/call correlation. They intentionally exclude server
 metadata, requests, results, schemas, frames, endpoints, credentials, and
 server error text. Observer failures are suppressed and exposed through
-`McpCatalogManager::observer_health`.
+`McpCatalogManager::observer_health`. A refresh buffers its successful
+Negotiation event and terminal Refresh event in that order, then delivers them
+only after refresh ownership, lifecycle locks, and dispatch permits have been
+released. Observer callbacks must still be nonblocking because delivery remains
+synchronous for the caller receiving the outcome.
+
+Calls to one canonical server ID share a process-global `ServerCallGate`, so
+serialization and queue admission apply across manager instances. The first
+live manager for a server establishes its finite, nonzero
+`McpLimits::max_server_waiters` bound. Additional live managers for that server
+must configure the same value and are rejected with
+`McpError::InvalidConfiguration` on a mismatch; they cannot weaken or expand
+the established bound. After all managers for that server are dropped, the
+unused gate may be pruned and a later manager may establish a new bound.

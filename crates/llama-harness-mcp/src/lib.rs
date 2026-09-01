@@ -30,6 +30,7 @@ const MAX_SERVER_GATES: usize = 256;
 struct ServerCallGate {
     permits: tokio::sync::Semaphore,
     waiters: AtomicUsize,
+    max_waiters: usize,
 }
 
 struct ServerWaiter<'a>(&'a AtomicUsize);
@@ -45,19 +46,27 @@ static SERVER_CALL_GATES: OnceLock<Mutex<HashMap<String, Weak<ServerCallGate>>>>
 fn server_call_gate_with_limit(
     server_id: &str,
     max_gates: usize,
+    max_waiters: usize,
 ) -> Result<Arc<ServerCallGate>, McpError> {
     let gates = SERVER_CALL_GATES.get_or_init(|| Mutex::new(HashMap::new()));
-    server_call_gate_from(gates, server_id, max_gates)
+    server_call_gate_from(gates, server_id, max_gates, max_waiters)
 }
 
 fn server_call_gate_from(
     gates: &Mutex<HashMap<String, Weak<ServerCallGate>>>,
     server_id: &str,
     max_gates: usize,
+    max_waiters: usize,
 ) -> Result<Arc<ServerCallGate>, McpError> {
+    validate_server_waiter_limit(max_waiters)?;
     let mut gates = gates.lock().expect("MCP server gate mutex");
     gates.retain(|_, gate| gate.strong_count() != 0);
     if let Some(gate) = gates.get(server_id).and_then(Weak::upgrade) {
+        if gate.max_waiters != max_waiters {
+            return Err(McpError::InvalidConfiguration(
+                "all live managers for one server must use the same max_server_waiters".into(),
+            ));
+        }
         return Ok(gate);
     }
     if gates.len() >= max_gates {
@@ -66,13 +75,14 @@ fn server_call_gate_from(
     let gate = Arc::new(ServerCallGate {
         permits: tokio::sync::Semaphore::new(1),
         waiters: AtomicUsize::new(0),
+        max_waiters,
     });
     gates.insert(server_id.to_owned(), Arc::downgrade(&gate));
     Ok(gate)
 }
 
-fn server_call_gate(server_id: &str) -> Result<Arc<ServerCallGate>, McpError> {
-    server_call_gate_with_limit(server_id, MAX_SERVER_GATES)
+fn server_call_gate(server_id: &str, max_waiters: usize) -> Result<Arc<ServerCallGate>, McpError> {
+    server_call_gate_with_limit(server_id, MAX_SERVER_GATES, max_waiters)
 }
 
 /// Explicit MCP protocol era negotiated with a server.
@@ -271,6 +281,10 @@ pub struct McpLimits {
     /// exhausted.
     pub max_retired_generations: usize,
     /// Maximum queued local calls for one server before calls fail closed.
+    ///
+    /// The value must be in `1..usize::MAX`. The first live manager for a
+    /// canonical server ID establishes the process-wide bound; every other
+    /// live manager for that server must configure the same value.
     pub max_server_waiters: usize,
 }
 
@@ -324,6 +338,9 @@ pub enum McpError {
     /// Untrusted server data was rejected.
     #[error("invalid MCP catalog: {0}")]
     InvalidCatalog(String),
+    /// Host configuration is invalid or conflicts with live process-global state.
+    #[error("invalid MCP configuration: {0}")]
+    InvalidConfiguration(String),
     /// Core registration failed.
     #[error(transparent)]
     Core(#[from] HarnessError),
@@ -721,6 +738,7 @@ impl McpCatalogManager {
         if let Some(max_stale) = cache_policy.max_stale {
             validate_duration(max_stale)?;
         }
+        let server_call_gate = server_call_gate(&server_id, limits.max_server_waiters)?;
         Ok(Self {
             server_id: server_id.clone(),
             transport,
@@ -737,7 +755,7 @@ impl McpCatalogManager {
             }),
             registration_group: ToolRegistrationGroup::new(format!("mcp:{server_id}"))
                 .map_err(McpError::Core)?,
-            server_call_gate: server_call_gate(&server_id)?,
+            server_call_gate,
             id_deriver: Arc::new(generated_id),
         })
     }
@@ -747,19 +765,42 @@ impl McpCatalogManager {
         &self,
         cancellation: CancellationToken,
     ) -> Result<McpCatalogSnapshot, McpError> {
-        let _refresh = self.refresh_lock.lock().await;
+        let refresh_guard = self.refresh_lock.lock().await;
         let ownership = self.begin_refresh()?;
         let started = Instant::now();
+        let mut lifecycle_events = Vec::with_capacity(2);
+        let result = self
+            .refresh_locked(
+                ownership.token,
+                cancellation,
+                started,
+                &mut lifecycle_events,
+            )
+            .await;
+        drop(ownership);
+        drop(refresh_guard);
+        for lifecycle_event in lifecycle_events {
+            self.observer.emit(lifecycle_event);
+        }
+        result
+    }
+
+    async fn refresh_locked(
+        &self,
+        token: u64,
+        cancellation: CancellationToken,
+        started: Instant,
+        lifecycle_events: &mut Vec<McpLifecycleEvent>,
+    ) -> Result<McpCatalogSnapshot, McpError> {
         let built = self
-            .fetch_complete(ownership.token, cancellation.child_token())
+            .fetch_complete(token, cancellation.child_token(), lifecycle_events)
             .await;
         let elapsed = elapsed_ms(started);
         let (context, tools, scope, bytes, pages) = match built {
             Ok(value) => value,
             Err(error) => {
                 let cancelled = cancellation.is_cancelled();
-                drop(_refresh);
-                self.observer.emit(event(
+                lifecycle_events.push(event(
                     McpLifecycleOperation::Refresh,
                     if cancelled {
                         McpLifecycleOutcome::Cancelled
@@ -782,7 +823,7 @@ impl McpCatalogManager {
             Ok(now) => now,
             Err(error) => {
                 return self
-                    .fail_refresh_context(ownership.token, context, error, started, bytes, pages)
+                    .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
                     .await
             }
         };
@@ -792,12 +833,12 @@ impl McpCatalogManager {
                 None => {
                     return self
                         .fail_refresh_context(
-                            ownership.token,
-                            context,
+                            token,
                             McpError::InvalidCatalog("modern catalog omitted ttl".into()),
                             started,
                             bytes,
                             pages,
+                            lifecycle_events,
                         )
                         .await
                 }
@@ -806,14 +847,7 @@ impl McpCatalogManager {
                 Ok(ttl) => ttl,
                 Err(error) => {
                     return self
-                        .fail_refresh_context(
-                            ownership.token,
-                            context,
-                            error,
-                            started,
-                            bytes,
-                            pages,
-                        )
+                        .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
                         .await
                 }
             },
@@ -823,12 +857,12 @@ impl McpCatalogManager {
             None => {
                 return self
                     .fail_refresh_context(
-                        ownership.token,
-                        context,
+                        token,
                         McpError::Clock,
                         started,
                         bytes,
                         pages,
+                        lifecycle_events,
                     )
                     .await
             }
@@ -837,7 +871,7 @@ impl McpCatalogManager {
             Ok(value) => value.unwrap_or(0),
             Err(error) => {
                 return self
-                    .fail_refresh_context(ownership.token, context, error, started, bytes, pages)
+                    .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
                     .await
             }
         };
@@ -846,7 +880,7 @@ impl McpCatalogManager {
             Ok(value) => value,
             Err(error) => {
                 return self
-                    .fail_refresh_context(ownership.token, context, error, started, bytes, pages)
+                    .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
                     .await
             }
         };
@@ -868,7 +902,7 @@ impl McpCatalogManager {
             Ok(generation) => generation,
             Err(error) => {
                 return self
-                    .fail_refresh_context(ownership.token, context, error, started, bytes, pages)
+                    .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
                     .await
             }
         };
@@ -906,12 +940,12 @@ impl McpCatalogManager {
         {
             return self
                 .fail_refresh_context(
-                    ownership.token,
-                    (*context).clone(),
+                    token,
                     McpError::InvalidCatalog("generated ID collision".into()),
                     started,
                     bytes,
                     pages,
+                    lifecycle_events,
                 )
                 .await;
         }
@@ -950,7 +984,7 @@ impl McpCatalogManager {
             if let Some(index) = state
                 .pending_refresh_contexts
                 .iter()
-                .rposition(|candidate| candidate.token == ownership.token)
+                .rposition(|candidate| candidate.token == token)
             {
                 state.pending_refresh_contexts.remove(index);
             } else {
@@ -968,14 +1002,7 @@ impl McpCatalogManager {
             Ok(previous) => previous,
             Err(error) => {
                 return self
-                    .fail_refresh_context(
-                        ownership.token,
-                        (*snapshot.context).clone(),
-                        error,
-                        started,
-                        bytes,
-                        pages,
-                    )
+                    .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
                     .await
             }
         };
@@ -985,8 +1012,7 @@ impl McpCatalogManager {
                 Arc::clone(&previous.in_flight),
             );
         }
-        drop(_refresh);
-        self.observer.emit(event(
+        lifecycle_events.push(event(
             McpLifecycleOperation::Refresh,
             McpLifecycleOutcome::Succeeded,
             elapsed,
@@ -1210,14 +1236,14 @@ impl McpCatalogManager {
     async fn fail_refresh_context<T>(
         &self,
         token: u64,
-        _context: McpContext,
         error: McpError,
         started: Instant,
         bytes: u64,
         pages: u64,
+        lifecycle_events: &mut Vec<McpLifecycleEvent>,
     ) -> Result<T, McpError> {
         self.cleanup_pending_context(token).await;
-        self.observer.emit(event(
+        lifecycle_events.push(event(
             McpLifecycleOperation::Refresh,
             outcome_for_error(&error),
             elapsed_ms(started),
@@ -1363,6 +1389,7 @@ impl McpCatalogManager {
         &self,
         token: u64,
         cancellation: CancellationToken,
+        lifecycle_events: &mut Vec<McpLifecycleEvent>,
     ) -> Result<(McpContext, FetchedTools, Option<McpCacheScope>, u64, u64), McpError> {
         let negotiation_started = Instant::now();
         let context = tokio::select! {
@@ -1385,7 +1412,7 @@ impl McpCatalogManager {
                 "unsupported version or missing tools capability".into(),
             ));
         }
-        self.observer.emit(event(
+        lifecycle_events.push(event(
             McpLifecycleOperation::Negotiation,
             McpLifecycleOutcome::Succeeded,
             elapsed_ms(negotiation_started),
@@ -1674,6 +1701,16 @@ fn validate_duration(duration: Duration) -> Result<(), McpError> {
     duration_ms(duration).map(|_| ())
 }
 
+fn validate_server_waiter_limit(max_waiters: usize) -> Result<(), McpError> {
+    if max_waiters == 0 || max_waiters == usize::MAX {
+        Err(McpError::InvalidConfiguration(
+            "max_server_waiters must be finite and nonzero".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn duration_ms(duration: Duration) -> Result<u64, McpError> {
     u64::try_from(duration.as_millis()).map_err(|_| McpError::Clock)
 }
@@ -1688,6 +1725,7 @@ fn outcome_for_error(error: &McpError) -> McpLifecycleOutcome {
         McpError::CatalogUnavailable
         | McpError::CleanupPending
         | McpError::Clock
+        | McpError::InvalidConfiguration(_)
         | McpError::InvalidCatalog(_)
         | McpError::ResourceLimit => McpLifecycleOutcome::Rejected,
         McpError::Core(_) => McpLifecycleOutcome::Failed,
@@ -1700,6 +1738,7 @@ fn dispatch_for_error(error: &McpError) -> McpDispatchState {
         McpError::CatalogUnavailable
         | McpError::CleanupPending
         | McpError::Clock
+        | McpError::InvalidConfiguration(_)
         | McpError::InvalidCatalog(_)
         | McpError::ResourceLimit
         | McpError::Core(_) => McpDispatchState::NotDispatched,
@@ -1820,7 +1859,7 @@ impl McpToolAdapter {
         cancellation: &CancellationToken,
     ) -> Result<tokio::sync::SemaphorePermit<'_>, HarnessError> {
         let queued = self.server_call_gate.waiters.fetch_add(1, Ordering::AcqRel);
-        if queued >= self.limits.max_server_waiters {
+        if queued >= self.server_call_gate.max_waiters {
             self.server_call_gate.waiters.fetch_sub(1, Ordering::AcqRel);
             return Err(HarnessError::ResourceLimit(
                 "MCP server queue is full".into(),
@@ -2584,6 +2623,7 @@ mod tests {
         operation: McpLifecycleOperation,
         armed: AtomicBool,
         blocked: AtomicBool,
+        events: Mutex<Vec<McpLifecycleEvent>>,
         entered: std::sync::mpsc::Sender<()>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
@@ -2592,10 +2632,19 @@ mod tests {
         fn arm(&self) {
             self.armed.store(true, Ordering::Release);
         }
+
+        fn clear_events(&self) {
+            self.events.lock().expect("test mutex").clear();
+        }
+
+        fn events(&self) -> Vec<McpLifecycleEvent> {
+            self.events.lock().expect("test mutex").clone()
+        }
     }
 
     impl McpObserver for BlockingLifecycleObserver {
         fn observe(&self, event: &McpLifecycleEvent) -> Result<(), McpObserverError> {
+            self.events.lock().expect("test mutex").push(event.clone());
             if event.operation == self.operation
                 && self.armed.load(Ordering::Acquire)
                 && !self.blocked.swap(true, Ordering::AcqRel)
@@ -2621,6 +2670,7 @@ mod tests {
                 operation,
                 armed: AtomicBool::new(false),
                 blocked: AtomicBool::new(false),
+                events: Mutex::new(Vec::new()),
                 entered,
                 release: Mutex::new(release),
             }),
@@ -2878,36 +2928,107 @@ mod tests {
     }
 
     #[test]
-    fn same_server_managers_share_a_process_wide_call_gate() {
+    fn same_server_managers_with_matching_waiter_limits_share_the_global_gate() {
         let clock = Arc::new(FakeClock::default());
-        let first = manager(
+        let server_id = unique_test_server_id("matching-waiter-limit");
+        let limits = McpLimits {
+            max_server_waiters: 3,
+            ..McpLimits::default()
+        };
+        let first = McpCatalogManager::with_configuration(
             Arc::new(FakeTransport::modern(100, vec![tool("one")])),
+            server_id.clone(),
+            limits.clone(),
+            McpTimeouts::default(),
+            McpCachePolicy::default(),
             clock.clone(),
             None,
-            None,
-        );
-        let second = manager(
+        )
+        .expect("first manager");
+        let second = McpCatalogManager::with_configuration(
             Arc::new(FakeTransport::modern(100, vec![tool("two")])),
+            server_id,
+            limits,
+            McpTimeouts::default(),
+            McpCachePolicy::default(),
             clock,
             None,
-            None,
-        );
+        )
+        .expect("second manager");
         assert!(Arc::ptr_eq(
             &first.server_call_gate,
             &second.server_call_gate
         ));
+        assert_eq!(first.server_call_gate.max_waiters, 3);
+    }
+
+    #[test]
+    fn same_server_managers_reject_conflicting_waiter_limits() {
+        let clock = Arc::new(FakeClock::default());
+        let server_id = unique_test_server_id("conflicting-waiter-limit");
+        let first = McpCatalogManager::with_configuration(
+            Arc::new(FakeTransport::modern(100, vec![tool("one")])),
+            server_id.clone(),
+            McpLimits {
+                max_server_waiters: 2,
+                ..McpLimits::default()
+            },
+            McpTimeouts::default(),
+            McpCachePolicy::default(),
+            clock.clone(),
+            None,
+        )
+        .expect("first manager establishes the process-wide bound");
+        for max_server_waiters in [1, 4] {
+            let conflicting = McpCatalogManager::with_configuration(
+                Arc::new(FakeTransport::modern(100, vec![tool("two")])),
+                server_id.clone(),
+                McpLimits {
+                    max_server_waiters,
+                    ..McpLimits::default()
+                },
+                McpTimeouts::default(),
+                McpCachePolicy::default(),
+                clock.clone(),
+                None,
+            );
+            assert!(matches!(
+                conflicting,
+                Err(McpError::InvalidConfiguration(_))
+            ));
+        }
+        assert_eq!(first.server_call_gate.max_waiters, 2);
+    }
+
+    #[test]
+    fn server_waiter_limit_must_be_finite_and_nonzero() {
+        for max_server_waiters in [0, usize::MAX] {
+            let result = McpCatalogManager::with_configuration(
+                Arc::new(FakeTransport::modern(100, vec![tool("one")])),
+                unique_test_server_id("invalid-waiter-limit"),
+                McpLimits {
+                    max_server_waiters,
+                    ..McpLimits::default()
+                },
+                McpTimeouts::default(),
+                McpCachePolicy::default(),
+                Arc::new(FakeClock::default()),
+                None,
+            );
+            assert!(matches!(result, Err(McpError::InvalidConfiguration(_))));
+        }
     }
 
     #[test]
     fn server_gate_prunes_dead_keys_and_enforces_live_bound() {
         let gates = Mutex::new(HashMap::new());
-        let first = server_call_gate_from(&gates, "one", 1).expect("first gate");
+        let first = server_call_gate_from(&gates, "one", 1, 2).expect("first gate");
         assert!(matches!(
-            server_call_gate_from(&gates, "two", 1),
+            server_call_gate_from(&gates, "two", 1, 2),
             Err(McpError::ResourceLimit)
         ));
         drop(first);
-        let second = server_call_gate_from(&gates, "two", 1).expect("pruned gate");
+        let second = server_call_gate_from(&gates, "two", 1, 2).expect("pruned gate");
         assert_eq!(second.waiters.load(Ordering::Acquire), 0);
     }
 
@@ -3149,6 +3270,149 @@ mod tests {
                 .generation,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_negotiation_observer_allows_a_concurrent_refresh_to_complete() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let (observer, entered, release) = blocking_observer(McpLifecycleOperation::Negotiation);
+        let manager = Arc::new(manager_for_server(
+            transport,
+            clock,
+            unique_test_server_id("blocked-negotiation-observer"),
+            Some(observer.clone()),
+        ));
+        observer.arm();
+
+        let first_manager = Arc::clone(&manager);
+        let first = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("test runtime")
+                .block_on(first_manager.refresh(CancellationToken::new()))
+        });
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("negotiation observer entered after refresh lock release");
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.refresh(CancellationToken::new()),
+        )
+        .await
+        .expect("second refresh is not blocked by negotiation observation")
+        .expect("second refresh succeeds");
+        assert_eq!(second.generation, 2);
+        assert!(manager
+            .state
+            .lock()
+            .expect("test mutex")
+            .refresh_tokens
+            .is_empty());
+
+        release.send(()).expect("release negotiation observer");
+        assert_eq!(
+            first
+                .join()
+                .expect("refresh thread")
+                .expect("first refresh result")
+                .generation,
+            1
+        );
+        let refresh_events = observer
+            .events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.operation,
+                    McpLifecycleOperation::Negotiation | McpLifecycleOperation::Refresh
+                )
+            })
+            .map(|event| event.operation)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            refresh_events,
+            vec![
+                McpLifecycleOperation::Negotiation,
+                McpLifecycleOperation::Negotiation,
+                McpLifecycleOperation::Refresh,
+                McpLifecycleOperation::Refresh,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_post_connect_clock_failure_observer_allows_close_to_complete() {
+        let clock = Arc::new(FakeClock::default());
+        clock.set(10);
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let (observer, entered, release) = blocking_observer(McpLifecycleOperation::Refresh);
+        let manager = Arc::new(manager_for_server(
+            transport.clone(),
+            clock.clone(),
+            unique_test_server_id("blocked-clock-failure-observer"),
+            Some(observer.clone()),
+        ));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("initial refresh");
+        observer.clear_events();
+        clock.set(9);
+        observer.arm();
+
+        let failing_manager = Arc::clone(&manager);
+        let failing = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("test runtime")
+                .block_on(failing_manager.refresh(CancellationToken::new()))
+        });
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("failed refresh observer entered after cleanup and lock release");
+        assert_eq!(transport.closes.load(Ordering::Acquire), 1);
+        assert!(manager
+            .state
+            .lock()
+            .expect("test mutex")
+            .refresh_tokens
+            .is_empty());
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.close(CancellationToken::new()),
+        )
+        .await
+        .expect("close is not blocked by failed refresh observation")
+        .expect("close succeeds");
+
+        release.send(()).expect("release failed refresh observer");
+        assert!(matches!(
+            failing.join().expect("refresh thread"),
+            Err(McpError::Clock)
+        ));
+        let refresh_events = observer
+            .events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.operation,
+                    McpLifecycleOperation::Negotiation | McpLifecycleOperation::Refresh
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(refresh_events.len(), 2);
+        assert_eq!(
+            refresh_events[0].operation,
+            McpLifecycleOperation::Negotiation
+        );
+        assert_eq!(refresh_events[1].operation, McpLifecycleOperation::Refresh);
+        assert_eq!(refresh_events[1].outcome, McpLifecycleOutcome::Rejected);
+        assert_eq!(transport.closes.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test]
