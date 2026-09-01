@@ -460,6 +460,8 @@ pub struct McpObserverHealth {
     pub attempted: u64,
     /// Observer failures suppressed by the adapter.
     pub failures: u64,
+    /// Observer callbacks exceeding the small host-integration budget.
+    pub slow: u64,
 }
 
 /// Local shutdown cleanup health without transport details.
@@ -478,16 +480,21 @@ struct ObserverHub {
     observer: Option<Arc<dyn McpObserver>>,
     attempted: AtomicU64,
     failures: AtomicU64,
+    slow: AtomicU64,
 }
 
 impl ObserverHub {
     fn emit(&self, event: McpLifecycleEvent) {
         if let Some(observer) = &self.observer {
             self.attempted.fetch_add(1, Ordering::Relaxed);
+            let started = Instant::now();
             if catch_unwind(AssertUnwindSafe(|| observer.observe(&event)))
                 .map_or(true, |result| result.is_err())
             {
                 self.failures.fetch_add(1, Ordering::Relaxed);
+            }
+            if started.elapsed() > Duration::from_millis(10) {
+                self.slow.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -496,6 +503,7 @@ impl ObserverHub {
         McpObserverHealth {
             attempted: self.attempted.load(Ordering::Relaxed),
             failures: self.failures.load(Ordering::Relaxed),
+            slow: self.slow.load(Ordering::Relaxed),
         }
     }
 }
@@ -517,6 +525,7 @@ struct ActiveCatalog {
     summary: McpCatalogSnapshot,
     context: Arc<McpContext>,
     in_flight: Arc<InFlightCalls>,
+    dispatch_gate: Arc<tokio::sync::RwLock<()>>,
     expires_at_ms: u64,
     stale_until_ms: u64,
     tools: Vec<Arc<ManagedMcpToolAdapter>>,
@@ -822,6 +831,7 @@ impl McpCatalogManager {
         };
         let context = Arc::new(context);
         let in_flight = Arc::new(InFlightCalls::default());
+        let dispatch_gate = Arc::new(tokio::sync::RwLock::new(()));
         let managed = tools
             .items
             .into_iter()
@@ -842,6 +852,7 @@ impl McpCatalogManager {
                     Arc::downgrade(&self.state),
                     Arc::clone(&self.clock),
                     Arc::clone(&in_flight),
+                    Arc::clone(&dispatch_gate),
                 ))
             })
             .collect::<Vec<_>>();
@@ -870,11 +881,22 @@ impl McpCatalogManager {
             },
             context: Arc::clone(&context),
             in_flight,
+            dispatch_gate,
             expires_at_ms,
             stale_until_ms,
             tools: managed,
         });
-        let previous = match (|| {
+        let retiring = self.state.lock().ok().and_then(|state| {
+            state
+                .active
+                .as_ref()
+                .map(|active| Arc::clone(&active.dispatch_gate))
+        });
+        let _retire_permit = match retiring {
+            Some(gate) => Some(gate.write_owned().await),
+            None => None,
+        };
+        let previous_result = (|| {
             let mut state = self
                 .state
                 .lock()
@@ -894,7 +916,12 @@ impl McpCatalogManager {
             let previous = state.active.replace(Arc::clone(&snapshot));
             state.invalidated = false;
             Ok(previous)
-        })() {
+        })();
+        // Observer delivery and cleanup are deliberately outside the
+        // retirement gate: observers are host code and never participate in
+        // dispatch/lifecycle ownership.
+        drop(_retire_permit);
+        let previous = match previous_result {
             Ok(previous) => previous,
             Err(error) => {
                 return self
@@ -932,6 +959,9 @@ impl McpCatalogManager {
 
     /// Explicitly invalidates the current list after a server list-change notice.
     pub fn invalidate_list_change(&self) {
+        // This uses the same state lock as post-permit call admission: work
+        // already admitted may finish, but a call that observes this update
+        // is rejected before it reaches the transport.
         if let Ok(mut state) = self.state.lock() {
             state.invalidated = true;
         }
@@ -984,6 +1014,10 @@ impl McpCatalogManager {
     /// Closes the manager. The local state is closed before bounded transport shutdown.
     pub async fn close(&self, cancellation: CancellationToken) -> Result<(), McpError> {
         let _close = self.close_lock.lock().await;
+        // Closing marks the state unavailable under the same lock used by a
+        // call's post-permit admission check. An already admitted call keeps
+        // its read permit and in-flight lease; close therefore stays bounded
+        // instead of waiting for a remote call to return.
         let contexts = {
             let mut state = self
                 .state
@@ -1353,6 +1387,7 @@ struct ManagedMcpToolAdapter {
     state: Weak<Mutex<CatalogState>>,
     clock: Arc<dyn McpClock>,
     in_flight: Arc<InFlightCalls>,
+    dispatch_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl ManagedMcpToolAdapter {
@@ -1362,6 +1397,7 @@ impl ManagedMcpToolAdapter {
         state: Weak<Mutex<CatalogState>>,
         clock: Arc<dyn McpClock>,
         in_flight: Arc<InFlightCalls>,
+        dispatch_gate: Arc<tokio::sync::RwLock<()>>,
     ) -> Self {
         Self {
             inner,
@@ -1369,6 +1405,7 @@ impl ManagedMcpToolAdapter {
             state,
             clock,
             in_flight,
+            dispatch_gate,
         }
     }
 
@@ -1431,6 +1468,10 @@ impl Tool for ManagedMcpToolAdapter {
         arguments: Value,
         cancellation: CancellationToken,
     ) -> Result<ToolResult, HarnessError> {
+        // This permit stays alive through the transport await. Retirement
+        // obtains the write side before changing generation state, so a call
+        // is either admitted before retirement or rejected before dispatch.
+        let _dispatch_permit = self.dispatch_gate.read().await;
         let (stale, _lease) = self.check_active()?;
         self.inner
             .execute_managed(call, arguments, cancellation, stale)
@@ -2203,6 +2244,11 @@ mod tests {
         list_started: AtomicBool,
         list_release: tokio::sync::Notify,
         hang_call: AtomicBool,
+        block_call: AtomicBool,
+        call_started: AtomicU64,
+        call_release: tokio::sync::Notify,
+        active_calls: AtomicU64,
+        max_active_calls: AtomicU64,
         fail_list: AtomicBool,
         call_failure: Mutex<Option<McpTransportError>>,
         result: Mutex<McpCallResult>,
@@ -2236,6 +2282,11 @@ mod tests {
                 list_started: AtomicBool::new(false),
                 list_release: tokio::sync::Notify::new(),
                 hang_call: AtomicBool::new(false),
+                block_call: AtomicBool::new(false),
+                call_started: AtomicU64::new(0),
+                call_release: tokio::sync::Notify::new(),
+                active_calls: AtomicU64::new(0),
+                max_active_calls: AtomicU64::new(0),
                 fail_list: AtomicBool::new(false),
                 call_failure: Mutex::new(None),
                 result: Mutex::new(McpCallResult {
@@ -2257,6 +2308,14 @@ mod tests {
 
         fn replace_tools(&self, tools: Vec<McpTool>) {
             self.pages.lock().expect("test mutex")[0].tools = tools;
+        }
+    }
+
+    struct FakeCallLease<'a>(&'a FakeTransport);
+
+    impl Drop for FakeCallLease<'_> {
+        fn drop(&mut self) {
+            self.0.active_calls.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -2295,8 +2354,15 @@ mod tests {
             _: CancellationToken,
         ) -> Result<McpCallResult, McpTransportError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            let active = self.active_calls.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_active_calls.fetch_max(active, Ordering::AcqRel);
+            let _lease = FakeCallLease(self);
             if let Some(error) = self.call_failure.lock().expect("test mutex").clone() {
                 return Err(error);
+            }
+            if self.block_call.load(Ordering::Relaxed) {
+                self.call_started.fetch_add(1, Ordering::Release);
+                self.call_release.notified().await;
             }
             if self.hang_call.load(Ordering::Relaxed) {
                 std::future::pending::<()>().await;
@@ -2345,6 +2411,28 @@ mod tests {
     impl McpObserver for PanicObserver {
         fn observe(&self, _: &McpLifecycleEvent) -> Result<(), McpObserverError> {
             panic!("observer panic must not escape")
+        }
+    }
+
+    struct SlowObserver {
+        manager: Mutex<Option<std::sync::Weak<McpCatalogManager>>>,
+        saw_snapshot: AtomicBool,
+    }
+
+    impl McpObserver for SlowObserver {
+        fn observe(&self, _: &McpLifecycleEvent) -> Result<(), McpObserverError> {
+            if let Some(manager) = self
+                .manager
+                .lock()
+                .expect("test mutex")
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+            {
+                self.saw_snapshot
+                    .store(manager.active_snapshot().is_some(), Ordering::Release);
+            }
+            std::thread::sleep(Duration::from_millis(15));
+            Ok(())
         }
     }
 
@@ -2586,6 +2674,69 @@ mod tests {
             &first.server_call_gate,
             &second.server_call_gate
         ));
+    }
+
+    #[tokio::test]
+    async fn two_managers_serialize_calls_to_the_same_server() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let first = manager(transport.clone(), clock.clone(), None, None);
+        let second = manager(transport.clone(), clock, None, None);
+        first
+            .refresh(CancellationToken::new())
+            .await
+            .expect("first refresh");
+        second
+            .refresh(CancellationToken::new())
+            .await
+            .expect("second refresh");
+        transport.block_call.store(true, Ordering::Release);
+        let first_tool = first.active_tools().remove(0);
+        let second_tool = second.active_tools().remove(0);
+        let first_call = tokio::spawn(async move {
+            first_tool
+                .execute(serde_json::json!({}), CancellationToken::new())
+                .await
+        });
+        while transport.call_started.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+        let second_call = tokio::spawn(async move {
+            second_tool
+                .execute(serde_json::json!({}), CancellationToken::new())
+                .await
+        });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(transport.calls.load(Ordering::Acquire), 1);
+        assert_eq!(transport.max_active_calls.load(Ordering::Acquire), 1);
+        transport.block_call.store(false, Ordering::Release);
+        transport.call_release.notify_waiters();
+        first_call.await.expect("first call").expect("first result");
+        second_call
+            .await
+            .expect("second call")
+            .expect("second result");
+        assert_eq!(transport.max_active_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_observer_is_measured_after_lifecycle_locks_are_released() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let observer = Arc::new(SlowObserver {
+            manager: Mutex::new(None),
+            saw_snapshot: AtomicBool::new(false),
+        });
+        let manager = Arc::new(manager(transport, clock, None, Some(observer.clone())));
+        *observer.manager.lock().expect("test mutex") = Some(Arc::downgrade(&manager));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        assert!(observer.saw_snapshot.load(Ordering::Acquire));
+        assert!(manager.observer_health().slow >= 1);
     }
 
     #[tokio::test]
@@ -2883,48 +3034,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_reports_pending_until_another_generation_drains() {
+    async fn retirement_waits_for_an_admitted_dispatch_and_rejects_new_work() {
         let clock = Arc::new(FakeClock::default());
         let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
-        transport.hang_call.store(true, Ordering::Relaxed);
+        transport.block_call.store(true, Ordering::Relaxed);
         let manager = manager(transport.clone(), clock, None, None);
         manager
             .refresh(CancellationToken::new())
             .await
             .expect("first refresh");
         let first_tool = manager.active_tools().remove(0);
-        let call_cancellation = CancellationToken::new();
-        let task_cancellation = call_cancellation.clone();
+        let stale_tool = Arc::clone(&first_tool);
         let active_call = tokio::spawn(async move {
             first_tool
-                .execute(serde_json::json!({}), task_cancellation)
+                .execute(serde_json::json!({}), CancellationToken::new())
                 .await
         });
-        while transport.calls.load(Ordering::Acquire) == 0 {
+        while transport.call_started.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
-        transport.hang_call.store(false, Ordering::Relaxed);
-        manager
-            .refresh(CancellationToken::new())
+        let manager = Arc::new(manager);
+        let replacement_manager = Arc::clone(&manager);
+        let replacement =
+            tokio::spawn(
+                async move { replacement_manager.refresh(CancellationToken::new()).await },
+            );
+        tokio::task::yield_now().await;
+        assert!(
+            !replacement.is_finished(),
+            "retirement must wait for the admitted old-generation dispatch"
+        );
+        assert_eq!(transport.calls.load(Ordering::Acquire), 1);
+        transport.block_call.store(false, Ordering::Relaxed);
+        transport.call_release.notify_waiters();
+        active_call
             .await
+            .expect("old call task")
+            .expect("old call result");
+        replacement
+            .await
+            .expect("replacement task")
             .expect("replacement refresh");
-        assert_eq!(manager.shutdown_health().in_progress_contexts, 1);
-        assert!(matches!(
-            manager.close(CancellationToken::new()).await,
-            Err(McpError::CleanupPending)
-        ));
-        call_cancellation.cancel();
-        assert!(matches!(
-            active_call.await.expect("call task"),
-            Err(HarnessError::Cancelled)
-        ));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while manager.shutdown_health().in_progress_contexts != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("retired generation drains");
+        assert!(stale_tool
+            .execute(serde_json::json!({}), CancellationToken::new())
+            .await
+            .is_err());
+        assert_eq!(transport.calls.load(Ordering::Acquire), 1);
         manager
             .close(CancellationToken::new())
             .await
