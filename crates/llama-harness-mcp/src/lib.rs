@@ -1958,6 +1958,7 @@ impl McpToolAdapter {
             Transport(McpTransportError),
         }
         let result = tokio::select! {
+            biased;
             _ = cancellation.cancelled() => Err(CallFailure::Cancelled),
             result = tokio::time::timeout(self.call_timeout, self.transport.call_tool(&self.context, McpCallRequest { name: self.native_name.clone(), arguments, context: call.clone() }, cancellation.child_token())) => match result {
                 Ok(Ok(result)) => Ok(result),
