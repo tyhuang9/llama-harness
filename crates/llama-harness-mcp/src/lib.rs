@@ -809,7 +809,7 @@ impl McpCatalogManager {
     ) -> Result<(McpCatalogSnapshot, ToolRegistry), McpError> {
         let refresh_guard = self.refresh_lock.lock().await;
         let ownership = self.begin_refresh(registry_transaction)?;
-        let started = Instant::now();
+        let started_ms = self.clock.now_ms();
         let mut lifecycle_events = Vec::with_capacity(2);
         let result = self
             .refresh_locked(
@@ -817,12 +817,18 @@ impl McpCatalogManager {
                 registry,
                 registry_transaction,
                 cancellation,
-                started,
                 &mut lifecycle_events,
             )
             .await;
         drop(ownership);
         drop(refresh_guard);
+        let refresh_duration_ms = self.clock.now_ms().saturating_sub(started_ms);
+        if let Some(refresh_event) = lifecycle_events
+            .iter_mut()
+            .find(|event| event.operation == McpLifecycleOperation::Refresh)
+        {
+            refresh_event.duration_ms = refresh_duration_ms;
+        }
         for lifecycle_event in lifecycle_events {
             self.observer.emit(lifecycle_event);
         }
@@ -835,7 +841,6 @@ impl McpCatalogManager {
         registry: &ToolRegistry,
         registry_transaction: bool,
         cancellation: CancellationToken,
-        started: Instant,
         lifecycle_events: &mut Vec<McpLifecycleEvent>,
     ) -> Result<(McpCatalogSnapshot, ToolRegistry), McpError> {
         let token = ownership.token;
@@ -843,7 +848,6 @@ impl McpCatalogManager {
         let built = self
             .fetch_complete(token, cancellation.child_token(), lifecycle_events)
             .await;
-        let elapsed = elapsed_ms(started);
         let (context, tools, scope, bytes, pages) = match built {
             Ok(value) => value,
             Err(error) => {
@@ -855,7 +859,7 @@ impl McpCatalogManager {
                     } else {
                         outcome_for_error(&error)
                     },
-                    elapsed,
+                    0,
                     0,
                     0,
                     0,
@@ -871,7 +875,7 @@ impl McpCatalogManager {
             Ok(now) => now,
             Err(error) => {
                 return self
-                    .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
+                    .fail_refresh_context(token, error, bytes, pages, lifecycle_events)
                     .await
             }
         };
@@ -883,7 +887,6 @@ impl McpCatalogManager {
                         .fail_refresh_context(
                             token,
                             McpError::InvalidCatalog("modern catalog omitted ttl".into()),
-                            started,
                             bytes,
                             pages,
                             lifecycle_events,
@@ -895,7 +898,7 @@ impl McpCatalogManager {
                 Ok(ttl) => ttl,
                 Err(error) => {
                     return self
-                        .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
+                        .fail_refresh_context(token, error, bytes, pages, lifecycle_events)
                         .await
                 }
             },
@@ -904,14 +907,7 @@ impl McpCatalogManager {
             Some(value) => value,
             None => {
                 return self
-                    .fail_refresh_context(
-                        token,
-                        McpError::Clock,
-                        started,
-                        bytes,
-                        pages,
-                        lifecycle_events,
-                    )
+                    .fail_refresh_context(token, McpError::Clock, bytes, pages, lifecycle_events)
                     .await
             }
         };
@@ -919,7 +915,7 @@ impl McpCatalogManager {
             Ok(value) => value.unwrap_or(0),
             Err(error) => {
                 return self
-                    .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
+                    .fail_refresh_context(token, error, bytes, pages, lifecycle_events)
                     .await
             }
         };
@@ -928,7 +924,7 @@ impl McpCatalogManager {
             Ok(value) => value,
             Err(error) => {
                 return self
-                    .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
+                    .fail_refresh_context(token, error, bytes, pages, lifecycle_events)
                     .await
             }
         };
@@ -945,7 +941,7 @@ impl McpCatalogManager {
             Ok(generation) => generation,
             Err(error) => {
                 return self
-                    .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
+                    .fail_refresh_context(token, error, bytes, pages, lifecycle_events)
                     .await
             }
         };
@@ -985,7 +981,6 @@ impl McpCatalogManager {
                 .fail_refresh_context(
                     token,
                     McpError::InvalidCatalog("generated ID collision".into()),
-                    started,
                     bytes,
                     pages,
                     lifecycle_events,
@@ -999,7 +994,6 @@ impl McpCatalogManager {
                     .fail_refresh_context(
                         token,
                         McpError::Core(error),
-                        started,
                         bytes,
                         pages,
                         lifecycle_events,
@@ -1074,7 +1068,7 @@ impl McpCatalogManager {
             Ok(previous) => previous,
             Err(error) => {
                 return self
-                    .fail_refresh_context(token, error, started, bytes, pages, lifecycle_events)
+                    .fail_refresh_context(token, error, bytes, pages, lifecycle_events)
                     .await
             }
         };
@@ -1087,7 +1081,7 @@ impl McpCatalogManager {
         lifecycle_events.push(event(
             McpLifecycleOperation::Refresh,
             McpLifecycleOutcome::Succeeded,
-            elapsed,
+            0,
             snapshot.summary.tool_count as u64,
             bytes,
             pages,
@@ -1330,7 +1324,6 @@ impl McpCatalogManager {
         &self,
         token: u64,
         error: McpError,
-        started: Instant,
         bytes: u64,
         pages: u64,
         lifecycle_events: &mut Vec<McpLifecycleEvent>,
@@ -1339,7 +1332,7 @@ impl McpCatalogManager {
         lifecycle_events.push(event(
             McpLifecycleOperation::Refresh,
             outcome_for_error(&error),
-            elapsed_ms(started),
+            0,
             0,
             bytes,
             pages,
@@ -2591,7 +2584,7 @@ mod tests {
 
     struct PostListBarrierClock {
         now: AtomicU64,
-        armed: AtomicBool,
+        observations_until_barrier: AtomicU64,
         reached: std::sync::mpsc::SyncSender<()>,
         release: Arc<std::sync::Barrier>,
     }
@@ -2603,7 +2596,7 @@ mod tests {
             (
                 Self {
                     now: AtomicU64::new(0),
-                    armed: AtomicBool::new(false),
+                    observations_until_barrier: AtomicU64::new(0),
                     reached,
                     release: Arc::clone(&release),
                 },
@@ -2613,13 +2606,20 @@ mod tests {
         }
 
         fn arm(&self) {
-            self.armed.store(true, Ordering::Release);
+            // Refresh start is the first lifecycle-clock observation; the
+            // second is checked_now immediately after the final list response.
+            self.observations_until_barrier.store(2, Ordering::Release);
         }
     }
 
     impl McpClock for PostListBarrierClock {
         fn now_ms(&self) -> u64 {
-            if self.armed.swap(false, Ordering::AcqRel) {
+            if self.observations_until_barrier.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            ) == Ok(1)
+            {
                 self.reached.send(()).expect("barrier receiver");
                 self.release.wait();
             }
@@ -2802,6 +2802,25 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    struct AdvancingNegotiationObserver {
+        events: Mutex<Vec<McpLifecycleEvent>>,
+        clock: Arc<FakeClock>,
+        armed: AtomicBool,
+        advance_to: u64,
+    }
+
+    impl McpObserver for AdvancingNegotiationObserver {
+        fn observe(&self, event: &McpLifecycleEvent) -> Result<(), McpObserverError> {
+            self.events.lock().expect("test mutex").push(event.clone());
+            if event.operation == McpLifecycleOperation::Negotiation
+                && self.armed.swap(false, Ordering::AcqRel)
+            {
+                self.clock.set(self.advance_to);
+            }
+            Ok(())
         }
     }
 
@@ -3690,6 +3709,82 @@ mod tests {
                 .generation,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_duration_includes_retirement_wait_and_excludes_observers() {
+        let clock = Arc::new(FakeClock::default());
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("old")]));
+        let observer = Arc::new(AdvancingNegotiationObserver {
+            events: Mutex::new(Vec::new()),
+            clock: Arc::clone(&clock),
+            armed: AtomicBool::new(false),
+            advance_to: 99,
+        });
+        let manager = Arc::new(manager_for_server(
+            transport.clone(),
+            clock.clone(),
+            unique_test_server_id("refresh-retirement-duration"),
+            Some(observer.clone()),
+        ));
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("initial refresh");
+        observer.events.lock().expect("test mutex").clear();
+
+        let retirement_gate = manager
+            .state
+            .lock()
+            .expect("test mutex")
+            .active
+            .as_ref()
+            .expect("active catalog")
+            .dispatch_gate
+            .clone();
+        let admitted = Arc::clone(&retirement_gate).read_owned().await;
+        transport.replace_tools(vec![tool("new")]);
+        transport.block_list.store(true, Ordering::Release);
+        transport.list_started.store(false, Ordering::Release);
+        clock.set(10);
+        observer.armed.store(true, Ordering::Release);
+
+        let refresh_manager = Arc::clone(&manager);
+        let refresh =
+            tokio::spawn(async move { refresh_manager.refresh(CancellationToken::new()).await });
+        while !transport.list_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        transport.block_list.store(false, Ordering::Release);
+        transport.list_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if retirement_gate.try_read().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh queues for the prior generation write gate");
+
+        clock.set(45);
+        drop(admitted);
+        let snapshot = refresh
+            .await
+            .expect("refresh task")
+            .expect("refresh after retirement wait");
+        assert_eq!(snapshot.generation, 2);
+        assert_eq!(clock.now_ms(), 99, "negotiation observer advanced clock");
+
+        let events = observer.events.lock().expect("test mutex");
+        let refresh_events = events
+            .iter()
+            .filter(|event| event.operation == McpLifecycleOperation::Refresh)
+            .collect::<Vec<_>>();
+        assert_eq!(refresh_events.len(), 1);
+        assert_eq!(refresh_events[0].outcome, McpLifecycleOutcome::Succeeded);
+        assert_eq!(refresh_events[0].duration_ms, 35);
     }
 
     #[tokio::test]
