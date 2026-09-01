@@ -104,6 +104,45 @@ broker and error contracts; only a forced, explicitly configured Programmatic
 request reaches this mapping. A pre-effect invalid Programmatic generation may
 continue through Direct under the same logical run; capability failures do not.
 
+## Forced guarded-speculation matrix
+
+Guarded speculation is a Direct overlay rather than a `RunStrategy`. Put the
+forced mode in application-owned fixture data and have the `EvalExecutor` build
+a fresh real runner for each case. Use the runner's trusted pull-only readiness
+and metrics after execution; do not infer candidate behavior from `RunEvent`,
+`RunResult`, SQLite, or protocol projections.
+
+- **Disabled:** uses ordinary completion and sequential Direct execution; pull
+  state remains Disabled.
+- **Shadow:** streams Direct, invokes only the authoritative Direct call,
+  records an exact observation, and never calls speculative policy.
+- **Active exact commit:** requires at least 1,000 exact same-runner
+  observations and explicit activation, issues once as Speculative, commits
+  the exact typed index-0 call once, and preserves task and final-state
+  correctness.
+- **Invalid result, deadline, or terminal stream failure:** discards or cancels
+  the candidate, trips only that tool to Shadow, and uses safe sequential
+  Direct fallback when permitted. Invocation mismatch is a defensive internal
+  breaker: a conforming provider cannot change a call after the finalized
+  index-0 boundary.
+- **Saturated global slot or concurrency key:** does not wait or queue and
+  immediately uses sequential Direct execution.
+- **Write, remote, egress-capable, or MCP import:** never enters Shadow or
+  Active and never crosses a speculative issue boundary.
+
+Correctness and safety rank before speed. A result is eligible for latency or
+cost comparison only after the task, expected output, and final-state checks
+pass and unauthorized, duplicate, and unintended effects are all zero. Keep a
+Disabled baseline and report Shadow, exact Active, discard fallback, and
+saturated fallback separately. The repository's ignored release evaluation is
+informational rather than a wall-clock CI gate.
+
+Add privacy canaries that prove canonical events, serialized results, SQLite
+exports, and protocol projections contain no candidate arguments, results, raw
+provider or tool errors, readiness streaks, modes, or counters. A terminal
+stream failure after an accepted item must show one stream attempt and no
+retry. See [Guarded speculative tool calling](speculative-tool-calling.md).
+
 Reports are serializable normalized JSON. Browse a saved report locally with:
 
 ```bash

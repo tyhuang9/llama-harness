@@ -263,6 +263,66 @@ fn discovery_events_persist_metadata_only() {
 }
 
 #[test]
+fn canonical_event_projection_and_sqlite_export_have_no_speculation_diagnostics() {
+    let store = SqliteEventSink::open_in_memory(TraceStoreConfig::default()).unwrap();
+    let events = vec![
+        started("run-speculation-private", "trace-speculation-private", 1),
+        record(
+            "run-speculation-private",
+            "trace-speculation-private",
+            2,
+            2,
+            RunEvent::ModelResponded { call_number: 1 },
+        ),
+        record(
+            "run-speculation-private",
+            "trace-speculation-private",
+            3,
+            3,
+            RunEvent::ToolCompleted {
+                call_id: "authoritative-call".into(),
+                tool_id: "local.read".into(),
+                ok: true,
+            },
+        ),
+        completed(
+            "run-speculation-private",
+            "trace-speculation-private",
+            4,
+            4,
+            RunStatus::Completed,
+        ),
+    ];
+    let projected = serde_json::to_string(&events).unwrap();
+    store
+        .append_batch(events.into_iter().map(|event| (event, None)))
+        .unwrap();
+    let exported = store
+        .export_run_json("run-speculation-private")
+        .unwrap()
+        .unwrap();
+
+    for forbidden in [
+        "\"speculation\":",
+        "\"shadow_matches\":",
+        "\"exact_shadow_observations\":",
+        "\"ready_to_activate\":",
+        "\"slot_saturated\":",
+        "\"candidate_arguments\":",
+        "\"candidate_result\":",
+        "\"candidate_error\":",
+    ] {
+        assert!(
+            !projected.contains(forbidden),
+            "projection leaked {forbidden}"
+        );
+        assert!(!exported.contains(forbidden), "SQLite leaked {forbidden}");
+    }
+    assert!(exported.contains("authoritative-call"));
+    assert!(exported.contains("tool_completed"));
+}
+
+#[test]
 fn programmatic_event_kinds_are_ordered_additive_and_redacted_on_reopen() {
     let path = temporary_database("programmatic-events");
     let canaries = [

@@ -1,0 +1,41 @@
+version: 1
+id: speculation-acceptance
+name: Deterministic Guarded Speculation Acceptance Matrix
+agent: speculation-fixture-agent
+models: [fixture-streaming-model]
+strategies: [direct]
+defaults:
+  repeat: 1
+cases:
+  - id: disabled
+    fixture: {id: disabled, data: {mode: disabled, tool: eligible}}
+    input: Read stable local state without speculation.
+    expected: {status: completed, required_tools: [local.read], final_output_contains: [done], max_model_calls: 2, max_tool_calls: 1}
+  - id: shadow
+    fixture: {id: shadow, data: {mode: shadow, tool: eligible}}
+    input: Observe an exact shadow candidate without issuing it.
+    expected: {status: completed, required_tools: [local.read], final_output_contains: [done], max_model_calls: 2, max_tool_calls: 1}
+  - id: active-exact
+    fixture: {id: active-exact, data: {mode: active_exact, tool: eligible}}
+    input: Commit one exact active candidate.
+    expected: {status: completed, required_tools: [local.read], final_output_contains: [done], max_model_calls: 2, max_tool_calls: 1}
+  - id: active-discard
+    fixture: {id: active-discard, data: {mode: active_discard, tool: invalid_speculative_result}}
+    input: Discard an invalid candidate result and fall back sequentially.
+    expected: {status: completed, required_tools: [local.read], final_output_contains: [done], max_model_calls: 2, max_tool_calls: 1}
+  - id: saturated-fallback
+    fixture: {id: saturated-fallback, data: {mode: saturated_fallback, tool: blocking_speculative_read}}
+    input: Fall back without waiting when the global speculative slot is occupied.
+    expected: {status: completed, required_tools: [local.read], final_output_contains: [done], max_model_calls: 2, max_tool_calls: 1}
+  - id: ineligible-write
+    fixture: {id: ineligible-write, data: {mode: shadow, tool: write}}
+    input: Execute an authoritative write without speculative issue.
+    expected: {status: completed, required_tools: [local.write], final_output_contains: [done], max_model_calls: 2, max_tool_calls: 1}
+  - id: ineligible-remote
+    fixture: {id: ineligible-remote, data: {mode: shadow, tool: remote_read}}
+    input: Execute an authoritative remote read without speculative issue.
+    expected: {status: completed, required_tools: [remote.read], final_output_contains: [done], max_model_calls: 2, max_tool_calls: 1}
+  - id: terminal-stream-failure
+    fixture: {id: terminal-stream-failure, data: {mode: active_terminal_failure, tool: eligible}}
+    input: Fail terminally after a finalized candidate without retry.
+    expected: {status: failed, max_model_calls: 1, max_tool_calls: 0, expected_failure: {code: model_stream.upstream_provider_failure}}

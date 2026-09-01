@@ -29,6 +29,7 @@ export const GUIDES = {
   "releasing.md": "releasing.html",
   "sdk-architecture.md": "sdk-architecture.html",
   "security.md": "security.html",
+  "speculative-tool-calling.md": "speculative-tool-calling.html",
   "tauri.md": "tauri.html",
   "tools-and-policies.md": "tools-and-policies.html",
   "typescript-sdk.md": "typescript-sdk.html",

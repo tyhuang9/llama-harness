@@ -21,6 +21,12 @@ policy, approval, call limits, cancellation, output validation, and the
 existing `ToolBroker`; there is no supported MCP execution bypass. Calls are
 never retried after dispatch because a remote effect may be uncertain.
 
+Imported definitions deliberately cannot satisfy the core speculation gates:
+they do not permit `ToolCaller::Speculative`, do not carry an enabled tool
+speculation policy, execute remotely, and may perform network egress. Configuring
+the runner for Shadow or Active speculation therefore cannot invoke an MCP
+transport speculatively. MCP calls remain authoritative Direct broker calls.
+
 `McpCatalogManager` installs only a fully validated immutable snapshot. Modern
 `tools/list` pages use MCP's `ttlMs` hint (zero is immediately stale) and a
 consistent public `cacheScope`; the manager uses the shortest page TTL for a

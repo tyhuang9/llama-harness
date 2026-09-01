@@ -52,6 +52,30 @@ cargo test -p llama-harness-core --release --all-features --locked discovery_rel
 
 It reports cold and warm median/P95 latency plus target status for 30, 100, and 1,000 normal tools and a 1,000-tool, 64-term adversarial query. Record the command output and machine/Rust details with evaluation results; do not turn those wall-clock targets into CI assertions.
 
+## Guarded speculation eligibility
+
+Speculation is a Direct-only overlay for explicitly attested local private
+reads. Runner configuration, tool configuration, and the host's dedicated
+`decide_speculative` policy decision are independent gates. An ordinary allow,
+an approval, or `AllowAllPolicy` never authorizes early issue.
+
+An eligible tool must allow both Direct and Speculative callers, enable its
+dedicated speculation policy, and declare read-only, idempotent,
+parallel-safe, guaranteed cancellation, guaranteed issue safety, local-private
+execution, and prohibited network egress. `Enabled` attests that Direct and
+Speculative successful results are caller-invariant and that authorization and
+meaningful freshness remain stable for the bounded candidate lifetime. Keep
+ACL-, identity-, caller-, or freshness-sensitive reads disabled. Writes,
+remote or egress-capable tools, and MCP imports fail closed.
+
+Each eligible tool begins in Shadow and requires at least 1,000 consecutive
+exact same-runner observations plus explicit host activation. Active issue uses
+one runner-wide no-wait slot and a no-wait concurrency-key permit. Exact typed
+identity and arguments, live registry and allowlist bindings, limits, policy,
+and the output schema are checked again before commit. Otherwise the candidate
+is skipped or discarded and safe work follows the ordinary sequential broker
+path. See [Guarded speculative tool calling](speculative-tool-calling.md).
+
 The runner validates model-proposed arguments against the registered schema before policy is evaluated or a tool executes. Unknown, disallowed, malformed, and invalid-schema calls become structured rejection events rather than application side effects. Rejected malformed calls do not enter the canonical `RunResult` tool-call transcript: retaining only a canonical parsed argument record avoids representing unparseable model text as an executed or replayable call.
 
 ## Agent allowlists

@@ -8,6 +8,21 @@ The runtime records structured facts such as run start and completion, model req
 
 The store supports run lookup, filterable summaries, paged event reads, redacted JSON export, retention by age or recent-run count, explicit run deletion, and SQLite compaction. Export refuses oversized traces instead of silently producing a partial file; callers can inspect large traces through the paged API. Public multi-event producers must pass one explicit execution ID to `EventRecord::new` and use contiguous sequences; this semver-major constructor change prevents each record from silently becoming a separate trace.
 
+## Speculation remains pull-only
+
+Guarded speculation deliberately leaves `RunEvent`, `RunResult`, the SQLite
+schema, event-kind projections, and protocol-facing traces unchanged. Shadow
+and Active candidate existence is privacy-sensitive. The sink never receives
+candidate arguments, results, raw errors, readiness streaks, modes, or
+speculative counters.
+
+Trusted same-process hosts may poll `AgentRunner::speculation_readiness` and
+`AgentRunner::speculation_metrics` for a controlled rollout. Those values are
+private operational state, not canonical telemetry or authorization. Do not
+copy them into `append_with_raw` payloads. Enabling raw payload persistence only
+stores values the application explicitly supplies; it does not cause the
+runner or sink to synthesize speculative diagnostics.
+
 ## Redaction and raw data
 
 All structured events are converted to JSON and redacted before they are written. The default redaction covers common sensitive field names including authorization, cookies, passwords, secrets, tokens, API keys, and program artifacts. Matching is case-insensitive and token-aware across separators, camel case, and acronyms, so names such as `accessToken`, `openaiApiKey`, and `programAST` are redacted without broad substring matching. Applications may supply additional key fragments and literal values through `RedactionConfig`.

@@ -10,7 +10,20 @@ The host supplies a `ModelProvider`, its own `Tool` implementations, a policy en
 
 The controlled `AgentRunner` validates an `AgentDefinition` and `RunRequest`, requests a model response, validates every requested tool call before execution, applies policy and approval, then returns tool results to the model. It stops on a final response, configured limits, cancellation, timeout, or an error. Tools are never retried implicitly.
 
+Guarded speculation is an optional overlay on that same Direct loop. Only a
+finalized provider index-0 call can become a candidate, and every issued
+candidate crosses the existing broker. One runner-wide no-wait slot and any
+tool concurrency-key permit bound overlap; saturation immediately preserves
+the sequential path. The optimization does not apply to declarative or
+Programmatic execution, and providers without a useful final-call stream
+boundary gain no overlap. See [Guarded speculative tool calling](speculative-tool-calling.md).
+
 The core library keeps only the data needed while a run is active. Persistence is deliberately an optional dependency: `llama-harness-observability` provides a local, redacted SQLite `EventSink`, while hosts decide whether they want to attach it. Raw payloads are off by default and must be explicitly enabled.
+
+Candidate existence is privacy-sensitive and remains inside the runner. Shadow
+readiness and Active counters are pull-only trusted-host data; they do not add
+canonical events, results, SQLite fields, sidecar protocol projections, or SDK
+messages.
 
 `ModelProvider` is provider-neutral: it exposes health, inventory, capabilities,
 and bounded cancellable completion. The scripted mock in `llama_harness::mock`

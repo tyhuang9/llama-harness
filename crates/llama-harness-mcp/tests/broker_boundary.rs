@@ -1,9 +1,12 @@
 use async_trait::async_trait;
+use futures_util::stream;
 use llama_harness_core::{
     mock::{final_response, tool_response, MockModelProvider},
-    AgentDefinition, AgentRunner, ApprovalHandler, ApprovalRecord, HarnessError, PolicyDecision,
-    PolicyEngine, RunRequest, Tool, ToolCall, ToolDefinition, ToolDiscoveryMetadata, ToolRegistry,
-    ToolResult,
+    AgentDefinition, AgentRunner, ApprovalHandler, ApprovalRecord, HarnessError, MessageRole,
+    ModelCapabilities, ModelEventStream, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
+    ModelStreamEvent, PolicyDecision, PolicyEngine, ProviderHealth, RunRequest, SpeculationConfig,
+    SpeculationMode, Tool, ToolCall, ToolCallContext, ToolCallDelta, ToolDefinition,
+    ToolDiscoveryMetadata, ToolRegistry, ToolResult, Usage,
 };
 use llama_harness_mcp::{
     McpCallRequest, McpCallResult, McpCatalogManager, McpContext, McpDispatchState, McpError,
@@ -180,6 +183,95 @@ impl ApprovalHandler for GrantApproval {
     }
 }
 
+struct ExplicitSpeculativeAllow {
+    decisions: AtomicU64,
+}
+
+#[async_trait]
+impl PolicyEngine for ExplicitSpeculativeAllow {
+    async fn decide(
+        &self,
+        _: &ToolDefinition,
+        _: &Value,
+        _: &RunRequest,
+    ) -> Result<PolicyDecision, HarnessError> {
+        Ok(PolicyDecision::Allow {
+            reason: "authoritative MCP test allow".into(),
+        })
+    }
+
+    async fn decide_speculative(
+        &self,
+        _: &ToolCallContext,
+        _: &ToolDefinition,
+        _: &Value,
+        _: &RunRequest,
+    ) -> Result<PolicyDecision, HarnessError> {
+        self.decisions.fetch_add(1, Ordering::Relaxed);
+        Ok(PolicyDecision::Allow {
+            reason: "explicit speculative test allow".into(),
+        })
+    }
+}
+
+struct StreamingToolProvider {
+    tool_id: String,
+}
+
+#[async_trait]
+impl ModelProvider for StreamingToolProvider {
+    fn id(&self) -> &str {
+        "mcp-streaming-test"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::new(true, true, false).with_streaming_tool_arguments(true)
+    }
+
+    async fn health(&self) -> Result<ProviderHealth, HarnessError> {
+        Ok(ProviderHealth::healthy())
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError> {
+        Ok(vec![ModelInfo::new("mock-model")])
+    }
+
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError> {
+        Ok(ModelResponse::new(request.model).with_final_output("unexpected completion path"))
+    }
+
+    async fn stream(&self, request: ModelRequest) -> Result<ModelEventStream, HarnessError> {
+        let events = if request
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Tool)
+        {
+            vec![
+                Ok(ModelStreamEvent::TextDelta {
+                    content: "done".into(),
+                }),
+                Ok(ModelStreamEvent::Completed {
+                    model: request.model,
+                    usage: Usage::default(),
+                }),
+            ]
+        } else {
+            vec![
+                Ok(ModelStreamEvent::ToolCallDelta(
+                    ToolCallDelta::new(0, r#"{"value":"safe"}"#, true)
+                        .with_call_id("call")
+                        .with_tool_id(self.tool_id.clone()),
+                )),
+                Ok(ModelStreamEvent::Completed {
+                    model: request.model,
+                    usage: Usage::default(),
+                }),
+            ]
+        };
+        Ok(Box::pin(stream::iter(events)))
+    }
+}
+
 async fn imported_registry(
     transport: Arc<FakeTransport>,
 ) -> (McpCatalogManager, ToolRegistry, String) {
@@ -273,6 +365,57 @@ async fn approval_gated_imported_tool_dispatches_through_the_runner_once() {
         [PolicyDecision::RequireApproval { .. }]
     ));
     assert!(result.approvals.iter().all(|approval| approval.granted));
+}
+
+#[tokio::test]
+async fn shadow_and_activation_configuration_cannot_speculatively_dispatch_imported_mcp_tools() {
+    let transport = Arc::new(FakeTransport::with_tools(vec![remote_tool("remote-read")]));
+    let (_manager, registry, tool_id) = imported_registry(transport.clone()).await;
+    let imported = registry.get(&tool_id).expect("imported tool is registered");
+    assert!(
+        !imported
+            .definition()
+            .allows_caller(llama_harness_core::ToolCaller::Speculative),
+        "MCP imports must remain Direct-only"
+    );
+
+    let policy = Arc::new(ExplicitSpeculativeAllow {
+        decisions: AtomicU64::new(0),
+    });
+    let runner = AgentRunner::builder(Arc::new(StreamingToolProvider {
+        tool_id: tool_id.clone(),
+    }))
+    .tools(registry)
+    .policy(policy.clone())
+    .speculation(SpeculationConfig::default())
+    .build();
+
+    assert_eq!(
+        runner.activate_speculation(&tool_id).mode,
+        SpeculationMode::Disabled
+    );
+    let result = runner
+        .run(request(tool_id.clone()))
+        .await
+        .expect("authoritative MCP call succeeds");
+
+    assert_eq!(result.final_output.as_deref(), Some("done"));
+    assert_eq!(
+        transport.calls(),
+        1,
+        "only the Direct broker call dispatches"
+    );
+    assert_eq!(policy.decisions.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        runner.speculation_readiness(&tool_id).mode,
+        SpeculationMode::Disabled
+    );
+    assert_eq!(runner.speculation_metrics(&tool_id).issued, 0);
+    assert_eq!(
+        runner.activate_speculation(&tool_id).mode,
+        SpeculationMode::Disabled,
+        "an imported tool cannot be forced into Active"
+    );
 }
 
 #[tokio::test]

@@ -8,4 +8,10 @@ The Rust protocol crate owns the canonical wire contracts and explicit bounds. T
 
 The initial runtime advertises `supports_output_deltas: false`: the current canonical model-provider contract is non-streaming. It does not synthesize token deltas from a completed response.
 
+Guarded speculation is a same-process Direct-runner optimization and does not
+extend protocol v1. No speculation configuration, candidate, mode, readiness,
+counter, argument, result, or raw error is projected into commands, callbacks,
+events, or terminal results. A protocol-backed provider without a useful
+finalized index-0 stream boundary gains no speculative overlap.
+
 The runtime accepts only `client_hello` as its first command. It generates run and callback IDs, accepts each callback response at most once, and fails a run closed on callback validation failure, timeout, cancellation, or disconnect. Every run-scoped runtime message has a monotonically increasing `run_sequence`; the terminal message is last.

@@ -10,6 +10,24 @@ plan support and sufficient plan, catalog, and model-call limits. Otherwise the
 run emits fallback metadata and uses the existing direct reactive loop. A
 forced declarative run never silently changes its selected strategy.
 
+## Direct speculative overlay
+
+Guarded speculation is not an Adaptive candidate or a new strategy. It can
+operate only after Adaptive selects Direct, using the same finalized index-0
+stream boundary and broker as a forced Direct run. Declarative and Programmatic
+paths never speculate. A provider without a useful final-call boundary streams
+normally but cannot overlap tool work.
+
+The overlay is disabled unless runner, tool, and dedicated speculative policy
+all opt in. Shadow must first accumulate at least 1,000 exact per-tool
+observations on the same runner, after which the host explicitly activates that
+tool. A per-tool breaker returns only the affected tool to Shadow. Exact commit
+reuses one typed result; every skip or safe fallback continues sequentially.
+Canonical strategy events and usage remain unchanged, and private readiness or
+candidate counters are never added to them. See
+[Guarded speculative tool calling](speculative-tool-calling.md) for the full
+safety and rollout contract.
+
 ## Programmatic tool calling
 
 Programmatic execution is an explicit same-process opt-in, not an Adaptive

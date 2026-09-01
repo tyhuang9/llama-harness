@@ -24,6 +24,7 @@ your application keeps ownership of its tools, data, policy, and UI.
 - One bounded `AgentRunner` for model calls and tool execution.
 - Application-defined providers, tools, policy, approvals, and event sinks.
 - Fail-closed defaults for state-changing tools and callback failures.
+- Optional guarded, shadow-first overlap for explicitly attested local reads.
 - Optional Ollama, MCP tool catalog, SQLite observability, evaluation, and Tauri integrations.
 
 ## Install
@@ -91,6 +92,7 @@ loop and enforces the boundaries you configure.
 - [Start embedding the runner](docs/embedding.md)
 - [Define tools, policy, and approvals](docs/tools-and-policies.md)
 - [Understand adaptive tool calling and recovery](docs/adaptive-tool-calling.md)
+- [Evaluate guarded speculative tool calling](docs/speculative-tool-calling.md)
 - [Add local observability](docs/observability.md)
 - [Build deterministic evaluations](docs/evaluations.md)
 - [Integrate with Tauri](docs/tauri.md)
