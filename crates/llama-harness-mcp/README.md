@@ -45,6 +45,18 @@ dispatch, and only permits stale use when the host configures a bounded
 `McpCachePolicy::max_stale`. Modern catalogs require consistent `cacheScope`
 and honor per-page `ttlMs`; legacy catalogs use the host-assigned age policy.
 
+Registry-integrated hosts should use `refresh_registered`, passing their latest
+immutable `ToolRegistry` and adopting the returned registry. It validates the
+candidate through the core registry's actual group replacement before changing
+the active MCP generation, so an invalid schema, invalid generated adapter, or
+collision with a host tool leaves the prior generation installed and callable.
+A successful empty catalog removes only this manager's group and preserves
+unrelated tools. `refresh` is the catalog-only workflow; `replace_registered`
+can bind one already-refreshed catalog (including an active empty catalog) for
+migration. After either registry operation succeeds, catalog-only `refresh`
+rejects before transport I/O and all later refreshes must use
+`refresh_registered`.
+
 `McpObserver` receives metadata-only lifecycle events. Events include local
 duration, bounded counts and bytes, page/cache/stale/cancellation/dispatch
 state, and core run/trace/call correlation. They intentionally exclude server

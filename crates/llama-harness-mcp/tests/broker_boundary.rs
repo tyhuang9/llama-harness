@@ -2,11 +2,12 @@ use async_trait::async_trait;
 use llama_harness_core::{
     mock::{final_response, tool_response, MockModelProvider},
     AgentDefinition, AgentRunner, ApprovalHandler, ApprovalRecord, HarnessError, PolicyDecision,
-    PolicyEngine, RunRequest, ToolCall, ToolDefinition, ToolDiscoveryMetadata, ToolRegistry,
+    PolicyEngine, RunRequest, Tool, ToolCall, ToolDefinition, ToolDiscoveryMetadata, ToolRegistry,
+    ToolResult,
 };
 use llama_harness_mcp::{
-    McpCallRequest, McpCallResult, McpCatalogManager, McpContext, McpDispatchState, McpLimits,
-    McpOperation, McpProtocolEra, McpTool, McpToolPage, McpTransport, McpTransportError,
+    McpCallRequest, McpCallResult, McpCatalogManager, McpContext, McpDispatchState, McpError,
+    McpLimits, McpOperation, McpProtocolEra, McpTool, McpToolPage, McpTransport, McpTransportError,
 };
 use serde_json::{json, Value};
 use std::{
@@ -36,8 +37,32 @@ fn remote_tool(name: &str) -> McpTool {
     }
 }
 
+struct LocalTool(ToolDefinition);
+
+#[async_trait]
+impl Tool for LocalTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.0
+    }
+
+    async fn execute(&self, _: Value, _: CancellationToken) -> Result<ToolResult, HarnessError> {
+        Ok(ToolResult::success(json!({"local": true})))
+    }
+}
+
+fn local_tool(id: &str) -> Arc<dyn Tool> {
+    Arc::new(LocalTool(ToolDefinition::new(
+        id,
+        "local-tool",
+        "local test tool",
+        json!({"type":"object"}),
+    )))
+}
+
 struct FakeTransport {
     calls: AtomicU64,
+    connects: AtomicU64,
+    lists: AtomicU64,
     tools: Mutex<Vec<McpTool>>,
     fail_list: AtomicU64,
 }
@@ -46,6 +71,8 @@ impl FakeTransport {
     fn with_tools(tools: Vec<McpTool>) -> Self {
         Self {
             calls: AtomicU64::new(0),
+            connects: AtomicU64::new(0),
+            lists: AtomicU64::new(0),
             tools: Mutex::new(tools),
             fail_list: AtomicU64::new(0),
         }
@@ -63,6 +90,7 @@ impl FakeTransport {
 #[async_trait]
 impl McpTransport for FakeTransport {
     async fn connect(&self, _: CancellationToken) -> Result<McpContext, McpTransportError> {
+        self.connects.fetch_add(1, Ordering::Relaxed);
         Ok(McpContext {
             era: McpProtocolEra::Modern20260728,
             version: "2026-07-28".into(),
@@ -77,6 +105,7 @@ impl McpTransport for FakeTransport {
         cursor: Option<&str>,
         _: CancellationToken,
     ) -> Result<McpToolPage, McpTransportError> {
+        self.lists.fetch_add(1, Ordering::Relaxed);
         if self.fail_list.load(Ordering::Relaxed) != 0 {
             return Err(McpTransportError {
                 operation: McpOperation::ListTools,
@@ -156,14 +185,11 @@ async fn imported_registry(
 ) -> (McpCatalogManager, ToolRegistry, String) {
     let manager = McpCatalogManager::new(transport, "server", McpLimits::default())
         .expect("valid host configuration");
-    manager
-        .refresh(CancellationToken::new())
+    let (_, registry) = manager
+        .refresh_registered(&ToolRegistry::default(), CancellationToken::new())
         .await
         .expect("catalog imports");
     let id = manager.active_tools()[0].definition().id.clone();
-    let registry = manager
-        .replace_registered(&ToolRegistry::default())
-        .expect("catalog registers atomically");
     (manager, registry, id)
 }
 
@@ -171,6 +197,27 @@ fn request(tool_id: String) -> RunRequest {
     let mut agent = AgentDefinition::new("agent", "Agent", "1", "mock-model");
     agent.tool_allowlist = vec![tool_id.clone()];
     RunRequest::new(agent, "call the imported tool")
+}
+
+async fn assert_approved_call_succeeds(registry: ToolRegistry, tool_id: String) {
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(ToolCall::new(
+            "call",
+            tool_id.clone(),
+            r#"{"value":"safe"}"#,
+        )),
+        final_response("done"),
+    ]));
+    let result = AgentRunner::builder(provider)
+        .tools(registry)
+        .policy(Arc::new(RequireApproval))
+        .approvals(Arc::new(GrantApproval))
+        .build()
+        .run(request(tool_id))
+        .await
+        .expect("prior registry remains broker-callable");
+    assert_eq!(result.final_output.as_deref(), Some("done"), "{result:#?}");
+    assert!(result.errors.is_empty(), "{result:#?}");
 }
 
 #[tokio::test]
@@ -233,27 +280,21 @@ async fn mcp_registry_replacement_is_atomic_and_keeps_old_runner_snapshot_immuta
     let transport = Arc::new(FakeTransport::with_tools(vec![remote_tool("remote-write")]));
     let manager =
         McpCatalogManager::new(transport.clone(), "server", McpLimits::default()).expect("manager");
-    manager
-        .refresh(CancellationToken::new())
+    let (_, old_registry) = manager
+        .refresh_registered(&ToolRegistry::default(), CancellationToken::new())
         .await
-        .expect("initial refresh");
+        .expect("initial refresh and install");
     let first_id = manager.active_tools()[0].definition().id.clone();
-    let old_registry = manager
-        .replace_registered(&ToolRegistry::default())
-        .expect("initial install");
 
     transport.replace_tools(vec![
         remote_tool("remote-write"),
         remote_tool("remote-read"),
     ]);
-    let second = manager
-        .refresh(CancellationToken::new())
+    let (second, added_registry) = manager
+        .refresh_registered(&old_registry, CancellationToken::new())
         .await
         .expect("add refresh");
     let added_id = manager.active_tools()[1].definition().id.clone();
-    let added_registry = manager
-        .replace_registered(&old_registry)
-        .expect("same-id plus add replacement");
     assert_eq!(second.generation, 2);
     assert!(old_registry.get(&first_id).is_some());
     assert!(old_registry.get(&added_id).is_none());
@@ -273,13 +314,10 @@ async fn mcp_registry_replacement_is_atomic_and_keeps_old_runner_snapshot_immuta
     .build();
 
     transport.replace_tools(vec![remote_tool("remote-read")]);
-    manager
-        .refresh(CancellationToken::new())
+    let (_, removed_registry) = manager
+        .refresh_registered(&added_registry, CancellationToken::new())
         .await
         .expect("remove refresh");
-    let removed_registry = manager
-        .replace_registered(&added_registry)
-        .expect("remove replacement");
     assert!(
         added_registry.get(&first_id).is_some(),
         "prior registry is immutable"
@@ -288,7 +326,10 @@ async fn mcp_registry_replacement_is_atomic_and_keeps_old_runner_snapshot_immuta
     assert!(removed_registry.get(&added_id).is_some());
 
     transport.fail_list.store(1, Ordering::Relaxed);
-    assert!(manager.refresh(CancellationToken::new()).await.is_err());
+    assert!(manager
+        .refresh_registered(&removed_registry, CancellationToken::new())
+        .await
+        .is_err());
     let after_failed_refresh = manager
         .replace_registered(&removed_registry)
         .expect("prior active catalog remains installable");
@@ -328,5 +369,175 @@ async fn mcp_registry_replacement_is_atomic_and_keeps_old_runner_snapshot_immuta
         .await
         .expect("new runner dispatches current catalog");
     assert_eq!(new_result.final_output.as_deref(), Some("done"));
+    assert_eq!(transport.calls(), 1);
+}
+
+#[tokio::test]
+async fn empty_refresh_removes_only_the_manager_group_and_remains_replaceable() {
+    let transport = Arc::new(FakeTransport::with_tools(vec![remote_tool("remote-write")]));
+    let manager =
+        McpCatalogManager::new(transport.clone(), "server", McpLimits::default()).expect("manager");
+    let mut base = ToolRegistry::default();
+    base.register_with_discovery(local_tool("local.keep"), ToolDiscoveryMetadata::deferred())
+        .expect("unrelated local tool");
+
+    let (_, installed) = manager
+        .refresh_registered(&base, CancellationToken::new())
+        .await
+        .expect("nonempty catalog installs");
+    let remote_id = manager.active_tools()[0].definition().id.clone();
+    assert!(installed.get("local.keep").is_some());
+    assert!(installed.get(&remote_id).is_some());
+
+    transport.replace_tools(Vec::new());
+    let (empty, removed) = manager
+        .refresh_registered(&installed, CancellationToken::new())
+        .await
+        .expect("empty catalog removes the manager group");
+    assert_eq!(empty.tool_count, 0);
+    assert!(manager.active_snapshot().is_some());
+    assert!(manager.active_tools().is_empty());
+    assert!(removed.get(&remote_id).is_none());
+    assert!(removed.get("local.keep").is_some());
+
+    let replaced_again = manager
+        .replace_registered(&removed)
+        .expect("active empty catalog remains replaceable");
+    assert!(replaced_again.get(&remote_id).is_none());
+    assert!(replaced_again.get("local.keep").is_some());
+}
+
+#[tokio::test]
+async fn bound_manager_rejects_catalog_only_refresh_before_transport_io() {
+    let transport = Arc::new(FakeTransport::with_tools(vec![remote_tool("remote-write")]));
+    let manager =
+        McpCatalogManager::new(transport.clone(), "server", McpLimits::default()).expect("manager");
+    let initial = manager
+        .refresh(CancellationToken::new())
+        .await
+        .expect("catalog-only initial refresh");
+    let tool_id = manager.active_tools()[0].definition().id.clone();
+    let registry = manager
+        .replace_registered(&ToolRegistry::default())
+        .expect("initial catalog binds to the registry workflow");
+    let connects = transport.connects.load(Ordering::Relaxed);
+    let lists = transport.lists.load(Ordering::Relaxed);
+
+    transport.replace_tools(vec![remote_tool("remote-read")]);
+    assert!(matches!(
+        manager.refresh(CancellationToken::new()).await,
+        Err(McpError::CatalogUnavailable)
+    ));
+    assert_eq!(transport.connects.load(Ordering::Relaxed), connects);
+    assert_eq!(transport.lists.load(Ordering::Relaxed), lists);
+    assert_eq!(manager.active_snapshot(), Some(initial));
+
+    let replacement = manager
+        .replace_registered(&registry)
+        .expect("prior generation remains replaceable");
+    assert_approved_call_succeeds(replacement, tool_id).await;
+    assert_eq!(transport.calls(), 1);
+}
+
+#[tokio::test]
+async fn transactional_refresh_collision_preserves_the_prior_callable_generation() {
+    let transport = Arc::new(FakeTransport::with_tools(vec![remote_tool("remote-read")]));
+    let manager =
+        McpCatalogManager::new(transport.clone(), "server", McpLimits::default()).expect("manager");
+    manager
+        .refresh(CancellationToken::new())
+        .await
+        .expect("probe generated read identifier");
+    let colliding_id = manager.active_tools()[0].definition().id.clone();
+
+    transport.replace_tools(vec![remote_tool("remote-write")]);
+    let prior = manager
+        .refresh(CancellationToken::new())
+        .await
+        .expect("install prior catalog before binding");
+    let prior_id = manager.active_tools()[0].definition().id.clone();
+    let mut base = ToolRegistry::default();
+    base.register_with_discovery(local_tool(&colliding_id), ToolDiscoveryMetadata::deferred())
+        .expect("host tool with the future generated identifier");
+    let installed = manager
+        .replace_registered(&base)
+        .expect("prior generation and host tool do not collide");
+
+    transport.replace_tools(vec![remote_tool("remote-read")]);
+    assert!(matches!(
+        manager
+            .refresh_registered(&installed, CancellationToken::new())
+            .await,
+        Err(McpError::Core(_))
+    ));
+    assert_eq!(manager.active_snapshot(), Some(prior));
+    assert_eq!(manager.active_tools()[0].definition().id, prior_id);
+
+    let replacement = manager
+        .replace_registered(&installed)
+        .expect("prior generation remains replaceable after collision");
+    assert!(replacement.get(&colliding_id).is_some());
+    assert!(replacement.get(&prior_id).is_some());
+    assert_approved_call_succeeds(replacement, prior_id).await;
+    assert_eq!(transport.calls(), 1);
+}
+
+#[tokio::test]
+async fn invalid_candidate_schema_preserves_the_prior_callable_generation() {
+    let transport = Arc::new(FakeTransport::with_tools(vec![remote_tool("remote-write")]));
+    let manager =
+        McpCatalogManager::new(transport.clone(), "server", McpLimits::default()).expect("manager");
+    let (prior, registry) = manager
+        .refresh_registered(&ToolRegistry::default(), CancellationToken::new())
+        .await
+        .expect("initial registered refresh");
+    let prior_id = manager.active_tools()[0].definition().id.clone();
+
+    let mut invalid = remote_tool("remote-read");
+    invalid.input_schema = json!({"type": 7});
+    transport.replace_tools(vec![invalid]);
+    assert!(matches!(
+        manager
+            .refresh_registered(&registry, CancellationToken::new())
+            .await,
+        Err(McpError::Core(_))
+    ));
+    assert_eq!(manager.active_snapshot(), Some(prior));
+    assert_eq!(manager.active_tools()[0].definition().id, prior_id);
+
+    let replacement = manager
+        .replace_registered(&registry)
+        .expect("prior generation remains replaceable after invalid schema");
+    assert_approved_call_succeeds(replacement, prior_id).await;
+    assert_eq!(transport.calls(), 1);
+}
+
+#[tokio::test]
+async fn invalid_candidate_names_preserve_the_prior_callable_generation() {
+    let transport = Arc::new(FakeTransport::with_tools(vec![remote_tool("remote-write")]));
+    let manager =
+        McpCatalogManager::new(transport.clone(), "server", McpLimits::default()).expect("manager");
+    let (prior, registry) = manager
+        .refresh_registered(&ToolRegistry::default(), CancellationToken::new())
+        .await
+        .expect("initial registered refresh");
+    let prior_id = manager.active_tools()[0].definition().id.clone();
+
+    for invalid_name in [" remote-read", "réad"] {
+        transport.replace_tools(vec![remote_tool(invalid_name)]);
+        assert!(matches!(
+            manager
+                .refresh_registered(&registry, CancellationToken::new())
+                .await,
+            Err(McpError::Core(_))
+        ));
+        assert_eq!(manager.active_snapshot(), Some(prior.clone()));
+        assert_eq!(manager.active_tools()[0].definition().id, prior_id);
+    }
+
+    let replacement = manager
+        .replace_registered(&registry)
+        .expect("prior generation remains replaceable after invalid names");
+    assert_approved_call_succeeds(replacement, prior_id).await;
     assert_eq!(transport.calls(), 1);
 }

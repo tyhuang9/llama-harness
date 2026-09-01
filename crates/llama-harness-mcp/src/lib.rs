@@ -331,6 +331,7 @@ impl Default for McpLimits {
 }
 /// Errors while negotiating or importing a catalog.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum McpError {
     /// Transport failure.
     #[error(transparent)]
@@ -626,6 +627,7 @@ struct RetiredContext {
 
 struct CatalogState {
     active: Option<Arc<ActiveCatalog>>,
+    registry_bound: bool,
     closed: bool,
     invalidated: bool,
     last_now_ms: u64,
@@ -644,6 +646,7 @@ impl Default for CatalogState {
     fn default() -> Self {
         Self {
             active: None,
+            registry_bound: false,
             closed: false,
             invalidated: false,
             last_now_ms: 0,
@@ -761,17 +764,51 @@ impl McpCatalogManager {
     }
 
     /// Refreshes a complete catalog and atomically installs it on success.
+    ///
+    /// This catalog-only operation validates generated adapters against an
+    /// empty core registry. Once [`Self::replace_registered`] or
+    /// [`Self::refresh_registered`] successfully binds this manager to a host
+    /// registry, further catalog changes must use [`Self::refresh_registered`]
+    /// and this method rejects before transport I/O.
     pub async fn refresh(
         &self,
         cancellation: CancellationToken,
     ) -> Result<McpCatalogSnapshot, McpError> {
+        self.refresh_with_registry(&ToolRegistry::default(), false, cancellation)
+            .await
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Refreshes and transactionally replaces this manager's registry group.
+    ///
+    /// Candidate adapters are validated against the supplied immutable
+    /// registry before the active generation changes. The returned registry
+    /// contains the exact adapters installed by the returned snapshot. Use
+    /// this method for every refresh in registry-integrated hosts.
+    pub async fn refresh_registered(
+        &self,
+        registry: &ToolRegistry,
+        cancellation: CancellationToken,
+    ) -> Result<(McpCatalogSnapshot, ToolRegistry), McpError> {
+        self.refresh_with_registry(registry, true, cancellation)
+            .await
+    }
+
+    async fn refresh_with_registry(
+        &self,
+        registry: &ToolRegistry,
+        registry_transaction: bool,
+        cancellation: CancellationToken,
+    ) -> Result<(McpCatalogSnapshot, ToolRegistry), McpError> {
         let refresh_guard = self.refresh_lock.lock().await;
-        let ownership = self.begin_refresh()?;
+        let ownership = self.begin_refresh(registry_transaction)?;
         let started = Instant::now();
         let mut lifecycle_events = Vec::with_capacity(2);
         let result = self
             .refresh_locked(
                 ownership.token,
+                registry,
+                registry_transaction,
                 cancellation,
                 started,
                 &mut lifecycle_events,
@@ -788,10 +825,12 @@ impl McpCatalogManager {
     async fn refresh_locked(
         &self,
         token: u64,
+        registry: &ToolRegistry,
+        registry_transaction: bool,
         cancellation: CancellationToken,
         started: Instant,
         lifecycle_events: &mut Vec<McpLifecycleEvent>,
-    ) -> Result<McpCatalogSnapshot, McpError> {
+    ) -> Result<(McpCatalogSnapshot, ToolRegistry), McpError> {
         let built = self
             .fetch_complete(token, cancellation.child_token(), lifecycle_events)
             .await;
@@ -885,19 +924,14 @@ impl McpCatalogManager {
             }
         };
         let generation = match (|| {
-            let mut state = self
+            let state = self
                 .state
                 .lock()
                 .map_err(|_| McpError::CatalogUnavailable)?;
             if state.closed {
                 return Err(McpError::CatalogUnavailable);
             }
-            let generation = state.next_generation;
-            state.next_generation = state
-                .next_generation
-                .checked_add(1)
-                .ok_or(McpError::Clock)?;
-            Ok(generation)
+            Ok(state.next_generation)
         })() {
             Ok(generation) => generation,
             Err(error) => {
@@ -949,6 +983,21 @@ impl McpCatalogManager {
                 )
                 .await;
         }
+        let replacement = match self.registry_with_tools(registry, &managed) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                return self
+                    .fail_refresh_context(
+                        token,
+                        McpError::Core(error),
+                        started,
+                        bytes,
+                        pages,
+                        lifecycle_events,
+                    )
+                    .await
+            }
+        };
         let snapshot = Arc::new(ActiveCatalog {
             summary: McpCatalogSnapshot {
                 generation,
@@ -981,6 +1030,13 @@ impl McpCatalogManager {
             if state.closed {
                 return Err(McpError::CatalogUnavailable);
             }
+            if !registry_transaction && state.registry_bound {
+                return Err(McpError::CatalogUnavailable);
+            }
+            if state.next_generation != generation {
+                return Err(McpError::CatalogUnavailable);
+            }
+            let next_generation = generation.checked_add(1).ok_or(McpError::Clock)?;
             if let Some(index) = state
                 .pending_refresh_contexts
                 .iter()
@@ -991,6 +1047,10 @@ impl McpCatalogManager {
                 return Err(McpError::CatalogUnavailable);
             }
             let previous = state.active.replace(Arc::clone(&snapshot));
+            state.next_generation = next_generation;
+            if registry_transaction {
+                state.registry_bound = true;
+            }
             state.invalidated = false;
             Ok(previous)
         })();
@@ -1024,7 +1084,7 @@ impl McpCatalogManager {
             McpDispatchState::Responded,
             None,
         ));
-        Ok(snapshot.summary.clone())
+        Ok((snapshot.summary.clone(), replacement))
     }
 
     /// Explicitly invalidates the current list after a server list-change notice.
@@ -1066,19 +1126,36 @@ impl McpCatalogManager {
     }
 
     /// Returns a new registry with the active snapshot atomically replacing this manager's group.
+    ///
+    /// This binds the manager to registry-integrated use after the replacement
+    /// succeeds. Subsequent catalog changes must use [`Self::refresh_registered`]
+    /// so a registry validation failure cannot strand installed prior tools.
+    /// An active empty catalog is a valid replacement that removes this group.
     pub fn replace_registered(&self, registry: &ToolRegistry) -> Result<ToolRegistry, McpError> {
-        let tools = self.active_tools();
-        if tools.is_empty() {
-            return Err(McpError::CatalogUnavailable);
-        }
-        registry
-            .replace_group(
-                &self.registration_group,
-                tools.into_iter().map(|tool| {
-                    GroupToolRegistration::new(tool, ToolDiscoveryMetadata::deferred())
-                }),
-            )
-            .map_err(McpError::Core)
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| McpError::CatalogUnavailable)?;
+        let active = state.active.as_ref().ok_or(McpError::CatalogUnavailable)?;
+        let replacement = self
+            .registry_with_tools(registry, &active.tools)
+            .map_err(McpError::Core)?;
+        state.registry_bound = true;
+        Ok(replacement)
+    }
+
+    fn registry_with_tools(
+        &self,
+        registry: &ToolRegistry,
+        tools: &[Arc<ManagedMcpToolAdapter>],
+    ) -> Result<ToolRegistry, HarnessError> {
+        registry.replace_group(
+            &self.registration_group,
+            tools.iter().cloned().map(|tool| {
+                let tool: Arc<dyn Tool> = tool;
+                GroupToolRegistration::new(tool, ToolDiscoveryMetadata::deferred())
+            }),
+        )
     }
 
     /// Closes the manager. The local state is closed before bounded transport shutdown.
@@ -1258,12 +1335,13 @@ impl McpCatalogManager {
         Err(error)
     }
 
-    fn begin_refresh(&self) -> Result<RefreshOwnership, McpError> {
+    fn begin_refresh(&self, registry_transaction: bool) -> Result<RefreshOwnership, McpError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| McpError::CatalogUnavailable)?;
         if state.closed
+            || (state.registry_bound && !registry_transaction)
             || owned_context_count(&state)
                 .is_none_or(|count| count >= self.limits.max_retired_generations)
         {
@@ -1581,11 +1659,42 @@ impl Tool for ManagedMcpToolAdapter {
             },
             permit = self.dispatch_gate.read() => permit,
         };
-        let (stale, lease) = self.check_active()?;
+        let (stale, lease) = match self.check_active() {
+            Ok(admission) => admission,
+            Err(error) => {
+                drop(dispatch_permit);
+                drop(server_permit);
+                self.inner.observer.emit(event(
+                    McpLifecycleOperation::Call,
+                    McpLifecycleOutcome::Rejected,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    false,
+                    McpDispatchState::NotDispatched,
+                    Some(McpCallCorrelation::from(call)),
+                ));
+                return Err(error);
+            }
+        };
         if cancellation.is_cancelled() {
             drop(lease);
             drop(dispatch_permit);
             drop(server_permit);
+            self.inner.observer.emit(event(
+                McpLifecycleOperation::Call,
+                McpLifecycleOutcome::Cancelled,
+                0,
+                0,
+                0,
+                0,
+                stale,
+                true,
+                McpDispatchState::NotDispatched,
+                Some(McpCallCorrelation::from(call)),
+            ));
             return Err(HarnessError::Cancelled);
         }
         let (result, lifecycle) = self
@@ -2409,6 +2518,35 @@ mod tests {
     impl McpClock for FakeClock {
         fn now_ms(&self) -> u64 {
             self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    struct CancellingClock {
+        now: AtomicU64,
+        armed: AtomicBool,
+        cancellation: CancellationToken,
+    }
+
+    impl CancellingClock {
+        fn new(cancellation: CancellationToken) -> Self {
+            Self {
+                now: AtomicU64::new(0),
+                armed: AtomicBool::new(false),
+                cancellation,
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::Release);
+        }
+    }
+
+    impl McpClock for CancellingClock {
+        fn now_ms(&self) -> u64 {
+            if self.armed.swap(false, Ordering::AcqRel) {
+                self.cancellation.cancel();
+            }
+            self.now.load(Ordering::Relaxed)
         }
     }
 
@@ -4047,7 +4185,8 @@ mod tests {
     async fn close_rejects_existing_tools_before_dispatch() {
         let clock = Arc::new(FakeClock::default());
         let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
-        let manager = manager(transport.clone(), clock, None, None);
+        let observer = Arc::new(RecordingObserver(Mutex::new(Vec::new()), false));
+        let manager = manager(transport.clone(), clock, None, Some(observer.clone()));
         manager
             .refresh(CancellationToken::new())
             .await
@@ -4064,6 +4203,11 @@ mod tests {
         ));
         assert_eq!(transport.calls.load(Ordering::Relaxed), 0);
         assert_eq!(transport.closes.load(Ordering::Relaxed), 1);
+        assert!(observer.0.lock().expect("test mutex").iter().any(|event| {
+            event.operation == McpLifecycleOperation::Call
+                && event.outcome == McpLifecycleOutcome::Rejected
+                && event.dispatch == McpDispatchState::NotDispatched
+        }));
     }
 
     #[tokio::test]
@@ -4145,6 +4289,42 @@ mod tests {
             Err(HarnessError::Cancelled)
         ));
         assert_eq!(transport.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_active_check_emits_before_dispatch_and_releases_guards() {
+        let cancellation = CancellationToken::new();
+        let clock = Arc::new(CancellingClock::new(cancellation.clone()));
+        let transport = Arc::new(FakeTransport::modern(100, vec![tool("one")]));
+        let observer = Arc::new(RecordingObserver(Mutex::new(Vec::new()), false));
+        let manager = manager_for_server(
+            transport.clone(),
+            clock.clone(),
+            unique_test_server_id("active-check-cancellation"),
+            Some(observer.clone()),
+        );
+        manager
+            .refresh(CancellationToken::new())
+            .await
+            .expect("refresh");
+        observer.0.lock().expect("test mutex").clear();
+        clock.arm();
+
+        assert!(matches!(
+            manager.active_tools()[0]
+                .execute(serde_json::json!({}), cancellation)
+                .await,
+            Err(HarnessError::Cancelled)
+        ));
+        assert_eq!(transport.calls.load(Ordering::Acquire), 0);
+        assert_eq!(manager.server_call_gate.waiters.load(Ordering::Acquire), 0);
+        assert_eq!(manager.server_call_gate.permits.available_permits(), 1);
+        assert!(observer.0.lock().expect("test mutex").iter().any(|event| {
+            event.operation == McpLifecycleOperation::Call
+                && event.outcome == McpLifecycleOutcome::Cancelled
+                && event.cancelled
+                && event.dispatch == McpDispatchState::NotDispatched
+        }));
     }
 
     #[tokio::test]
