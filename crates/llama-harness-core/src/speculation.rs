@@ -96,11 +96,15 @@ pub struct SpeculationReadiness {
 
 impl SpeculationReadiness {
     pub(crate) fn disabled(tool_id: &str) -> Self {
+        Self::disabled_with_required(tool_id, MIN_SPECULATION_SHADOW_OBSERVATIONS)
+    }
+
+    fn disabled_with_required(tool_id: &str, required_shadow_observations: u64) -> Self {
         Self {
             tool_id: tool_id.to_owned(),
             mode: SpeculationMode::Disabled,
             exact_shadow_observations: 0,
-            required_shadow_observations: MIN_SPECULATION_SHADOW_OBSERVATIONS,
+            required_shadow_observations,
             ready_to_activate: false,
         }
     }
@@ -207,7 +211,10 @@ impl SpeculationController {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(state) = tools.get(tool_id) else {
-            return SpeculationReadiness::disabled(tool_id);
+            return SpeculationReadiness::disabled_with_required(
+                tool_id,
+                self.config.required_shadow_observations,
+            );
         };
         SpeculationReadiness {
             tool_id: tool_id.to_owned(),
@@ -241,7 +248,10 @@ impl SpeculationController {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(state) = tools.get_mut(tool_id) else {
-            return SpeculationReadiness::disabled(tool_id);
+            return SpeculationReadiness::disabled_with_required(
+                tool_id,
+                self.config.required_shadow_observations,
+            );
         };
         if state_is_ready(state, &self.config) {
             state.mode = SpeculationMode::Active;
@@ -262,7 +272,10 @@ impl SpeculationController {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(state) = tools.get_mut(tool_id) else {
-            return SpeculationReadiness::disabled(tool_id);
+            return SpeculationReadiness::disabled_with_required(
+                tool_id,
+                self.config.required_shadow_observations,
+            );
         };
         trip(state);
         SpeculationReadiness {
@@ -404,24 +417,57 @@ pub(crate) struct StreamedReactiveResponse {
 }
 
 pub(crate) struct ReadySpeculativeCommit {
-    pub(crate) tool_id: String,
     pub(crate) execution: Box<SpeculativeExecution>,
+    pub(crate) deadline: Instant,
     _slot: OwnedSemaphorePermit,
+    guard: IssuedCandidateGuard,
+}
+
+impl ReadySpeculativeCommit {
+    pub(crate) fn settle(&mut self, resolution: SpeculativeResolution) {
+        self.guard.settle(resolution);
+    }
 }
 
 pub(crate) fn discard_ready_commit(
-    controller: &SpeculationController,
-    ready: ReadySpeculativeCommit,
+    _controller: &SpeculationController,
+    mut ready: ReadySpeculativeCommit,
     cancelled: bool,
 ) {
-    controller.record_resolution(
-        &ready.tool_id,
-        if cancelled {
-            SpeculativeResolution::Cancelled
-        } else {
-            SpeculativeResolution::Discarded
-        },
-    );
+    ready.settle(if cancelled {
+        SpeculativeResolution::Cancelled
+    } else {
+        SpeculativeResolution::Discarded
+    });
+}
+
+struct IssuedCandidateGuard {
+    controller: Arc<SpeculationController>,
+    tool_id: String,
+    settled: bool,
+}
+
+impl IssuedCandidateGuard {
+    fn new(controller: &Arc<SpeculationController>, tool_id: &str) -> Self {
+        Self {
+            controller: Arc::clone(controller),
+            tool_id: tool_id.to_owned(),
+            settled: false,
+        }
+    }
+
+    fn settle(&mut self, resolution: SpeculativeResolution) {
+        if !self.settled {
+            self.controller.record_resolution(&self.tool_id, resolution);
+            self.settled = true;
+        }
+    }
+}
+
+impl Drop for IssuedCandidateGuard {
+    fn drop(&mut self) {
+        self.settle(SpeculativeResolution::Discarded);
+    }
 }
 
 enum CandidateState {
@@ -435,6 +481,7 @@ enum CandidateState {
         execution: Box<SpeculativeExecution>,
         deadline: Instant,
         slot: OwnedSemaphorePermit,
+        guard: IssuedCandidateGuard,
     },
 }
 
@@ -520,7 +567,7 @@ impl StreamResponseAssembler {
 pub(crate) async fn stream_reactive_response(
     provider: &Arc<dyn ModelProvider>,
     broker: &ToolBroker<'_>,
-    controller: &SpeculationController,
+    controller: &Arc<SpeculationController>,
     request: &crate::RunRequest,
     model_request: ModelRequest,
     run_id: &str,
@@ -674,12 +721,17 @@ pub(crate) async fn stream_reactive_response(
                                         {
                                             SpeculativeAttempt::NotIssued => None,
                                             SpeculativeAttempt::Issued(Ok(execution)) => {
+                                                let guard = IssuedCandidateGuard::new(
+                                                    controller,
+                                                    &call.tool_id,
+                                                );
                                                 Some(CandidateState::Active {
                                                     call,
                                                     key,
                                                     execution,
                                                     deadline,
                                                     slot,
+                                                    guard,
                                                 })
                                             }
                                             SpeculativeAttempt::Issued(Err(error)) => {
@@ -733,19 +785,19 @@ pub(crate) async fn stream_reactive_response(
             execution,
             deadline,
             slot,
+            guard,
         }) => {
             if Instant::now() >= deadline {
-                controller.record_resolution(&call.tool_id, SpeculativeResolution::Discarded);
                 None
             } else if invocation_matches(&call, &key, authoritative) {
                 Some(ReadySpeculativeCommit {
-                    tool_id: call.tool_id,
                     execution,
+                    deadline,
                     _slot: slot,
+                    guard,
                 })
             } else {
                 controller.record_mismatch_and_trip(&call.tool_id);
-                controller.record_resolution(&call.tool_id, SpeculativeResolution::Discarded);
                 None
             }
         }
@@ -814,19 +866,16 @@ fn invocation_matches(
 }
 
 fn discard_candidate(
-    controller: &SpeculationController,
+    _controller: &SpeculationController,
     candidate: Option<CandidateState>,
     cancelled: bool,
 ) {
-    if let Some(CandidateState::Active { call, .. }) = candidate {
-        controller.record_resolution(
-            &call.tool_id,
-            if cancelled {
-                SpeculativeResolution::Cancelled
-            } else {
-                SpeculativeResolution::Discarded
-            },
-        );
+    if let Some(CandidateState::Active { mut guard, .. }) = candidate {
+        guard.settle(if cancelled {
+            SpeculativeResolution::Cancelled
+        } else {
+            SpeculativeResolution::Discarded
+        });
     }
 }
 
@@ -835,9 +884,11 @@ fn fail_candidate_stream(controller: &SpeculationController, candidate: Option<C
         Some(CandidateState::Shadow { call, .. }) => {
             controller.record_terminal_stream_failure_and_trip(&call.tool_id);
         }
-        Some(CandidateState::Active { call, .. }) => {
+        Some(CandidateState::Active {
+            call, mut guard, ..
+        }) => {
             controller.record_terminal_stream_failure_and_trip(&call.tool_id);
-            controller.record_resolution(&call.tool_id, SpeculativeResolution::Discarded);
+            guard.settle(SpeculativeResolution::Discarded);
         }
         None => {}
     }
@@ -911,6 +962,13 @@ mod tests {
             &candidate,
             &key,
             Some(&ToolCall::new("call-0", "read", r#"{"a":"1","b":true}"#))
+        ));
+        let negative_zero = ToolCall::new("call-zero", "read", "-0.0");
+        let negative_key = InvocationKey::new("read", &json!(-0.0));
+        assert!(!invocation_matches(
+            &negative_zero,
+            &negative_key,
+            Some(&ToolCall::new("call-zero", "read", "0.0"))
         ));
     }
 

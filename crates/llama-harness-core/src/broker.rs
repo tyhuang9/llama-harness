@@ -12,7 +12,6 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     future::Future,
-    hash::{Hash, Hasher},
     sync::{Arc, Weak},
     time::Instant as StdInstant,
 };
@@ -963,10 +962,10 @@ where
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct InvocationKey {
     pub(crate) tool_id: String,
-    pub(crate) arguments: Value,
+    canonical_arguments: String,
     programmatic_occurrence: Option<String>,
 }
 
@@ -984,6 +983,25 @@ pub(crate) struct SpeculativeExecution {
     result: Arc<ToolResult>,
 }
 
+/// Broker outcome after revalidating a completed candidate at the normal
+/// authoritative Direct boundary.
+pub(crate) enum SpeculativeCommitOutcome {
+    /// The cached result passed both policy boundaries and was recorded once.
+    Committed(Arc<ToolResult>),
+    /// Speculation was disabled or invalidated; execute this already-authorized
+    /// Direct preparation without repeating policy or approval.
+    ExecuteDirect(Box<PreparedCall>),
+    /// Normal Direct preparation produced a canonical rejection or reuse.
+    Resolved(Arc<ToolResult>),
+    /// Normal Direct limits stopped the run.
+    Stop,
+    /// The candidate did not reach the ordinary Direct boundary and may use the
+    /// normal sequential fallback path.
+    NotCommitted,
+    /// Ordinary Direct preparation failed after mutating normal accounting.
+    DirectError(HarnessError),
+}
+
 struct SpeculativePreparedCall {
     call: ToolCall,
     arguments: Value,
@@ -999,10 +1017,30 @@ impl InvocationKey {
     pub(crate) fn new(tool_id: &str, arguments: &Value) -> Self {
         Self {
             tool_id: tool_id.to_owned(),
-            arguments: arguments.clone(),
+            canonical_arguments: canonical_json(arguments),
             programmatic_occurrence: None,
         }
     }
+}
+
+fn canonical_json(value: &Value) -> String {
+    fn normalized(value: &Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.iter().map(normalized).collect()),
+            Value::Object(values) => {
+                let mut entries = values.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by_key(|(key, _)| *key);
+                let mut object = serde_json::Map::new();
+                for (key, value) in entries {
+                    object.insert(key.clone(), normalized(value));
+                }
+                Value::Object(object)
+            }
+            value => value.clone(),
+        }
+    }
+
+    serde_json::to_string(&normalized(value)).expect("serde_json::Value always serializes")
 }
 
 impl<'a> ToolBroker<'a> {
@@ -1097,6 +1135,26 @@ impl<'a> ToolBroker<'a> {
         let mut context =
             ToolCallContext::new(run_id, trace_id, call.id.clone(), call.tool_id.clone());
         context.caller = Some(ToolCaller::Speculative);
+        let mut direct_context = context.clone();
+        direct_context.caller = Some(ToolCaller::Direct);
+        let ordinary = await_guarded(
+            self.policy.decide_with_context(
+                &direct_context,
+                tool.definition(),
+                &arguments,
+                request,
+            ),
+            &request.cancellation,
+            deadline,
+            "ordinary policy decision exceeded candidate deadline",
+            None,
+        )
+        .await?;
+        // Approval is never requested before hidden issue. A visible
+        // authoritative Direct call handles RequireApproval later.
+        if !matches!(ordinary, PolicyDecision::Allow { .. }) {
+            return Ok(None);
+        }
         let decision = await_guarded(
             self.policy
                 .decide_speculative(&context, tool.definition(), &arguments, request),
@@ -1208,21 +1266,36 @@ impl<'a> ToolBroker<'a> {
         execution: &SpeculativeExecution,
         authoritative_call: &ToolCall,
         model_call_number: u32,
-        deadline: Option<Instant>,
-    ) -> Result<Option<Arc<ToolResult>>, HarnessError> {
+        candidate_deadline: Instant,
+        run_deadline: Option<Instant>,
+    ) -> Result<SpeculativeCommitOutcome, HarnessError> {
         controller.config().validate()?;
+        let commit_deadline =
+            Some(run_deadline.map_or(candidate_deadline, |run| run.min(candidate_deadline)));
+        if let Err(error) = check_stopped(
+            &request.cancellation,
+            commit_deadline,
+            "speculative candidate expired before commit",
+        ) {
+            if matches!(error, HarnessError::Cancelled)
+                || run_deadline.is_some_and(|run| run <= candidate_deadline)
+            {
+                return Err(error);
+            }
+            return Ok(SpeculativeCommitOutcome::NotCommitted);
+        }
         if !controller.is_active(&execution.prepared.call.tool_id)
             || execution.prepared.model_call_number != model_call_number
             || execution.prepared.call.id != authoritative_call.id
             || authoritative_call.arguments_json.len() as u64
                 > request.agent.limits.max_tool_arguments_bytes
         {
-            return Ok(None);
+            return Ok(SpeculativeCommitOutcome::NotCommitted);
         }
         let authoritative_arguments: Value =
             match serde_json::from_str(&authoritative_call.arguments_json) {
                 Ok(arguments) => arguments,
-                Err(_) => return Ok(None),
+                Err(_) => return Ok(SpeculativeCommitOutcome::NotCommitted),
             };
         if ensure_json_depth(
             "authoritative speculative tool arguments",
@@ -1231,7 +1304,7 @@ impl<'a> ToolBroker<'a> {
         )
         .is_err()
         {
-            return Ok(None);
+            return Ok(SpeculativeCommitOutcome::NotCommitted);
         }
         let authoritative_key =
             InvocationKey::new(&authoritative_call.tool_id, &authoritative_arguments);
@@ -1254,9 +1327,68 @@ impl<'a> ToolBroker<'a> {
                 .validate_output(&authoritative_call.tool_id, &execution.result.output)
                 .is_err()
         {
-            return Ok(None);
+            return Ok(SpeculativeCommitOutcome::NotCommitted);
         }
-        let decision = await_guarded(
+        // Cross the ordinary Direct authorization and approval boundary exactly
+        // once. If cached reuse is later invalidated, the returned preparation is
+        // executed normally without re-running policy or approval.
+        let attempts_before = state.tool_calls;
+        let classified_before = state.classified_tool_calls();
+        let prepared = match self
+            .prepare(
+                request,
+                result,
+                events,
+                state,
+                authoritative_call.clone(),
+                ToolCaller::Direct,
+                false,
+                false,
+                None,
+                run_deadline,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if state.tool_calls > attempts_before
+                    && state.classified_tool_calls() == classified_before
+                {
+                    state.record_pre_dispatch_error(&error);
+                }
+                return Ok(SpeculativeCommitOutcome::DirectError(error));
+            }
+        };
+        let prepared = match prepared {
+            PrepareOutcome::Ready(prepared) => prepared,
+            PrepareOutcome::Rejected(result) => {
+                return Ok(SpeculativeCommitOutcome::Resolved(Arc::new(result)));
+            }
+            PrepareOutcome::Reused(result) => {
+                return Ok(SpeculativeCommitOutcome::Resolved(result));
+            }
+            PrepareOutcome::Stop => return Ok(SpeculativeCommitOutcome::Stop),
+        };
+
+        if let Err(error) = check_stopped(
+            &request.cancellation,
+            commit_deadline,
+            "speculative candidate expired after ordinary authorization",
+        ) {
+            if matches!(error, HarnessError::Cancelled)
+                || run_deadline.is_some_and(|run| run <= candidate_deadline)
+            {
+                return Err(error);
+            }
+            return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
+        }
+        if !controller.is_active(&execution.prepared.call.tool_id)
+            || !self.speculative_prepared_is_live(request, &execution.prepared)
+        {
+            return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
+        }
+
+        let decision = match await_guarded(
             self.policy.decide_speculative(
                 &execution.prepared.context,
                 execution.prepared.tool.definition(),
@@ -1264,50 +1396,54 @@ impl<'a> ToolBroker<'a> {
                 request,
             ),
             &request.cancellation,
-            deadline,
-            "speculative commit policy decision exceeded run deadline",
+            commit_deadline,
+            "speculative commit policy decision exceeded candidate deadline",
             None,
         )
-        .await?;
+        .await
+        {
+            Ok(decision) => decision,
+            Err(HarnessError::TimedOut(_))
+                if run_deadline.is_none_or(|run| candidate_deadline < run) =>
+            {
+                return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
+            }
+            Err(error) => return Err(error),
+        };
         if !matches!(decision, PolicyDecision::Allow { .. })
             || !controller.is_active(&execution.prepared.call.tool_id)
             || !self.speculative_prepared_is_live(request, &execution.prepared)
         {
-            return Ok(None);
+            return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
         }
-        if state.tool_calls >= request.agent.limits.max_tool_calls {
-            return Ok(None);
-        }
-        let repeated = state
-            .identical_calls
-            .get(&authoritative_key)
-            .copied()
-            .unwrap_or_default();
-        if repeated >= request.agent.limits.max_identical_tool_calls {
-            return Ok(None);
+        if let Err(error) = check_stopped(
+            &request.cancellation,
+            commit_deadline,
+            "speculative candidate expired after commit policy",
+        ) {
+            if matches!(error, HarnessError::Cancelled)
+                || run_deadline.is_some_and(|run| run <= candidate_deadline)
+            {
+                return Err(error);
+            }
+            return Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared));
         }
 
-        let mut canonical_call = authoritative_call.clone();
-        canonical_call.arguments_json = authoritative_key.canonical_arguments();
-        state.tool_calls += 1;
-        *state.identical_calls.entry(authoritative_key).or_default() += 1;
-        state.tool_issued += 1;
-        state.tool_completed += 1;
-        result.tool_calls.push(canonical_call.clone());
-        let public_decision = PolicyDecision::Allow {
-            reason: "policy allowed the call".into(),
+        self.mark_dispatched(state, &prepared);
+        let committed = BrokerExecution {
+            result: Arc::clone(&execution.result),
+            validation_error: None,
+            duration_ms: 0,
         };
-        result.policy_decisions.push(public_decision.clone());
-        events.emit(RunEvent::PolicyDecided {
-            call_id: canonical_call.id.clone(),
-            decision: public_decision,
-        });
+        self.record_execution(state, &prepared, &committed);
         events.emit(RunEvent::ToolCompleted {
-            call_id: canonical_call.id,
-            tool_id: canonical_call.tool_id,
+            call_id: prepared.call.id.clone(),
+            tool_id: prepared.call.tool_id.clone(),
             ok: true,
         });
-        Ok(Some(Arc::clone(&execution.result)))
+        Ok(SpeculativeCommitOutcome::Committed(Arc::clone(
+            &execution.result,
+        )))
     }
 
     pub(crate) fn validate_shadow_candidate(
@@ -1398,27 +1534,17 @@ impl InvocationKey {
     fn programmatic(tool_id: &str, arguments: &Value, occurrence: &str) -> Self {
         Self {
             tool_id: tool_id.to_owned(),
-            arguments: arguments.clone(),
+            canonical_arguments: canonical_json(arguments),
             programmatic_occurrence: Some(occurrence.to_owned()),
         }
-    }
-
-    pub(crate) fn canonical_arguments(&self) -> String {
-        serde_json::to_string(&self.arguments).unwrap_or_else(|_| "null".into())
-    }
-}
-
-impl Hash for InvocationKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.tool_id.hash(state);
-        self.canonical_arguments().hash(state);
-        self.programmatic_occurrence.hash(state);
     }
 }
 
 #[cfg(test)]
 mod speculation_tests {
-    use super::ToolConcurrencyLimiter;
+    use super::{InvocationKey, ToolConcurrencyLimiter};
+    use serde_json::Value;
+    use std::collections::{HashMap, HashSet};
 
     #[tokio::test]
     async fn speculative_keyed_admission_is_nonblocking_and_never_queues() {
@@ -1427,5 +1553,30 @@ mod speculation_tests {
         assert!(limiter.try_acquire("resource").unwrap().is_none());
         drop(held);
         assert!(limiter.try_acquire("resource").unwrap().is_some());
+    }
+
+    #[test]
+    fn invocation_key_equality_and_hash_share_one_canonical_representation() {
+        let negative_zero: Value = serde_json::from_str("-0.0").unwrap();
+        let positive_zero: Value = serde_json::from_str("0.0").unwrap();
+        let negative = InvocationKey::new("read", &negative_zero);
+        let positive = InvocationKey::new("read", &positive_zero);
+
+        assert_ne!(negative, positive);
+        let keys = HashSet::from([negative.clone(), positive.clone()]);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&negative));
+        assert!(keys.contains(&positive));
+        let mut repeated_calls = HashMap::new();
+        *repeated_calls.entry(negative.clone()).or_insert(0_u32) += 1;
+        *repeated_calls.entry(positive.clone()).or_insert(0_u32) += 1;
+        *repeated_calls.entry(negative.clone()).or_insert(0_u32) += 1;
+        assert_eq!(repeated_calls[&negative], 2);
+        assert_eq!(repeated_calls[&positive], 1);
+
+        let reordered =
+            InvocationKey::new("read", &serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap());
+        let canonical = InvocationKey::new("read", &serde_json::json!({"a":1,"b":2}));
+        assert_eq!(reordered, canonical);
     }
 }

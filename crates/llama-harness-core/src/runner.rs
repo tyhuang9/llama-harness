@@ -1,6 +1,8 @@
 use crate::{
     agent::{RunRequest, RunResult, RunStatus},
-    broker::{BrokerState, PrepareOutcome, ToolBroker, ToolConcurrencyLimiter},
+    broker::{
+        BrokerState, PrepareOutcome, SpeculativeCommitOutcome, ToolBroker, ToolConcurrencyLimiter,
+    },
     discovery::{ToolScope, ToolScopeSelection},
     event::{EventEmitter, EventSink, InMemoryEventSink, RunEvent},
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len, AgentLimits},
@@ -481,10 +483,9 @@ impl AgentRunner {
 
             for (call_index, call) in response.tool_calls.into_iter().enumerate() {
                 if call_index == 0 {
-                    if let (Some(controller), Some(ready)) =
+                    if let (Some(controller), Some(mut ready)) =
                         (self.speculation.as_ref(), speculative.take())
                     {
-                        let tool_id = ready.tool_id.clone();
                         match broker
                             .commit_speculative(
                                 controller,
@@ -495,15 +496,13 @@ impl AgentRunner {
                                 &ready.execution,
                                 &call,
                                 model_calls,
+                                ready.deadline,
                                 deadline,
                             )
                             .await
                         {
-                            Ok(Some(tool_result)) => {
-                                controller.record_resolution(
-                                    &tool_id,
-                                    crate::speculation::SpeculativeResolution::Committed,
-                                );
+                            Ok(SpeculativeCommitOutcome::Committed(tool_result)) => {
+                                ready.settle(crate::speculation::SpeculativeResolution::Committed);
                                 if let Err(error) = push_tool_message(
                                     &mut messages,
                                     &call,
@@ -515,8 +514,80 @@ impl AgentRunner {
                                 }
                                 continue;
                             }
-                            Ok(None) => {
+                            Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared)) => {
                                 crate::speculation::discard_ready_commit(controller, ready, false);
+                                broker.mark_dispatched(&mut broker_state, &prepared);
+                                let execution =
+                                    match broker.execute(&prepared, &request, deadline).await {
+                                        Ok(execution) => execution,
+                                        Err(error) => {
+                                            broker_state.record_execution_error(&error);
+                                            broker.mark_uncertain(&mut broker_state, &prepared);
+                                            events.emit(RunEvent::ToolCompleted {
+                                                call_id: call.id.clone(),
+                                                tool_id: call.tool_id.clone(),
+                                                ok: false,
+                                            });
+                                            apply_terminal_error(&mut result, error);
+                                            break 'run;
+                                        }
+                                    };
+                                events.emit(RunEvent::ToolCompleted {
+                                    call_id: call.id.clone(),
+                                    tool_id: call.tool_id.clone(),
+                                    ok: execution.result.ok,
+                                });
+                                broker.record_execution(&mut broker_state, &prepared, &execution);
+                                if let Some(error) = execution.validation_error {
+                                    result.errors.push(error);
+                                } else if !execution.result.ok {
+                                    result.errors.push(RunError::new(
+                                        "tool_error",
+                                        "tool returned a failure result",
+                                    ));
+                                }
+                                if let Err(error) = push_tool_message(
+                                    &mut messages,
+                                    &call,
+                                    &execution.result,
+                                    &request.agent.limits,
+                                ) {
+                                    apply_terminal_error(&mut result, error);
+                                    break 'run;
+                                }
+                                continue;
+                            }
+                            Ok(SpeculativeCommitOutcome::Resolved(tool_result)) => {
+                                crate::speculation::discard_ready_commit(controller, ready, false);
+                                if let Err(error) = push_tool_message(
+                                    &mut messages,
+                                    &call,
+                                    &tool_result,
+                                    &request.agent.limits,
+                                ) {
+                                    apply_terminal_error(&mut result, error);
+                                    break 'run;
+                                }
+                                continue;
+                            }
+                            Ok(SpeculativeCommitOutcome::Stop) => {
+                                crate::speculation::discard_ready_commit(controller, ready, false);
+                                break 'run;
+                            }
+                            Ok(SpeculativeCommitOutcome::NotCommitted) => {
+                                crate::speculation::discard_ready_commit(controller, ready, false);
+                            }
+                            Ok(SpeculativeCommitOutcome::DirectError(error)) => {
+                                crate::speculation::discard_ready_commit(
+                                    controller,
+                                    ready,
+                                    matches!(
+                                        error,
+                                        HarnessError::Cancelled | HarnessError::TimedOut(_)
+                                    ),
+                                );
+                                apply_terminal_error(&mut result, error);
+                                break 'run;
                             }
                             Err(error) => {
                                 let cancelled = matches!(
