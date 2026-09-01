@@ -40,6 +40,7 @@ enum StreamBehavior {
     InvalidResponse,
     HugeArguments,
     CancellationAwareOversizedText,
+    AbortAwarePendingTail,
     PullDrivenDelayed,
 }
 
@@ -128,6 +129,36 @@ impl Stream for CancellationCheckingStream {
 }
 
 impl Drop for CancellationCheckingStream {
+    fn drop(&mut self) {
+        self.observed
+            .store(self.cancellation.is_cancelled(), Ordering::SeqCst);
+    }
+}
+
+struct AbortCheckingPendingStream {
+    first: Option<Result<ModelStreamEvent, HarnessError>>,
+    cancellation: CancellationToken,
+    observed: Arc<AtomicBool>,
+    tail_polled: Arc<Semaphore>,
+    signalled_tail: bool,
+}
+
+impl Stream for AbortCheckingPendingStream {
+    type Item = Result<ModelStreamEvent, HarnessError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(first) = self.first.take() {
+            return Poll::Ready(Some(first));
+        }
+        if !self.signalled_tail {
+            self.signalled_tail = true;
+            self.tail_polled.add_permits(1);
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for AbortCheckingPendingStream {
     fn drop(&mut self) {
         self.observed
             .store(self.cancellation.is_cancelled(), Ordering::SeqCst);
@@ -364,6 +395,19 @@ impl ModelProvider for StreamingProvider {
                         ]),
                         cancellation: model_cancellation,
                         observed: Arc::clone(&self.stream_drop_saw_cancellation),
+                    }));
+                }
+                StreamBehavior::AbortAwarePendingTail => {
+                    return Ok(Box::pin(AbortCheckingPendingStream {
+                        first: Some(Ok(ModelStreamEvent::ToolCallDelta(
+                            ToolCallDelta::new(0, r#"{"query":"status"}"#, true)
+                                .with_call_id("call-0")
+                                .with_tool_id(TOOL_ID),
+                        ))),
+                        cancellation: model_cancellation,
+                        observed: Arc::clone(&self.stream_drop_saw_cancellation),
+                        tail_polled: Arc::clone(&self.tail_polled),
+                        signalled_tail: false,
                     }));
                 }
                 StreamBehavior::PullDrivenDelayed => {
@@ -2318,6 +2362,63 @@ async fn aborted_run_cancels_tool_future_before_drop_and_settles_once() {
     assert_eq!(fallback.status, RunStatus::Completed);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1_002);
     assert_eq!(runner.speculation_metrics(TOOL_ID).issued, 1);
+}
+
+#[tokio::test]
+async fn aborted_reactive_stream_cancels_model_before_provider_drop_for_direct_and_adaptive() {
+    for strategy in [RunStrategy::Direct, RunStrategy::Adaptive] {
+        let provider = Arc::new(match strategy {
+            RunStrategy::Direct => StreamingProvider::new(StreamBehavior::Normal),
+            RunStrategy::Adaptive => StreamingProvider::adaptive_direct(),
+            _ => unreachable!("test covers reactive strategies only"),
+        });
+        let tool = Arc::new(AbortAwareSpeculativeTool::new());
+        let runner = Arc::new(
+            AgentRunner::builder(provider.clone())
+                .tools(registry(tool.clone()))
+                .policy(Arc::new(TestPolicy::new(true)))
+                .speculation(SpeculationConfig::default())
+                .build(),
+        );
+        train_and_activate(&runner).await;
+        provider.set_behavior(StreamBehavior::AbortAwarePendingTail);
+
+        let active_runner = Arc::clone(&runner);
+        let run =
+            tokio::spawn(async move { active_runner.run_with_strategy(request(), strategy).await });
+        let tool_entered = tool
+            .entered
+            .acquire()
+            .await
+            .expect("abort tool entry semaphore open");
+        tool_entered.forget();
+        let tail_polled = provider
+            .tail_polled
+            .acquire()
+            .await
+            .expect("pending provider tail semaphore open");
+        tail_polled.forget();
+
+        run.abort();
+        assert!(run
+            .await
+            .expect_err("aborted task must not complete")
+            .is_cancelled());
+
+        assert!(provider.stream_drop_saw_cancellation.load(Ordering::SeqCst));
+        assert!(tool.future_drop_saw_cancellation.load(Ordering::SeqCst));
+        let metrics = runner.speculation_metrics(TOOL_ID);
+        assert_eq!(metrics.issued, 1);
+        assert_eq!(metrics.in_flight, 0);
+        assert_eq!(metrics.cancelled, 1);
+        assert_eq!(metrics.committed, 0);
+        assert_eq!(metrics.discarded, 0);
+        assert_eq!(metrics.mode, SpeculationMode::Shadow);
+        assert_eq!(
+            metrics.issued,
+            metrics.in_flight + metrics.committed + metrics.discarded + metrics.cancelled
+        );
+    }
 }
 
 #[tokio::test]

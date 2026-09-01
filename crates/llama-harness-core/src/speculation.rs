@@ -158,7 +158,7 @@ pub struct SpeculationMetrics {
     pub oldest_in_flight_ms: u64,
     /// Dispatch-to-tool-resolution latency using a fixed-memory histogram.
     pub execution_duration_ms: SpeculationLatencyHistogram,
-    /// Successful-tool-resolution-to-terminal-publication latency histogram.
+    /// Tool-result-ready-to-terminal-settlement latency histogram.
     pub publication_wait_ms: SpeculationLatencyHistogram,
 }
 
@@ -667,6 +667,32 @@ enum DeadlineKind {
     Candidate,
 }
 
+struct ModelCancellationOnDrop {
+    cancellation: tokio_util::sync::CancellationToken,
+    armed: bool,
+}
+
+impl ModelCancellationOnDrop {
+    fn new(cancellation: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            cancellation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ModelCancellationOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
 struct StreamResponseAssembler {
     model: Option<String>,
     usage: Usage,
@@ -810,6 +836,9 @@ pub(crate) async fn stream_reactive_response(
     )
     .await?;
     tokio::pin!(stream);
+    // Declared after the pinned stream so task cancellation drops this guard
+    // first and cancels the provider token before dropping the stream itself.
+    let mut model_cancellation_on_drop = ModelCancellationOnDrop::new(model_cancellation.clone());
 
     let mut response = StreamResponseAssembler::new(request.agent.limits.max_model_response_bytes);
     let mut candidate = None;
@@ -1137,6 +1166,7 @@ pub(crate) async fn stream_reactive_response(
         }
         None => None,
     };
+    model_cancellation_on_drop.disarm();
     Ok(StreamedReactiveResponse {
         response,
         speculative,
