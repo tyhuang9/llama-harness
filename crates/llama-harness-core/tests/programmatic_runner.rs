@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use llama_harness_core::{
     mock::{final_response, MockModelProvider},
     AgentDefinition, AgentRunner, AllowAllPolicy, ApprovalHandler, ApprovalRecord, HarnessError,
-    InMemoryEventSink, ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
-    PolicyDecision, PolicyEngine, ProgramLifecycleOutcome, ProgrammaticConformance,
+    InMemoryEventSink, ModelCapabilities, ModelEventStream, ModelInfo, ModelProvider, ModelRequest,
+    ModelResponse, PolicyDecision, PolicyEngine, ProgramLifecycleOutcome, ProgrammaticConformance,
     ProgrammaticHostConfig, ProviderCapabilityLimits, ProviderHealth, RunEvent, RunRequest,
     RunResult, RunStatus, RunStrategy, SpeculationConfig, SpeculationMode, StrategyFallbackReason,
     Tool, ToolCallContext, ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
@@ -53,6 +53,53 @@ struct SynthesisBarrierProvider {
     planning_calls: AtomicU32,
     synthesis_entered: Arc<Semaphore>,
     synthesis_releases: Arc<Semaphore>,
+}
+
+struct StreamingProgrammaticFallbackProvider {
+    complete_calls: AtomicU32,
+    stream_calls: AtomicU32,
+}
+
+#[async_trait]
+impl ModelProvider for StreamingProgrammaticFallbackProvider {
+    fn id(&self) -> &str {
+        "streaming-programmatic-fallback"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::new(true, true, true)
+            .with_streaming_tool_arguments(true)
+            .with_programmatic_conformance(ProgrammaticConformance::StrictJsonAstV1)
+            .with_limits(ProviderCapabilityLimits::new().with_max_program_bytes(64 * 1024))
+    }
+
+    async fn health(&self) -> Result<ProviderHealth, HarnessError> {
+        Ok(ProviderHealth::healthy())
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError> {
+        Ok(vec![
+            ModelInfo::new("mock-model").with_capabilities(self.capabilities())
+        ])
+    }
+
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError> {
+        let ordinal = self.complete_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(
+            ModelResponse::new(request.model).with_final_output(if ordinal == 0 {
+                "not json"
+            } else {
+                "fallback"
+            }),
+        )
+    }
+
+    async fn stream(&self, _: ModelRequest) -> Result<ModelEventStream, HarnessError> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        Err(HarnessError::Provider(
+            "programmatic continuation must remain sequential".into(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -2618,6 +2665,29 @@ async fn two_call_programmatic_budget_skips_repair_and_preserves_direct_fallback
             ..
         }
     )));
+}
+
+#[tokio::test]
+async fn programmatic_direct_continuation_never_starts_speculation() {
+    let provider = Arc::new(StreamingProgrammaticFallbackProvider {
+        complete_calls: AtomicU32::new(0),
+        stream_calls: AtomicU32::new(0),
+    });
+    let mut run_request = request(&[]);
+    run_request.agent.limits.max_model_calls = 2;
+
+    let result = AgentRunner::builder(provider.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .speculation(SpeculationConfig::default())
+        .build()
+        .run_with_strategy(run_request, RunStrategy::Programmatic)
+        .await
+        .expect("programmatic fallback completes sequentially");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.final_output.as_deref(), Some("fallback"));
+    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

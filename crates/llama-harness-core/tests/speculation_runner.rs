@@ -31,6 +31,7 @@ const PRIVACY_CANARY: &str = "speculation-private-canary";
 #[derive(Clone, Copy)]
 enum StreamBehavior {
     Normal,
+    RetryableBeforeCandidate,
     FailAfterCandidate,
     EmptyFlood,
     InterleavedMultiple,
@@ -81,6 +82,13 @@ impl StreamingProvider {
     fn adaptive_direct() -> Self {
         Self {
             planner_response: Some(r#"{"strategy":"direct"}"#),
+            ..Self::new(StreamBehavior::Normal)
+        }
+    }
+
+    fn adaptive_invalid_plan() -> Self {
+        Self {
+            planner_response: Some("not-json"),
             ..Self::new(StreamBehavior::Normal)
         }
     }
@@ -198,11 +206,16 @@ impl ModelProvider for StreamingProvider {
     }
 
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError> {
-        let ordinal = self.complete_calls.fetch_add(1, Ordering::SeqCst);
-        if ordinal == 0 {
-            if let Some(response) = self.planner_response {
-                return Ok(ModelResponse::new(request.model).with_final_output(response));
-            }
+        self.complete_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(response) = self.planner_response.filter(|_| {
+            request.structured_output.as_ref().is_some_and(|output| {
+                matches!(
+                    output.name.as_str(),
+                    "llama_harness_planner_envelope_v1" | "llama_harness_declarative_plan_v1"
+                )
+            })
+        }) {
+            return Ok(ModelResponse::new(request.model).with_final_output(response));
         }
         let requests_tool = Self::requests_tool(&request);
         if requests_tool {
@@ -219,13 +232,16 @@ impl ModelProvider for StreamingProvider {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelEventStream, HarnessError> {
-        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        let stream_ordinal = self.stream_calls.fetch_add(1, Ordering::SeqCst);
         let requests_tool = Self::requests_tool(&request);
         let model_cancellation = request.cancellation.clone();
-        let pending_start = matches!(
-            *self.behavior.lock().expect("behavior lock"),
-            StreamBehavior::AbortAwarePendingStart
-        );
+        let behavior = *self.behavior.lock().expect("behavior lock");
+        if matches!(behavior, StreamBehavior::RetryableBeforeCandidate) && stream_ordinal == 0 {
+            return Err(HarnessError::RetryableProvider(
+                "retry before candidate".into(),
+            ));
+        }
+        let pending_start = matches!(behavior, StreamBehavior::AbortAwarePendingStart);
         if pending_start {
             *self
                 .stream_start_cancellation
@@ -247,7 +263,7 @@ impl ModelProvider for StreamingProvider {
                 }),
             ]
         } else {
-            match *self.behavior.lock().expect("behavior lock") {
+            match behavior {
                 StreamBehavior::Normal => vec![
                     Ok(ModelStreamEvent::ToolCallDelta(
                         ToolCallDelta::new(0, r#"{"query":"status"}"#, true)
@@ -259,6 +275,9 @@ impl ModelProvider for StreamingProvider {
                         usage: Usage::default(),
                     }),
                 ],
+                StreamBehavior::RetryableBeforeCandidate => vec![Err(
+                    HarnessError::RetryableProvider("retry before candidate".into()),
+                )],
                 StreamBehavior::FailAfterCandidate => vec![
                     Ok(ModelStreamEvent::ToolCallDelta(
                         ToolCallDelta::new(0, r#"{"query":"status"}"#, true)
@@ -1389,8 +1408,8 @@ async fn shadow_observes_without_speculative_execution_or_policy() {
         .expect("shadow run succeeds");
 
     assert_eq!(result.status, RunStatus::Completed);
-    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         tool.callers.lock().unwrap().as_slice(),
@@ -1412,7 +1431,7 @@ async fn activation_requires_threshold_and_exact_active_match_commits_once() {
     let tool = Arc::new(CountingTool::eligible());
     let policy = Arc::new(TestPolicy::new(true));
     let events = Arc::new(InMemoryEventSink::default());
-    let runner = AgentRunner::builder(provider)
+    let runner = AgentRunner::builder(provider.clone())
         .tools(registry(tool.clone()))
         .policy(policy.clone())
         .event_sink(events.clone())
@@ -1451,6 +1470,8 @@ async fn activation_requires_threshold_and_exact_active_match_commits_once() {
         .expect("active run succeeds");
     assert_eq!(result.status, RunStatus::Completed);
     assert_eq!(result.tool_calls.len(), 1);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1_001);
+    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 1_001);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1_001);
     assert_eq!(
         tool.callers.lock().unwrap().last(),
@@ -2027,6 +2048,40 @@ async fn terminal_stream_failure_after_candidate_is_value_free_and_never_retried
 }
 
 #[tokio::test]
+async fn retry_after_speculative_stream_failure_is_sequential() {
+    let provider = Arc::new(StreamingProvider::new(
+        StreamBehavior::RetryableBeforeCandidate,
+    ));
+    let tool = Arc::new(CountingTool::eligible());
+    let events = Arc::new(InMemoryEventSink::default());
+    let runner = AgentRunner::builder(provider.clone())
+        .tools(registry(tool.clone()))
+        .policy(Arc::new(TestPolicy::new(true)))
+        .event_sink(events.clone())
+        .speculation(SpeculationConfig::default())
+        .build();
+
+    let result = runner
+        .run_with_strategy(request(), RunStrategy::Direct)
+        .await
+        .expect("retry completes through the sequential provider path");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runner.speculation_metrics(TOOL_ID).issued, 0);
+    assert_eq!(
+        events
+            .events()
+            .iter()
+            .filter(|record| matches!(record.event, RunEvent::ModelRetrying { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn every_post_issue_stream_or_response_validation_error_settles_the_candidate() {
     for behavior in [
         StreamBehavior::OversizedText,
@@ -2097,28 +2152,34 @@ async fn transcript_overflow_after_issue_settles_without_publishing_the_candidat
 }
 
 #[tokio::test]
-async fn adaptive_post_issue_validation_error_uses_the_same_settlement_guard() {
-    let provider = Arc::new(StreamingProvider::adaptive_direct());
+async fn adaptive_invalid_plan_fallback_never_starts_speculation() {
+    let provider = Arc::new(StreamingProvider::adaptive_invalid_plan());
     let tool = Arc::new(CountingTool::declarative_eligible());
+    let events = Arc::new(InMemoryEventSink::default());
     let runner = AgentRunner::builder(provider.clone())
         .tools(registry(tool.clone()))
         .policy(Arc::new(TestPolicy::new(true)))
+        .event_sink(events.clone())
         .speculation(SpeculationConfig::default())
         .build();
-    train_and_activate(&runner).await;
-    provider.set_behavior(StreamBehavior::InvalidResponse);
 
     let result = runner
         .run(request())
         .await
-        .expect("adaptive failure is represented");
+        .expect("adaptive invalid plan falls back to direct");
 
-    assert_ne!(result.status, RunStatus::Cancelled);
-    assert_eq!(tool.calls.load(Ordering::SeqCst), 1_001);
-    let metrics = runner.speculation_metrics(TOOL_ID);
-    assert_eq!(metrics.issued, 1);
-    assert_eq!(metrics.discarded, 1);
-    assert_eq!(metrics.committed, 0);
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runner.speculation_metrics(TOOL_ID).issued, 0);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyFallback {
+            reason: llama_harness_core::StrategyFallbackReason::InvalidPlan,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
@@ -2386,109 +2447,103 @@ async fn aborted_run_cancels_tool_future_before_drop_and_settles_once() {
 }
 
 #[tokio::test]
-async fn aborted_reactive_stream_cancels_model_before_provider_drop_for_direct_and_adaptive() {
-    for strategy in [RunStrategy::Direct, RunStrategy::Adaptive] {
-        let provider = Arc::new(match strategy {
-            RunStrategy::Direct => StreamingProvider::new(StreamBehavior::Normal),
-            RunStrategy::Adaptive => StreamingProvider::adaptive_direct(),
-            _ => unreachable!("test covers reactive strategies only"),
-        });
-        let tool = Arc::new(AbortAwareSpeculativeTool::new());
-        let runner = Arc::new(
-            AgentRunner::builder(provider.clone())
-                .tools(registry(tool.clone()))
-                .policy(Arc::new(TestPolicy::new(true)))
-                .speculation(SpeculationConfig::default())
-                .build(),
-        );
-        train_and_activate(&runner).await;
-        provider.set_behavior(StreamBehavior::AbortAwarePendingTail);
+async fn aborted_direct_stream_cancels_model_before_provider_drop() {
+    let provider = Arc::new(StreamingProvider::new(StreamBehavior::Normal));
+    let tool = Arc::new(AbortAwareSpeculativeTool::new());
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry(tool.clone()))
+            .policy(Arc::new(TestPolicy::new(true)))
+            .speculation(SpeculationConfig::default())
+            .build(),
+    );
+    train_and_activate(&runner).await;
+    provider.set_behavior(StreamBehavior::AbortAwarePendingTail);
 
-        let active_runner = Arc::clone(&runner);
-        let run =
-            tokio::spawn(async move { active_runner.run_with_strategy(request(), strategy).await });
-        let tool_entered = tool
-            .entered
-            .acquire()
+    let active_runner = Arc::clone(&runner);
+    let run = tokio::spawn(async move {
+        active_runner
+            .run_with_strategy(request(), RunStrategy::Direct)
             .await
-            .expect("abort tool entry semaphore open");
-        tool_entered.forget();
-        let tail_polled = provider
-            .tail_polled
-            .acquire()
-            .await
-            .expect("pending provider tail semaphore open");
-        tail_polled.forget();
+    });
+    let tool_entered = tool
+        .entered
+        .acquire()
+        .await
+        .expect("abort tool entry semaphore open");
+    tool_entered.forget();
+    let tail_polled = provider
+        .tail_polled
+        .acquire()
+        .await
+        .expect("pending provider tail semaphore open");
+    tail_polled.forget();
 
-        run.abort();
-        assert!(run
-            .await
-            .expect_err("aborted task must not complete")
-            .is_cancelled());
+    run.abort();
+    assert!(run
+        .await
+        .expect_err("aborted task must not complete")
+        .is_cancelled());
 
-        assert!(provider.stream_drop_saw_cancellation.load(Ordering::SeqCst));
-        assert!(tool.future_drop_saw_cancellation.load(Ordering::SeqCst));
-        let metrics = runner.speculation_metrics(TOOL_ID);
-        assert_eq!(metrics.issued, 1);
-        assert_eq!(metrics.in_flight, 0);
-        assert_eq!(metrics.cancelled, 1);
-        assert_eq!(metrics.committed, 0);
-        assert_eq!(metrics.discarded, 0);
-        assert_eq!(metrics.mode, SpeculationMode::Shadow);
-        assert_eq!(
-            metrics.issued,
-            metrics.in_flight + metrics.committed + metrics.discarded + metrics.cancelled
-        );
-    }
+    assert!(provider.stream_drop_saw_cancellation.load(Ordering::SeqCst));
+    assert!(tool.future_drop_saw_cancellation.load(Ordering::SeqCst));
+    let metrics = runner.speculation_metrics(TOOL_ID);
+    assert_eq!(metrics.issued, 1);
+    assert_eq!(metrics.in_flight, 0);
+    assert_eq!(metrics.cancelled, 1);
+    assert_eq!(metrics.committed, 0);
+    assert_eq!(metrics.discarded, 0);
+    assert_eq!(metrics.mode, SpeculationMode::Shadow);
+    assert_eq!(
+        metrics.issued,
+        metrics.in_flight + metrics.committed + metrics.discarded + metrics.cancelled
+    );
 }
 
 #[tokio::test]
-async fn aborted_reactive_stream_start_cancels_model_for_direct_and_adaptive() {
-    for strategy in [RunStrategy::Direct, RunStrategy::Adaptive] {
-        let provider = Arc::new(match strategy {
-            RunStrategy::Direct => StreamingProvider::new(StreamBehavior::Normal),
-            RunStrategy::Adaptive => StreamingProvider::adaptive_direct(),
-            _ => unreachable!("test covers reactive strategies only"),
-        });
-        let tool = Arc::new(CountingTool::eligible());
-        let runner = Arc::new(
-            AgentRunner::builder(provider.clone())
-                .tools(registry(tool))
-                .policy(Arc::new(TestPolicy::new(true)))
-                .speculation(SpeculationConfig::default())
-                .build(),
-        );
-        train_and_activate(&runner).await;
-        provider.set_behavior(StreamBehavior::AbortAwarePendingStart);
+async fn aborted_direct_stream_start_cancels_model() {
+    let provider = Arc::new(StreamingProvider::new(StreamBehavior::Normal));
+    let tool = Arc::new(CountingTool::eligible());
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry(tool))
+            .policy(Arc::new(TestPolicy::new(true)))
+            .speculation(SpeculationConfig::default())
+            .build(),
+    );
+    train_and_activate(&runner).await;
+    provider.set_behavior(StreamBehavior::AbortAwarePendingStart);
 
-        let active_runner = Arc::clone(&runner);
-        let run =
-            tokio::spawn(async move { active_runner.run_with_strategy(request(), strategy).await });
-        let entered = provider
-            .stream_start_entered
-            .acquire()
+    let active_runner = Arc::clone(&runner);
+    let run = tokio::spawn(async move {
+        active_runner
+            .run_with_strategy(request(), RunStrategy::Direct)
             .await
-            .expect("pending stream startup semaphore open");
-        entered.forget();
+    });
+    let entered = provider
+        .stream_start_entered
+        .acquire()
+        .await
+        .expect("pending stream startup semaphore open");
+    entered.forget();
 
-        run.abort();
-        assert!(run
-            .await
-            .expect_err("aborted task must not complete")
-            .is_cancelled());
-        assert!(provider
-            .stream_start_cancellation
-            .lock()
-            .expect("stream start cancellation lock")
-            .as_ref()
-            .expect("provider observed model cancellation token")
-            .is_cancelled());
+    run.abort();
+    assert!(run
+        .await
+        .expect_err("aborted task must not complete")
+        .is_cancelled());
+    assert!(provider
+        .stream_start_cancellation
+        .lock()
+        .expect("stream start cancellation lock")
+        .as_ref()
+        .expect("provider observed model cancellation token")
+        .is_cancelled());
 
-        let metrics = runner.speculation_metrics(TOOL_ID);
-        assert_eq!(metrics.mode, SpeculationMode::Active);
-        assert_eq!(metrics.issued, 0);
-        assert_eq!(metrics.in_flight, 0);
-    }
+    let metrics = runner.speculation_metrics(TOOL_ID);
+    assert_eq!(metrics.mode, SpeculationMode::Active);
+    assert_eq!(metrics.issued, 0);
+    assert_eq!(metrics.in_flight, 0);
 }
 
 #[tokio::test]
@@ -2747,7 +2802,7 @@ async fn terminal_stream_error_cancels_and_drains_a_pending_attempt() {
         .expect("terminal stream error is represented");
 
     assert_eq!(result.status, RunStatus::Failed);
-    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2_001);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1_001);
     assert_eq!(tool.observed_cancellation.load(Ordering::SeqCst), 1);
     let metrics = runner.speculation_metrics(TOOL_ID);
     assert_eq!(metrics.issued, 1);
@@ -2857,7 +2912,7 @@ async fn stream_event_and_run_argument_limits_prevent_dispatch() {
 }
 
 #[tokio::test]
-async fn adaptive_direct_uses_the_same_shadow_stream_helper() {
+async fn adaptive_planner_selected_direct_never_starts_speculation() {
     let provider = Arc::new(StreamingProvider::adaptive_direct());
     let tool = Arc::new(CountingTool::declarative_eligible());
     let runner = AgentRunner::builder(provider.clone())
@@ -2872,13 +2927,45 @@ async fn adaptive_direct_uses_the_same_shadow_stream_helper() {
         .expect("adaptive direct run succeeds");
 
     assert_eq!(result.status, RunStatus::Completed);
-    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         tool.callers.lock().unwrap().as_slice(),
         [ToolCaller::Direct]
     );
-    assert_eq!(runner.speculation_metrics(TOOL_ID).shadow_matches, 1);
+    assert_eq!(runner.speculation_metrics(TOOL_ID).shadow_matches, 0);
+    assert_eq!(runner.speculation_metrics(TOOL_ID).issued, 0);
+}
+
+#[tokio::test]
+async fn adaptive_capability_downgrade_never_starts_speculation() {
+    let provider = Arc::new(StreamingProvider::new(StreamBehavior::Normal));
+    let tool = Arc::new(CountingTool::eligible());
+    let events = Arc::new(InMemoryEventSink::default());
+    let runner = AgentRunner::builder(provider.clone())
+        .tools(registry(tool.clone()))
+        .policy(Arc::new(TestPolicy::new(true)))
+        .event_sink(events.clone())
+        .speculation(SpeculationConfig::default())
+        .build();
+
+    let result = runner
+        .run(request())
+        .await
+        .expect("adaptive capability downgrade succeeds sequentially");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runner.speculation_metrics(TOOL_ID).issued, 0);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyFallback {
+            reason: llama_harness_core::StrategyFallbackReason::UnsupportedCapability,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]

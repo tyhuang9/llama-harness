@@ -115,9 +115,16 @@ impl AgentRunner {
         request: RunRequest,
         strategy_events: Option<DirectStrategyEvents>,
         preflight: RunPreflight,
+        speculation_eligibility: SpeculationEligibility,
     ) -> Result<RunResult, HarnessError> {
-        self.run_direct_internal(request, strategy_events, preflight, None)
-            .await
+        self.run_direct_internal(
+            request,
+            strategy_events,
+            preflight,
+            None,
+            speculation_eligibility,
+        )
+        .await
     }
 
     /// Continues a pre-effect strategy fallback in the existing run identity,
@@ -135,6 +142,7 @@ impl AgentRunner {
             Some(strategy_events),
             preflight,
             Some(continuation),
+            SpeculationEligibility::SequentialOnly,
         )
         .await
     }
@@ -145,6 +153,7 @@ impl AgentRunner {
         strategy_events: Option<DirectStrategyEvents>,
         preflight: RunPreflight,
         continuation: Option<DirectContinuation>,
+        mut speculation_eligibility: SpeculationEligibility,
     ) -> Result<RunResult, HarnessError> {
         let capabilities = self.provider.capabilities();
         let selection = self.tools.select_scope_for_run(
@@ -364,8 +373,9 @@ impl AgentRunner {
                     metadata: request.metadata.clone(),
                     cancellation: call_cancellation.clone(),
                 };
+                let speculate_this_attempt = speculation_eligibility.begin_provider_attempt();
                 let completion = if let Some(controller) = self.speculation.as_ref().filter(|_| {
-                    continuation_usage.is_none() && self.provider.capabilities().supports_streaming
+                    speculate_this_attempt && self.provider.capabilities().supports_streaming
                 }) {
                     crate::speculation::stream_reactive_response(
                         &self.provider,
@@ -790,6 +800,24 @@ impl AgentRunner {
             .any(|id| id == &call.tool_id)
             && tool.definition().allows_caller(ToolCaller::Direct)
             && self.tools.validate(&call.tool_id, &arguments).is_ok()
+    }
+}
+
+/// One-shot execution state controlling whether a provider attempt may enter
+/// guarded streaming speculation. Every provider attempt consumes the only
+/// eligible state, including an attempt that fails and is retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpeculationEligibility {
+    FirstProviderAttempt,
+    SequentialOnly,
+}
+
+impl SpeculationEligibility {
+    pub(crate) fn begin_provider_attempt(&mut self) -> bool {
+        matches!(
+            std::mem::replace(self, Self::SequentialOnly),
+            Self::FirstProviderAttempt
+        )
     }
 }
 

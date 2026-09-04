@@ -16,7 +16,7 @@ use crate::{
         initial_messages, merge_generation, pre_event_terminal_result,
         pre_event_terminal_result_with_scopes, preflight_request, preflight_terminal_result,
         provider_deadline, push_tool_message, validate_model_response, validate_output,
-        DirectStrategyEvents, RunPreflight,
+        DirectStrategyEvents, RunPreflight, SpeculationEligibility,
     },
     AgentRunner, ExecutionPlan, HarnessError, Message, ModelRequest, ModelResponse,
     PlanConcurrency, PlanLifecycleOutcome, PlanNode, PlanNodeOutcome, PlanPhase, RunError,
@@ -77,6 +77,7 @@ struct StrategyRun<'a> {
     direct_scope: ToolScope,
     plan_scope: ToolScope,
     pending_speculative: Option<crate::speculation::ReadySpeculativeCommit>,
+    speculation_eligibility: SpeculationEligibility,
 }
 
 struct PreparedPlanScope {
@@ -260,6 +261,7 @@ impl AgentRunner {
                         prior_discovery: None,
                     }),
                     preflight,
+                    SpeculationEligibility::FirstProviderAttempt,
                 )
                 .await
             }
@@ -334,6 +336,7 @@ impl AgentRunner {
                                 prior_discovery: None,
                             }),
                             preflight,
+                            SpeculationEligibility::SequentialOnly,
                         )
                         .await
                     }
@@ -354,6 +357,7 @@ impl AgentRunner {
                                 )),
                             }),
                             preflight,
+                            SpeculationEligibility::SequentialOnly,
                         )
                         .await
                     }
@@ -510,7 +514,6 @@ impl AgentRunner {
                     plan_scope.clone(),
                     model_phase,
                     true,
-                    false,
                 )
                 .await
             {
@@ -736,7 +739,6 @@ impl AgentRunner {
                                 plan_scope.clone(),
                                 ModelCallPhase::Recovery,
                                 true,
-                                false,
                             )
                             .await
                         {
@@ -877,6 +879,7 @@ impl<'a> StrategyRun<'a> {
             direct_scope,
             plan_scope: prepared_plan.scope,
             pending_speculative: None,
+            speculation_eligibility: SpeculationEligibility::SequentialOnly,
         }
     }
 
@@ -940,7 +943,6 @@ impl<'a> StrategyRun<'a> {
         scope: ToolScope,
         phase: ModelCallPhase,
         reserve_final_synthesis: bool,
-        allow_speculation: bool,
     ) -> Result<Option<ModelResponse>, HarnessError> {
         let structured_output = self.structured_output_for_phase(phase)?;
         let mut provider_retries = 0;
@@ -985,7 +987,8 @@ impl<'a> StrategyRun<'a> {
                 metadata: self.request.metadata.clone(),
                 cancellation: call_cancellation.clone(),
             };
-            let completion = if allow_speculation {
+            let speculate_this_attempt = self.speculation_eligibility.begin_provider_attempt();
+            let completion = if speculate_this_attempt {
                 if let Some(controller) = self
                     .runner
                     .speculation
@@ -2067,7 +2070,6 @@ impl<'a> StrategyRun<'a> {
                     self.direct_scope.clone(),
                     phase,
                     false,
-                    self.selected == RunStrategy::Direct,
                 )
                 .await
             {
