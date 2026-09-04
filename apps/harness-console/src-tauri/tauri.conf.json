@@ -13,5 +13,5 @@
     "windows": [{"title": "Llama Harness Developer Console", "width": 1360, "height": 900, "minWidth": 960, "minHeight": 640}],
     "security": {"csp": "default-src 'self'; connect-src ipc: http://ipc.localhost"}
   },
-  "bundle": {"active": true, "targets": "all", "icon": ["icons/icon.ico"]}
+  "bundle": {"active": true, "targets": "all", "icon": ["icons/icon.ico", "../../../docs/assets/favicon.png"]}
 }
