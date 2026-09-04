@@ -13,7 +13,10 @@ All notable changes to this project are documented here.
 - Document the 0.1-to-0.2 migration, release sequencing, and immutable-package
   rollback boundaries.
 
-## 0.1.0 — Unreleased
+## 0.1.0 — Superseded development baseline
+
+This unpublished compatibility baseline was superseded by the unified 0.2.0
+release candidate.
 
 - Add the public Rust facade and release package metadata.
 - Stabilize named `ollama`, `observability`, `evals`, `tauri`, and `programmatic`
