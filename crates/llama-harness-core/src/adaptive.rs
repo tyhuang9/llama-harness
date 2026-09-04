@@ -570,7 +570,9 @@ impl AgentRunner {
         let plan_scope = run.plan_scope.clone();
         let mut planner_messages = run.messages.clone();
         #[cfg(feature = "programmatic")]
-        let planner_prompt = if self.adaptive_programmatic_allowlist.is_empty() {
+        let planner_prompt = if requested != RunStrategy::Adaptive
+            || self.adaptive_programmatic_allowlist.is_empty()
+        {
             PLANNER_PROMPT.to_owned()
         } else {
             planner_prompt_with_programmatic(&self.adaptive_programmatic_allowlist)
@@ -917,7 +919,12 @@ impl AgentRunner {
                     run.run_reactive(ModelCallPhase::Reactive).await;
                     return Ok(run.finish());
                 }
-                match self.prepare_adaptive_programmatic(&request, run.model_calls, run.deadline) {
+                match self.prepare_adaptive_programmatic(
+                    &request,
+                    workload_class,
+                    run.model_calls,
+                    run.deadline,
+                ) {
                     Ok(AdaptiveProgrammaticReadiness::Ready(prepared)) => {
                         run.deadline = prepared.deadline;
                         emit_discovery(

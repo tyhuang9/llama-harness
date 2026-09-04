@@ -334,7 +334,12 @@ async fn forced_declarative_rejects_a_programmatic_envelope() {
         .unwrap();
 
     assert_eq!(result.status, RunStatus::Failed);
-    assert_eq!(provider.requests().len(), 1);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].messages[0].content, LEGACY_PLANNER_PROMPT);
+    let structured = requests[0].structured_output.as_ref().unwrap();
+    assert_eq!(structured.name, "llama_harness_declarative_plan_v1");
+    assert!(!structured.schema.to_string().contains("programmatic"));
 }
 
 #[tokio::test]

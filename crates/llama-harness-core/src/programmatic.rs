@@ -613,9 +613,19 @@ impl AgentRunner {
     pub(crate) fn prepare_adaptive_programmatic(
         &self,
         request: &RunRequest,
+        workload_class: ProgrammaticWorkloadClass,
         model_calls: u32,
         run_deadline: Option<Instant>,
     ) -> Result<AdaptiveProgrammaticReadiness, HarnessError> {
+        // Re-prove promotion authority at the execution boundary. The planner
+        // caller performs the same check for an early downgrade, but admission
+        // must not depend on one adjacent call site remaining correct.
+        if !self
+            .adaptive_programmatic_allowlist
+            .contains(&workload_class)
+        {
+            return Ok(AdaptiveProgrammaticReadiness::Fallback(None));
+        }
         let Some(config) = self.programmatic.as_ref() else {
             return Ok(AdaptiveProgrammaticReadiness::Fallback(None));
         };
