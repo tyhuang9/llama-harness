@@ -113,6 +113,27 @@ fn compatible_minor_versions_and_optional_fields_are_accepted() {
 }
 
 #[test]
+fn v1_minor_negotiation_selects_the_highest_mutual_version() {
+    assert_eq!(ProtocolVersion::V1, ProtocolVersion::V1_0);
+    assert_eq!(ProtocolVersion::CURRENT, ProtocolVersion::V1_1);
+    assert_eq!(
+        ProtocolVersion::CURRENT.negotiate(ProtocolVersion::V1_0),
+        Some(ProtocolVersion::V1_0)
+    );
+    assert_eq!(
+        ProtocolVersion::CURRENT.negotiate(ProtocolVersion {
+            major: 1,
+            minor: 99
+        }),
+        Some(ProtocolVersion::V1_1)
+    );
+    assert_eq!(
+        ProtocolVersion::CURRENT.negotiate(ProtocolVersion { major: 2, minor: 0 }),
+        None
+    );
+}
+
+#[test]
 fn incompatible_major_unknown_messages_and_bounds_are_rejected() {
     let incompatible = r#"{"protocol_version":"2.0","request_id":"hello-1","type":"ping","payload":{"nonce":"ping-1"}}"#;
     assert!(matches!(

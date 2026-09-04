@@ -5,7 +5,7 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 pub const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 pub const MAX_JSON_DEPTH: u32 = 64;
 pub const MAX_PENDING_CALLBACKS: u16 = 128;
@@ -24,13 +24,36 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
-    pub const V1: Self = Self {
+    pub const V1_0: Self = Self {
         major: PROTOCOL_MAJOR,
-        minor: PROTOCOL_MINOR,
+        minor: 0,
     };
+    pub const V1_1: Self = Self {
+        major: PROTOCOL_MAJOR,
+        minor: 1,
+    };
+    /// The latest protocol version implemented by this crate.
+    pub const CURRENT: Self = Self::V1_1;
+    /// Compatibility alias for callers compiled against the original v1 API.
+    pub const V1: Self = Self::V1_0;
 
     pub const fn is_compatible_with(self, other: Self) -> bool {
         self.major == other.major
+    }
+
+    /// Selects the highest version mutually supported by a v1 peer offer.
+    pub const fn negotiate(self, offered: Self) -> Option<Self> {
+        if self.major != offered.major {
+            return None;
+        }
+        Some(Self {
+            major: self.major,
+            minor: if self.minor < offered.minor {
+                self.minor
+            } else {
+                offered.minor
+            },
+        })
     }
 }
 
@@ -112,7 +135,7 @@ impl Envelope {
         message: ProtocolMessage,
     ) -> Self {
         Self {
-            protocol_version: ProtocolVersion::V1,
+            protocol_version: ProtocolVersion::CURRENT,
             request_id: request_id.into(),
             run_id,
             message,
@@ -233,8 +256,22 @@ pub struct WireRunRequest {
     pub evaluation: Extensions,
     #[serde(default)]
     pub tools: Vec<WireToolDefinition>,
+    /// Optional v1.1 execution-strategy selection. Omitted requests preserve
+    /// the v1.0 adaptive/default execution behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<WireRunStrategy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_database_path: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireRunStrategy {
+    #[default]
+    Adaptive,
+    Direct,
+    DeclarativePlan,
+    Programmatic,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -349,6 +386,106 @@ pub struct WireToolDefinition {
     pub risk: WireToolRisk,
     pub idempotent: bool,
     pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parallel_safe: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "is_wire_cancellation_safety_unknown")]
+    pub cancellation_safety: WireCancellationSafety,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_latency_ms: Option<u64>,
+    #[serde(
+        default = "wire_direct_caller_only",
+        skip_serializing_if = "is_wire_direct_caller_only"
+    )]
+    pub allowed_callers: BTreeSet<WireToolCaller>,
+    #[serde(default, skip_serializing_if = "is_wire_speculation_policy_disabled")]
+    pub speculation_policy: WireSpeculationPolicy,
+    #[serde(default, skip_serializing_if = "is_wire_issue_safety_unknown")]
+    pub issue_safety: WireIssueSafety,
+    #[serde(default, skip_serializing_if = "is_wire_execution_location_unknown")]
+    pub execution_location: WireExecutionLocation,
+    #[serde(default, skip_serializing_if = "is_wire_network_egress_unknown")]
+    pub network_egress: WireNetworkEgress,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn wire_direct_caller_only() -> BTreeSet<WireToolCaller> {
+    BTreeSet::from([WireToolCaller::Direct])
+}
+
+fn is_wire_direct_caller_only(callers: &BTreeSet<WireToolCaller>) -> bool {
+    callers == &wire_direct_caller_only()
+}
+
+fn is_wire_cancellation_safety_unknown(value: &WireCancellationSafety) -> bool {
+    *value == WireCancellationSafety::Unknown
+}
+fn is_wire_speculation_policy_disabled(value: &WireSpeculationPolicy) -> bool {
+    *value == WireSpeculationPolicy::Disabled
+}
+fn is_wire_issue_safety_unknown(value: &WireIssueSafety) -> bool {
+    *value == WireIssueSafety::Unknown
+}
+fn is_wire_execution_location_unknown(value: &WireExecutionLocation) -> bool {
+    *value == WireExecutionLocation::Unknown
+}
+fn is_wire_network_egress_unknown(value: &WireNetworkEgress) -> bool {
+    *value == WireNetworkEgress::Unknown
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireCancellationSafety {
+    #[default]
+    Unknown,
+    Cooperative,
+    Guaranteed,
+}
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WireToolCaller {
+    Direct,
+    DeclarativePlan,
+    Programmatic,
+    Speculative,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireSpeculationPolicy {
+    #[default]
+    Disabled,
+    Enabled,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireIssueSafety {
+    #[default]
+    Unknown,
+    Guaranteed,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireExecutionLocation {
+    #[default]
+    Unknown,
+    LocalPrivate,
+    Remote,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireNetworkEgress {
+    #[default]
+    Unknown,
+    Prohibited,
+    Permitted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -470,6 +607,98 @@ pub enum WireRunEvent {
     ModelResponded {
         call_number: u32,
     },
+    ToolDiscoveryCompleted {
+        caller: WireToolCaller,
+        outcome: WireToolDiscoveryOutcome,
+        selection: WireToolDiscoverySelection,
+        candidate_count: u32,
+        selected_count: u32,
+        deferred_candidate_count: u32,
+        effective_tool_count_budget: u32,
+        effective_schema_byte_budget: u64,
+        selected_schema_bytes: u64,
+        expansion_count: u32,
+        expansion_limit: u32,
+        catalog_exceeded_budget: bool,
+        duration_ms: u64,
+    },
+    StrategySelected {
+        requested: WireRunStrategy,
+        selected: WireRunStrategy,
+        reason: WireStrategySelectionReason,
+    },
+    StrategyFallback {
+        from: WireRunStrategy,
+        to: WireRunStrategy,
+        reason: WireStrategyFallbackReason,
+    },
+    PlanLifecycle {
+        phase: WirePlanPhase,
+        attempt: u32,
+        outcome: WirePlanLifecycleOutcome,
+    },
+    PlanValidated {
+        attempt: u32,
+        node_count: u32,
+    },
+    ProgramLifecycle {
+        attempt: u32,
+        outcome: WireProgramLifecycleOutcome,
+    },
+    ProgramValidated {
+        attempt: u32,
+        statement_count: u32,
+        instruction_count: u32,
+    },
+    ProgramExecutionCompleted {
+        attempt: u32,
+        fuel_used: u64,
+        scheduling_slices: u64,
+        tool_yields: u32,
+        branches: u64,
+        loop_iterations: u64,
+        fanout_batches: u32,
+        partial_failures: u32,
+        peak_accounted_bytes: u64,
+        duration_ms: u64,
+    },
+    PlanNodeStarted {
+        node_id: String,
+        tool_id: String,
+        attempt: u32,
+        wave: u32,
+    },
+    PlanNodeCompleted {
+        node_id: String,
+        tool_id: String,
+        attempt: u32,
+        wave: u32,
+        ok: bool,
+        outcome: WirePlanNodeOutcome,
+        duration_ms: u64,
+    },
+    ToolEffectReused {
+        call_id: String,
+        tool_id: String,
+    },
+    StrategyUsage {
+        strategy: WireRunStrategy,
+        model_calls: u32,
+        planning_model_calls: u32,
+        repair_model_calls: u32,
+        recovery_model_calls: u32,
+        final_synthesis_model_calls: u32,
+        reactive_model_calls: u32,
+        tool_calls: u32,
+        tool_issued: u32,
+        tool_reused: u32,
+        tool_rejected: u32,
+        tool_pre_dispatch_aborted: u32,
+        tool_completed: u32,
+        tool_failed: u32,
+        tool_cancelled: u32,
+        duration_ms: u64,
+    },
     ToolRejected {
         call_id: String,
         tool_id: String,
@@ -491,6 +720,94 @@ pub enum WireRunEvent {
     Completed {
         status: WireRunStatus,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireToolDiscoveryOutcome {
+    #[default]
+    Selected,
+    LimitReached,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireToolDiscoverySelection {
+    #[default]
+    LegacyUnclassified,
+    EmptyCatalog,
+    NoCapacity,
+    FullCatalog,
+    HotOnly,
+    Exact,
+    LexicalConfident,
+    LexicalExpanded,
+    NoMatch,
+    CountLimit,
+    SchemaByteLimit,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireStrategySelectionReason {
+    Forced,
+    AdaptivePlanner,
+    PlannerSelectedDirect,
+    PlannerSelectedPlan,
+    CapabilityDowngrade,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireStrategyFallbackReason {
+    UnsupportedCapability,
+    InvalidPlan,
+    InvalidProgram,
+    ExecutionRecovery,
+    PlannerFailure,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireProgramLifecycleOutcome {
+    Started,
+    Validated,
+    Invalid,
+    Succeeded,
+    Fallback,
+    Failed,
+    Cancelled,
+    TimedOut,
+    LimitReached,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WirePlanPhase {
+    Planning,
+    Repair,
+    Validation,
+    Preflight,
+    Recovery,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WirePlanLifecycleOutcome {
+    Started,
+    Succeeded,
+    Invalid,
+    Rejected,
+    Failed,
+    Cancelled,
+    TimedOut,
+    LimitReached,
+    Skipped,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WirePlanNodeOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Rejected,
+    LimitReached,
+    Reused,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -628,4 +945,61 @@ pub struct ModelCapabilities {
     pub supports_tools: bool,
     pub supports_streaming: bool,
     pub supports_structured_output: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub supports_strict_tool_schemas: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub supports_streaming_tool_arguments: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub supports_parallel_tool_calls: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub supports_structured_plans: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub supports_programmatic_calling: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub programmatic_conformance: Option<WireProgrammaticConformance>,
+    #[serde(
+        default,
+        skip_serializing_if = "WireProviderCapabilityLimits::is_empty"
+    )]
+    pub limits: WireProviderCapabilityLimits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireProgrammaticConformance {
+    StrictJsonAstV1,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct WireProviderCapabilityLimits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tools: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tool_schema_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_parallel_tool_calls: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_streamed_argument_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_streamed_tool_calls: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_plan_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_plan_nodes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_program_bytes: Option<u64>,
+}
+
+impl WireProviderCapabilityLimits {
+    pub const fn is_empty(&self) -> bool {
+        self.max_tools.is_none()
+            && self.max_tool_schema_bytes.is_none()
+            && self.max_parallel_tool_calls.is_none()
+            && self.max_streamed_argument_bytes.is_none()
+            && self.max_streamed_tool_calls.is_none()
+            && self.max_plan_bytes.is_none()
+            && self.max_plan_nodes.is_none()
+            && self.max_program_bytes.is_none()
+    }
 }
