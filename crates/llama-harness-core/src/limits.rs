@@ -175,12 +175,30 @@ pub(crate) fn validate_schema_references(schema: &Value) -> Result<(), String> {
     }
 }
 
+struct JsonLengthCounter(u64);
+
+impl io::Write for JsonLengthCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(
+                u64::try_from(bytes.len()).map_err(|_| io::Error::other("length overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) fn serialized_len(value: &impl Serialize) -> Result<u64, HarnessError> {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len() as u64)
-        .map_err(|error| {
-            HarnessError::InvalidRequest(format!("payload is not serializable: {error}"))
-        })
+    let mut counter = JsonLengthCounter(0);
+    serde_json::to_writer(&mut counter, value).map_err(|error| {
+        HarnessError::InvalidRequest(format!("payload is not serializable: {error}"))
+    })?;
+    Ok(counter.0)
 }
 
 pub(crate) fn json_depth(value: &Value) -> u32 {

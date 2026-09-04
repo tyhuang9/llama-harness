@@ -9,13 +9,16 @@ cannot start safely.
 Adaptive planning is capability gated per strategy. Declarative plans require
 structured-plan support and sufficient plan, catalog, and model-call limits;
 Programmatic does not depend on declarative-plan support. The planner receives
-the union of tools authorized for the strategies that are actually eligible,
-so a Programmatic-only tool is visible during selection without becoming
-authorized for a declarative node. Every Adaptive planning request also receives
+the union of Direct tools and tools authorized for the advanced strategies that
+are actually eligible, so a Direct-only mutation can force a safe reactive
+choice and a Programmatic-only tool remains visible without becoming authorized
+for a declarative node. Every Adaptive planning request also receives
 value-free risk, read-only, idempotence, parallel-safety, cancellation, latency,
 and advanced-caller annotations. Shared concurrency keys are represented only
 as deterministic run-local group labels, and the complete annotated transcript
 and serialized model request are bounded before provider accounting or contact.
+The same serialized-request boundary applies to Direct calls, capability
+downgrades, and every Programmatic generation, repair, and synthesis phase.
 If no advanced strategy is eligible, the
 run emits fallback metadata and uses the existing direct reactive loop. A
 forced declarative run never silently changes its selected strategy.
@@ -110,9 +113,13 @@ Final synthesis receives only the program's explicitly bounded return value and
 a value-free broker summary (`total`, `succeeded`, and `failed`). Raw tool
 arguments and results are never copied into the synthesis prompt. A program
 must filter, aggregate, or otherwise reduce large intermediate values inside
-the sandbox before returning them; the acceptance suite proves that three
-256 KiB results produce a synthesis input smaller than one percent of their raw
-payload while the default transcript limit remains in force.
+the sandbox before returning them. Before VM execution, the host reserves the
+worst-case summary and derives a separate program-return bound that guarantees
+the complete final model request fits; this does not reduce the independent
+tool-response/intermediate-data bound. The acceptance suite proves that three
+256 KiB results are reduced to the value `6` and produce a synthesis input
+smaller than one percent of their raw payload while the default transcript
+limit remains in force.
 
 One correction prompt is permitted only before an effect is dispatched and
 only while more than one model call remains: one call stays reserved for final

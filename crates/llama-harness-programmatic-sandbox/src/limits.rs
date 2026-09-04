@@ -19,6 +19,7 @@ pub const HARD_LIMITS: SandboxLimits = SandboxLimits {
     max_live_bytes: 16 * 1024 * 1024,
     max_cumulative_bytes: 64 * 1024 * 1024,
     max_output_bytes: 1024 * 1024,
+    max_return_bytes: 1024 * 1024,
 };
 
 /// Resource limits applied while parsing, compiling, and executing a program.
@@ -60,8 +61,10 @@ pub struct SandboxLimits {
     pub max_live_bytes: usize,
     /// Maximum cumulatively allocated VM-owned bytes.
     pub max_cumulative_bytes: usize,
-    /// Maximum serialized return value bytes.
+    /// Maximum serialized tool-response batch bytes retained by the VM.
     pub max_output_bytes: usize,
+    /// Maximum serialized program return bytes.
+    pub max_return_bytes: usize,
 }
 
 impl Default for SandboxLimits {
@@ -84,6 +87,7 @@ impl Default for SandboxLimits {
             max_live_bytes: 4 * 1024 * 1024,
             max_cumulative_bytes: 16 * 1024 * 1024,
             max_output_bytes: 1024 * 1024,
+            max_return_bytes: 1024 * 1024,
         }
     }
 }
@@ -122,6 +126,7 @@ impl SandboxLimits {
         bounded!(max_live_bytes);
         bounded!(max_cumulative_bytes);
         bounded!(max_output_bytes);
+        bounded!(max_return_bytes);
         if self.max_slice_fuel > self.max_fuel {
             return Err(SandboxError::new(
                 SandboxErrorCode::InvalidLimits,
@@ -159,6 +164,7 @@ impl SandboxLimits {
             max_live_bytes: self.max_live_bytes.min(other.max_live_bytes),
             max_cumulative_bytes: self.max_cumulative_bytes.min(other.max_cumulative_bytes),
             max_output_bytes: self.max_output_bytes.min(other.max_output_bytes),
+            max_return_bytes: self.max_return_bytes.min(other.max_return_bytes),
         }
     }
 }

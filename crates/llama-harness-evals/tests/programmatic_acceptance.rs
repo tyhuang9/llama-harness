@@ -306,7 +306,14 @@ fn program(scenario: &str, tool_ids: &[String]) -> String {
             json!({"kind": "fan_out", "name": "results", "tool_id": "read", "item": "item", "max_calls": 3,
                 "collection": {"kind": "array", "items": [{"kind": "integer", "value": 1}, {"kind": "integer", "value": 2}, {"kind": "integer", "value": 3}]},
                 "arguments": {"kind": "object", "entries": [{"key": "value", "value": {"kind": "variable", "name": "item"}}]}}),
-            ret(scenario),
+            json!({"kind": "map", "name": "values", "item": "result", "max_items": 3,
+                "collection": {"kind": "variable", "name": "results"},
+                "value": {"kind": "path", "value": {"kind": "variable", "name": "result"}, "pointer": "/output/value"}}),
+            json!({"kind": "reduce", "name": "total", "item": "item", "accumulator": "acc", "max_items": 3,
+                "collection": {"kind": "variable", "name": "values"},
+                "initial": {"kind": "integer", "value": 0},
+                "value": {"kind": "binary", "operator": "add", "left": {"kind": "variable", "name": "acc"}, "right": {"kind": "variable", "name": "item"}}}),
+            json!({"kind": "return", "value": {"kind": "variable", "name": "total"}}),
         ],
         "filter" => vec![
             invoke(
@@ -578,6 +585,16 @@ impl EvalExecutor for AcceptanceExecutor {
             if synthesis_input.contains("\"payload\"") {
                 return Err(EvalError::Executor(
                     "programmatic synthesis reinjected raw tool-result payloads".into(),
+                ));
+            }
+            let synthesis_value: Value = serde_json::from_str(synthesis_input).map_err(|_| {
+                EvalError::Executor(
+                    "programmatic large-intermediate synthesis input was not JSON".into(),
+                )
+            })?;
+            if synthesis_value["program_return"] != json!(6) {
+                return Err(EvalError::Executor(
+                    "programmatic large-intermediate results were not reduced by the VM".into(),
                 ));
             }
         }

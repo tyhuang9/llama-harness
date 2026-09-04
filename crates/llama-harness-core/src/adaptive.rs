@@ -12,8 +12,8 @@ use crate::{
     },
     runner::{
         agent_structured_output, apply_terminal_error, discovery_limit_terminal_result,
-        discovery_limit_terminal_result_with_scopes, emit_discovery, ensure_transcript,
-        initial_messages, merge_generation, pre_event_terminal_result,
+        discovery_limit_terminal_result_with_scopes, emit_discovery, ensure_model_request_size,
+        ensure_transcript, initial_messages, merge_generation, pre_event_terminal_result,
         pre_event_terminal_result_with_scopes, preflight_request, preflight_terminal_result,
         provider_deadline, push_tool_message, validate_model_response, validate_output,
         DirectStrategyEvents, RunPreflight, SpeculationEligibility,
@@ -593,12 +593,19 @@ impl AgentRunner {
             ));
         }
 
-        let mut callers = Vec::with_capacity(2);
+        let mut callers = Vec::with_capacity(3);
         if declarative_available {
             callers.push(ToolCaller::DeclarativePlan);
         }
         if programmatic_available {
             callers.push(ToolCaller::Programmatic);
+        }
+        // Adaptive planning must see Direct-only mutations and approval-bound
+        // tools as well as advanced-callable tools. The scope retains an
+        // advanced caller for declarative execution, and every selected mode
+        // obtains or revalidates its own caller-specific execution scope.
+        if requested == RunStrategy::Adaptive {
+            callers.push(ToolCaller::Direct);
         }
         let scope_caller = callers[0];
         let selection = self.tools.select_scope_for_run_callers(
@@ -1303,13 +1310,7 @@ impl<'a> StrategyRun<'a> {
                 metadata: self.request.metadata.clone(),
                 cancellation: call_cancellation.clone(),
             };
-            if serialized_len(&model_request)? > self.request.agent.limits.max_request_payload_bytes
-            {
-                return Err(HarnessError::ResourceLimit(format!(
-                    "model request exceeds {} bytes",
-                    self.request.agent.limits.max_request_payload_bytes
-                )));
-            }
+            ensure_model_request_size(&model_request, &self.request.agent.limits)?;
             self.model_calls += 1;
             match phase {
                 ModelCallPhase::Planning => self.planning_model_calls += 1,

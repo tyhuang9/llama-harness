@@ -2744,6 +2744,121 @@ async fn three_call_programmatic_budget_allows_repair_and_reserves_final_synthes
 }
 
 #[tokio::test]
+async fn programmatic_generation_and_repair_requests_are_bounded_before_accounting() {
+    let valid_program = return_program_with_exact_serialized_bytes(256);
+    let probe = Arc::new(
+        MockModelProvider::scripted([
+            final_response("not json"),
+            final_response(valid_program),
+            final_response("done"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    AgentRunner::builder(probe.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(request(&[]), RunStrategy::Programmatic)
+        .await
+        .unwrap();
+    let probe_requests = probe.requests();
+    let generation_bytes = serde_json::to_vec(&probe_requests[0]).unwrap().len() as u64;
+    let repair_bytes = serde_json::to_vec(&probe_requests[1]).unwrap().len() as u64;
+    assert!(repair_bytes > generation_bytes);
+
+    for (limit, expected_provider_calls, expected_model_calls) in [
+        (generation_bytes - 1, 0usize, 0u32),
+        (generation_bytes, 1usize, 1u32),
+    ] {
+        let provider = Arc::new(
+            MockModelProvider::scripted([final_response("not json")])
+                .with_capabilities(capabilities()),
+        );
+        let events = Arc::new(InMemoryEventSink::default());
+        let mut run_request = request(&[]);
+        run_request.agent.limits.max_request_payload_bytes = limit;
+        assert!(serde_json::to_vec(&run_request).unwrap().len() as u64 <= limit);
+        let result = AgentRunner::builder(provider.clone())
+            .event_sink(events.clone())
+            .programmatic(ProgrammaticHostConfig::default())
+            .build()
+            .run_with_strategy(run_request, RunStrategy::Programmatic)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, RunStatus::LimitReached);
+        assert_eq!(provider.requests().len(), expected_provider_calls);
+        assert_eq!(
+            events
+                .events()
+                .iter()
+                .filter(|record| matches!(record.event, RunEvent::ModelRequested { .. }))
+                .count(),
+            expected_model_calls as usize
+        );
+        assert!(events.events().iter().any(|record| matches!(
+            record.event,
+            RunEvent::StrategyUsage {
+                strategy: RunStrategy::Programmatic,
+                model_calls,
+                planning_model_calls,
+                repair_model_calls: 0,
+                final_synthesis_model_calls: 0,
+                ..
+            } if model_calls == expected_model_calls && planning_model_calls == expected_model_calls
+        )));
+    }
+}
+
+#[tokio::test]
+async fn programmatic_reserves_synthesis_request_capacity_before_vm_execution() {
+    let probe = Arc::new(
+        MockModelProvider::scripted([
+            final_response(return_program_with_exact_serialized_bytes(256)),
+            final_response("done"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    AgentRunner::builder(probe.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(request(&[]), RunStrategy::Programmatic)
+        .await
+        .unwrap();
+    let generation_bytes = serde_json::to_vec(&probe.requests()[0]).unwrap().len() as u64;
+
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(return_program_with_exact_serialized_bytes(
+            32 * 1024,
+        ))])
+        .with_capabilities(capabilities()),
+    );
+    let events = Arc::new(InMemoryEventSink::default());
+    let mut run_request = request(&[]);
+    run_request.agent.limits.max_request_payload_bytes = generation_bytes + 512;
+    let result = AgentRunner::builder(provider.clone())
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(run_request, RunStrategy::Programmatic)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::LimitReached);
+    assert_eq!(provider.requests().len(), 1);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            strategy: RunStrategy::Programmatic,
+            model_calls: 1,
+            planning_model_calls: 1,
+            repair_model_calls: 0,
+            final_synthesis_model_calls: 0,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
 async fn program_lifecycle_succeeds_only_after_final_synthesis() {
     let program =
         json!({"version":1,"body":[{"kind":"return","value":{"kind":"string","value":"safe"}}]});

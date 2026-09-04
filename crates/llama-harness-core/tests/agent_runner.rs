@@ -1505,6 +1505,49 @@ async fn request_and_model_response_byte_limits_are_inclusive() {
 }
 
 #[tokio::test]
+async fn expanded_direct_requests_are_bounded_before_provider_and_accounting() {
+    for strategy in [RunStrategy::Direct, RunStrategy::Adaptive] {
+        let provider = Arc::new(MockModelProvider::scripted([]));
+        let events = Arc::new(InMemoryEventSink::default());
+        let tool = Arc::new(TestTool::read(
+            "read",
+            json!({
+                "type": "object",
+                "description": "x".repeat(16 * 1024),
+            }),
+        ));
+        let mut run_request = request();
+        run_request.agent.limits.max_request_payload_bytes = 4 * 1024;
+        let result = AgentRunner::builder(provider.clone())
+            .tools(registry(tool as Arc<dyn Tool>))
+            .event_sink(events.clone())
+            .build()
+            .run_with_strategy(run_request, strategy)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, RunStatus::LimitReached, "{strategy:?}");
+        assert!(provider.requests().is_empty(), "{strategy:?}");
+        let records = events.events();
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record.event, RunEvent::ModelRequested { .. })),
+            "{strategy:?}"
+        );
+        assert!(records.iter().any(|record| matches!(
+            record.event,
+            RunEvent::StrategyUsage {
+                strategy: RunStrategy::Direct,
+                model_calls: 0,
+                reactive_model_calls: 0,
+                ..
+            }
+        )));
+    }
+}
+
+#[tokio::test]
 async fn tool_argument_and_result_byte_limits_are_inclusive() {
     let exact_arguments = "{}";
     let exact_tool = Arc::new(TestTool::read("read", json!({"type": "object"})));

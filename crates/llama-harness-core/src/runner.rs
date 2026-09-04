@@ -368,11 +368,6 @@ impl AgentRunner {
                     break 'run;
                 }
 
-                model_calls += 1;
-                events.emit(RunEvent::ModelRequested {
-                    call_number: model_calls,
-                    model: model.clone(),
-                });
                 let call_cancellation = request.cancellation.child_token();
                 let call_deadline = match provider_deadline(
                     deadline,
@@ -397,6 +392,16 @@ impl AgentRunner {
                     metadata: request.metadata.clone(),
                     cancellation: call_cancellation.clone(),
                 };
+                if let Err(error) = ensure_model_request_size(&model_request, &request.agent.limits)
+                {
+                    apply_terminal_error(&mut result, error);
+                    break 'run;
+                }
+                model_calls += 1;
+                events.emit(RunEvent::ModelRequested {
+                    call_number: model_calls,
+                    model: model.clone(),
+                });
                 let speculate_this_attempt = speculation_eligibility.begin_provider_attempt();
                 let completion = if let Some(controller) = self.speculation.as_ref().filter(|_| {
                     speculate_this_attempt && self.provider.capabilities().supports_streaming
@@ -1296,6 +1301,19 @@ pub(crate) fn validate_model_response(
         return Err(HarnessError::ResourceLimit(format!(
             "model response exceeds {} bytes",
             limits.max_model_response_bytes
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_model_request_size(
+    request: &ModelRequest,
+    limits: &AgentLimits,
+) -> Result<(), HarnessError> {
+    if serialized_len(request)? > limits.max_request_payload_bytes {
+        return Err(HarnessError::ResourceLimit(format!(
+            "model request exceeds {} bytes",
+            limits.max_request_payload_bytes
         )));
     }
     Ok(())

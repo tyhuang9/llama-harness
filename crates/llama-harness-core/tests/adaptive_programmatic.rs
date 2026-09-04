@@ -51,6 +51,13 @@ fn return_program() -> String {
     .to_string()
 }
 
+fn large_return_program(bytes: usize) -> String {
+    json!({"version":1,"body":[
+        {"kind":"return","value":{"kind":"string","value":"x".repeat(bytes)}}
+    ]})
+    .to_string()
+}
+
 struct TestTool {
     definition: ToolDefinition,
     fail: bool,
@@ -528,15 +535,27 @@ async fn mixed_caller_planner_catalog_describes_each_eligible_strategy() {
         TestTool::new("programmatic_only", [ToolCaller::Programmatic], false);
     programmatic_only.definition.concurrency_key = Some("tenant-secret-resource".into());
     let programmatic_only = Arc::new(programmatic_only);
+    let mut direct_only = TestTool::new("direct_only", [ToolCaller::Direct], false);
+    direct_only.definition.risk = ToolRisk::High;
+    direct_only.definition.read_only = false;
+    direct_only.definition.idempotent = false;
+    direct_only.definition.parallel_safe = false;
+    let direct_only = Arc::new(direct_only);
+    let events = Arc::new(InMemoryEventSink::default());
     let result = AgentRunner::builder(provider.clone())
         .tools(registry([
             declarative_only as Arc<dyn Tool>,
             programmatic_only as Arc<dyn Tool>,
+            direct_only as Arc<dyn Tool>,
         ]))
+        .event_sink(events.clone())
         .programmatic(ProgrammaticHostConfig::default())
         .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
         .build()
-        .run(request(&["declarative_only", "programmatic_only"], 3))
+        .run(request(
+            &["declarative_only", "programmatic_only", "direct_only"],
+            3,
+        ))
         .await
         .unwrap();
 
@@ -546,11 +565,90 @@ async fn mixed_caller_planner_catalog_describes_each_eligible_strategy() {
         .contains(r#""id":"declarative_only","allowed_advanced_strategies":["declarative_plan"]"#));
     assert!(prompt
         .contains(r#""id":"programmatic_only","allowed_advanced_strategies":["programmatic"]"#));
+    assert!(prompt.contains(r#""id":"direct_only","allowed_advanced_strategies":[]"#));
     assert!(!prompt.contains("tenant-secret-resource"));
     assert_eq!(
         prompt.matches(r#""concurrency_group":"group_1""#).count(),
         2
     );
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategySelected {
+            requested: RunStrategy::Adaptive,
+            selected: RunStrategy::Direct,
+            reason: StrategySelectionReason::PlannerSelectedDirect,
+        }
+    )));
+}
+
+#[tokio::test]
+async fn adaptive_programmatic_reserves_synthesis_capacity_before_vm_execution() {
+    let program = large_return_program(32 * 1024);
+    let probe_provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(proposal(ProgrammaticWorkloadClass::Loop)),
+            final_response(program.clone()),
+            final_response("done"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let probe_tool = Arc::new(TestTool::new(
+        "program_only",
+        [ToolCaller::Programmatic],
+        false,
+    ));
+    AgentRunner::builder(probe_provider.clone())
+        .tools(registry([probe_tool as Arc<dyn Tool>]))
+        .programmatic(ProgrammaticHostConfig::default())
+        .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
+        .build()
+        .run(request(&["program_only"], 3))
+        .await
+        .unwrap();
+    let probe_requests = probe_provider.requests();
+    let pre_execution_request_bytes = probe_requests[..2]
+        .iter()
+        .map(|request| serde_json::to_vec(request).unwrap().len() as u64)
+        .max()
+        .unwrap();
+
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(proposal(ProgrammaticWorkloadClass::Loop)),
+            final_response(program),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let tool = Arc::new(TestTool::new(
+        "program_only",
+        [ToolCaller::Programmatic],
+        false,
+    ));
+    let events = Arc::new(InMemoryEventSink::default());
+    let mut run_request = request(&["program_only"], 3);
+    run_request.agent.limits.max_request_payload_bytes = pre_execution_request_bytes + 512;
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([tool.clone() as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::LimitReached);
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            strategy: RunStrategy::Programmatic,
+            model_calls: 2,
+            final_synthesis_model_calls: 0,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]

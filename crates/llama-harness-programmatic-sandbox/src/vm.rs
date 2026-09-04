@@ -789,7 +789,7 @@ impl Execution {
                 self.start_materialize(value, MaterializePurpose::FanOut)?;
             }
             EvalPurpose::Return => {
-                if value.measurement().serialized > self.program.limits.max_output_bytes {
+                if value.measurement().serialized > self.program.limits.max_return_bytes {
                     return Err(resource("output byte limit exceeded"));
                 }
                 self.start_materialize(value, MaterializePurpose::Return)?;
@@ -2807,6 +2807,33 @@ mod tests {
                 other => panic!("unexpected outcome: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn program_return_limit_is_independent_from_tool_response_limit() {
+        let raw =
+            r#"{"version":1,"body":[{"kind":"return","value":{"kind":"string","value":"abc"}}]}"#;
+        let rejected_limits = SandboxLimits {
+            max_return_bytes: 4,
+            ..SandboxLimits::default()
+        };
+        let mut rejected = execution(raw, 15, rejected_limits);
+        let error = loop {
+            match rejected.step(1) {
+                Ok(StepOutcome::Sliced) => {}
+                Ok(other) => panic!("unexpected outcome: {other:?}"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.code(), SandboxErrorCode::ResourceLimit);
+
+        let admitted_limits = SandboxLimits {
+            max_output_bytes: 1,
+            max_return_bytes: 5,
+            ..SandboxLimits::default()
+        };
+        let mut admitted = execution(raw, 16, admitted_limits);
+        assert_eq!(complete(&mut admitted, 1), json!("abc"));
     }
 
     #[test]

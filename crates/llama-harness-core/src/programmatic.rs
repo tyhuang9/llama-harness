@@ -4,9 +4,9 @@ use crate::{
     event::{EventEmitter, ProgramLifecycleOutcome, RunEvent, StrategySelectionReason},
     runner::{
         agent_structured_output, apply_terminal_error, await_guarded, check_stopped,
-        emit_discovery, ensure_transcript, initial_messages, merge_generation, provider_deadline,
-        validate_model_response, validate_output, DirectContinuation, DirectStrategyEvents,
-        ProgrammaticUsage, RunPreflight,
+        emit_discovery, ensure_model_request_size, ensure_transcript, initial_messages,
+        merge_generation, provider_deadline, validate_model_response, validate_output,
+        DirectContinuation, DirectStrategyEvents, ProgrammaticUsage, RunPreflight,
     },
     AgentRunner, HarnessError, Message, ModelCapabilities, ModelRequest, ModelResponse,
     ProgrammaticConformance, RunRequest, RunResult, RunStatus, RunStrategy, StrategyFallbackReason,
@@ -311,13 +311,21 @@ impl ProgrammaticTranscript {
             summary: ProgrammaticBrokerSummary::default(),
             initial_message_bytes,
             limit: request.agent.limits.max_transcript_bytes,
-            maximum_program_return_bytes: u64::try_from(limits.max_output_bytes).map_err(|_| {
+            maximum_program_return_bytes: u64::try_from(limits.max_return_bytes).map_err(|_| {
                 HarnessError::ResourceLimit(
                     "program return byte limit does not fit accounting".into(),
                 )
             })?,
         };
-        transcript.ensure_summary(transcript.summary, transcript.maximum_program_return_bytes)?;
+        let maximum_calls = u64::from(request.agent.limits.max_tool_calls);
+        transcript.ensure_summary(
+            ProgrammaticBrokerSummary {
+                total: maximum_calls,
+                succeeded: maximum_calls,
+                failed: maximum_calls,
+            },
+            transcript.maximum_program_return_bytes,
+        )?;
         Ok(transcript)
     }
 
@@ -544,6 +552,73 @@ fn effective_programmatic_limits(
             "effective provider program byte limit is invalid".into(),
         )
     })?;
+    Ok(limits)
+}
+
+fn constrain_programmatic_synthesis_output(
+    mut limits: SandboxLimits,
+    request: &RunRequest,
+    model: &str,
+    capabilities: &ModelCapabilities,
+) -> Result<SandboxLimits, HarnessError> {
+    let maximum_calls = u64::from(request.agent.limits.max_tool_calls);
+    let maximum_summary = ProgrammaticBrokerSummary {
+        total: maximum_calls,
+        succeeded: maximum_calls,
+        failed: maximum_calls,
+    };
+    let fixed_payload_bytes = synthesis_payload_bytes(0, maximum_summary)?;
+    let mut messages = initial_messages(request);
+    messages.push(Message::system(SYNTHESIS_PROMPT));
+    messages.push(Message::user(String::new()));
+    let empty_request = ModelRequest {
+        model: model.into(),
+        messages,
+        tools: Vec::new(),
+        prepared_tools: None,
+        generation: merge_generation(&request.agent.generation, &request.overrides.generation),
+        structured_output: agent_structured_output(
+            capabilities,
+            request.agent.output_schema.as_ref(),
+        ),
+        metadata: request.metadata.clone(),
+        cancellation: request.cancellation.child_token(),
+    };
+    let base_bytes = crate::limits::serialized_len(&empty_request)?;
+    let available = request
+        .agent
+        .limits
+        .max_request_payload_bytes
+        .checked_sub(base_bytes)
+        .ok_or_else(|| {
+            HarnessError::ResourceLimit(format!(
+                "programmatic synthesis request exceeds {} bytes",
+                request.agent.limits.max_request_payload_bytes
+            ))
+        })?;
+    // The synthesis payload is valid JSON text. When that text is serialized
+    // as Message.content, each byte is preserved or escaped to at most two
+    // bytes (quotes and backslashes). Reserve that worst case before the VM
+    // can issue a tool effect.
+    let maximum_payload_bytes = available / 2;
+    let maximum_return_bytes = maximum_payload_bytes
+        .checked_sub(fixed_payload_bytes)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| {
+            HarnessError::ResourceLimit(format!(
+                "programmatic synthesis request exceeds {} bytes",
+                request.agent.limits.max_request_payload_bytes
+            ))
+        })?;
+    limits.max_return_bytes =
+        limits
+            .max_return_bytes
+            .min(usize::try_from(maximum_return_bytes).map_err(|_| {
+                HarnessError::ResourceLimit(
+                    "programmatic synthesis output limit does not fit memory".into(),
+                )
+            })?);
+    limits.validate().map_err(sandbox_error)?;
     Ok(limits)
 }
 
@@ -849,6 +924,8 @@ impl AgentRunner {
                         )
                     })?,
             };
+            let limits =
+                constrain_programmatic_synthesis_output(limits, request, &model, &capabilities)?;
             let mut broker_transcript = ProgrammaticTranscript::new(request, &limits)?;
             let mut generation_messages = initial_messages(request);
             generation_messages.push(Message::system(PROGRAM_PROMPT));
@@ -1153,29 +1230,28 @@ impl AgentRunner {
                 "model call limit reached".into(),
             ));
         }
+        let call_cancellation = request.cancellation.child_token();
+        let call_deadline =
+            provider_deadline(deadline, request.agent.limits.max_model_call_duration_ms)?;
+        let model_request = ModelRequest {
+            model: model.into(),
+            messages,
+            tools: scope.map_or_else(Vec::new, |scope| scope.definitions().to_vec()),
+            prepared_tools: scope.and_then(ToolScope::prepared),
+            generation: merge_generation(&request.agent.generation, &request.overrides.generation),
+            structured_output,
+            metadata: request.metadata.clone(),
+            cancellation: call_cancellation.clone(),
+        };
+        ensure_model_request_size(&model_request, &request.agent.limits)?;
         *model_calls += 1;
         *phase_calls += 1;
         events.emit(RunEvent::ModelRequested {
             call_number: *model_calls,
             model: model.into(),
         });
-        let call_cancellation = request.cancellation.child_token();
-        let call_deadline =
-            provider_deadline(deadline, request.agent.limits.max_model_call_duration_ms)?;
         let response = await_guarded(
-            self.provider.complete(ModelRequest {
-                model: model.into(),
-                messages,
-                tools: scope.map_or_else(Vec::new, |scope| scope.definitions().to_vec()),
-                prepared_tools: scope.and_then(ToolScope::prepared),
-                generation: merge_generation(
-                    &request.agent.generation,
-                    &request.overrides.generation,
-                ),
-                structured_output,
-                metadata: request.metadata.clone(),
-                cancellation: call_cancellation.clone(),
-            }),
+            self.provider.complete(model_request),
             &request.cancellation,
             call_deadline,
             "provider call deadline reached",
