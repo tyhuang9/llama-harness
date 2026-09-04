@@ -258,6 +258,66 @@ fn readiness_result(
     result
 }
 
+fn cohort_result(
+    case_id: &str,
+    strategy: RunStrategy,
+    repetition: u32,
+    recovery_success: bool,
+    tool_selection_accuracy: f64,
+    duration_ms: u64,
+    tokens: u64,
+) -> EvaluationCaseResult {
+    let mut result = readiness_result(strategy, recovery_success, duration_ms, tokens);
+    result.case_id = case_id.into();
+    result.repetition = repetition;
+    result.strategy_metrics.tool_selection_accuracy = Some(tool_selection_accuracy);
+    result
+}
+
+fn cohort_strategy_results(
+    case_id: &str,
+    strategy: RunStrategy,
+    samples: &[(bool, f64, u64, u64)],
+) -> Vec<EvaluationCaseResult> {
+    samples
+        .iter()
+        .enumerate()
+        .map(
+            |(index, &(recovery_success, tool_selection_accuracy, duration_ms, tokens))| {
+                cohort_result(
+                    case_id,
+                    strategy,
+                    u32::try_from(index + 1).unwrap(),
+                    recovery_success,
+                    tool_selection_accuracy,
+                    duration_ms,
+                    tokens,
+                )
+            },
+        )
+        .collect()
+}
+
+fn readiness_for_cohort(
+    case_id: &str,
+    adaptive: &[(bool, f64, u64, u64)],
+    direct: &[(bool, f64, u64, u64)],
+    declarative: &[(bool, f64, u64, u64)],
+) -> llama_harness_evals::AdaptiveReadiness {
+    let mut results = cohort_strategy_results(case_id, RunStrategy::Adaptive, adaptive);
+    results.extend(cohort_strategy_results(
+        case_id,
+        RunStrategy::Direct,
+        direct,
+    ));
+    results.extend(cohort_strategy_results(
+        case_id,
+        RunStrategy::DeclarativePlan,
+        declarative,
+    ));
+    EvaluationReport::new("cohort-ranking", "suite", 1, results).adaptive_readiness()
+}
+
 #[test]
 fn adaptive_readiness_is_input_order_independent_and_efficiency_is_nonblocking() {
     let adaptive = readiness_result(RunStrategy::Adaptive, false, 1_200, 1_200);
@@ -289,6 +349,8 @@ fn adaptive_readiness_is_input_order_independent_and_efficiency_is_nonblocking()
     assert_eq!(forward, reverse);
     assert!(forward.ready);
     assert_eq!(forward.comparisons.len(), 1);
+    assert_eq!(forward.comparisons[0].sample_count, 1);
+    assert_eq!(forward.comparisons[0].repetition, 0);
     assert_eq!(
         forward.comparisons[0].best_forced_strategy,
         RunStrategy::DeclarativePlan
@@ -301,6 +363,8 @@ fn adaptive_readiness_is_input_order_independent_and_efficiency_is_nonblocking()
     assert_eq!(forward.comparisons[0].adaptive.tool_selection_accuracy, 0.9);
     assert!(forward.comparisons[0].best_forced.recovery_success);
     assert_eq!(forward.comparisons[0].adaptive.total_tokens, 1_200);
+    assert_eq!(forward.comparisons[0].adaptive.p50_latency_ms, 1_200);
+    assert_eq!(forward.comparisons[0].adaptive.p95_latency_ms, 1_200);
     assert_eq!(forward.comparisons[0].adaptive.model_calls, 2);
     assert_eq!(forward.comparisons[0].adaptive.tool_calls, 1);
     assert_eq!(forward.comparisons[0].adaptive.wasted_tool_calls, 0);
@@ -323,7 +387,7 @@ fn adaptive_readiness_is_input_order_independent_and_efficiency_is_nonblocking()
     assert!(matches!(
         candidates[0].disposition,
         ForcedCandidateDisposition::Outranked {
-            decisive_criterion: StrategySelectionCriterion::RecoverySuccess
+            decisive_criterion: StrategySelectionCriterion::RecoverySuccessRate
         }
     ));
     assert_eq!(
@@ -335,6 +399,334 @@ fn adaptive_readiness_is_input_order_independent_and_efficiency_is_nonblocking()
         ForcedCandidateDisposition::Ineligible { code, .. }
             if code == "safety_hard_gate_failed"
     ));
+}
+
+#[test]
+fn cohort_percentiles_use_nearest_rank_for_odd_and_even_sample_counts() {
+    let mut results = cohort_strategy_results(
+        "odd",
+        RunStrategy::Adaptive,
+        &[
+            (true, 0.9, 11, 10),
+            (true, 0.9, 21, 10),
+            (true, 0.9, 31, 10),
+            (true, 0.9, 41, 10),
+            (true, 0.9, 51, 10),
+        ],
+    );
+    results.extend(cohort_strategy_results(
+        "odd",
+        RunStrategy::Direct,
+        &[
+            (true, 0.9, 10, 10),
+            (true, 0.9, 20, 10),
+            (true, 0.9, 30, 10),
+            (true, 0.9, 40, 10),
+            (true, 0.9, 50, 10),
+        ],
+    ));
+    results.extend(cohort_strategy_results(
+        "even",
+        RunStrategy::Adaptive,
+        &[
+            (true, 0.9, 11, 10),
+            (true, 0.9, 21, 10),
+            (true, 0.9, 31, 10),
+            (true, 0.9, 41, 10),
+        ],
+    ));
+    results.extend(cohort_strategy_results(
+        "even",
+        RunStrategy::Direct,
+        &[
+            (true, 0.9, 10, 10),
+            (true, 0.9, 20, 10),
+            (true, 0.9, 30, 10),
+            (true, 0.9, 40, 10),
+        ],
+    ));
+
+    let readiness = EvaluationReport::new("percentiles", "suite", 1, results).adaptive_readiness();
+    assert!(readiness.ready, "{readiness:#?}");
+    assert_eq!(readiness.comparisons.len(), 2);
+    let odd = &readiness.comparisons[0];
+    assert_eq!(odd.case_id, "even");
+    assert_eq!(odd.sample_count, 4);
+    assert_eq!(odd.best_forced.p50_latency_ms, 20);
+    assert_eq!(odd.best_forced.p95_latency_ms, 40);
+    let even = &readiness.comparisons[1];
+    assert_eq!(even.case_id, "odd");
+    assert_eq!(even.sample_count, 5);
+    assert_eq!(even.best_forced.p50_latency_ms, 30);
+    assert_eq!(even.best_forced.p95_latency_ms, 50);
+}
+
+#[test]
+fn cohort_p95_reports_a_high_tail_outlier_at_the_nearest_rank() {
+    let direct = [
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 10, 10),
+        (true, 0.9, 500, 10),
+        (true, 0.9, 1_000, 10),
+    ];
+    let adaptive = direct
+        .map(|(recovery, accuracy, latency, tokens)| (recovery, accuracy, latency + 1, tokens));
+    let readiness = readiness_for_cohort("outlier", &adaptive, &direct, &[]);
+    assert!(readiness.ready, "{readiness:#?}");
+    assert_eq!(readiness.comparisons[0].sample_count, 20);
+    assert_eq!(readiness.comparisons[0].best_forced.p50_latency_ms, 10);
+    assert_eq!(readiness.comparisons[0].best_forced.p95_latency_ms, 500);
+}
+
+#[test]
+fn cohort_readiness_fails_closed_on_duplicate_or_mismatched_repetitions() {
+    let adaptive = cohort_strategy_results(
+        "mismatch",
+        RunStrategy::Adaptive,
+        &[(true, 0.9, 10, 10), (true, 0.9, 20, 10)],
+    );
+    let direct = cohort_strategy_results("mismatch", RunStrategy::Direct, &[(true, 0.9, 10, 10)]);
+    let mismatch = EvaluationReport::new(
+        "mismatch",
+        "suite",
+        1,
+        adaptive.into_iter().chain(direct).collect(),
+    )
+    .adaptive_readiness();
+    assert!(!mismatch.ready);
+    assert!(mismatch
+        .failures
+        .iter()
+        .any(|failure| failure.code == "mismatched_repetition_sets"));
+
+    let adaptive = cohort_result("duplicate", RunStrategy::Adaptive, 1, true, 0.9, 10, 10);
+    let duplicate = adaptive.clone();
+    let direct = cohort_result("duplicate", RunStrategy::Direct, 1, true, 0.9, 10, 10);
+    let duplicate =
+        EvaluationReport::new("duplicate", "suite", 1, vec![adaptive, duplicate, direct])
+            .adaptive_readiness();
+    assert!(!duplicate.ready);
+    assert!(duplicate
+        .failures
+        .iter()
+        .any(|failure| failure.code == "duplicate_baseline"));
+}
+
+#[test]
+fn one_unsafe_adaptive_sample_invalidates_its_entire_cohort() {
+    let mut unsafe_adaptive = cohort_result("unsafe", RunStrategy::Adaptive, 2, true, 0.9, 20, 10);
+    unsafe_adaptive.strategy_metrics.unauthorized_effects = Some(1);
+    let readiness = EvaluationReport::new(
+        "unsafe",
+        "suite",
+        1,
+        vec![
+            cohort_result("unsafe", RunStrategy::Adaptive, 1, true, 0.9, 10, 10),
+            unsafe_adaptive,
+            cohort_result("unsafe", RunStrategy::Direct, 1, true, 0.9, 10, 10),
+            cohort_result("unsafe", RunStrategy::Direct, 2, true, 0.9, 20, 10),
+        ],
+    )
+    .adaptive_readiness();
+    assert!(!readiness.ready);
+    assert!(readiness.comparisons.is_empty());
+    assert!(readiness
+        .failures
+        .iter()
+        .any(|failure| failure.code == "adaptive_hard_gate_failed"));
+}
+
+#[test]
+fn cohort_ranking_prioritizes_reliability_before_latency() {
+    let recovery_winner = readiness_for_cohort(
+        "recovery-rate",
+        &[(true, 0.9, 10, 10), (true, 0.9, 10, 10)],
+        &[(true, 0.9, 1, 1), (false, 0.9, 1, 1)],
+        &[(true, 0.9, 100, 100), (true, 0.9, 100, 100)],
+    );
+    assert!(recovery_winner.ready, "{recovery_winner:#?}");
+    assert_eq!(
+        recovery_winner.comparisons[0].best_forced_strategy,
+        RunStrategy::DeclarativePlan,
+        "recovery success rate must outrank P50 latency"
+    );
+    assert_eq!(
+        recovery_winner.comparisons[0]
+            .best_forced
+            .recovery_success_rate,
+        1.0
+    );
+    assert!(matches!(
+        recovery_winner.comparisons[0].forced_candidates[0].disposition,
+        ForcedCandidateDisposition::Outranked {
+            decisive_criterion: StrategySelectionCriterion::RecoverySuccessRate
+        }
+    ));
+
+    let accuracy_winner = readiness_for_cohort(
+        "accuracy-mean",
+        &[(true, 0.9, 10, 10), (true, 0.9, 10, 10)],
+        &[(true, 0.4, 1, 1), (true, 0.4, 1, 1)],
+        &[(true, 0.8, 100, 100), (true, 0.8, 100, 100)],
+    );
+    assert!(accuracy_winner.ready, "{accuracy_winner:#?}");
+    assert_eq!(
+        accuracy_winner.comparisons[0].best_forced_strategy,
+        RunStrategy::DeclarativePlan,
+        "mean tool-selection accuracy must outrank P50 latency"
+    );
+    assert!(matches!(
+        accuracy_winner.comparisons[0].forced_candidates[0].disposition,
+        ForcedCandidateDisposition::Outranked {
+            decisive_criterion: StrategySelectionCriterion::ToolSelectionAccuracy
+        }
+    ));
+}
+
+#[test]
+fn cohort_ranking_prioritizes_p50_then_p95_before_cost() {
+    let p50_winner = readiness_for_cohort(
+        "p50-before-p95",
+        &[
+            (true, 0.9, 10, 10),
+            (true, 0.9, 10, 10),
+            (true, 0.9, 10, 10),
+            (true, 0.9, 10, 10),
+        ],
+        &[
+            (true, 0.9, 1, 10),
+            (true, 0.9, 1, 10),
+            (true, 0.9, 100, 10),
+            (true, 0.9, 100, 10),
+        ],
+        &[
+            (true, 0.9, 2, 10),
+            (true, 0.9, 2, 10),
+            (true, 0.9, 2, 10),
+            (true, 0.9, 2, 10),
+        ],
+    );
+    assert!(p50_winner.ready, "{p50_winner:#?}");
+    assert_eq!(
+        p50_winner.comparisons[0].best_forced_strategy,
+        RunStrategy::Direct,
+        "P50 must outrank P95"
+    );
+    assert!(matches!(
+        p50_winner.comparisons[0].forced_candidates[1].disposition,
+        ForcedCandidateDisposition::Outranked {
+            decisive_criterion: StrategySelectionCriterion::P50LatencyMs
+        }
+    ));
+
+    let p95_winner = readiness_for_cohort(
+        "p95-before-cost",
+        &[
+            (true, 0.9, 10, 10),
+            (true, 0.9, 10, 10),
+            (true, 0.9, 10, 10),
+            (true, 0.9, 10, 10),
+        ],
+        &[
+            (true, 0.9, 10, 100),
+            (true, 0.9, 10, 100),
+            (true, 0.9, 10, 100),
+            (true, 0.9, 100, 100),
+        ],
+        &[
+            (true, 0.9, 10, 1),
+            (true, 0.9, 10, 1),
+            (true, 0.9, 10, 1),
+            (true, 0.9, 200, 1),
+        ],
+    );
+    assert!(p95_winner.ready, "{p95_winner:#?}");
+    assert_eq!(
+        p95_winner.comparisons[0].best_forced_strategy,
+        RunStrategy::Direct,
+        "P95 must outrank aggregate cost"
+    );
+    assert!(
+        p95_winner.comparisons[0].best_forced.total_tokens
+            > p95_winner.comparisons[0].forced_candidates[1]
+                .metrics
+                .total_tokens
+    );
+    assert!(matches!(
+        p95_winner.comparisons[0].forced_candidates[1].disposition,
+        ForcedCandidateDisposition::Outranked {
+            decisive_criterion: StrategySelectionCriterion::P95LatencyMs
+        }
+    ));
+}
+
+#[test]
+fn cohort_aggregation_is_input_order_independent() {
+    let adaptive = cohort_strategy_results(
+        "order-independent",
+        RunStrategy::Adaptive,
+        &[
+            (true, 0.9, 31, 30),
+            (true, 0.9, 11, 10),
+            (true, 0.9, 41, 40),
+            (true, 0.9, 21, 20),
+        ],
+    );
+    let direct = cohort_strategy_results(
+        "order-independent",
+        RunStrategy::Direct,
+        &[
+            (true, 0.9, 30, 30),
+            (true, 0.9, 10, 10),
+            (true, 0.9, 40, 40),
+            (true, 0.9, 20, 20),
+        ],
+    );
+    let declarative = cohort_strategy_results(
+        "order-independent",
+        RunStrategy::DeclarativePlan,
+        &[
+            (true, 0.8, 25, 25),
+            (true, 0.8, 25, 25),
+            (true, 0.8, 25, 25),
+            (true, 0.8, 25, 25),
+        ],
+    );
+    let mut forward = adaptive.clone();
+    forward.extend(direct.clone());
+    forward.extend(declarative.clone());
+    let mut reverse = declarative;
+    reverse.reverse();
+    let mut direct_reverse = direct;
+    direct_reverse.reverse();
+    reverse.extend(direct_reverse);
+    let mut adaptive_reverse = adaptive;
+    adaptive_reverse.reverse();
+    reverse.extend(adaptive_reverse);
+
+    let forward = EvaluationReport::new("forward", "suite", 1, forward).adaptive_readiness();
+    let reverse = EvaluationReport::new("reverse", "suite", 1, reverse).adaptive_readiness();
+    assert_eq!(forward, reverse);
+    assert!(forward.ready, "{forward:#?}");
+    assert_eq!(forward.comparisons[0].sample_count, 4);
+    assert_eq!(forward.comparisons[0].best_forced.p50_latency_ms, 20);
+    assert_eq!(forward.comparisons[0].best_forced.p95_latency_ms, 40);
 }
 
 fn selected_forced(direct: EvaluationCaseResult, declarative: EvaluationCaseResult) -> RunStrategy {

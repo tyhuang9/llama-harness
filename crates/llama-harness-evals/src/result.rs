@@ -1,7 +1,10 @@
 use llama_harness_core::{RunStatus, RunStrategy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -217,15 +220,26 @@ impl EvaluationCaseResult {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-/// Ranking inputs reported for one strategy in an Adaptive comparison.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+/// Aggregate ranking inputs reported for one strategy in an Adaptive cohort comparison.
 pub struct StrategyComparisonMetrics {
-    /// Whether recovery succeeded.
+    /// Whether recovery succeeded for every sample in the cohort.
+    ///
+    /// This retained compatibility field is not used for ranking; use
+    /// [`Self::recovery_success_rate`] for the aggregate reliability measure.
     pub recovery_success: bool,
-    /// Tool-selection accuracy.
+    /// Fraction of samples for which recovery succeeded.
+    pub recovery_success_rate: f64,
+    /// Mean tool-selection accuracy across every sample in the cohort.
     pub tool_selection_accuracy: f64,
-    /// Run latency in milliseconds.
+    /// P50 latency in milliseconds, using the deterministic nearest-rank method.
+    ///
+    /// This retained compatibility field equals [`Self::p50_latency_ms`].
     pub duration_ms: u64,
+    /// P50 latency in milliseconds, using the deterministic nearest-rank method.
+    pub p50_latency_ms: u64,
+    /// P95 latency in milliseconds, using the deterministic nearest-rank method.
+    pub p95_latency_ms: u64,
     /// Total input and output tokens.
     pub total_tokens: u64,
     /// Number of model calls.
@@ -240,12 +254,22 @@ pub struct StrategyComparisonMetrics {
 #[serde(rename_all = "snake_case")]
 /// First lexicographic ranking field that determined a forced-candidate outcome.
 pub enum StrategySelectionCriterion {
-    /// Successful recovery outranked unsuccessful recovery.
+    /// Legacy single-sample recovery criterion.
+    ///
+    /// Cohort comparisons use [`Self::RecoverySuccessRate`] instead.
     RecoverySuccess,
+    /// A higher recovery success rate won.
+    RecoverySuccessRate,
     /// Higher tool-selection accuracy won.
     ToolSelectionAccuracy,
-    /// Lower latency won.
+    /// Legacy single-sample latency criterion.
+    ///
+    /// Cohort comparisons use [`Self::P50LatencyMs`] instead.
     DurationMs,
+    /// Lower P50 latency won.
+    P50LatencyMs,
+    /// Lower P95 latency won after P50 latency tied.
+    P95LatencyMs,
     /// Lower total token usage won.
     TotalTokens,
     /// Fewer model calls won.
@@ -290,13 +314,19 @@ pub struct ForcedCandidateComparison {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-/// Deterministic Adaptive-to-forced comparison for one workload key.
+/// Deterministic Adaptive-to-forced comparison for one `(case_id, model)` cohort.
 pub struct AdaptiveComparison {
     /// Evaluation case identifier.
     pub case_id: String,
     /// Model identifier.
     pub model: String,
-    /// One-based repetition number.
+    /// Number of matched repetitions aggregated into this comparison.
+    pub sample_count: u32,
+    /// Legacy per-repetition field.
+    ///
+    /// Cohort comparisons aggregate every matched repetition, so this is always
+    /// zero. Use [`Self::sample_count`] and the P50/P95 fields in the strategy
+    /// metrics instead.
     pub repetition: u32,
     /// Deterministically selected forced baseline strategy.
     pub best_forced_strategy: RunStrategy,
@@ -315,7 +345,8 @@ pub struct AdaptiveReadinessFailure {
     pub case_id: String,
     /// Model identifier, or empty for report-level failures.
     pub model: String,
-    /// One-based repetition number, or zero for report-level failures.
+    /// One-based repetition number for a per-repetition failure, or zero for a
+    /// cohort- or report-level failure.
     pub repetition: u32,
     /// Stable machine-readable failure code.
     pub code: String,
@@ -377,21 +408,25 @@ impl EvaluationReport {
         self.results.len().saturating_sub(self.passed_count())
     }
 
-    /// Compares Adaptive with the best forced strategy for each identical workload.
+    /// Compares Adaptive with the best forced strategy for each `(case_id, model)`
+    /// cohort.
     ///
-    /// The assessment fails closed on missing or duplicate baselines, invalid or
-    /// unknown metrics, incomplete results, and Adaptive safety/correctness
-    /// regressions. Reliability, latency, cost, and tool accuracy select the best
-    /// forced baseline deterministically but do not block Adaptive readiness once
-    /// both sides pass safety and correctness hard gates.
+    /// Every participating strategy must provide the same unique, nonzero
+    /// repetition set. The assessment fails closed on missing or duplicate
+    /// baselines, mismatched repetitions, invalid or unknown metrics, incomplete
+    /// results, and Adaptive safety/correctness regressions. Hard gates aggregate
+    /// across every repetition before ranking. Eligible forced baselines rank by
+    /// recovery-success rate, mean tool-selection accuracy, P50 latency, P95
+    /// latency, and then total tokens, model calls, tool calls, and wasted tool
+    /// calls. These ranking fields do not block Adaptive readiness once both sides
+    /// pass the complete safety and correctness hard gates.
     pub fn adaptive_readiness(&self) -> AdaptiveReadiness {
-        let mut workloads: BTreeMap<WorkloadKey, Vec<&EvaluationCaseResult>> = BTreeMap::new();
+        let mut workloads: BTreeMap<CohortKey, Vec<&EvaluationCaseResult>> = BTreeMap::new();
         for result in &self.results {
             workloads
-                .entry(WorkloadKey {
+                .entry(CohortKey {
                     case_id: result.case_id.clone(),
                     model: result.model.clone(),
-                    repetition: result.repetition,
                 })
                 .or_default()
                 .push(result);
@@ -410,7 +445,7 @@ impl EvaluationReport {
         }
 
         for (key, results) in workloads {
-            assess_workload(&key, &results, &mut comparisons, &mut failures);
+            assess_cohort(&key, &results, &mut comparisons, &mut failures);
         }
 
         AdaptiveReadiness {
@@ -422,38 +457,54 @@ impl EvaluationReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct WorkloadKey {
+struct CohortKey {
     case_id: String,
     model: String,
-    repetition: u32,
 }
 
-fn assess_workload(
-    key: &WorkloadKey,
+fn assess_cohort(
+    key: &CohortKey,
     results: &[&EvaluationCaseResult],
     comparisons: &mut Vec<AdaptiveComparison>,
     failures: &mut Vec<AdaptiveReadinessFailure>,
 ) {
-    let mut results = results.to_vec();
-    results.sort_by_key(|result| strategy_rank(result.strategy));
-    let mut counts = [0usize; 4];
-    for result in &results {
-        counts[strategy_rank(result.strategy) as usize] += 1;
-    }
-    for (rank, count) in counts.iter().enumerate() {
-        if *count > 1 {
-            push_failure(
+    let mut samples: [BTreeMap<u32, &EvaluationCaseResult>; 4] =
+        std::array::from_fn(|_| BTreeMap::new());
+    let mut invalid = false;
+
+    for result in results {
+        if result.repetition == 0 {
+            push_failure_at_repetition(
                 failures,
                 key,
-                "duplicate_baseline",
+                result.repetition,
+                "invalid_repetition",
                 format!(
-                    "strategy '{}' has {count} results for the same workload",
-                    strategy_name(strategy_from_rank(rank as u8))
+                    "strategy '{}' has invalid zero repetition",
+                    strategy_name(result.strategy)
                 ),
             );
+            invalid = true;
+            continue;
+        }
+        let repetitions = &mut samples[strategy_rank(result.strategy) as usize];
+        if repetitions.insert(result.repetition, *result).is_some() {
+            push_failure_at_repetition(
+                failures,
+                key,
+                result.repetition,
+                "duplicate_baseline",
+                format!(
+                    "strategy '{}' has duplicate repetition {} in one cohort",
+                    strategy_name(result.strategy),
+                    result.repetition
+                ),
+            );
+            invalid = true;
         }
     }
-    if counts[0] == 0 {
+
+    if samples[0].is_empty() {
         push_failure(
             failures,
             key,
@@ -461,7 +512,7 @@ fn assess_workload(
             "Adaptive result is missing for this workload",
         );
     }
-    if counts[1..].iter().sum::<usize>() == 0 {
+    if samples[1..].iter().all(BTreeMap::is_empty) {
         push_failure(
             failures,
             key,
@@ -469,15 +520,39 @@ fn assess_workload(
             "forced strategy result is missing for this workload",
         );
     }
-    if counts.iter().any(|count| *count > 1)
-        || counts[0] == 0
-        || counts[1..].iter().sum::<usize>() == 0
-    {
+    if invalid || samples[0].is_empty() || samples[1..].iter().all(BTreeMap::is_empty) {
         return;
     }
 
-    let mut invalid = false;
-    for result in &results {
+    let expected_repetitions = samples[0].keys().copied().collect::<BTreeSet<_>>();
+    for repetitions in samples
+        .iter()
+        .skip(1)
+        .filter(|repetitions| !repetitions.is_empty())
+    {
+        let actual_repetitions = repetitions.keys().copied().collect::<BTreeSet<_>>();
+        if actual_repetitions != expected_repetitions {
+            let strategy = repetitions
+                .values()
+                .next()
+                .expect("nonempty repetitions have a strategy")
+                .strategy;
+            push_failure(
+                failures,
+                key,
+                "mismatched_repetition_sets",
+                format!(
+                    "strategy '{}' repetitions {:?} do not match Adaptive repetitions {:?}",
+                    strategy_name(strategy),
+                    actual_repetitions,
+                    expected_repetitions
+                ),
+            );
+            invalid = true;
+        }
+    }
+
+    for result in results {
         if let Err(error) = result.strategy_metrics.validate() {
             push_failure(
                 failures,
@@ -519,15 +594,54 @@ fn assess_workload(
         return;
     }
 
-    let adaptive = results
+    let sample_count = match u32::try_from(expected_repetitions.len()) {
+        Ok(sample_count) => sample_count,
+        Err(_) => {
+            push_failure(
+                failures,
+                key,
+                "metrics_overflow",
+                "cohort sample count exceeds its supported range",
+            );
+            return;
+        }
+    };
+
+    let mut aggregates = Vec::new();
+    for (rank, repetitions) in samples.iter().enumerate() {
+        if repetitions.is_empty() {
+            continue;
+        }
+        match aggregate_strategy(
+            strategy_from_rank(rank as u8),
+            repetitions.values().copied().collect(),
+        ) {
+            Ok(aggregate) => aggregates.push(aggregate),
+            Err(error) => {
+                push_failure(
+                    failures,
+                    key,
+                    "metrics_overflow",
+                    format!(
+                        "strategy '{}': {}",
+                        strategy_name(strategy_from_rank(rank as u8)),
+                        error.message()
+                    ),
+                );
+                return;
+            }
+        }
+    }
+
+    let adaptive = aggregates
         .iter()
-        .copied()
-        .find(|result| result.strategy == RunStrategy::Adaptive)
-        .expect("adaptive count was validated");
-    let best_forced = results
+        .find(|aggregate| aggregate.strategy == RunStrategy::Adaptive)
+        .expect("adaptive cohort was validated");
+    let best_forced = aggregates
         .iter()
-        .copied()
-        .filter(|result| result.strategy != RunStrategy::Adaptive && result.passes_readiness())
+        .filter(|aggregate| {
+            aggregate.strategy != RunStrategy::Adaptive && aggregate.passes_readiness
+        })
         .min_by(|left, right| compare_forced(left, right));
     let Some(best_forced) = best_forced else {
         push_failure(
@@ -538,7 +652,7 @@ fn assess_workload(
         );
         return;
     };
-    if !adaptive.passes_readiness() {
+    if !adaptive.passes_readiness {
         push_failure(
             failures,
             key,
@@ -551,31 +665,132 @@ fn assess_workload(
     comparisons.push(AdaptiveComparison {
         case_id: key.case_id.clone(),
         model: key.model.clone(),
-        repetition: key.repetition,
+        sample_count,
+        repetition: 0,
         best_forced_strategy: best_forced.strategy,
-        adaptive: comparison_metrics(adaptive),
-        best_forced: comparison_metrics(best_forced),
-        forced_candidates: results
+        adaptive: adaptive.metrics,
+        best_forced: best_forced.metrics,
+        forced_candidates: aggregates
             .iter()
-            .copied()
-            .filter(|result| result.strategy != RunStrategy::Adaptive)
+            .filter(|aggregate| aggregate.strategy != RunStrategy::Adaptive)
             .map(|candidate| ForcedCandidateComparison {
                 strategy: candidate.strategy,
-                metrics: comparison_metrics(candidate),
+                metrics: candidate.metrics,
                 disposition: forced_candidate_disposition(best_forced, candidate),
             })
             .collect(),
     });
 }
 
+struct StrategyCohort<'a> {
+    strategy: RunStrategy,
+    samples: Vec<&'a EvaluationCaseResult>,
+    metrics: StrategyComparisonMetrics,
+    passes_readiness: bool,
+}
+
+enum AggregateError {
+    CounterOverflow(&'static str),
+}
+
+impl AggregateError {
+    fn message(&self) -> String {
+        match self {
+            Self::CounterOverflow(field) => format!("'{field}' exceeds its supported range"),
+        }
+    }
+}
+
+fn aggregate_strategy<'a>(
+    strategy: RunStrategy,
+    samples: Vec<&'a EvaluationCaseResult>,
+) -> Result<StrategyCohort<'a>, AggregateError> {
+    let sample_count = u64::try_from(samples.len())
+        .map_err(|_| AggregateError::CounterOverflow("sample_count"))?;
+    let mut successful_recoveries = 0_u64;
+    let mut accuracy_sum = 0.0_f64;
+    let mut latencies = Vec::with_capacity(samples.len());
+    let mut total_token_count = 0_u64;
+    let mut model_call_count = 0_u32;
+    let mut tool_call_count = 0_u32;
+    let mut wasted_tool_call_count = 0_u32;
+
+    for sample in &samples {
+        let metrics = &sample.strategy_metrics;
+        if metrics.recovery_success.expect("metrics were validated") {
+            successful_recoveries = successful_recoveries
+                .checked_add(1)
+                .ok_or(AggregateError::CounterOverflow("recovery_success"))?;
+        }
+        accuracy_sum += metrics
+            .tool_selection_accuracy
+            .expect("metrics were validated");
+        if !accuracy_sum.is_finite() {
+            return Err(AggregateError::CounterOverflow("tool_selection_accuracy"));
+        }
+        latencies.push(sample.duration_ms.expect("metrics were validated"));
+        total_token_count = total_token_count
+            .checked_add(checked_total_tokens(metrics)?)
+            .ok_or(AggregateError::CounterOverflow("total_tokens"))?;
+        model_call_count = model_call_count
+            .checked_add(sample.model_calls.expect("metrics were validated"))
+            .ok_or(AggregateError::CounterOverflow("model_calls"))?;
+        tool_call_count = tool_call_count
+            .checked_add(sample.tool_calls.expect("metrics were validated"))
+            .ok_or(AggregateError::CounterOverflow("tool_calls"))?;
+        wasted_tool_call_count = wasted_tool_call_count
+            .checked_add(metrics.wasted_tool_calls.expect("metrics were validated"))
+            .ok_or(AggregateError::CounterOverflow("wasted_tool_calls"))?;
+    }
+
+    let p50_latency_ms = nearest_rank_percentile(&mut latencies, 50);
+    let p95_latency_ms = nearest_rank_percentile(&mut latencies, 95);
+    Ok(StrategyCohort {
+        strategy,
+        passes_readiness: samples.iter().all(|sample| sample.passes_readiness()),
+        samples,
+        metrics: StrategyComparisonMetrics {
+            recovery_success: successful_recoveries == sample_count,
+            recovery_success_rate: successful_recoveries as f64 / sample_count as f64,
+            tool_selection_accuracy: accuracy_sum / sample_count as f64,
+            duration_ms: p50_latency_ms,
+            p50_latency_ms,
+            p95_latency_ms,
+            total_tokens: total_token_count,
+            model_calls: model_call_count,
+            tool_calls: tool_call_count,
+            wasted_tool_calls: wasted_tool_call_count,
+        },
+    })
+}
+
+fn nearest_rank_percentile(values: &mut [u64], percentile: u8) -> u64 {
+    debug_assert!(!values.is_empty());
+    debug_assert!((1..=100).contains(&percentile));
+    values.sort_unstable();
+    let percentile = usize::from(percentile);
+    let hundreds = values.len() / 100;
+    let remainder = values.len() % 100;
+    let rank = hundreds * percentile + (remainder * percentile).div_ceil(100);
+    values[rank - 1]
+}
+
+fn checked_total_tokens(metrics: &StrategyMetrics) -> Result<u64, AggregateError> {
+    metrics
+        .input_tokens
+        .expect("metrics were validated")
+        .checked_add(metrics.output_tokens.expect("metrics were validated"))
+        .ok_or(AggregateError::CounterOverflow("total_tokens"))
+}
+
 fn forced_candidate_disposition(
-    selected: &EvaluationCaseResult,
-    candidate: &EvaluationCaseResult,
+    selected: &StrategyCohort<'_>,
+    candidate: &StrategyCohort<'_>,
 ) -> ForcedCandidateDisposition {
     if candidate.strategy == selected.strategy {
         return ForcedCandidateDisposition::Selected;
     }
-    if !candidate.passes_readiness() {
+    if !candidate.passes_readiness {
         let (code, reason) = ineligible_reason(candidate);
         return ForcedCandidateDisposition::Ineligible {
             code: code.into(),
@@ -583,24 +798,33 @@ fn forced_candidate_disposition(
         };
     }
     ForcedCandidateDisposition::Outranked {
-        decisive_criterion: decisive_criterion(selected, candidate),
+        decisive_criterion: decisive_criterion(&selected.metrics, &candidate.metrics),
     }
 }
 
-fn ineligible_reason(result: &EvaluationCaseResult) -> (&'static str, &'static str) {
-    if !result.passed {
+fn ineligible_reason(cohort: &StrategyCohort<'_>) -> (&'static str, &'static str) {
+    if cohort.samples.iter().any(|sample| !sample.passed) {
         ("case_not_passed", "evaluation expectations did not pass")
-    } else if result.status != Some(RunStatus::Completed) {
+    } else if cohort
+        .samples
+        .iter()
+        .any(|sample| sample.status != Some(RunStatus::Completed))
+    {
         ("run_not_completed", "run status was not completed")
-    } else if !result.failures.is_empty() {
+    } else if cohort
+        .samples
+        .iter()
+        .any(|sample| !sample.failures.is_empty())
+    {
         (
             "assertion_failures",
             "evaluation result contains assertion failures",
         )
-    } else if result.strategy_metrics.unauthorized_effects != Some(0)
-        || result.strategy_metrics.duplicate_effects != Some(0)
-        || result.strategy_metrics.unintended_effects != Some(0)
-    {
+    } else if cohort.samples.iter().any(|sample| {
+        sample.strategy_metrics.unauthorized_effects != Some(0)
+            || sample.strategy_metrics.duplicate_effects != Some(0)
+            || sample.strategy_metrics.unintended_effects != Some(0)
+    }) {
         (
             "safety_hard_gate_failed",
             "one or more measured safety effect counters were nonzero",
@@ -614,85 +838,62 @@ fn ineligible_reason(result: &EvaluationCaseResult) -> (&'static str, &'static s
 }
 
 fn decisive_criterion(
-    selected: &EvaluationCaseResult,
-    candidate: &EvaluationCaseResult,
+    selected: &StrategyComparisonMetrics,
+    candidate: &StrategyComparisonMetrics,
 ) -> StrategySelectionCriterion {
-    if selected.strategy_metrics.recovery_success != candidate.strategy_metrics.recovery_success {
-        StrategySelectionCriterion::RecoverySuccess
-    } else if selected.strategy_metrics.tool_selection_accuracy
-        != candidate.strategy_metrics.tool_selection_accuracy
-    {
+    if selected.recovery_success_rate != candidate.recovery_success_rate {
+        StrategySelectionCriterion::RecoverySuccessRate
+    } else if selected.tool_selection_accuracy != candidate.tool_selection_accuracy {
         StrategySelectionCriterion::ToolSelectionAccuracy
-    } else if selected.duration_ms != candidate.duration_ms {
-        StrategySelectionCriterion::DurationMs
-    } else if total_tokens(&selected.strategy_metrics) != total_tokens(&candidate.strategy_metrics)
-    {
+    } else if selected.p50_latency_ms != candidate.p50_latency_ms {
+        StrategySelectionCriterion::P50LatencyMs
+    } else if selected.p95_latency_ms != candidate.p95_latency_ms {
+        StrategySelectionCriterion::P95LatencyMs
+    } else if selected.total_tokens != candidate.total_tokens {
         StrategySelectionCriterion::TotalTokens
     } else if selected.model_calls != candidate.model_calls {
         StrategySelectionCriterion::ModelCalls
     } else if selected.tool_calls != candidate.tool_calls {
         StrategySelectionCriterion::ToolCalls
-    } else if selected.strategy_metrics.wasted_tool_calls
-        != candidate.strategy_metrics.wasted_tool_calls
-    {
+    } else if selected.wasted_tool_calls != candidate.wasted_tool_calls {
         StrategySelectionCriterion::WastedToolCalls
     } else {
         StrategySelectionCriterion::StableStrategyOrder
     }
 }
 
-fn compare_forced(left: &EvaluationCaseResult, right: &EvaluationCaseResult) -> Ordering {
+fn compare_forced(left: &StrategyCohort<'_>, right: &StrategyCohort<'_>) -> Ordering {
     right
-        .strategy_metrics
-        .recovery_success
-        .cmp(&left.strategy_metrics.recovery_success)
+        .metrics
+        .recovery_success_rate
+        .partial_cmp(&left.metrics.recovery_success_rate)
+        .expect("validated recovery rates are finite")
         .then_with(|| {
             right
-                .strategy_metrics
+                .metrics
                 .tool_selection_accuracy
-                .partial_cmp(&left.strategy_metrics.tool_selection_accuracy)
-                .unwrap_or(Ordering::Equal)
+                .partial_cmp(&left.metrics.tool_selection_accuracy)
+                .expect("validated tool-selection accuracy is finite")
         })
-        .then_with(|| left.duration_ms.cmp(&right.duration_ms))
         .then_with(|| {
-            total_tokens(&left.strategy_metrics).cmp(&total_tokens(&right.strategy_metrics))
+            left.metrics
+                .p50_latency_ms
+                .cmp(&right.metrics.p50_latency_ms)
         })
-        .then_with(|| left.model_calls.cmp(&right.model_calls))
-        .then_with(|| left.tool_calls.cmp(&right.tool_calls))
         .then_with(|| {
-            left.strategy_metrics
+            left.metrics
+                .p95_latency_ms
+                .cmp(&right.metrics.p95_latency_ms)
+        })
+        .then_with(|| left.metrics.total_tokens.cmp(&right.metrics.total_tokens))
+        .then_with(|| left.metrics.model_calls.cmp(&right.metrics.model_calls))
+        .then_with(|| left.metrics.tool_calls.cmp(&right.metrics.tool_calls))
+        .then_with(|| {
+            left.metrics
                 .wasted_tool_calls
-                .cmp(&right.strategy_metrics.wasted_tool_calls)
+                .cmp(&right.metrics.wasted_tool_calls)
         })
         .then_with(|| strategy_rank(left.strategy).cmp(&strategy_rank(right.strategy)))
-}
-
-fn comparison_metrics(result: &EvaluationCaseResult) -> StrategyComparisonMetrics {
-    StrategyComparisonMetrics {
-        recovery_success: result
-            .strategy_metrics
-            .recovery_success
-            .expect("metrics were validated"),
-        tool_selection_accuracy: result
-            .strategy_metrics
-            .tool_selection_accuracy
-            .expect("metrics were validated"),
-        duration_ms: result.duration_ms.expect("metrics were validated"),
-        total_tokens: total_tokens(&result.strategy_metrics),
-        model_calls: result.model_calls.expect("metrics were validated"),
-        tool_calls: result.tool_calls.expect("metrics were validated"),
-        wasted_tool_calls: result
-            .strategy_metrics
-            .wasted_tool_calls
-            .expect("metrics were validated"),
-    }
-}
-
-fn total_tokens(metrics: &StrategyMetrics) -> u64 {
-    metrics
-        .input_tokens
-        .expect("metrics were validated")
-        .saturating_add(metrics.output_tokens.expect("metrics were validated"))
 }
 
 fn strategy_rank(strategy: RunStrategy) -> u8 {
@@ -724,14 +925,30 @@ fn strategy_name(strategy: RunStrategy) -> &'static str {
 
 fn push_failure(
     failures: &mut Vec<AdaptiveReadinessFailure>,
-    key: &WorkloadKey,
+    key: &CohortKey,
     code: &str,
     message: impl Into<String>,
 ) {
     failures.push(AdaptiveReadinessFailure {
         case_id: key.case_id.clone(),
         model: key.model.clone(),
-        repetition: key.repetition,
+        repetition: 0,
+        code: code.into(),
+        message: message.into(),
+    });
+}
+
+fn push_failure_at_repetition(
+    failures: &mut Vec<AdaptiveReadinessFailure>,
+    key: &CohortKey,
+    repetition: u32,
+    code: &str,
+    message: impl Into<String>,
+) {
+    failures.push(AdaptiveReadinessFailure {
+        case_id: key.case_id.clone(),
+        model: key.model.clone(),
+        repetition,
         code: code.into(),
         message: message.into(),
     });
