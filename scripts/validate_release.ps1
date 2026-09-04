@@ -15,7 +15,7 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $workspacePackages = @($cargoMetadata.packages | Where-Object { $cargoMetadata.workspace_members -contains $_.id })
 $wrongCargoVersions = @($workspacePackages | Where-Object { $_.version -ne $Version } | ForEach-Object { "$($_.name)=$($_.version)" })
 if ($wrongCargoVersions.Count -ne 0) {
-  throw "Cargo workspace package versions do not match release version $Version: $($wrongCargoVersions -join ', ')"
+  throw "Cargo workspace package versions do not match release version ${Version}: $($wrongCargoVersions -join ', ')"
 }
 $runtimePackage = @($workspacePackages | Where-Object { $_.name -eq "llama-harness-runtime" })
 if ($runtimePackage.Count -ne 1) { throw "expected exactly one llama-harness-runtime package in Cargo workspace metadata" }
