@@ -3,13 +3,14 @@ import { writeFileSync } from "node:fs";
 
 function write(envelope: object): void { process.stdout.write(`${JSON.stringify(envelope)}\n`); }
 const mode = process.argv[2] ?? "legacy";
-const selectedVersion = mode === "modern" || mode === "drift" || mode === "protocol_error" || mode === "version_mismatch" || mode === "malformed_metadata" || mode === "hello_error" ? "1.1" : mode === "incompatible" ? "2.0" : "1.0";
+const selectedVersion = mode === "modern" || mode === "drift" || mode === "protocol_error" || mode === "version_mismatch" || mode === "malformed_metadata" || mode === "hello_error" || mode === "hello_error_unresponsive" ? "1.1" : mode === "incompatible" ? "2.0" : "1.0";
 const shutdownMarker = process.argv[3];
+if (mode === "hello_error_unresponsive" && shutdownMarker) writeFileSync(shutdownMarker, String(process.pid), "utf8");
 
 createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line) as { protocol_version: string; request_id: string; type: string; payload: Record<string, unknown>; };
   if (message.type === "client_hello") {
-    if (mode === "hello_error") { write({ protocol_version: selectedVersion, request_id: message.request_id, type: "protocol_error", payload: { code: "invalid_state", message: "hello rejected", retryable: false } }); return; }
+    if (mode === "hello_error" || mode === "hello_error_unresponsive") { write({ protocol_version: selectedVersion, request_id: message.request_id, type: "protocol_error", payload: { code: "invalid_state", message: "hello rejected", retryable: false } }); return; }
     if ((message.payload.sdk as { version?: string } | undefined)?.version !== "0.2.0") { write({ protocol_version: selectedVersion, request_id: message.request_id, type: "protocol_error", payload: { code: "invalid_message", message: "SDK identity version mismatch", retryable: false } }); return; }
     write({ protocol_version: selectedVersion, request_id: message.request_id, type: "runtime_hello", payload: { runtime_version: mode === "version_mismatch" ? "0.1.0" : "0.2.0", capabilities: { supports_output_deltas: false, supports_structured_output: true, supports_trace_persistence: false, concurrent_runs: 1, max_pending_callbacks: 1, max_queue_depth: 8 }, providers: ["ollama"] } });
   } else if (message.protocol_version !== selectedVersion) {
@@ -36,6 +37,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   } else if (message.type === "policy_decision" && mode === "malformed_metadata") {
     write({ protocol_version: selectedVersion, request_id: "complete-1", run_id: "test-run", type: "run_completed", payload: { run_sequence: 2, result: { status: "completed", final_output: "denied", model: "mock", trace_id: "test-trace", duration_ms: 1 } } });
   } else if (message.type === "shutdown") {
+    if (mode === "hello_error_unresponsive") return;
     if (shutdownMarker) writeFileSync(shutdownMarker, "closed\n", "utf8");
     write({ protocol_version: selectedVersion, request_id: message.request_id, type: "command_acknowledged", payload: { command: "shutdown" } });
   }

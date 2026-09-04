@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -72,10 +72,15 @@ test("fails incompatible majors, envelope drift, and structured protocol errors"
 
 test("terminates the child when the handshake request is rejected", async () => {
   const directory = mkdtempSync(join(tmpdir(), "llama-harness-sdk-hello-"));
-  const marker = join(directory, "closed");
+  const marker = join(directory, "pid");
   try {
-    await assert.rejects(HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "hello_error", marker] }), /hello rejected/);
-    assert.equal(existsSync(marker), true);
+    const startedAt = Date.now();
+    await assert.rejects(HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "hello_error_unresponsive", marker] }), /hello rejected/);
+    assert.ok(Date.now() - startedAt < 1_000, "failed handshake cleanup must be bounded");
+    const childPid = Number(readFileSync(marker, "utf8"));
+    let childIsRunning = true;
+    try { process.kill(childPid, 0); } catch { childIsRunning = false; }
+    assert.equal(childIsRunning, false, "failed handshake child must be terminated");
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 

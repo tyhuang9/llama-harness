@@ -182,7 +182,7 @@ export class HarnessClient {
       if (runtimeVersion !== SDK_VERSION) throw new RuntimeProtocolError(`Runtime version mismatch: SDK ${SDK_VERSION}, runtime ${String(runtimeVersion)}`);
       return client;
     }
-    catch (error) { await client.close(); throw error; }
+    catch (error) { await client.abortStartup(); throw error; }
   }
 
   /** Exact protocol version selected by the runtime hello envelope. */
@@ -262,6 +262,20 @@ export class HarnessClient {
     this.process.once("error", (error) => this.failAll(new RuntimeExitedError(`Runtime process error: ${error.message}`)));
   }
 
+  private async abortStartup(): Promise<void> {
+    this.closed = true;
+    this.process.stdin.destroy();
+    if (this.process.exitCode !== null || this.process.signalCode !== null) return;
+    let exited = false;
+    const exit = once(this.process, "exit").then(() => { exited = true; }, () => { exited = true; });
+    this.process.kill();
+    await Promise.race([exit, delay(250)]);
+    if (!exited && this.process.exitCode === null && this.process.signalCode === null) {
+      this.process.kill("SIGKILL");
+      await Promise.race([exit, delay(250)]);
+    }
+  }
+
   private receive(envelope: Envelope): void {
     if (this._negotiatedProtocolVersion && envelope.protocol_version !== this._negotiatedProtocolVersion) {
       this.terminalError = new RuntimeProtocolError(`Runtime protocol version drift: expected ${this._negotiatedProtocolVersion}, received ${envelope.protocol_version}`);
@@ -330,6 +344,7 @@ function parseEnvelope(line: string): Envelope { const value = JSON.parse(line) 
 function selectedProtocolVersion(version: string): ProtocolVersion { if (version === "1.0" || version === "1.1") return version; throw new RuntimeProtocolError(`Unsupported runtime protocol version ${version}`, "incompatible_version", false); }
 function protocolError(payload: Record<string, Json>): RuntimeProtocolError { return new RuntimeProtocolError(String(payload.message ?? "Runtime protocol error"), typeof payload.code === "string" ? payload.code : undefined, optionalBoolean(payload.retryable)); }
 function once(target: NodeJS.EventEmitter, event: string): Promise<unknown> { return new Promise((resolve, reject) => { target.once(event, resolve); target.once("error", reject); }); }
+function delay(milliseconds: number): Promise<void> { return new Promise((resolve) => { const timer = setTimeout(resolve, milliseconds); timer.unref(); }); }
 function readSdkVersion(): string { const manifest = createRequire(import.meta.url)("../package.json") as { version?: unknown }; if (typeof manifest.version !== "string" || !manifest.version) throw new RuntimeProtocolError("SDK package metadata does not contain a version"); return manifest.version; }
 function optionalNumber(value: Json | undefined): number | undefined { return typeof value === "number" ? value : undefined; }
 function optionalBoolean(value: Json | undefined): boolean | undefined { return typeof value === "boolean" ? value : undefined; }
