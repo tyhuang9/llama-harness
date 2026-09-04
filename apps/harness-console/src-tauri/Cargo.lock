@@ -1947,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "llama-harness-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "llama-harness-evals"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "llama-harness-core",
@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "llama-harness-observability"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "llama-harness-core",
  "rusqlite",
@@ -1989,7 +1989,7 @@ dependencies = [
 
 [[package]]
 name = "llama-harness-ollama"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",

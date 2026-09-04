@@ -33,7 +33,7 @@ fn serializes_the_client_hello_golden_fixture() {
         ProtocolMessage::ClientHello(ClientHello {
             sdk: ClientIdentity {
                 name: "@llama-harness/sdk".into(),
-                version: "0.1.0".into(),
+                version: "0.2.0".into(),
             },
             capabilities: ["async_callbacks".into()].into_iter().collect(),
         }),
@@ -55,7 +55,7 @@ fn serializes_the_runtime_hello_golden_fixture() {
         "hello-1",
         None,
         ProtocolMessage::RuntimeHello(RuntimeHello {
-            runtime_version: "0.1.0".into(),
+            runtime_version: "0.2.0".into(),
             capabilities: RuntimeCapabilities {
                 supports_output_deltas: false,
                 supports_structured_output: true,
