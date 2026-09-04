@@ -1759,7 +1759,7 @@ async fn forced_programmatic_fails_closed_for_each_missing_or_zero_provider_decl
 }
 
 #[tokio::test]
-async fn adaptive_never_selects_programmatic_even_when_available() {
+async fn adaptive_does_not_select_programmatic_without_promotion_allowlist() {
     let provider = Arc::new(
         MockModelProvider::scripted([final_response("direct")]).with_capabilities(capabilities()),
     );

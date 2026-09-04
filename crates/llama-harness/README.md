@@ -124,9 +124,11 @@ let _tool = ReadStatus(
   be idempotent or use application-level idempotency keys.
 - `programmatic` is disabled by default. It requires the facade feature, an
   explicit `ProgrammaticHostConfig` on the runner, and a conforming provider;
-  `Adaptive` never selects it. The sandbox has no ambient authority, but it is
-  same-process code and every yielded tool request still goes through the core
-  broker, policy, approval, and effect-ledger gates.
+  Adaptive additionally requires an explicit, evaluation-backed
+  `adaptive_programmatic_allowlist` entry for the proposed workload class. The
+  allowlist is empty by default. The sandbox has no ambient authority, but it
+  is same-process code and every yielded tool request still goes through the
+  core broker, policy, approval, and effect-ledger gates.
 - The harness exposes no universal shell, filesystem, database, or network tool.
 
 See the [embedding guide](https://github.com/tyhuang9/llama-harness/blob/main/docs/embedding.md)
