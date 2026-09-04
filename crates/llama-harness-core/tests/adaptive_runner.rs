@@ -482,6 +482,83 @@ async fn successful_plan_emits_phase_attempt_outcome_timing_and_reconciled_usage
 }
 
 #[tokio::test]
+async fn adaptive_requests_phase_specific_strict_schemas_from_capable_providers() {
+    let envelope = json!({
+        "strategy": "declarative_plan",
+        "plan": {"nodes": [{"id": "read", "tool_id": "read", "arguments": {}}]}
+    });
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(envelope.to_string()),
+            final_response(r#"{"answer":"done"}"#),
+        ])
+        .with_capabilities(planning_capabilities(1)),
+    );
+    let tool = Arc::new(FixedTool::new(
+        "read",
+        true,
+        ToolResult::success(json!({"value":"ok"})),
+    ));
+    let mut run_request = request(&["read"]);
+    run_request.agent.output_schema = Some(json!({
+        "type":"object",
+        "required":["answer"],
+        "properties":{"answer":{"type":"string"}},
+        "additionalProperties":false
+    }));
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([tool as Arc<dyn Tool>]))
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let planning = requests[0].structured_output.as_ref().unwrap();
+    assert_eq!(planning.name, "llama_harness_planner_envelope_v1");
+    assert!(planning.strict);
+    assert!(planning.schema.get("oneOf").is_some());
+    planning.validate().unwrap();
+    let synthesis = requests[1].structured_output.as_ref().unwrap();
+    assert_eq!(synthesis.name, "llama_harness_agent_output");
+    synthesis.validate().unwrap();
+}
+
+#[tokio::test]
+async fn adaptive_keeps_prompt_and_core_validation_without_structured_output_capability() {
+    let capabilities = ModelCapabilities::new(true, false, false)
+        .with_structured_plans(true)
+        .with_limits(
+            ProviderCapabilityLimits::new()
+                .with_max_plan_nodes(8)
+                .with_max_plan_bytes(32 * 1024),
+        );
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(r#"{"strategy":"direct"}"#),
+            final_response("done"),
+        ])
+        .with_capabilities(capabilities),
+    );
+    let tool = Arc::new(FixedTool::new("read", true, ToolResult::success(json!({}))));
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([tool as Arc<dyn Tool>]))
+        .build()
+        .run(request(&["read"]))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(provider
+        .requests()
+        .iter()
+        .all(|request| request.structured_output.is_none()));
+}
+
+#[tokio::test]
 async fn adaptive_downgrades_to_direct_when_provider_cannot_plan() {
     let provider = Arc::new(MockModelProvider::scripted([final_response("direct")]));
     let events = Arc::new(InMemoryEventSink::default());
@@ -1938,7 +2015,24 @@ async fn invalid_plan_repair_does_not_consume_execution_recovery() {
         .unwrap();
 
     assert_eq!(result.status, RunStatus::Completed);
-    assert_eq!(provider.requests().len(), 4);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[..2].iter().all(|request| request
+        .structured_output
+        .as_ref()
+        .is_some_and(|output| output.name == "llama_harness_planner_envelope_v1")));
+    assert_eq!(
+        requests[2].structured_output.as_ref().unwrap().name,
+        "llama_harness_recovery_plan_v1"
+    );
+    assert!(requests[2]
+        .structured_output
+        .as_ref()
+        .unwrap()
+        .schema
+        .get("oneOf")
+        .is_none());
+    assert!(requests[3].structured_output.is_none());
 }
 
 #[tokio::test]

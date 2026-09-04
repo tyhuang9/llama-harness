@@ -12,6 +12,13 @@ const DEFAULT_MAX_TOOL_RESULT_BYTES: u64 = 1024 * 1024;
 const DEFAULT_MAX_TRANSCRIPT_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_MAX_JSON_DEPTH: u32 = 64;
 
+/// Maximum UTF-8 byte length of a provider-neutral structured-output name.
+pub const MAX_STRUCTURED_OUTPUT_NAME_BYTES: usize = 64;
+/// Maximum serialized JSON Schema size in a structured-output request.
+pub const MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES: u64 = 256 * 1024;
+/// Maximum JSON nesting depth in a structured-output schema.
+pub const MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH: u32 = 64;
+
 /// Immutable library ceiling for generated program bytes in a Programmatic run.
 pub const HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES: u64 = 256 * 1024;
 /// Immutable library ceiling for concurrent Programmatic read-only fan-out calls.
@@ -140,7 +147,7 @@ pub(crate) fn compile_trusted_schema(
         .map_err(|validation_error| error(validation_error.to_string()))
 }
 
-fn validate_schema_references(schema: &Value) -> Result<(), String> {
+pub(crate) fn validate_schema_references(schema: &Value) -> Result<(), String> {
     match schema {
         Value::Object(values) => {
             for (key, value) in values {

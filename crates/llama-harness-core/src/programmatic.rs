@@ -3,13 +3,14 @@ use crate::{
     discovery::{ToolScope, ToolScopeSelection},
     event::{EventEmitter, ProgramLifecycleOutcome, RunEvent, StrategySelectionReason},
     runner::{
-        apply_terminal_error, await_guarded, check_stopped, emit_discovery, ensure_transcript,
-        initial_messages, merge_generation, provider_deadline, validate_model_response,
-        validate_output, DirectContinuation, DirectStrategyEvents, ProgrammaticUsage, RunPreflight,
+        agent_structured_output, apply_terminal_error, await_guarded, check_stopped,
+        emit_discovery, ensure_transcript, initial_messages, merge_generation, provider_deadline,
+        validate_model_response, validate_output, DirectContinuation, DirectStrategyEvents,
+        ProgrammaticUsage, RunPreflight,
     },
-    AgentRunner, HarnessError, Message, ModelRequest, ModelResponse, ProgrammaticConformance,
-    RunRequest, RunResult, RunStatus, RunStrategy, StrategyFallbackReason, ToolCall,
-    ToolCallContext, ToolCaller, ToolResult,
+    AgentRunner, HarnessError, Message, ModelCapabilities, ModelRequest, ModelResponse,
+    ProgrammaticConformance, RunRequest, RunResult, RunStatus, RunStrategy, StrategyFallbackReason,
+    StructuredOutputRequest, ToolCall, ToolCallContext, ToolCaller, ToolResult,
 };
 use futures_util::future::join_all;
 use llama_harness_programmatic_sandbox::{
@@ -45,6 +46,172 @@ const PROGRAM_PROMPT: &str = r#"Return only a strict llama-harness program JSON 
 const REPAIR_PROMPT: &str = "The previous program failed strict structural verification. Return one corrected version-1 program JSON object only. Do not add markdown or prose.";
 
 const SYNTHESIS_PROMPT: &str = "A verified program completed. Produce the final answer using only the inert program return and broker-audited tool transcript in the next user message.";
+
+fn program_schema(limits: &SandboxLimits) -> Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["version", "body"],
+        "properties": {
+            "version": {"const": 1},
+            "body": {"$ref": "#/$defs/body"}
+        },
+        "additionalProperties": false,
+        "$defs": {
+            "body": {
+                "type": "array",
+                "maxItems": limits.max_ast_nodes,
+                "items": {"$ref": "#/$defs/statement"}
+            },
+            "statement": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "required": ["kind", "name", "value"],
+                        "properties": {
+                            "kind": {"const": "let"},
+                            "name": {"type": "string", "minLength": 1},
+                            "value": {"$ref": "#/$defs/expression"}
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "condition", "then_body"],
+                        "properties": {
+                            "kind": {"const": "branch"},
+                            "condition": {"$ref": "#/$defs/expression"},
+                            "then_body": {"$ref": "#/$defs/body"},
+                            "else_body": {"$ref": "#/$defs/body"}
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "item", "collection", "max_iterations", "body"],
+                        "properties": {
+                            "kind": {"const": "for_each"},
+                            "item": {"type": "string", "minLength": 1},
+                            "collection": {"$ref": "#/$defs/expression"},
+                            "max_iterations": {"type": "integer", "minimum": 1, "maximum": limits.max_loop_iterations},
+                            "body": {"$ref": "#/$defs/body"}
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "name", "item", "collection", "max_items", "value"],
+                        "properties": {
+                            "kind": {"const": "map"},
+                            "name": {"type": "string", "minLength": 1},
+                            "item": {"type": "string", "minLength": 1},
+                            "collection": {"$ref": "#/$defs/expression"},
+                            "max_items": {"type": "integer", "minimum": 1, "maximum": limits.max_collection_items},
+                            "value": {"$ref": "#/$defs/expression"}
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "name", "item", "collection", "max_items", "predicate"],
+                        "properties": {
+                            "kind": {"const": "filter"},
+                            "name": {"type": "string", "minLength": 1},
+                            "item": {"type": "string", "minLength": 1},
+                            "collection": {"$ref": "#/$defs/expression"},
+                            "max_items": {"type": "integer", "minimum": 1, "maximum": limits.max_collection_items},
+                            "predicate": {"$ref": "#/$defs/expression"}
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "name", "item", "accumulator", "collection", "max_items", "initial", "value"],
+                        "properties": {
+                            "kind": {"const": "reduce"},
+                            "name": {"type": "string", "minLength": 1},
+                            "item": {"type": "string", "minLength": 1},
+                            "accumulator": {"type": "string", "minLength": 1},
+                            "collection": {"$ref": "#/$defs/expression"},
+                            "max_items": {"type": "integer", "minimum": 1, "maximum": limits.max_collection_items},
+                            "initial": {"$ref": "#/$defs/expression"},
+                            "value": {"$ref": "#/$defs/expression"}
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "name", "tool_id", "arguments"],
+                        "properties": {
+                            "kind": {"const": "invoke"},
+                            "name": {"type": "string", "minLength": 1},
+                            "tool_id": {"type": "string", "minLength": 1},
+                            "arguments": {"$ref": "#/$defs/expression"}
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "name", "tool_id", "item", "collection", "max_calls", "arguments"],
+                        "properties": {
+                            "kind": {"const": "fan_out"},
+                            "name": {"type": "string", "minLength": 1},
+                            "tool_id": {"type": "string", "minLength": 1},
+                            "item": {"type": "string", "minLength": 1},
+                            "collection": {"$ref": "#/$defs/expression"},
+                            "max_calls": {"type": "integer", "minimum": 1, "maximum": limits.max_fanout},
+                            "arguments": {"$ref": "#/$defs/expression"}
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "value"],
+                        "properties": {
+                            "kind": {"const": "return"},
+                            "value": {"$ref": "#/$defs/expression"}
+                        },
+                        "additionalProperties": false
+                    }
+                ]
+            },
+            "expression": {
+                "oneOf": [
+                    {"type": "object", "required": ["kind"], "properties": {"kind": {"const": "null"}}, "additionalProperties": false},
+                    {"type": "object", "required": ["kind", "value"], "properties": {"kind": {"const": "boolean"}, "value": {"type": "boolean"}}, "additionalProperties": false},
+                    {"type": "object", "required": ["kind", "value"], "properties": {"kind": {"const": "integer"}, "value": {"type": "integer"}}, "additionalProperties": false},
+                    {"type": "object", "required": ["kind", "value"], "properties": {"kind": {"const": "string"}, "value": {"type": "string"}}, "additionalProperties": false},
+                    {"type": "object", "required": ["kind", "name"], "properties": {"kind": {"const": "variable"}, "name": {"type": "string", "minLength": 1}}, "additionalProperties": false},
+                    {"type": "object", "required": ["kind", "value", "pointer"], "properties": {"kind": {"const": "path"}, "value": {"$ref": "#/$defs/expression"}, "pointer": {"type": "string"}}, "additionalProperties": false},
+                    {"type": "object", "required": ["kind", "items"], "properties": {"kind": {"const": "array"}, "items": {"type": "array", "maxItems": limits.max_collection_items, "items": {"$ref": "#/$defs/expression"}}}, "additionalProperties": false},
+                    {"type": "object", "required": ["kind", "entries"], "properties": {"kind": {"const": "object"}, "entries": {"type": "array", "maxItems": limits.max_collection_items, "items": {"$ref": "#/$defs/object_entry"}}}, "additionalProperties": false},
+                    {"type": "object", "required": ["kind", "operator", "left", "right"], "properties": {"kind": {"const": "binary"}, "operator": {"enum": ["add", "subtract", "multiply", "divide", "remainder", "equal", "not_equal", "less_than", "less_than_or_equal", "greater_than", "greater_than_or_equal", "and", "or"]}, "left": {"$ref": "#/$defs/expression"}, "right": {"$ref": "#/$defs/expression"}}, "additionalProperties": false},
+                    {"type": "object", "required": ["kind", "operator", "value"], "properties": {"kind": {"const": "unary"}, "operator": {"enum": ["not", "negate", "count", "sum", "all", "any"]}, "value": {"$ref": "#/$defs/expression"}}, "additionalProperties": false}
+                ]
+            },
+            "object_entry": {
+                "type": "object",
+                "required": ["key", "value"],
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"$ref": "#/$defs/expression"}
+                },
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn program_structured_output(
+    capabilities: &ModelCapabilities,
+    limits: &SandboxLimits,
+) -> Result<Option<StructuredOutputRequest>, HarnessError> {
+    if !capabilities.supports_structured_output {
+        return Ok(None);
+    }
+    StructuredOutputRequest::new("llama_harness_program_ast_v1", program_schema(limits), true)
+        .map(Some)
+}
 
 // `{"tool_id":<id>,"arguments":<args>,"ok":<bool>,"output":<output>}`
 // excluding the three serialized dynamic values and the boolean spelling.
@@ -431,6 +598,7 @@ impl AgentRunner {
                 "effective provider program byte limit is invalid".into(),
             )
         })?;
+        let program_structured_output = program_structured_output(&capabilities, &limits)?;
 
         let started = preflight.started;
         let run_id = request
@@ -520,6 +688,7 @@ impl AgentRunner {
                         &model,
                         generation_messages.clone(),
                         Some(&scope),
+                        program_structured_output.clone(),
                         deadline,
                         &mut model_calls,
                         phase_calls,
@@ -666,6 +835,7 @@ impl AgentRunner {
                     &model,
                     synthesis_messages,
                     None,
+                    agent_structured_output(&capabilities, request.agent.output_schema.as_ref()),
                     deadline,
                     &mut model_calls,
                     &mut synthesis_calls,
@@ -778,6 +948,7 @@ impl AgentRunner {
         model: &str,
         messages: Vec<Message>,
         scope: Option<&ToolScope>,
+        structured_output: Option<StructuredOutputRequest>,
         deadline: Option<Instant>,
         model_calls: &mut u32,
         phase_calls: &mut u32,
@@ -807,6 +978,7 @@ impl AgentRunner {
                     &request.agent.generation,
                     &request.overrides.generation,
                 ),
+                structured_output,
                 metadata: request.metadata.clone(),
                 cancellation: call_cancellation.clone(),
             }),

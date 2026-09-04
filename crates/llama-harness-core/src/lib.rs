@@ -43,14 +43,16 @@ pub use event::{
 };
 pub use limits::{
     AgentLimits, GenerationOptions, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
-    HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
+    HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES, MAX_STRUCTURED_OUTPUT_NAME_BYTES,
+    MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES, MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH,
 };
 #[cfg(feature = "programmatic")]
 pub use llama_harness_programmatic_sandbox as programmatic_sandbox;
 pub use message::{Message, MessageRole};
 pub use model::{
     ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, PreparedToolCatalog,
-    ProgrammaticConformance, ProviderCapabilityLimits, ProviderHealth, Usage,
+    ProgrammaticConformance, ProviderCapabilityLimits, ProviderHealth, StructuredOutputRequest,
+    Usage,
 };
 pub use plan::{
     ExecutionPlan, PlanConcurrency, PlanNode, ResultBinding, ResultRef,

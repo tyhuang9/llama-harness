@@ -158,6 +158,11 @@ impl OllamaProvider {
         if request.cancellation.is_cancelled() {
             return Err(HarnessError::Cancelled);
         }
+        if request.structured_output.is_some() {
+            return Err(HarnessError::UnsupportedCapability(
+                "Ollama provider does not implement the structured-output contract".into(),
+            ));
+        }
         let body = chat_request(
             request.model,
             &request.messages,
@@ -289,6 +294,11 @@ impl ModelProvider for OllamaProvider {
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError> {
         if request.cancellation.is_cancelled() {
             return Err(HarnessError::Cancelled);
+        }
+        if request.structured_output.is_some() {
+            return Err(HarnessError::UnsupportedCapability(
+                "Ollama provider does not implement the structured-output contract".into(),
+            ));
         }
         let requested_model = request.model.clone();
         let body = chat_request(

@@ -1334,6 +1334,56 @@ async fn schema_repair_succeeds_and_exhaustion_fails_at_the_exact_limit() {
 }
 
 #[tokio::test]
+async fn final_output_schema_is_requested_only_from_capable_providers() {
+    let schema = json!({
+        "type":"object",
+        "required":["answer"],
+        "properties":{"answer":{"type":"string"}},
+        "additionalProperties":false
+    });
+    let capable = Arc::new(MockModelProvider::scripted([final_response(
+        r#"{"answer":"done"}"#,
+    )]));
+    let mut capable_request = request();
+    capable_request.agent.output_schema = Some(schema.clone());
+    let result = AgentRunner::builder(capable.clone())
+        .build()
+        .run_with_strategy(capable_request, RunStrategy::Direct)
+        .await
+        .unwrap();
+    assert_eq!(result.status, RunStatus::Completed);
+    let structured = capable.requests()[0]
+        .structured_output
+        .clone()
+        .expect("capable provider receives the final-output contract");
+    assert_eq!(structured.name, "llama_harness_agent_output");
+    assert_eq!(structured.schema, schema);
+    assert!(structured.strict);
+
+    let unsupported = Arc::new(
+        MockModelProvider::scripted([
+            final_response("not json"),
+            final_response(r#"{"answer":"repaired"}"#),
+        ])
+        .with_capabilities(ModelCapabilities::new(true, false, false)),
+    );
+    let mut fallback_request = request();
+    fallback_request.agent.output_schema = Some(schema);
+    fallback_request.agent.limits.max_output_repairs = 1;
+    let result = AgentRunner::builder(unsupported.clone())
+        .build()
+        .run_with_strategy(fallback_request, RunStrategy::Direct)
+        .await
+        .unwrap();
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(unsupported.requests().len(), 2);
+    assert!(unsupported
+        .requests()
+        .iter()
+        .all(|request| request.structured_output.is_none()));
+}
+
+#[tokio::test]
 async fn input_and_transcript_limits_are_inclusive() {
     let mut exact_input = request();
     exact_input.input = "four".into();

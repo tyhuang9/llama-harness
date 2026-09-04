@@ -1,8 +1,8 @@
 use futures_util::StreamExt;
 use llama_harness_core::{
     GenerationOptions, HarnessError, Message, MessageRole, ModelProvider, ModelRequest,
-    ModelStreamEvent, ModelStreamFailureKind, PreparedToolCatalog, ToolCall, ToolDefinition,
-    ToolRisk,
+    ModelStreamEvent, ModelStreamFailureKind, PreparedToolCatalog, StructuredOutputRequest,
+    ToolCall, ToolDefinition, ToolRisk,
 };
 use llama_harness_ollama::{OllamaProvider, OllamaStreamEvent};
 use serde_json::{json, Value};
@@ -53,6 +53,24 @@ fn provider(base_url: &str) -> OllamaProvider {
         .base_url(base_url)
         .build()
         .unwrap()
+}
+
+#[tokio::test]
+async fn unsupported_structured_output_is_never_silently_dropped() {
+    let provider = OllamaProvider::new().unwrap();
+    assert!(!provider.capabilities().supports_structured_output);
+    let mut model_request = request(CancellationToken::new());
+    model_request.structured_output =
+        Some(StructuredOutputRequest::new("answer", json!({"type":"string"}), true).unwrap());
+
+    assert!(matches!(
+        provider.complete(model_request.clone()).await,
+        Err(HarnessError::UnsupportedCapability(_))
+    ));
+    assert!(matches!(
+        provider.stream_chat(model_request).await,
+        Err(HarnessError::UnsupportedCapability(_))
+    ));
 }
 
 #[tokio::test]

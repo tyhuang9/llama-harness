@@ -2,9 +2,10 @@ use async_trait::async_trait;
 use llama_harness_core::{
     mock::MockModelProvider, CancellationSafety, ExecutionLocation, HarnessError, IssueSafety,
     ModelCapabilities, ModelProvider, ModelRequest, ModelStreamController, ModelStreamEvent,
-    ModelStreamFailureKind, NetworkEgress, ProviderCapabilityLimits, SpeculationPolicy, Tool,
-    ToolCallAssembler, ToolCallAssemblyLimits, ToolCallDelta, ToolCaller, ToolDefinition,
-    ToolRegistry, ToolResult, Usage,
+    ModelStreamFailureKind, NetworkEgress, ProviderCapabilityLimits, SpeculationPolicy,
+    StructuredOutputRequest, Tool, ToolCallAssembler, ToolCallAssemblyLimits, ToolCallDelta,
+    ToolCaller, ToolDefinition, ToolRegistry, ToolResult, Usage, MAX_STRUCTURED_OUTPUT_NAME_BYTES,
+    MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES, MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -157,6 +158,59 @@ fn new_model_capabilities_remain_false_unless_advertised() {
         .with_limits(limits.clone());
     assert!(advertised.supports_programmatic_calling);
     assert_eq!(advertised.limits, limits);
+}
+
+#[test]
+fn structured_output_requests_are_typed_and_bounded() {
+    let request = StructuredOutputRequest::new(
+        "agent_output_v1",
+        json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+            "additionalProperties": false
+        }),
+        true,
+    )
+    .unwrap();
+    assert_eq!(request.name, "agent_output_v1");
+    assert!(request.strict);
+    request.validate().unwrap();
+
+    for (name, schema) in [
+        ("", json!({"type":"object"})),
+        (
+            &"x".repeat(MAX_STRUCTURED_OUTPUT_NAME_BYTES + 1),
+            json!({"type":"object"}),
+        ),
+        ("not valid", json!({"type":"object"})),
+        (
+            "external_ref",
+            json!({"$ref":"https://attacker.invalid/schema.json"}),
+        ),
+    ] {
+        assert!(matches!(
+            StructuredOutputRequest::new(name, schema, true),
+            Err(HarnessError::InvalidRequest(_))
+        ));
+    }
+
+    let mut too_deep = Value::Null;
+    for _ in 0..=MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH {
+        too_deep = json!({"nested": too_deep});
+    }
+    assert!(matches!(
+        StructuredOutputRequest::new("too_deep", too_deep, true),
+        Err(HarnessError::InvalidRequest(message)) if message.contains("depth")
+    ));
+    assert!(matches!(
+        StructuredOutputRequest::new(
+            "too_large",
+            json!({"description":"x".repeat(MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES as usize)}),
+            true,
+        ),
+        Err(HarnessError::InvalidRequest(message)) if message.contains("bytes")
+    ));
 }
 
 fn assembler(limits: ToolCallAssemblyLimits) -> ToolCallAssembler {

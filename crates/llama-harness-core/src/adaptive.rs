@@ -6,9 +6,12 @@ use crate::{
     discovery::{ToolDiscoveryStats, ToolScope, ToolScopeSelection},
     event::EventEmitter,
     limits::serialized_len,
-    plan::{MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES},
+    plan::{
+        MAX_EXECUTION_PLAN_BINDINGS, MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES,
+        MAX_PLAN_ID_LENGTH, MAX_PLAN_POINTER_LENGTH,
+    },
     runner::{
-        apply_terminal_error, discovery_limit_terminal_result,
+        agent_structured_output, apply_terminal_error, discovery_limit_terminal_result,
         discovery_limit_terminal_result_with_scopes, emit_discovery, ensure_transcript,
         initial_messages, merge_generation, pre_event_terminal_result,
         pre_event_terminal_result_with_scopes, preflight_request, preflight_terminal_result,
@@ -18,7 +21,7 @@ use crate::{
     AgentRunner, ExecutionPlan, HarnessError, Message, ModelRequest, ModelResponse,
     PlanConcurrency, PlanLifecycleOutcome, PlanNode, PlanNodeOutcome, PlanPhase, RunError,
     RunEvent, RunRequest, RunResult, RunStatus, RunStrategy, StrategyFallbackReason,
-    StrategySelectionReason, ToolCall, ToolCaller, ToolResult,
+    StrategySelectionReason, StructuredOutputRequest, ToolCall, ToolCaller, ToolResult,
 };
 use futures_util::future::join_all;
 use jsonschema::Validator;
@@ -116,6 +119,98 @@ enum ModelCallPhase {
     Recovery,
     FinalSynthesis,
     Reactive,
+}
+
+fn plan_schema(max_nodes: usize, allow_direct: bool) -> Value {
+    let declarative = serde_json::json!({
+        "type": "object",
+        "required": ["strategy", "plan"],
+        "properties": {
+            "strategy": {"const": "declarative_plan"},
+            "plan": {"$ref": "#/$defs/plan"}
+        },
+        "additionalProperties": false
+    });
+    let envelope = if allow_direct {
+        serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["strategy"],
+                    "properties": {"strategy": {"const": "direct"}},
+                    "additionalProperties": false
+                },
+                declarative
+            ]
+        })
+    } else {
+        declarative
+    };
+    let mut root = envelope.as_object().cloned().unwrap_or_default();
+    root.insert(
+        "$schema".into(),
+        Value::String("https://json-schema.org/draft/2020-12/schema".into()),
+    );
+    root.insert(
+        "$defs".into(),
+        serde_json::json!({
+            "plan": {
+                "type": "object",
+                "required": ["nodes"],
+                "properties": {
+                    "nodes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": max_nodes,
+                        "items": {"$ref": "#/$defs/node"}
+                    }
+                },
+                "additionalProperties": false
+            },
+            "node": {
+                "type": "object",
+                "required": ["id", "tool_id", "arguments"],
+                "properties": {
+                    "id": {"type": "string", "minLength": 1, "maxLength": MAX_PLAN_ID_LENGTH},
+                    "tool_id": {"type": "string", "minLength": 1, "maxLength": MAX_PLAN_ID_LENGTH},
+                    "arguments": {},
+                    "depends_on": {
+                        "type": "array",
+                        "maxItems": max_nodes,
+                        "items": {"type": "string", "minLength": 1, "maxLength": MAX_PLAN_ID_LENGTH}
+                    },
+                    "result_bindings": {
+                        "type": "array",
+                        "maxItems": MAX_EXECUTION_PLAN_BINDINGS,
+                        "items": {"$ref": "#/$defs/binding"}
+                    },
+                    "concurrency": {"enum": ["tool_default", "serial"]},
+                    "approval_barrier": {"type": "boolean"},
+                    "commit_boundary": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            },
+            "binding": {
+                "type": "object",
+                "required": ["target_pointer", "source"],
+                "properties": {
+                    "target_pointer": {"type": "string", "minLength": 1, "maxLength": MAX_PLAN_POINTER_LENGTH},
+                    "source": {"$ref": "#/$defs/result_ref"}
+                },
+                "additionalProperties": false
+            },
+            "result_ref": {
+                "type": "object",
+                "required": ["node_id"],
+                "properties": {
+                    "node_id": {"type": "string", "minLength": 1, "maxLength": MAX_PLAN_ID_LENGTH},
+                    "output_pointer": {"type": "string", "maxLength": MAX_PLAN_POINTER_LENGTH}
+                },
+                "additionalProperties": false
+            }
+        }),
+    );
+    Value::Object(root)
 }
 
 impl AgentRunner {
@@ -847,6 +942,7 @@ impl<'a> StrategyRun<'a> {
         reserve_final_synthesis: bool,
         allow_speculation: bool,
     ) -> Result<Option<ModelResponse>, HarnessError> {
+        let structured_output = self.structured_output_for_phase(phase)?;
         let mut provider_retries = 0;
         loop {
             if self.model_calls >= self.request.agent.limits.max_model_calls {
@@ -885,6 +981,7 @@ impl<'a> StrategyRun<'a> {
                     &self.request.agent.generation,
                     &self.request.overrides.generation,
                 ),
+                structured_output: structured_output.clone(),
                 metadata: self.request.metadata.clone(),
                 cancellation: call_cancellation.clone(),
             };
@@ -962,6 +1059,54 @@ impl<'a> StrategyRun<'a> {
                 }
                 Err(error) => return Err(error),
             }
+        }
+    }
+
+    fn structured_output_for_phase(
+        &self,
+        phase: ModelCallPhase,
+    ) -> Result<Option<StructuredOutputRequest>, HarnessError> {
+        let capabilities = self.runner.provider.capabilities();
+        if !capabilities.supports_structured_output {
+            return Ok(None);
+        }
+        match phase {
+            ModelCallPhase::Planning | ModelCallPhase::Repair => {
+                let max_nodes = capabilities
+                    .limits
+                    .max_plan_nodes
+                    .map_or(MAX_EXECUTION_PLAN_NODES, |limit| limit as usize)
+                    .min(self.request.agent.limits.max_tool_calls as usize)
+                    .min(MAX_EXECUTION_PLAN_NODES);
+                let allow_direct = self.selected == RunStrategy::Adaptive;
+                StructuredOutputRequest::new(
+                    if allow_direct {
+                        "llama_harness_planner_envelope_v1"
+                    } else {
+                        "llama_harness_declarative_plan_v1"
+                    },
+                    plan_schema(max_nodes, allow_direct),
+                    true,
+                )
+                .map(Some)
+            }
+            ModelCallPhase::Recovery => {
+                let max_nodes = capabilities
+                    .limits
+                    .max_plan_nodes
+                    .map_or(MAX_EXECUTION_PLAN_NODES, |limit| limit as usize)
+                    .min(self.request.agent.limits.max_tool_calls as usize)
+                    .min(MAX_EXECUTION_PLAN_NODES);
+                StructuredOutputRequest::new(
+                    "llama_harness_recovery_plan_v1",
+                    plan_schema(max_nodes, false),
+                    true,
+                )
+                .map(Some)
+            }
+            ModelCallPhase::FinalSynthesis | ModelCallPhase::Reactive => Ok(
+                agent_structured_output(&capabilities, self.request.agent.output_schema.as_ref()),
+            ),
         }
     }
 

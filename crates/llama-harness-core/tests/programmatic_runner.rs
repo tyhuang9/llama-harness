@@ -695,6 +695,71 @@ async fn forced_programmatic_runs_model_program_broker_and_final_synthesis() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].tools.len(), 1);
     assert!(requests[1].tools.is_empty());
+    let generation = requests[0].structured_output.as_ref().unwrap();
+    assert_eq!(generation.name, "llama_harness_program_ast_v1");
+    assert!(generation.strict);
+    generation.validate().unwrap();
+    assert!(requests[1].structured_output.is_none());
+}
+
+#[tokio::test]
+async fn programmatic_final_synthesis_receives_the_agent_output_contract() {
+    let program = json!({"version":1,"body":[
+        {"kind":"return","value":{"kind":"string","value":"safe"}}
+    ]});
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(program.to_string()),
+            final_response(r#""done""#),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let mut run_request = request(&[]);
+    run_request.agent.output_schema = Some(json!({"type":"string"}));
+    let result = AgentRunner::builder(provider.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(run_request, RunStrategy::Programmatic)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.final_output.as_deref(), Some(r#""done""#));
+    let requests = provider.requests();
+    assert_eq!(
+        requests[0].structured_output.as_ref().unwrap().name,
+        "llama_harness_program_ast_v1"
+    );
+    let synthesis = requests[1].structured_output.as_ref().unwrap();
+    assert_eq!(synthesis.name, "llama_harness_agent_output");
+    synthesis.validate().unwrap();
+}
+
+#[tokio::test]
+async fn programmatic_keeps_strict_parser_fallback_without_structured_output_capability() {
+    let program = json!({"version":1,"body":[
+        {"kind":"return","value":{"kind":"string","value":"safe"}}
+    ]});
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response(program.to_string()), final_response("done")])
+            .with_capabilities(
+                ModelCapabilities::new(true, false, false)
+                    .with_programmatic_conformance(ProgrammaticConformance::StrictJsonAstV1)
+                    .with_limits(ProviderCapabilityLimits::new().with_max_program_bytes(64 * 1024)),
+            ),
+    );
+    let result = AgentRunner::builder(provider.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .build()
+        .run_with_strategy(request(&[]), RunStrategy::Programmatic)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(provider
+        .requests()
+        .iter()
+        .all(|request| request.structured_output.is_none()));
 }
 
 #[tokio::test]
@@ -2471,7 +2536,13 @@ async fn invalid_program_gets_exactly_one_repair_before_dispatch() {
         .await
         .unwrap();
     assert!(matches!(result.status, RunStatus::Completed));
-    assert_eq!(provider.requests().len(), 3);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[..2].iter().all(|request| request
+        .structured_output
+        .as_ref()
+        .is_some_and(|output| output.name == "llama_harness_program_ast_v1")));
+    assert!(requests[2].structured_output.is_none());
 }
 
 #[tokio::test]

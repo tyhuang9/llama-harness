@@ -1,4 +1,11 @@
-use crate::{GenerationOptions, HarnessError, JsonMap, Message, ModelEventStream, ToolDefinition};
+use crate::{
+    limits::{
+        compile_trusted_schema, ensure_json_depth, serialized_len,
+        MAX_STRUCTURED_OUTPUT_NAME_BYTES, MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES,
+        MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH,
+    },
+    GenerationOptions, HarnessError, JsonMap, Message, ModelEventStream, ToolDefinition,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -105,6 +112,9 @@ pub struct ModelRequest {
     pub prepared_tools: Option<Arc<PreparedToolCatalog>>,
     /// Generation settings for this request.
     pub generation: GenerationOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional provider-neutral request for schema-constrained output.
+    pub structured_output: Option<StructuredOutputRequest>,
     #[serde(default)]
     /// Provider-specific request metadata.
     pub metadata: JsonMap,
@@ -122,8 +132,93 @@ impl ModelRequest {
             tools: Vec::new(),
             prepared_tools: None,
             generation: GenerationOptions::default(),
+            structured_output: None,
             metadata: JsonMap::new(),
             cancellation: CancellationToken::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+/// Provider-neutral schema contract for one structured model response.
+///
+/// Providers must treat `schema` as inert JSON Schema and must not resolve
+/// non-local references. Core runners validate the same response again before
+/// any generated plan or program can execute.
+pub struct StructuredOutputRequest {
+    /// Stable provider-facing schema name.
+    pub name: String,
+    /// JSON Schema constraining the complete response value.
+    pub schema: serde_json::Value,
+    /// Whether the provider must reject output outside `schema`.
+    pub strict: bool,
+}
+
+impl StructuredOutputRequest {
+    /// Creates and validates a bounded provider-neutral structured-output request.
+    pub fn new(
+        name: impl Into<String>,
+        schema: serde_json::Value,
+        strict: bool,
+    ) -> Result<Self, HarnessError> {
+        let request = Self {
+            name: name.into(),
+            schema,
+            strict,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Validates name, size, depth, references, and JSON Schema syntax.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        if self.name.is_empty() {
+            return Err(HarnessError::InvalidRequest(
+                "structured-output name must not be empty".into(),
+            ));
+        }
+        if self.name.len() > MAX_STRUCTURED_OUTPUT_NAME_BYTES {
+            return Err(HarnessError::InvalidRequest(format!(
+                "structured-output name exceeds {MAX_STRUCTURED_OUTPUT_NAME_BYTES} bytes"
+            )));
+        }
+        if !self
+            .name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(HarnessError::InvalidRequest(
+                "structured-output name must contain only ASCII letters, digits, '_' or '-'".into(),
+            ));
+        }
+        if serialized_len(&self.schema)? > MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES {
+            return Err(HarnessError::InvalidRequest(format!(
+                "structured-output schema exceeds {MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES} bytes"
+            )));
+        }
+        ensure_json_depth(
+            "structured-output schema",
+            &self.schema,
+            MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH,
+        )
+        .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?;
+        compile_trusted_schema(&self.schema, |error| {
+            HarnessError::InvalidRequest(format!("invalid structured-output schema: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn from_prevalidated(
+        name: impl Into<String>,
+        schema: serde_json::Value,
+        strict: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+            strict,
         }
     }
 }
@@ -456,6 +551,10 @@ pub trait ModelProvider: Send + Sync {
     /// Lists models available from the provider.
     async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError>;
     /// Completes one model request.
+    ///
+    /// Providers that cannot enforce a supplied [`StructuredOutputRequest`]
+    /// must return [`HarnessError::UnsupportedCapability`] instead of silently
+    /// dropping the contract.
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError>;
     /// Streams one model request when the provider implements streaming.
     async fn stream(&self, _: ModelRequest) -> Result<ModelEventStream, HarnessError> {

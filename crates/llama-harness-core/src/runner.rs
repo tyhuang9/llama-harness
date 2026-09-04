@@ -7,7 +7,9 @@ use crate::{
     event::{EventEmitter, EventSink, InMemoryEventSink, RunEvent},
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len, AgentLimits},
     message::Message,
-    model::{ModelProvider, ModelRequest, ModelResponse},
+    model::{
+        ModelCapabilities, ModelProvider, ModelRequest, ModelResponse, StructuredOutputRequest,
+    },
     policy::{ApprovalHandler, DenyApproval, PolicyEngine, SafeDefaultPolicy},
     tool::{ToolCall, ToolCaller, ToolRegistry, ToolResult},
     GenerationOptions, HarnessError, RunError, ToolDiscoveryLimits,
@@ -144,12 +146,13 @@ impl AgentRunner {
         preflight: RunPreflight,
         continuation: Option<DirectContinuation>,
     ) -> Result<RunResult, HarnessError> {
+        let capabilities = self.provider.capabilities();
         let selection = self.tools.select_scope_for_run(
             &request.input,
             &request.agent.tool_allowlist,
             ToolCaller::Direct,
             self.discovery_limits,
-            &self.provider.capabilities().limits,
+            &capabilities.limits,
             &request.cancellation,
             preflight.deadline,
         );
@@ -296,6 +299,8 @@ impl AgentRunner {
         let model = result.model.clone();
         let mut messages = initial_messages(&request);
         let mut output_repairs = 0;
+        let structured_output =
+            agent_structured_output(&capabilities, request.agent.output_schema.as_ref());
         let broker = ToolBroker::new(
             &self.tools,
             &tool_scope,
@@ -355,6 +360,7 @@ impl AgentRunner {
                         &request.agent.generation,
                         &request.overrides.generation,
                     ),
+                    structured_output: structured_output.clone(),
                     metadata: request.metadata.clone(),
                     cancellation: call_cancellation.clone(),
                 };
@@ -1114,11 +1120,24 @@ pub(crate) fn validate_request(request: &RunRequest) -> Result<Option<Validator>
         .map(|schema| {
             ensure_json_depth("output schema", schema, limits.max_json_depth)
                 .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?;
+            StructuredOutputRequest::new("llama_harness_agent_output", schema.clone(), true)?;
             compile_trusted_schema(schema, |error| {
                 HarnessError::InvalidRequest(format!("invalid output schema: {error}"))
             })
         })
         .transpose()
+}
+
+pub(crate) fn agent_structured_output(
+    capabilities: &ModelCapabilities,
+    schema: Option<&Value>,
+) -> Option<StructuredOutputRequest> {
+    if !capabilities.supports_structured_output {
+        return None;
+    }
+    schema.cloned().map(|schema| {
+        StructuredOutputRequest::from_prevalidated("llama_harness_agent_output", schema, true)
+    })
 }
 
 pub(crate) fn preflight_request(request: &RunRequest) -> Result<RunPreflight, HarnessError> {
