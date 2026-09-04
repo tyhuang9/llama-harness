@@ -646,6 +646,9 @@ impl AgentRunner {
                     reason: StrategySelectionReason::PlannerSelectedDirect,
                 });
                 run.selected = RunStrategy::Direct;
+                if requested == RunStrategy::Adaptive {
+                    run.speculation_eligibility = SpeculationEligibility::FirstProviderAttempt;
+                }
                 run.run_reactive(ModelCallPhase::Reactive).await;
             }
             PlannerEnvelope::DeclarativePlan { mut plan } => {

@@ -51,6 +51,7 @@ struct StreamingProvider {
     stream_calls: AtomicUsize,
     behavior: Mutex<StreamBehavior>,
     planner_response: Option<&'static str>,
+    planner_error: bool,
     partial_emitted: Arc<Semaphore>,
     release_final: Arc<Semaphore>,
     stream_drop_saw_cancellation: Arc<AtomicBool>,
@@ -68,6 +69,7 @@ impl StreamingProvider {
             stream_calls: AtomicUsize::new(0),
             behavior: Mutex::new(behavior),
             planner_response: None,
+            planner_error: false,
             partial_emitted: Arc::new(Semaphore::new(0)),
             release_final: Arc::new(Semaphore::new(0)),
             stream_drop_saw_cancellation: Arc::new(AtomicBool::new(false)),
@@ -89,6 +91,13 @@ impl StreamingProvider {
     fn adaptive_invalid_plan() -> Self {
         Self {
             planner_response: Some("not-json"),
+            ..Self::new(StreamBehavior::Normal)
+        }
+    }
+
+    fn adaptive_planner_failure() -> Self {
+        Self {
+            planner_error: true,
             ..Self::new(StreamBehavior::Normal)
         }
     }
@@ -185,10 +194,11 @@ impl ModelProvider for StreamingProvider {
     }
 
     fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities::new(true, true, self.planner_response.is_some())
+        let supports_planning = self.planner_response.is_some() || self.planner_error;
+        ModelCapabilities::new(true, true, supports_planning)
             .with_streaming_tool_arguments(true)
             .with_parallel_tool_calls(true)
-            .with_structured_plans(self.planner_response.is_some())
+            .with_structured_plans(supports_planning)
             .with_limits(
                 ProviderCapabilityLimits::new()
                     .with_max_parallel_tool_calls(2)
@@ -207,14 +217,16 @@ impl ModelProvider for StreamingProvider {
 
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError> {
         self.complete_calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(response) = self.planner_response.filter(|_| {
-            request.structured_output.as_ref().is_some_and(|output| {
-                matches!(
-                    output.name.as_str(),
-                    "llama_harness_planner_envelope_v1" | "llama_harness_declarative_plan_v1"
-                )
-            })
-        }) {
+        let is_planner_request = request.structured_output.as_ref().is_some_and(|output| {
+            matches!(
+                output.name.as_str(),
+                "llama_harness_planner_envelope_v1" | "llama_harness_declarative_plan_v1"
+            )
+        });
+        if self.planner_error && is_planner_request {
+            return Err(HarnessError::Provider("planner failed".into()));
+        }
+        if let Some(response) = self.planner_response.filter(|_| is_planner_request) {
             return Ok(ModelResponse::new(request.model).with_final_output(response));
         }
         let requests_tool = Self::requests_tool(&request);
@@ -2912,7 +2924,7 @@ async fn stream_event_and_run_argument_limits_prevent_dispatch() {
 }
 
 #[tokio::test]
-async fn adaptive_planner_selected_direct_never_starts_speculation() {
+async fn adaptive_planner_selected_direct_can_speculate_on_first_reactive_attempt() {
     let provider = Arc::new(StreamingProvider::adaptive_direct());
     let tool = Arc::new(CountingTool::declarative_eligible());
     let runner = AgentRunner::builder(provider.clone())
@@ -2920,6 +2932,11 @@ async fn adaptive_planner_selected_direct_never_starts_speculation() {
         .policy(Arc::new(TestPolicy::new(true)))
         .speculation(SpeculationConfig::default())
         .build();
+    train_and_activate(&runner).await;
+    provider.complete_calls.store(0, Ordering::SeqCst);
+    provider.stream_calls.store(0, Ordering::SeqCst);
+    tool.calls.store(0, Ordering::SeqCst);
+    tool.callers.lock().unwrap().clear();
 
     let result = runner
         .run(request())
@@ -2927,14 +2944,45 @@ async fn adaptive_planner_selected_direct_never_starts_speculation() {
         .expect("adaptive direct run succeeds");
 
     assert_eq!(result.status, RunStatus::Completed);
-    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 3);
-    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         tool.callers.lock().unwrap().as_slice(),
-        [ToolCaller::Direct]
+        [ToolCaller::Speculative]
     );
-    assert_eq!(runner.speculation_metrics(TOOL_ID).shadow_matches, 0);
+    assert_eq!(runner.speculation_metrics(TOOL_ID).issued, 1);
+    assert_eq!(runner.speculation_metrics(TOOL_ID).committed, 1);
+}
+
+#[tokio::test]
+async fn adaptive_planner_failure_fallback_never_starts_speculation() {
+    let provider = Arc::new(StreamingProvider::adaptive_planner_failure());
+    let tool = Arc::new(CountingTool::declarative_eligible());
+    let events = Arc::new(InMemoryEventSink::default());
+    let runner = AgentRunner::builder(provider.clone())
+        .tools(registry(tool.clone()))
+        .policy(Arc::new(TestPolicy::new(true)))
+        .event_sink(events.clone())
+        .speculation(SpeculationConfig::default())
+        .build();
+
+    let result = runner
+        .run(request())
+        .await
+        .expect("adaptive planner failure falls back sequentially");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     assert_eq!(runner.speculation_metrics(TOOL_ID).issued, 0);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyFallback {
+            reason: llama_harness_core::StrategyFallbackReason::PlannerFailure,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
