@@ -62,7 +62,9 @@ pub use llama_harness_core::{
 #[cfg(feature = "programmatic")]
 /// Deterministic programmatic sandbox contracts and explicit host configuration.
 pub mod programmatic {
-    pub use llama_harness_core::{programmatic_sandbox::*, ProgrammaticHostConfig};
+    pub use llama_harness_core::{
+        programmatic_sandbox::*, ProgrammaticHostConfig, ProgrammaticWorkloadClass,
+    };
 }
 pub use serde_json;
 pub use serde_json::Value as JsonValue;

@@ -1,6 +1,6 @@
 use crate::{
     broker::{BrokerState, PrepareOutcome, PreparedCall, ToolBroker},
-    discovery::{ToolScope, ToolScopeSelection},
+    discovery::{ToolDiscoveryStats, ToolScope, ToolScopeSelection},
     event::{EventEmitter, ProgramLifecycleOutcome, RunEvent, StrategySelectionReason},
     runner::{
         agent_structured_output, apply_terminal_error, await_guarded, check_stopped,
@@ -17,7 +17,7 @@ use llama_harness_programmatic_sandbox::{
     Execution, ExecutionId, Program, SandboxErrorCode, SandboxLimits, StepOutcome, ToolBatch,
     ToolResponse, HARD_LIMITS,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     io::{self, Write},
@@ -35,6 +35,67 @@ const HARD_PROGRAMMATIC_DURATION_MS: u64 = 300_000;
 const DEFAULT_VM_ADMISSION: usize = 4;
 const HARD_VM_ADMISSION: usize = 16;
 const MAX_FANOUT_CONCURRENCY: usize = 8;
+
+/// A bounded workload shape that a host may allow Adaptive planning to promote
+/// to deterministic Programmatic execution.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProgrammaticWorkloadClass {
+    /// Bounded iteration over a collection or repeated operation.
+    Loop,
+    /// Bounded parallel dispatch of independent read-only work.
+    FanOut,
+    /// Bounded selection of values from an intermediate collection.
+    Filter,
+    /// Bounded reduction or aggregation of intermediate values.
+    Aggregation,
+    /// Work whose bounded intermediate representation is materially larger
+    /// than is practical to shuttle through a native tool-calling transcript.
+    LargeIntermediateData,
+}
+
+impl ProgrammaticWorkloadClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loop => "loop",
+            Self::FanOut => "fan_out",
+            Self::Filter => "filter",
+            Self::Aggregation => "aggregation",
+            Self::LargeIntermediateData => "large_intermediate_data",
+        }
+    }
+}
+
+pub(crate) struct AdaptiveProgrammaticPrepared {
+    pub(crate) scope: ToolScope,
+    pub(crate) discovery: ToolDiscoveryStats,
+    capabilities: ModelCapabilities,
+    limits: SandboxLimits,
+    structured_output: Option<StructuredOutputRequest>,
+    pub(crate) deadline: Option<Instant>,
+    admission: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+pub(crate) enum AdaptiveProgrammaticReadiness {
+    Ready(Box<AdaptiveProgrammaticPrepared>),
+    Fallback(Option<ToolDiscoveryStats>),
+}
+
+pub(crate) struct ProgrammaticContinuation {
+    pub(crate) result: RunResult,
+    pub(crate) events: EventEmitter,
+    pub(crate) output_validator: Option<jsonschema::Validator>,
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) started: StdInstant,
+    pub(crate) model: String,
+    pub(crate) model_calls: u32,
+    pub(crate) planning_calls: u32,
+    pub(crate) repair_calls: u32,
+    pub(crate) synthesis_calls: u32,
+    pub(crate) broker_state: BrokerState,
+    pub(crate) prepared_direct_scope: Option<ToolScope>,
+}
 
 // The sandbox only needs a process-local opaque resume scope. Public broker
 // occurrence and effect identities use the full UUID below; this counter is
@@ -518,11 +579,128 @@ impl ProgrammaticHostConfig {
     }
 }
 
+fn programmatic_deadline(
+    config: &ProgrammaticHostConfig,
+    run_deadline: Option<Instant>,
+) -> Result<Option<Instant>, HarnessError> {
+    let configured_deadline = Instant::now()
+        .checked_add(Duration::from_millis(config.max_duration_ms))
+        .ok_or_else(|| HarnessError::InvalidRequest("programmatic duration is too large".into()))?;
+    Ok(Some(run_deadline.map_or(configured_deadline, |run| {
+        run.min(configured_deadline)
+    })))
+}
+
+fn effective_programmatic_limits(
+    config: &ProgrammaticHostConfig,
+    request: &RunRequest,
+    provider_program_bytes: u64,
+) -> Result<SandboxLimits, HarnessError> {
+    let mut limits = config.limits.constrained_by(HARD_LIMITS);
+    limits.max_program_bytes = limits
+        .max_program_bytes
+        .min(request.agent.limits.max_programmatic_program_bytes as usize)
+        .min(usize::try_from(provider_program_bytes).unwrap_or(usize::MAX));
+    limits.validate().map_err(|_| {
+        HarnessError::UnsupportedCapability(
+            "effective provider program byte limit is invalid".into(),
+        )
+    })?;
+    Ok(limits)
+}
+
 impl AgentRunner {
+    pub(crate) fn prepare_adaptive_programmatic(
+        &self,
+        request: &RunRequest,
+        model_calls: u32,
+        run_deadline: Option<Instant>,
+    ) -> Result<AdaptiveProgrammaticReadiness, HarnessError> {
+        let Some(config) = self.programmatic.as_ref() else {
+            return Ok(AdaptiveProgrammaticReadiness::Fallback(None));
+        };
+        // An explicitly supplied but invalid host configuration is a terminal
+        // host error, not a capability downgrade.
+        config.validate()?;
+        let capabilities = self.provider.capabilities();
+        if !capabilities.supports_tools
+            || !capabilities.supports_programmatic_calling
+            || capabilities.programmatic_conformance
+                != Some(ProgrammaticConformance::StrictJsonAstV1)
+        {
+            return Ok(AdaptiveProgrammaticReadiness::Fallback(None));
+        }
+        let Some(provider_program_bytes) = capabilities
+            .limits
+            .max_program_bytes
+            .filter(|bytes| *bytes > 0)
+        else {
+            return Ok(AdaptiveProgrammaticReadiness::Fallback(None));
+        };
+        if request
+            .agent
+            .limits
+            .max_model_calls
+            .saturating_sub(model_calls)
+            < 2
+        {
+            return Ok(AdaptiveProgrammaticReadiness::Fallback(None));
+        }
+
+        let deadline = programmatic_deadline(config, run_deadline)?;
+        check_stopped(
+            &request.cancellation,
+            deadline,
+            "programmatic run deadline reached",
+        )?;
+        // Admission is deliberately acquired before discovery or any model
+        // work. Saturation is a fail-fast resource limit, never a queued wait
+        // or an Adaptive downgrade.
+        let admission = Arc::clone(&self.programmatic_admission)
+            .try_acquire_owned()
+            .map_err(|_| {
+                HarnessError::ResourceLimit("programmatic run admission limit reached".into())
+            })?;
+        let selection = self.tools.select_scope_for_run(
+            &request.input,
+            &request.agent.tool_allowlist,
+            ToolCaller::Programmatic,
+            self.discovery_limits,
+            &capabilities.limits,
+            &request.cancellation,
+            deadline,
+        )?;
+        let (scope, discovery) = match selection {
+            ToolScopeSelection::Selected(scope, stats) => (scope, stats),
+            ToolScopeSelection::LimitReached(stats) => {
+                return Ok(AdaptiveProgrammaticReadiness::Fallback(Some(stats)));
+            }
+        };
+        let limits = match effective_programmatic_limits(config, request, provider_program_bytes) {
+            Ok(limits) => limits,
+            Err(HarnessError::UnsupportedCapability(_)) => {
+                return Ok(AdaptiveProgrammaticReadiness::Fallback(Some(discovery)));
+            }
+            Err(error) => return Err(error),
+        };
+        let structured_output = program_structured_output(&capabilities, &limits)?;
+        Ok(AdaptiveProgrammaticReadiness::Ready(Box::new(
+            AdaptiveProgrammaticPrepared {
+                scope,
+                discovery,
+                capabilities,
+                limits,
+                structured_output,
+                deadline,
+                admission: Some(admission),
+            },
+        )))
+    }
+
     pub(crate) async fn run_programmatic(
         &self,
         request: RunRequest,
-        mut preflight: RunPreflight,
+        preflight: RunPreflight,
     ) -> Result<RunResult, HarnessError> {
         let config = self.programmatic.as_ref().ok_or_else(|| {
             HarnessError::UnsupportedCapability(
@@ -555,16 +733,7 @@ impl AgentRunner {
             ));
         }
 
-        let configured_deadline = Instant::now()
-            .checked_add(Duration::from_millis(config.max_duration_ms))
-            .ok_or_else(|| {
-                HarnessError::InvalidRequest("programmatic duration is too large".into())
-            })?;
-        let deadline = Some(
-            preflight
-                .deadline
-                .map_or(configured_deadline, |run| run.min(configured_deadline)),
-        );
+        let deadline = programmatic_deadline(config, preflight.deadline)?;
         check_stopped(
             &request.cancellation,
             deadline,
@@ -588,16 +757,7 @@ impl AgentRunner {
             }
         };
 
-        let mut limits = config.limits.constrained_by(HARD_LIMITS);
-        limits.max_program_bytes = limits
-            .max_program_bytes
-            .min(request.agent.limits.max_programmatic_program_bytes as usize)
-            .min(usize::try_from(provider_program_bytes).unwrap_or(usize::MAX));
-        limits.validate().map_err(|_| {
-            HarnessError::UnsupportedCapability(
-                "effective provider program byte limit is invalid".into(),
-            )
-        })?;
+        let limits = effective_programmatic_limits(config, &request, provider_program_bytes)?;
         let program_structured_output = program_structured_output(&capabilities, &limits)?;
 
         let started = preflight.started;
@@ -614,7 +774,7 @@ impl AgentRunner {
             .model
             .clone()
             .unwrap_or_else(|| request.agent.default_model.clone());
-        let mut result = RunResult::new(&run_id, RunStatus::Failed, &model, &trace_id);
+        let result = RunResult::new(&run_id, RunStatus::Failed, &model, &trace_id);
         let mut events = EventEmitter::new(run_id.clone(), trace_id, Arc::clone(&self.events));
         events.emit(RunEvent::Started {
             run_id: run_id.clone(),
@@ -627,11 +787,87 @@ impl AgentRunner {
             reason: StrategySelectionReason::Forced,
         });
 
-        let mut model_calls = 0u32;
-        let mut planning_calls = 0u32;
-        let mut repair_calls = 0u32;
-        let mut synthesis_calls = 0u32;
-        let mut broker_state = BrokerState::default();
+        self.run_programmatic_engine(
+            &request,
+            AdaptiveProgrammaticPrepared {
+                scope,
+                discovery,
+                capabilities,
+                limits,
+                structured_output: program_structured_output,
+                deadline,
+                // Forced execution retains its historical admission point
+                // inside the engine.
+                admission: None,
+            },
+            ProgrammaticContinuation {
+                result,
+                events,
+                output_validator: preflight.output_validator,
+                deadline,
+                started,
+                model,
+                model_calls: 0,
+                planning_calls: 0,
+                repair_calls: 0,
+                synthesis_calls: 0,
+                broker_state: BrokerState::default(),
+                prepared_direct_scope: None,
+            },
+            RunStrategy::Programmatic,
+            StrategySelectionReason::Forced,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_adaptive_programmatic(
+        &self,
+        request: &RunRequest,
+        prepared: AdaptiveProgrammaticPrepared,
+        continuation: ProgrammaticContinuation,
+    ) -> Result<RunResult, HarnessError> {
+        self.run_programmatic_engine(
+            request,
+            prepared,
+            continuation,
+            RunStrategy::Adaptive,
+            StrategySelectionReason::PlannerSelectedDirect,
+        )
+        .await
+    }
+
+    async fn run_programmatic_engine(
+        &self,
+        request: &RunRequest,
+        prepared: AdaptiveProgrammaticPrepared,
+        continuation: ProgrammaticContinuation,
+        requested: RunStrategy,
+        fallback_selection_reason: StrategySelectionReason,
+    ) -> Result<RunResult, HarnessError> {
+        let AdaptiveProgrammaticPrepared {
+            scope,
+            discovery: _,
+            capabilities,
+            limits,
+            structured_output: program_structured_output,
+            deadline: prepared_deadline,
+            admission: prepared_admission,
+        } = prepared;
+        let ProgrammaticContinuation {
+            mut result,
+            mut events,
+            output_validator,
+            deadline,
+            started,
+            model,
+            mut model_calls,
+            mut planning_calls,
+            mut repair_calls,
+            mut synthesis_calls,
+            mut broker_state,
+            prepared_direct_scope,
+        } = continuation;
+        debug_assert_eq!(deadline, prepared_deadline);
         let broker = ToolBroker::new(
             &self.tools,
             &scope,
@@ -641,8 +877,8 @@ impl AgentRunner {
         );
         let mut dispatched = false;
         let mut invalid_program_exhausted = false;
+        let mut program_attempt = 0u32;
         let terminal = async {
-            let mut program_attempt = 0u32;
             events.emit(RunEvent::ProgramLifecycle {
                 attempt: program_attempt.saturating_add(1),
                 outcome: ProgramLifecycleOutcome::Started,
@@ -655,13 +891,18 @@ impl AgentRunner {
             // nonblocking check prevents a tool-held run from deadlocking a
             // reentrant Programmatic run and avoids model or tool work for a
             // rejected candidate.
-            let _live_run_permit = Arc::clone(&self.programmatic_admission)
-                .try_acquire_owned()
-                .map_err(|_| {
-                    HarnessError::ResourceLimit("programmatic run admission limit reached".into())
-                })?;
-            let mut broker_transcript = ProgrammaticTranscript::new(&request, &limits)?;
-            let mut generation_messages = initial_messages(&request);
+            let _live_run_permit = match prepared_admission {
+                Some(permit) => permit,
+                None => Arc::clone(&self.programmatic_admission)
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        HarnessError::ResourceLimit(
+                            "programmatic run admission limit reached".into(),
+                        )
+                    })?,
+            };
+            let mut broker_transcript = ProgrammaticTranscript::new(request, &limits)?;
+            let mut generation_messages = initial_messages(request);
             generation_messages.push(Message::system(PROGRAM_PROMPT));
             ensure_transcript(&generation_messages, &request.agent.limits)?;
 
@@ -684,7 +925,7 @@ impl AgentRunner {
                 };
                 let response = self
                     .programmatic_completion(
-                        &request,
+                        request,
                         &model,
                         generation_messages.clone(),
                         Some(&scope),
@@ -784,7 +1025,7 @@ impl AgentRunner {
                     StepOutcome::Yielded { batch, resume } => {
                         let responses = self
                             .execute_programmatic_batch(
-                                &request,
+                                request,
                                 &broker,
                                 &mut result,
                                 &mut events,
@@ -825,13 +1066,13 @@ impl AgentRunner {
             drop(vm);
 
             let output_json = serialize_synthesis_input(&program_output, &broker_transcript)?;
-            let mut synthesis_messages = initial_messages(&request);
+            let mut synthesis_messages = initial_messages(request);
             synthesis_messages.push(Message::system(SYNTHESIS_PROMPT));
             synthesis_messages.push(Message::user(output_json));
             ensure_transcript(&synthesis_messages, &request.agent.limits)?;
             let response = self
                 .programmatic_completion(
-                    &request,
+                    request,
                     &model,
                     synthesis_messages,
                     None,
@@ -851,7 +1092,7 @@ impl AgentRunner {
                 ));
             }
             validate_output(
-                preflight.output_validator.as_ref(),
+                output_validator.as_ref(),
                 &output,
                 request.agent.limits.max_json_depth,
             )?;
@@ -867,23 +1108,27 @@ impl AgentRunner {
 
         if invalid_program_exhausted && !dispatched && broker_state.tool_issued == 0 {
             events.emit(RunEvent::ProgramLifecycle {
-                attempt: repair_calls.saturating_add(1),
+                attempt: program_attempt.saturating_add(1),
                 outcome: ProgramLifecycleOutcome::Fallback,
             });
             // The continuation is one logical run, including its tightened
             // programmatic host deadline rather than the preflight request
             // deadline that may be longer.
-            preflight.deadline = deadline;
             return self
                 .run_direct_continuation(
-                    request,
+                    request.clone(),
                     DirectStrategyEvents {
-                        requested: RunStrategy::Programmatic,
-                        reason: StrategySelectionReason::Forced,
+                        requested,
+                        reason: fallback_selection_reason,
                         fallback: Some(StrategyFallbackReason::InvalidProgram),
+                        fallback_from: Some(RunStrategy::Programmatic),
                         prior_discovery: None,
                     },
-                    preflight,
+                    RunPreflight {
+                        output_validator,
+                        deadline,
+                        started,
+                    },
                     DirectContinuation {
                         result,
                         events,
@@ -894,13 +1139,14 @@ impl AgentRunner {
                             repair_model_calls: repair_calls,
                             final_synthesis_model_calls: synthesis_calls,
                         },
+                        prepared_direct_scope,
                     },
                 )
                 .await;
         }
         if let Err(error) = terminal {
             events.emit(RunEvent::ProgramLifecycle {
-                attempt: repair_calls.saturating_add(1).max(1),
+                attempt: program_attempt.saturating_add(1),
                 outcome: terminal_lifecycle_outcome(&error),
             });
             if dispatched {

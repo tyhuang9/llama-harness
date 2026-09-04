@@ -16,6 +16,8 @@ use crate::{
 };
 use jsonschema::Validator;
 use serde_json::Value;
+#[cfg(feature = "programmatic")]
+use std::collections::BTreeSet;
 use std::{
     future::Future,
     sync::Arc,
@@ -38,6 +40,8 @@ pub struct AgentRunner {
     #[cfg(feature = "programmatic")]
     pub(crate) programmatic: Option<crate::ProgrammaticHostConfig>,
     #[cfg(feature = "programmatic")]
+    pub(crate) adaptive_programmatic_allowlist: BTreeSet<crate::ProgrammaticWorkloadClass>,
+    #[cfg(feature = "programmatic")]
     pub(crate) programmatic_admission: Arc<tokio::sync::Semaphore>,
 }
 
@@ -53,6 +57,8 @@ pub struct AgentRunnerBuilder {
     speculation: Option<crate::SpeculationConfig>,
     #[cfg(feature = "programmatic")]
     programmatic: Option<crate::ProgrammaticHostConfig>,
+    #[cfg(feature = "programmatic")]
+    adaptive_programmatic_allowlist: BTreeSet<crate::ProgrammaticWorkloadClass>,
 }
 
 pub(crate) struct RunPreflight {
@@ -75,6 +81,8 @@ impl AgentRunner {
             speculation: None,
             #[cfg(feature = "programmatic")]
             programmatic: None,
+            #[cfg(feature = "programmatic")]
+            adaptive_programmatic_allowlist: BTreeSet::new(),
         }
     }
 
@@ -152,69 +160,76 @@ impl AgentRunner {
         request: RunRequest,
         strategy_events: Option<DirectStrategyEvents>,
         preflight: RunPreflight,
-        continuation: Option<DirectContinuation>,
+        mut continuation: Option<DirectContinuation>,
         mut speculation_eligibility: SpeculationEligibility,
     ) -> Result<RunResult, HarnessError> {
         let capabilities = self.provider.capabilities();
-        let selection = self.tools.select_scope_for_run(
-            &request.input,
-            &request.agent.tool_allowlist,
-            ToolCaller::Direct,
-            self.discovery_limits,
-            &capabilities.limits,
-            &request.cancellation,
-            preflight.deadline,
-        );
-        let (tool_scope, discovery) = match selection {
-            Ok(ToolScopeSelection::Selected(scope, stats)) => (scope, stats),
-            Ok(ToolScopeSelection::LimitReached(stats)) => {
-                if let Some(mut continuation) = continuation {
-                    emit_discovery(&mut continuation.events, ToolCaller::Direct, stats);
-                    apply_terminal_error(
-                        &mut continuation.result,
-                        HarnessError::ResourceLimit("tool discovery budget reached".into()),
-                    );
-                    continuation.result.duration_ms =
-                        preflight.started.elapsed().as_millis() as u64;
-                    return Ok(finish_programmatic_continuation(continuation));
+        let prepared_direct_scope = continuation
+            .as_mut()
+            .and_then(|continuation| continuation.prepared_direct_scope.take());
+        let (tool_scope, discovery) = if let Some(scope) = prepared_direct_scope {
+            (scope, None)
+        } else {
+            let selection = self.tools.select_scope_for_run(
+                &request.input,
+                &request.agent.tool_allowlist,
+                ToolCaller::Direct,
+                self.discovery_limits,
+                &capabilities.limits,
+                &request.cancellation,
+                preflight.deadline,
+            );
+            match selection {
+                Ok(ToolScopeSelection::Selected(scope, stats)) => (scope, Some(stats)),
+                Ok(ToolScopeSelection::LimitReached(stats)) => {
+                    if let Some(mut continuation) = continuation {
+                        emit_discovery(&mut continuation.events, ToolCaller::Direct, stats);
+                        apply_terminal_error(
+                            &mut continuation.result,
+                            HarnessError::ResourceLimit("tool discovery budget reached".into()),
+                        );
+                        continuation.result.duration_ms =
+                            preflight.started.elapsed().as_millis() as u64;
+                        return Ok(finish_programmatic_continuation(continuation));
+                    }
+                    let mut completed_scopes = Vec::with_capacity(2);
+                    if let Some((caller, prior)) =
+                        strategy_events.and_then(|events| events.prior_discovery)
+                    {
+                        completed_scopes.push((caller, prior));
+                    }
+                    completed_scopes.push((ToolCaller::Direct, stats));
+                    return Ok(discovery_limit_terminal_result_with_scopes(
+                        &request,
+                        &completed_scopes,
+                        &self.events,
+                        crate::RunStrategy::Direct,
+                        preflight.started,
+                        strategy_events,
+                    ));
                 }
-                let mut completed_scopes = Vec::with_capacity(2);
-                if let Some((caller, prior)) =
-                    strategy_events.and_then(|events| events.prior_discovery)
-                {
-                    completed_scopes.push((caller, prior));
+                Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
+                    if let Some(mut continuation) = continuation {
+                        apply_terminal_error(&mut continuation.result, error);
+                        continuation.result.duration_ms =
+                            preflight.started.elapsed().as_millis() as u64;
+                        return Ok(finish_programmatic_continuation(continuation));
+                    }
+                    let prior = strategy_events
+                        .and_then(|events| events.prior_discovery)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    return Ok(pre_event_terminal_result_with_scopes(
+                        &request,
+                        error,
+                        &self.events,
+                        crate::RunStrategy::Direct,
+                        preflight.started,
+                        &prior,
+                    ));
                 }
-                completed_scopes.push((ToolCaller::Direct, stats));
-                return Ok(discovery_limit_terminal_result_with_scopes(
-                    &request,
-                    &completed_scopes,
-                    &self.events,
-                    crate::RunStrategy::Direct,
-                    preflight.started,
-                    strategy_events,
-                ));
+                Err(error) => return Err(error),
             }
-            Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
-                if let Some(mut continuation) = continuation {
-                    apply_terminal_error(&mut continuation.result, error);
-                    continuation.result.duration_ms =
-                        preflight.started.elapsed().as_millis() as u64;
-                    return Ok(finish_programmatic_continuation(continuation));
-                }
-                let prior = strategy_events
-                    .and_then(|events| events.prior_discovery)
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                return Ok(pre_event_terminal_result_with_scopes(
-                    &request,
-                    error,
-                    &self.events,
-                    crate::RunStrategy::Direct,
-                    preflight.started,
-                    &prior,
-                ));
-            }
-            Err(error) => return Err(error),
         };
         let started = preflight.started;
         let deadline = preflight.deadline;
@@ -227,12 +242,17 @@ impl AgentRunner {
                         broker_state,
                         model_calls,
                         usage,
+                        prepared_direct_scope: _,
                     } = continuation;
-                    emit_discovery(&mut events, ToolCaller::Direct, discovery);
+                    if let Some(discovery) = discovery {
+                        emit_discovery(&mut events, ToolCaller::Direct, discovery);
+                    }
                     if let Some(strategy_events) = strategy_events {
                         if let Some(reason) = strategy_events.fallback {
                             events.emit(RunEvent::StrategyFallback {
-                                from: strategy_events.requested,
+                                from: strategy_events
+                                    .fallback_from
+                                    .unwrap_or(strategy_events.requested),
                                 to: crate::RunStrategy::Direct,
                                 reason,
                             });
@@ -286,11 +306,15 @@ impl AgentRunner {
                     {
                         emit_discovery(&mut events, caller, prior);
                     }
-                    emit_discovery(&mut events, ToolCaller::Direct, discovery);
+                    if let Some(discovery) = discovery {
+                        emit_discovery(&mut events, ToolCaller::Direct, discovery);
+                    }
                     if let Some(strategy_events) = strategy_events {
                         if let Some(reason) = strategy_events.fallback {
                             events.emit(RunEvent::StrategyFallback {
-                                from: strategy_events.requested,
+                                from: strategy_events
+                                    .fallback_from
+                                    .unwrap_or(strategy_events.requested),
                                 to: crate::RunStrategy::Direct,
                                 reason,
                             });
@@ -718,6 +742,7 @@ impl AgentRunner {
                 broker_state,
                 model_calls,
                 usage,
+                prepared_direct_scope: None,
             };
             return Ok(finish_programmatic_continuation(continuation));
         }
@@ -868,7 +893,9 @@ pub(crate) fn discovery_limit_terminal_result_with_scopes(
     if let Some(strategy_events) = strategy_events {
         if let Some(reason) = strategy_events.fallback {
             events.emit(RunEvent::StrategyFallback {
-                from: strategy_events.requested,
+                from: strategy_events
+                    .fallback_from
+                    .unwrap_or(strategy_events.requested),
                 to: strategy,
                 reason,
             });
@@ -916,6 +943,7 @@ pub(crate) struct DirectStrategyEvents {
     pub(crate) requested: crate::RunStrategy,
     pub(crate) reason: crate::StrategySelectionReason,
     pub(crate) fallback: Option<crate::StrategyFallbackReason>,
+    pub(crate) fallback_from: Option<crate::RunStrategy>,
     pub(crate) prior_discovery: Option<(ToolCaller, crate::discovery::ToolDiscoveryStats)>,
 }
 
@@ -934,6 +962,7 @@ pub(crate) struct DirectContinuation {
     pub(crate) broker_state: BrokerState,
     pub(crate) model_calls: u32,
     pub(crate) usage: ProgrammaticUsage,
+    pub(crate) prepared_direct_scope: Option<ToolScope>,
 }
 
 fn finish_programmatic_continuation(mut continuation: DirectContinuation) -> RunResult {
@@ -972,6 +1001,21 @@ impl AgentRunnerBuilder {
     /// Explicitly opts this host into bounded programmatic execution.
     pub fn programmatic(mut self, config: crate::ProgrammaticHostConfig) -> Self {
         self.programmatic = Some(config);
+        self
+    }
+
+    #[cfg(feature = "programmatic")]
+    /// Allows Adaptive runs to promote selected workload classes to Programmatic execution.
+    ///
+    /// The default allowlist is empty, preserving the Adaptive planner contract and
+    /// behavior from releases that predate Programmatic promotion. Forced
+    /// Programmatic runs do not consult this allowlist.
+    pub fn adaptive_programmatic_allowlist(
+        mut self,
+        workload_classes: impl IntoIterator<Item = crate::ProgrammaticWorkloadClass>,
+    ) -> Self {
+        self.adaptive_programmatic_allowlist
+            .extend(workload_classes);
         self
     }
     /// Replaces the tool registry used by the runner.
@@ -1035,6 +1079,8 @@ impl AgentRunnerBuilder {
                 .map(Arc::new),
             #[cfg(feature = "programmatic")]
             programmatic: self.programmatic,
+            #[cfg(feature = "programmatic")]
+            adaptive_programmatic_allowlist: self.adaptive_programmatic_allowlist,
             #[cfg(feature = "programmatic")]
             programmatic_admission: admission,
         }

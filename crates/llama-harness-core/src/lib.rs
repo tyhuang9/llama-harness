@@ -65,7 +65,7 @@ pub use policy::{
     SafeDefaultPolicy,
 };
 #[cfg(feature = "programmatic")]
-pub use programmatic::ProgrammaticHostConfig;
+pub use programmatic::{ProgrammaticHostConfig, ProgrammaticWorkloadClass};
 pub use runner::{AgentRunner, AgentRunnerBuilder};
 pub use speculation::{
     SpeculationConfig, SpeculationLatencyHistogram, SpeculationMetrics, SpeculationMode,
