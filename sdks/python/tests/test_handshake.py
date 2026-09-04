@@ -32,6 +32,9 @@ class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
         path, args = self.fake_runtime_args("incompatible")
         with self.assertRaises(RuntimeProtocolError):
             await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args)
+        path, args = self.fake_runtime_args("version_mismatch")
+        with self.assertRaisesRegex(RuntimeProtocolError, "Runtime version mismatch"):
+            await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args)
         path, args = self.fake_runtime_args("drift")
         async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args) as client:
             with self.assertRaises(RuntimeProtocolError):

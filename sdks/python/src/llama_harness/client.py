@@ -195,6 +195,9 @@ class HarnessClient:
             raise RuntimeProtocolError(f"Expected runtime_hello, received {response['type']}")
         try:
             client._negotiated_protocol_version = _selected_protocol_version(str(response["protocol_version"]))
+            runtime_version = response["payload"].get("runtime_version")
+            if runtime_version != SDK_VERSION:
+                raise RuntimeProtocolError(f"Runtime version mismatch: SDK {SDK_VERSION}, runtime {runtime_version}")
         except BaseException:
             await client.close()
             raise

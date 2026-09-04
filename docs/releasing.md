@@ -255,14 +255,21 @@ deferred until a separately bounded contract is released.
 
 ## Sidecar SDK distribution
 
-The release workflow at `.github/workflows/release.yml` is manual-dispatch only. It builds `llama-harness-runtime` for supported Windows x64, macOS arm64, and Linux x64 targets, generates checksums and a machine-readable manifest, and stages a matching platform-specific npm runtime package plus Python wheel. It does not build model images, pull models, or package Ollama.
+The release workflow at `.github/workflows/release.yml` is manual-dispatch only.
+Dispatch it from `main` with the exact reviewed 40-character source commit; its
+preflight rejects another ref or commit before any platform build starts. The
+workflow builds `llama-harness-runtime` for supported Windows x64, macOS arm64,
+and Linux x64 targets, generates checksums and a machine-readable manifest, and
+stages a matching platform-specific npm runtime package plus Python wheel. It
+does not build model images, pull models, or package Ollama.
 
 The workflow is validation-only: it has no registry upload, tag, or GitHub
 release step. It checks that the requested version is identical in Cargo
 metadata, the built runtime's `runtime_hello`, the npm SDK package, the Python
 project, and the SDK `client_hello` tests. It also rejects package payloads that
 do not contain exactly the reviewed files. A successful workflow is evidence for
-manual review, not publication authorization.
+manual review, not publication authorization. The workflow run itself records
+the gated immutable source commit alongside the generated artifact manifest.
 
 After separately reviewing the combined manifest, checksums, package contents,
 registry identities, and release notes, publish each platform runtime package

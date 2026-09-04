@@ -176,7 +176,11 @@ export class HarnessClient {
     await once(process, "spawn").catch((error) => { throw new RuntimeUnavailableError(`Could not start ${runtimePath}: ${String(error)}`); });
     const response = await client.request({ type: "client_hello", payload: { sdk: { name: "@llama-harness/sdk", version: SDK_VERSION }, capabilities: ["async_callbacks"] } });
     if (response.type !== "runtime_hello") { await client.close(); throw new RuntimeProtocolError(`Expected runtime_hello, received ${response.type}`); }
-    try { client._negotiatedProtocolVersion = selectedProtocolVersion(response.protocol_version); }
+    try {
+      client._negotiatedProtocolVersion = selectedProtocolVersion(response.protocol_version);
+      const runtimeVersion = response.payload.runtime_version;
+      if (runtimeVersion !== SDK_VERSION) throw new RuntimeProtocolError(`Runtime version mismatch: SDK ${SDK_VERSION}, runtime ${String(runtimeVersion)}`);
+    }
     catch (error) { await client.close(); throw error; }
     return client;
   }

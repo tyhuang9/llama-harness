@@ -4,7 +4,7 @@ import json
 import sys
 
 mode = sys.argv[1] if len(sys.argv) > 1 else "legacy"
-selected = "2.0" if mode == "incompatible" else "1.1" if mode in {"modern", "drift", "protocol_error"} else "1.0"
+selected = "2.0" if mode == "incompatible" else "1.1" if mode in {"modern", "drift", "protocol_error", "version_mismatch"} else "1.0"
 
 for line in sys.stdin:
     message = json.loads(line)
@@ -13,7 +13,7 @@ for line in sys.stdin:
         if message["payload"].get("sdk", {}).get("version") != "0.2.0":
             response = {"protocol_version": selected, "request_id": message["request_id"], "type": "protocol_error", "payload": {"code": "invalid_message", "message": "SDK identity version mismatch", "retryable": False}}
         else:
-            response = {"protocol_version": selected, "request_id": message["request_id"], "type": "runtime_hello", "payload": {"runtime_version": "test", "capabilities": {}, "providers": ["ollama"]}}
+            response = {"protocol_version": selected, "request_id": message["request_id"], "type": "runtime_hello", "payload": {"runtime_version": "0.1.0" if mode == "version_mismatch" else "0.2.0", "capabilities": {}, "providers": ["ollama"]}}
     elif message.get("protocol_version") != selected:
         response = {"protocol_version": selected, "request_id": message["request_id"], "type": "protocol_error", "payload": {"code": "incompatible_version", "message": "client version drift", "retryable": False}}
     elif kind == "start_run" and mode == "protocol_error":

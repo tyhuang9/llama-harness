@@ -2,13 +2,13 @@ import { createInterface } from "node:readline";
 
 function write(envelope: object): void { process.stdout.write(`${JSON.stringify(envelope)}\n`); }
 const mode = process.argv[2] ?? "legacy";
-const selectedVersion = mode === "modern" || mode === "drift" || mode === "protocol_error" ? "1.1" : mode === "incompatible" ? "2.0" : "1.0";
+const selectedVersion = mode === "modern" || mode === "drift" || mode === "protocol_error" || mode === "version_mismatch" ? "1.1" : mode === "incompatible" ? "2.0" : "1.0";
 
 createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line) as { protocol_version: string; request_id: string; type: string; payload: Record<string, unknown>; };
   if (message.type === "client_hello") {
     if ((message.payload.sdk as { version?: string } | undefined)?.version !== "0.2.0") { write({ protocol_version: selectedVersion, request_id: message.request_id, type: "protocol_error", payload: { code: "invalid_message", message: "SDK identity version mismatch", retryable: false } }); return; }
-    write({ protocol_version: selectedVersion, request_id: message.request_id, type: "runtime_hello", payload: { runtime_version: "test", capabilities: { supports_output_deltas: false, supports_structured_output: true, supports_trace_persistence: false, concurrent_runs: 1, max_pending_callbacks: 1, max_queue_depth: 8 }, providers: ["ollama"] } });
+    write({ protocol_version: selectedVersion, request_id: message.request_id, type: "runtime_hello", payload: { runtime_version: mode === "version_mismatch" ? "0.1.0" : "0.2.0", capabilities: { supports_output_deltas: false, supports_structured_output: true, supports_trace_persistence: false, concurrent_runs: 1, max_pending_callbacks: 1, max_queue_depth: 8 }, providers: ["ollama"] } });
   } else if (message.protocol_version !== selectedVersion) {
     write({ protocol_version: selectedVersion, request_id: message.request_id, type: "protocol_error", payload: { code: "incompatible_version", message: "client version drift", retryable: false } });
   } else if (message.type === "get_provider_health") {

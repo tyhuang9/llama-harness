@@ -57,6 +57,7 @@ test("falls back to 1.0 and rejects forced advanced strategies before start_run"
 
 test("fails incompatible majors, envelope drift, and structured protocol errors", async () => {
   await assert.rejects(HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "incompatible"] }), RuntimeProtocolError);
+  await assert.rejects(HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "version_mismatch"] }), /Runtime version mismatch/);
   const drift = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "drift"] });
   try {
     const run = await drift.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test" });

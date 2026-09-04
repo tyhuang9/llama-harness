@@ -301,6 +301,12 @@ class InputAndAbiTests(unittest.TestCase):
         self.assertIn("protocol_check(root)?", xtask)
         self.assertIn('"llama-harness-runtime"', xtask)
         self.assertIn("Test and inspect the Python SDK acceptance package", release_workflow)
+        self.assertIn("Reviewed main source gate", release_workflow)
+        self.assertIn("refs/heads/main", release_workflow)
+        self.assertEqual(release_workflow.count("${{ inputs.source_commit }}"), 1)
+        self.assertEqual(release_workflow.count("${{ github.sha }}"), 1)
+        self.assertIn("does not match the checked-out main commit", release_workflow)
+        self.assertGreaterEqual(release_workflow.count("persist-credentials: false"), 5)
         self.assertNotIn("inputs.publish", release_workflow)
 
     def test_workflows_pin_actions_and_do_not_interpolate_dispatch_version_in_scripts(self) -> None:
