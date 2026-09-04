@@ -16,6 +16,8 @@ use std::time::Duration;
 use tokio::sync::{Barrier, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+const PLANNER_TRANSCRIPT_HEADROOM: u64 = 16 * 1024;
+
 fn planning_capabilities(parallel: u32) -> ModelCapabilities {
     ModelCapabilities::new(true, false, true)
         .with_structured_plans(true)
@@ -1247,7 +1249,8 @@ async fn late_effect_reuse_is_charged_before_a_later_mutation() {
             .with_capabilities(planning_capabilities(1)),
     );
     let lookup_result = ToolResult::success(json!({"value": "same"}));
-    let write_result = ToolResult::success(json!({"written": true}));
+    let write_result =
+        ToolResult::success(json!({"written": true, "payload": "x".repeat(32 * 1024)}));
     let lookup = Arc::new(FixedTool::new("lookup", true, lookup_result.clone()));
     let write = Arc::new(FixedTool::new("write", false, write_result.clone()));
     let serialized_result_bytes =
@@ -1274,8 +1277,11 @@ async fn late_effect_reuse_is_charged_before_a_later_mutation() {
 
     let mut run_request = request(&["lookup", "write"]);
     run_request.agent.limits.max_tool_result_bytes = max_result_bytes;
-    run_request.agent.limits.max_transcript_bytes =
-        run_request.input.len() as u64 + lookup_entry + write_entry + later_worst_case;
+    run_request.agent.limits.max_transcript_bytes = run_request.input.len() as u64
+        + PLANNER_TRANSCRIPT_HEADROOM
+        + lookup_entry
+        + write_entry
+        + later_worst_case;
     let events = Arc::new(InMemoryEventSink::default());
     let result = AgentRunner::builder(provider.clone())
         .tools(registry([
@@ -1293,6 +1299,7 @@ async fn late_effect_reuse_is_charged_before_a_later_mutation() {
     assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
     assert_eq!(write.calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.requests().len(), 1);
+    assert!(provider.requests()[0].messages[0].content.len() as u64 <= PLANNER_TRANSCRIPT_HEADROOM);
     assert!(events
         .events()
         .iter()
@@ -1905,10 +1912,11 @@ async fn plan_transcript_limit_is_terminal_before_final_model_call() {
     let read = Arc::new(FixedTool::new(
         "read",
         true,
-        ToolResult::success(json!({"large": "payload"})),
+        ToolResult::success(json!({"large": "x".repeat(32 * 1024)})),
     ));
     let mut run_request = request(&["read"]);
-    run_request.agent.limits.max_transcript_bytes = run_request.input.len() as u64 + 1;
+    run_request.agent.limits.max_transcript_bytes =
+        run_request.input.len() as u64 + PLANNER_TRANSCRIPT_HEADROOM;
     let result = AgentRunner::builder(provider.clone())
         .tools(registry([read as Arc<dyn Tool>]))
         .build()
@@ -1918,6 +1926,7 @@ async fn plan_transcript_limit_is_terminal_before_final_model_call() {
 
     assert_eq!(result.status, RunStatus::LimitReached);
     assert_eq!(provider.requests().len(), 1);
+    assert!(provider.requests()[0].messages[0].content.len() as u64 <= PLANNER_TRANSCRIPT_HEADROOM);
     assert!(result.final_output.is_none());
 }
 

@@ -45,6 +45,10 @@ const MAX_PLAN_RETAINED_BYTES: u64 = 16 * 1024 * 1024;
 const PLANNER_PROMPT: &str = "Select the safest efficient tool strategy. Return only one strict JSON object: {\"strategy\":\"direct\"} when no finite safe plan is justified, or {\"strategy\":\"declarative_plan\",\"plan\":{\"nodes\":[...]}} for a finite dependency DAG. Use only the supplied tools. Every plan node requires id, tool_id, and schema-valid arguments. Optional fields are depends_on, result_bindings, concurrency, approval_barrier, and commit_boundary. Choose direct for mutations, approval-sensitive work, ambiguity, or an uncertain next step.";
 const REPAIR_PROMPT: &str = "The previous strategy envelope was invalid. Repair it once. Return only the strict JSON envelope requested by the planning instructions, with no prose or markdown.";
 const RECOVERY_PROMPT: &str = "Execution stopped after the recorded completed results. Produce one replacement declarative plan using only those results as prior state. Never repeat a completed mutation. Return only {\"strategy\":\"declarative_plan\",\"plan\":{\"nodes\":[...]}}.";
+const NO_ADVANCED_STRATEGIES: &[&str] = &[];
+const DECLARATIVE_STRATEGY: &[&str] = &["declarative_plan"];
+const PROGRAMMATIC_STRATEGY: &[&str] = &["programmatic"];
+const BOTH_ADVANCED_STRATEGIES: &[&str] = &["declarative_plan", "programmatic"];
 
 #[derive(Deserialize)]
 #[serde(tag = "strategy", rename_all = "snake_case", deny_unknown_fields)]
@@ -277,18 +281,68 @@ fn plan_schema_with_programmatic(
     schema
 }
 
-#[cfg(feature = "programmatic")]
 #[derive(Serialize)]
 struct PlannerToolAnnotation<'a> {
     id: &'a str,
-    allowed_strategies: Vec<&'static str>,
+    allowed_advanced_strategies: &'static [&'static str],
     risk: &'a crate::ToolRisk,
     read_only: bool,
     idempotent: bool,
     parallel_safe: bool,
-    concurrency_key: Option<&'a str>,
+    concurrency_group: Option<&'a str>,
     cancellation_safety: crate::CancellationSafety,
     expected_latency_ms: Option<u64>,
+}
+
+fn planner_prompt_with_annotations(
+    base: String,
+    scope: &ToolScope,
+) -> Result<String, HarnessError> {
+    let mut concurrency_groups = BTreeMap::<&str, String>::new();
+    for definition in scope.definitions() {
+        if let Some(key) = definition.concurrency_key.as_deref() {
+            if !concurrency_groups.contains_key(key) {
+                let label = format!("group_{}", concurrency_groups.len().saturating_add(1));
+                concurrency_groups.insert(key, label);
+            }
+        }
+    }
+    let annotations = scope
+        .definitions()
+        .iter()
+        .map(|definition| {
+            let allowed_advanced_strategies = match (
+                definition.allows_caller(ToolCaller::DeclarativePlan),
+                definition.allows_caller(ToolCaller::Programmatic),
+            ) {
+                (true, true) => BOTH_ADVANCED_STRATEGIES,
+                (true, false) => DECLARATIVE_STRATEGY,
+                (false, true) => PROGRAMMATIC_STRATEGY,
+                (false, false) => NO_ADVANCED_STRATEGIES,
+            };
+            PlannerToolAnnotation {
+                id: &definition.id,
+                allowed_advanced_strategies,
+                risk: &definition.risk,
+                read_only: definition.read_only,
+                idempotent: definition.idempotent,
+                parallel_safe: definition.parallel_safe,
+                concurrency_group: definition
+                    .concurrency_key
+                    .as_deref()
+                    .and_then(|key| concurrency_groups.get(key))
+                    .map(String::as_str),
+                cancellation_safety: definition.cancellation_safety,
+                expected_latency_ms: definition.expected_latency_ms,
+            }
+        })
+        .collect::<Vec<_>>();
+    let annotations = serde_json::to_string(&annotations).map_err(|_| {
+        HarnessError::InvalidRequest("planner routing metadata could not be serialized".into())
+    })?;
+    Ok(format!(
+        "{base} Value-free tool routing metadata (advisory; core revalidates every call and concurrency groups are run-local): {annotations}."
+    ))
 }
 
 #[cfg(feature = "programmatic")]
@@ -303,33 +357,6 @@ fn planner_prompt_with_programmatic(
         .map(ProgrammaticWorkloadClass::as_str)
         .collect::<Vec<_>>()
         .join(", ");
-    let annotations = scope
-        .definitions()
-        .iter()
-        .map(|definition| {
-            let mut allowed_strategies = Vec::with_capacity(2);
-            if definition.allows_caller(ToolCaller::DeclarativePlan) {
-                allowed_strategies.push("declarative_plan");
-            }
-            if definition.allows_caller(ToolCaller::Programmatic) {
-                allowed_strategies.push("programmatic");
-            }
-            PlannerToolAnnotation {
-                id: &definition.id,
-                allowed_strategies,
-                risk: &definition.risk,
-                read_only: definition.read_only,
-                idempotent: definition.idempotent,
-                parallel_safe: definition.parallel_safe,
-                concurrency_key: definition.concurrency_key.as_deref(),
-                cancellation_safety: definition.cancellation_safety,
-                expected_latency_ms: definition.expected_latency_ms,
-            }
-        })
-        .collect::<Vec<_>>();
-    let annotations = serde_json::to_string(&annotations).map_err(|_| {
-        HarnessError::InvalidRequest("planner routing metadata could not be serialized".into())
-    })?;
     let base = if allow_declarative {
         format!(
             "{PLANNER_PROMPT} You may instead return {{\"strategy\":\"programmatic\",\"workload_class\":<class>}} only when deterministic bounded orchestration materially fits one of these host-promoted workload classes: {classes}."
@@ -339,9 +366,7 @@ fn planner_prompt_with_programmatic(
             "Select the safest efficient tool strategy. Return only one strict JSON object: {{\"strategy\":\"direct\"}} when no bounded Programmatic workflow is justified, or {{\"strategy\":\"programmatic\",\"workload_class\":<class>}} only when deterministic bounded orchestration materially fits one of these host-promoted workload classes: {classes}. Use only the supplied tools. Choose direct for mutations, approval-sensitive work, ambiguity, or an uncertain next step."
         )
     };
-    Ok(format!(
-        "{base} Value-free tool routing metadata (advisory; core revalidates every call): {annotations}."
-    ))
+    planner_prompt_with_annotations(base, scope)
 }
 
 impl AgentRunner {
@@ -704,19 +729,28 @@ impl AgentRunner {
         let plan_scope = run.plan_scope.clone();
         let mut planner_messages = run.messages.clone();
         #[cfg(feature = "programmatic")]
-        let planner_prompt =
-            if requested != RunStrategy::Adaptive || run.programmatic_candidates.is_empty() {
-                PLANNER_PROMPT.to_owned()
-            } else {
-                planner_prompt_with_programmatic(
-                    run.declarative_available,
-                    &run.programmatic_candidates,
-                    &run.plan_scope,
-                )?
-            };
+        let planner_prompt = if requested != RunStrategy::Adaptive {
+            PLANNER_PROMPT.to_owned()
+        } else if run.programmatic_candidates.is_empty() {
+            planner_prompt_with_annotations(PLANNER_PROMPT.to_owned(), &run.plan_scope)?
+        } else {
+            planner_prompt_with_programmatic(
+                run.declarative_available,
+                &run.programmatic_candidates,
+                &run.plan_scope,
+            )?
+        };
         #[cfg(not(feature = "programmatic"))]
-        let planner_prompt = PLANNER_PROMPT.to_owned();
+        let planner_prompt = if requested == RunStrategy::Adaptive {
+            planner_prompt_with_annotations(PLANNER_PROMPT.to_owned(), &run.plan_scope)?
+        } else {
+            PLANNER_PROMPT.to_owned()
+        };
         planner_messages.insert(0, Message::system(planner_prompt));
+        if let Err(error) = ensure_transcript(&planner_messages, &request.agent.limits) {
+            run.terminate(error);
+            return Ok(run.finish());
+        }
         let mut invalid_repair_used = false;
         let envelope = loop {
             let (plan_phase, model_phase) = if invalid_repair_used {
@@ -806,6 +840,11 @@ impl AgentRunner {
                     });
                     invalid_repair_used = true;
                     planner_messages.push(Message::system(REPAIR_PROMPT));
+                    if let Err(error) = ensure_transcript(&planner_messages, &request.agent.limits)
+                    {
+                        run.terminate(error);
+                        return Ok(run.finish());
+                    }
                     run.result
                         .errors
                         .retain(|record| record.code != "invalid_plan");
@@ -1246,18 +1285,6 @@ impl<'a> StrategyRun<'a> {
                 self.terminal = true;
                 return Ok(None);
             }
-            self.model_calls += 1;
-            match phase {
-                ModelCallPhase::Planning => self.planning_model_calls += 1,
-                ModelCallPhase::Repair => self.repair_model_calls += 1,
-                ModelCallPhase::Recovery => self.recovery_model_calls += 1,
-                ModelCallPhase::FinalSynthesis => self.final_synthesis_model_calls += 1,
-                ModelCallPhase::Reactive => self.reactive_model_calls += 1,
-            }
-            self.events.emit(RunEvent::ModelRequested {
-                call_number: self.model_calls,
-                model: self.model.clone(),
-            });
             let call_cancellation = self.request.cancellation.child_token();
             let call_deadline = provider_deadline(
                 self.deadline,
@@ -1276,6 +1303,25 @@ impl<'a> StrategyRun<'a> {
                 metadata: self.request.metadata.clone(),
                 cancellation: call_cancellation.clone(),
             };
+            if serialized_len(&model_request)? > self.request.agent.limits.max_request_payload_bytes
+            {
+                return Err(HarnessError::ResourceLimit(format!(
+                    "model request exceeds {} bytes",
+                    self.request.agent.limits.max_request_payload_bytes
+                )));
+            }
+            self.model_calls += 1;
+            match phase {
+                ModelCallPhase::Planning => self.planning_model_calls += 1,
+                ModelCallPhase::Repair => self.repair_model_calls += 1,
+                ModelCallPhase::Recovery => self.recovery_model_calls += 1,
+                ModelCallPhase::FinalSynthesis => self.final_synthesis_model_calls += 1,
+                ModelCallPhase::Reactive => self.reactive_model_calls += 1,
+            }
+            self.events.emit(RunEvent::ModelRequested {
+                call_number: self.model_calls,
+                model: self.model.clone(),
+            });
             let speculate_this_attempt = self.speculation_eligibility.begin_provider_attempt();
             let completion = if speculate_this_attempt {
                 if let Some(controller) = self

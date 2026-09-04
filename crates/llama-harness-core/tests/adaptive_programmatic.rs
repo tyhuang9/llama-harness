@@ -140,7 +140,7 @@ fn workload_classes_are_stable_snake_case_values() {
 }
 
 #[tokio::test]
-async fn empty_allowlist_preserves_legacy_planner_prompt_schema_and_name() {
+async fn empty_allowlist_adds_common_routing_metadata_without_programmatic_schema() {
     let provider = Arc::new(
         MockModelProvider::scripted([
             final_response(r#"{"strategy":"direct"}"#),
@@ -163,7 +163,15 @@ async fn empty_allowlist_preserves_legacy_planner_prompt_schema_and_name() {
 
     assert_eq!(result.final_output.as_deref(), Some("done"));
     let requests = provider.requests();
-    assert_eq!(requests[0].messages[0].content, LEGACY_PLANNER_PROMPT);
+    assert!(requests[0].messages[0]
+        .content
+        .starts_with(LEGACY_PLANNER_PROMPT));
+    assert!(requests[0].messages[0]
+        .content
+        .contains(r#""id":"both","allowed_advanced_strategies":["declarative_plan"]"#));
+    assert!(requests[0].messages[0]
+        .content
+        .contains(r#""read_only":true,"idempotent":true,"parallel_safe":true"#));
     let structured = requests[0].structured_output.as_ref().unwrap();
     assert_eq!(structured.name, "llama_harness_planner_envelope_v1");
     assert!(!structured.schema.to_string().contains("programmatic"));
@@ -492,7 +500,7 @@ async fn programmatic_promotion_does_not_require_declarative_plan_support() {
         .contains("finite dependency DAG"));
     assert!(requests[0].messages[0]
         .content
-        .contains(r#""id":"program_only","allowed_strategies":["programmatic"]"#));
+        .contains(r#""id":"program_only","allowed_advanced_strategies":["programmatic"]"#));
     assert!(events.events().iter().any(|record| matches!(
         record.event,
         RunEvent::StrategySelected {
@@ -512,16 +520,14 @@ async fn mixed_caller_planner_catalog_describes_each_eligible_strategy() {
         ])
         .with_capabilities(capabilities()),
     );
-    let declarative_only = Arc::new(TestTool::new(
-        "declarative_only",
-        [ToolCaller::DeclarativePlan],
-        false,
-    ));
-    let programmatic_only = Arc::new(TestTool::new(
-        "programmatic_only",
-        [ToolCaller::Programmatic],
-        false,
-    ));
+    let mut declarative_only =
+        TestTool::new("declarative_only", [ToolCaller::DeclarativePlan], false);
+    declarative_only.definition.concurrency_key = Some("tenant-secret-resource".into());
+    let declarative_only = Arc::new(declarative_only);
+    let mut programmatic_only =
+        TestTool::new("programmatic_only", [ToolCaller::Programmatic], false);
+    programmatic_only.definition.concurrency_key = Some("tenant-secret-resource".into());
+    let programmatic_only = Arc::new(programmatic_only);
     let result = AgentRunner::builder(provider.clone())
         .tools(registry([
             declarative_only as Arc<dyn Tool>,
@@ -536,8 +542,151 @@ async fn mixed_caller_planner_catalog_describes_each_eligible_strategy() {
 
     assert_eq!(result.status, RunStatus::Completed);
     let prompt = &provider.requests()[0].messages[0].content;
-    assert!(prompt.contains(r#""id":"declarative_only","allowed_strategies":["declarative_plan"]"#));
-    assert!(prompt.contains(r#""id":"programmatic_only","allowed_strategies":["programmatic"]"#));
+    assert!(prompt
+        .contains(r#""id":"declarative_only","allowed_advanced_strategies":["declarative_plan"]"#));
+    assert!(prompt
+        .contains(r#""id":"programmatic_only","allowed_advanced_strategies":["programmatic"]"#));
+    assert!(!prompt.contains("tenant-secret-resource"));
+    assert_eq!(
+        prompt.matches(r#""concurrency_group":"group_1""#).count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn planner_annotations_obey_transcript_limit_before_provider_accounting() {
+    let provider = Arc::new(MockModelProvider::scripted([]).with_capabilities(capabilities()));
+    let program_only = Arc::new(TestTool::new(
+        "program_only",
+        [ToolCaller::Programmatic],
+        false,
+    ));
+    let events = Arc::new(InMemoryEventSink::default());
+    let mut run_request = request(&["program_only"], 3);
+    run_request.agent.limits.max_transcript_bytes = run_request.input.len() as u64 + 1;
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([program_only as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::LimitReached);
+    assert!(provider.requests().is_empty());
+    let records = events.events();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.event, RunEvent::Started { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.event, RunEvent::Completed { .. }))
+            .count(),
+        1
+    );
+    assert!(records
+        .iter()
+        .any(|record| matches!(record.event, RunEvent::StrategyUsage { model_calls: 0, .. })));
+}
+
+#[tokio::test]
+async fn planner_repair_prompt_is_rechecked_against_transcript_limit() {
+    let probe_provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(r#"{"strategy":"direct"}"#),
+            final_response("done"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let probe_tool = Arc::new(TestTool::new(
+        "program_only",
+        [ToolCaller::Programmatic],
+        false,
+    ));
+    AgentRunner::builder(probe_provider.clone())
+        .tools(registry([probe_tool as Arc<dyn Tool>]))
+        .programmatic(ProgrammaticHostConfig::default())
+        .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
+        .build()
+        .run(request(&["program_only"], 3))
+        .await
+        .unwrap();
+    let prompt_bytes = probe_provider.requests()[0].messages[0].content.len() as u64;
+
+    let provider = Arc::new(
+        MockModelProvider::scripted([final_response("not-json")]).with_capabilities(capabilities()),
+    );
+    let program_only = Arc::new(TestTool::new(
+        "program_only",
+        [ToolCaller::Programmatic],
+        false,
+    ));
+    let events = Arc::new(InMemoryEventSink::default());
+    let mut run_request = request(&["program_only"], 3);
+    run_request.agent.limits.max_transcript_bytes = run_request.input.len() as u64 + prompt_bytes;
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([program_only as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::LimitReached);
+    assert_eq!(provider.requests().len(), 1);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyUsage {
+            model_calls: 1,
+            planning_model_calls: 1,
+            repair_model_calls: 0,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn planner_annotations_obey_model_request_limit_before_provider_accounting() {
+    let provider = Arc::new(MockModelProvider::scripted([]).with_capabilities(capabilities()));
+    let program_only = Arc::new(TestTool::new(
+        "program_only",
+        [ToolCaller::Programmatic],
+        false,
+    ));
+    let events = Arc::new(InMemoryEventSink::default());
+    let mut run_request = request(&["program_only"], 3);
+    loop {
+        let serialized = serde_json::to_vec(&run_request).unwrap().len() as u64;
+        if run_request.agent.limits.max_request_payload_bytes == serialized {
+            break;
+        }
+        run_request.agent.limits.max_request_payload_bytes = serialized;
+    }
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([program_only as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
+        .build()
+        .run(run_request)
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::LimitReached);
+    assert!(provider.requests().is_empty());
+    assert!(events
+        .events()
+        .iter()
+        .any(|record| matches!(record.event, RunEvent::StrategyUsage { model_calls: 0, .. })));
 }
 
 #[tokio::test]

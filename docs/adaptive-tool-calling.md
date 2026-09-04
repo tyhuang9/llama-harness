@@ -11,7 +11,12 @@ structured-plan support and sufficient plan, catalog, and model-call limits;
 Programmatic does not depend on declarative-plan support. The planner receives
 the union of tools authorized for the strategies that are actually eligible,
 so a Programmatic-only tool is visible during selection without becoming
-authorized for a declarative node. If no advanced strategy is eligible, the
+authorized for a declarative node. Every Adaptive planning request also receives
+value-free risk, read-only, idempotence, parallel-safety, cancellation, latency,
+and advanced-caller annotations. Shared concurrency keys are represented only
+as deterministic run-local group labels, and the complete annotated transcript
+and serialized model request are bounded before provider accounting or contact.
+If no advanced strategy is eligible, the
 run emits fallback metadata and uses the existing direct reactive loop. A
 forced declarative run never silently changes its selected strategy.
 Programmatic is an Adaptive candidate only when the optional sandbox, explicit
@@ -188,8 +193,10 @@ invocation.
 State-changing calls have an effect-ledger state independent of success:
 
 - `Dispatched` is recorded immediately before invocation.
-- `Completed` contains the validated successful result for the exact canonical
-  tool-and-arguments signature.
+- `Completed` records a validated successful result for the exact canonical
+  tool-and-arguments signature. It retains the result payload only when the
+  selected strategy enables exact committed-effect reuse; Direct and
+  Programmatic completion markers do not retain an otherwise unused payload.
 - `Uncertain` records any failure after dispatch, including a failure result,
   invalid output, timeout, cancellation, or result resource-limit failure.
 
