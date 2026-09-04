@@ -9,6 +9,7 @@ use crate::{
 };
 use alloc::{
     collections::{BTreeMap, BTreeSet},
+    rc::Rc,
     string::String,
     vec,
     vec::Vec,
@@ -696,7 +697,7 @@ fn verify_bytecode(
         return Err(resource("bytecode instruction limit exceeded"));
     }
 
-    verify_definite_local_initialization(code, local_count, &loop_bodies)?;
+    verify_definite_local_initialization(code, local_count, &loop_bodies, limits)?;
     Ok(())
 }
 
@@ -756,37 +757,78 @@ fn verify_instruction_expressions(
             }
         }
     }
-    if let Instruction::Return { value } = instruction {
-        let minimum = minimum_serialized_expression_bytes(&value.0, limits)?;
-        if minimum > limits.max_return_bytes {
-            return Err(SandboxError::output_limit());
-        }
-    }
     Ok(total)
 }
 
-/// Computes a conservative serialized-size lower bound for one verified
-/// postfix expression. Dynamic values use the smallest valid JSON value, so a
-/// rejection here is safe even when the expression depends on tool results.
-fn minimum_serialized_expression_bytes(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AbstractValue {
+    minimum_serialized: usize,
+    structure: Option<Rc<AbstractStructure>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AbstractStructure {
+    Array(Vec<AbstractValue>),
+    Object(BTreeMap<String, AbstractValue>),
+}
+
+impl AbstractValue {
+    const fn unknown() -> Self {
+        Self {
+            minimum_serialized: 1,
+            structure: None,
+        }
+    }
+
+    const fn scalar(minimum_serialized: usize) -> Self {
+        Self {
+            minimum_serialized,
+            structure: None,
+        }
+    }
+
+    fn joined(&self, other: &Self) -> Self {
+        if self == other {
+            self.clone()
+        } else {
+            Self::scalar(self.minimum_serialized.min(other.minimum_serialized))
+        }
+    }
+}
+
+/// Computes a conservative abstract value for one verified postfix
+/// expression. Dynamic values use the smallest valid JSON value. Statically
+/// constructed arrays and objects retain only bounded shape and size facts so
+/// later path operations can select a precise child without retaining values.
+fn analyze_expression(
     code: &[ExprInstruction],
     limits: &SandboxLimits,
-) -> Result<usize, SandboxError> {
+    locals: &BTreeMap<usize, AbstractValue>,
+) -> Result<AbstractValue, SandboxError> {
     let mut stack = Vec::new();
     stack
         .try_reserve(code.len().min(limits.max_operand_stack))
         .map_err(|_| resource("bytecode output analysis allocation failed"))?;
     for instruction in code {
-        let minimum = match instruction {
-            ExprInstruction::Constant(value) => measure_value(value, limits)?.serialized,
-            // A signed integer such as zero is the smallest value a dynamic
-            // expression can serialize to.
-            ExprInstruction::Load(_) => 1,
-            ExprInstruction::Path(_) | ExprInstruction::Unary(_) => {
+        let abstract_value = match instruction {
+            ExprInstruction::Constant(value) => {
+                AbstractValue::scalar(measure_value(value, limits)?.serialized)
+            }
+            ExprInstruction::Load(slot) => locals
+                .get(slot)
+                .cloned()
+                .ok_or_else(|| verify("bytecode output local is unavailable"))?,
+            ExprInstruction::Path(pointer) => {
+                let source = stack
+                    .pop()
+                    .ok_or_else(|| verify("bytecode output expression stack is invalid"))?;
+                resolve_static_path(source, pointer)?.unwrap_or_else(AbstractValue::unknown)
+            }
+            ExprInstruction::Unary(_) => {
                 stack
                     .pop()
                     .ok_or_else(|| verify("bytecode output expression stack is invalid"))?;
-                1
+                AbstractValue::unknown()
             }
             ExprInstruction::Binary(_) => {
                 stack
@@ -795,36 +837,46 @@ fn minimum_serialized_expression_bytes(
                 stack
                     .pop()
                     .ok_or_else(|| verify("bytecode output expression stack is invalid"))?;
-                1
+                AbstractValue::unknown()
             }
             ExprInstruction::Array(count) => {
                 let mut bytes = checked_add(2, count.saturating_sub(1))?;
+                let mut items = Vec::new();
+                items
+                    .try_reserve_exact(*count)
+                    .map_err(|_| resource("bytecode output analysis allocation failed"))?;
                 for _ in 0..*count {
-                    bytes = checked_add(
-                        bytes,
-                        stack
-                            .pop()
-                            .ok_or_else(|| verify("bytecode output expression stack is invalid"))?,
-                    )?;
+                    let item = stack
+                        .pop()
+                        .ok_or_else(|| verify("bytecode output expression stack is invalid"))?;
+                    bytes = checked_add(bytes, item.minimum_serialized)?;
+                    items.push(item);
                 }
-                bytes
+                items.reverse();
+                AbstractValue {
+                    minimum_serialized: bytes,
+                    structure: Some(Rc::new(AbstractStructure::Array(items))),
+                }
             }
             ExprInstruction::Object(keys) => {
                 let mut bytes = checked_add(2, keys.len().saturating_sub(1))?;
-                for key in keys {
+                let mut entries = BTreeMap::new();
+                for key in keys.iter().rev() {
+                    let value = stack
+                        .pop()
+                        .ok_or_else(|| verify("bytecode output expression stack is invalid"))?;
                     bytes = checked_add(bytes, serialized_string_len(key)?)?;
                     bytes = checked_add(bytes, 1)?;
-                    bytes = checked_add(
-                        bytes,
-                        stack
-                            .pop()
-                            .ok_or_else(|| verify("bytecode output expression stack is invalid"))?,
-                    )?;
+                    bytes = checked_add(bytes, value.minimum_serialized)?;
+                    entries.insert(key.clone(), value);
                 }
-                bytes
+                AbstractValue {
+                    minimum_serialized: bytes,
+                    structure: Some(Rc::new(AbstractStructure::Object(entries))),
+                }
             }
         };
-        stack.push(minimum);
+        stack.push(abstract_value);
     }
     if stack.len() != 1 {
         return Err(verify("bytecode output expression stack is invalid"));
@@ -832,6 +884,71 @@ fn minimum_serialized_expression_bytes(
     stack
         .pop()
         .ok_or_else(|| verify("bytecode output expression stack is invalid"))
+}
+
+fn resolve_static_path(
+    mut value: AbstractValue,
+    pointer: &str,
+) -> Result<Option<AbstractValue>, SandboxError> {
+    if pointer.is_empty() {
+        return Ok(Some(value));
+    }
+    for encoded in pointer[1..].split('/') {
+        let segment = decode_pointer_segment(encoded)?;
+        let Some(structure) = value.structure.as_deref() else {
+            return Ok(None);
+        };
+        value = match structure {
+            AbstractStructure::Object(entries) => match entries.get(&segment) {
+                Some(selected) => selected.clone(),
+                None => return Ok(None),
+            },
+            AbstractStructure::Array(items) => {
+                let Some(index) = parse_pointer_index(&segment) else {
+                    return Ok(None);
+                };
+                match items.get(index) {
+                    Some(selected) => selected.clone(),
+                    None => return Ok(None),
+                }
+            }
+        };
+    }
+    Ok(Some(value))
+}
+
+fn decode_pointer_segment(encoded: &str) -> Result<String, SandboxError> {
+    let mut decoded = String::new();
+    decoded
+        .try_reserve_exact(encoded.len())
+        .map_err(|_| resource("bytecode output analysis allocation failed"))?;
+    let mut characters = encoded.chars();
+    while let Some(character) = characters.next() {
+        if character == '~' {
+            decoded.push(match characters.next() {
+                Some('0') => '~',
+                Some('1') => '/',
+                _ => return Err(verify("bytecode JSON pointer escape is invalid")),
+            });
+        } else {
+            decoded.push(character);
+        }
+    }
+    Ok(decoded)
+}
+
+fn parse_pointer_index(segment: &str) -> Option<usize> {
+    if segment.is_empty() || (segment.len() > 1 && segment.starts_with('0')) {
+        return None;
+    }
+    let mut value = 0usize;
+    for byte in segment.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as usize)?;
+    }
+    Some(value)
 }
 
 fn verify_constant_domain(value: &Value) -> Result<(), SandboxError> {
@@ -850,6 +967,7 @@ fn verify_definite_local_initialization(
     code: &[Instruction],
     local_count: usize,
     loop_bodies: &BTreeMap<usize, (usize, usize)>,
+    limits: &SandboxLimits,
 ) -> Result<(), SandboxError> {
     let mut loop_locals = BTreeMap::new();
     for (body_target, (_, end_target)) in loop_bodies {
@@ -862,8 +980,8 @@ fn verify_definite_local_initialization(
         loop_locals.insert(*body_target, locals);
     }
 
-    let mut states: Vec<Option<BTreeSet<usize>>> = vec![None; code.len()];
-    states[0] = Some(BTreeSet::new());
+    let mut states: Vec<Option<BTreeMap<usize, AbstractValue>>> = vec![None; code.len()];
+    states[0] = Some(BTreeMap::new());
     let mut pending = vec![0usize];
     while let Some(pc) = pending.pop() {
         let available = states[pc]
@@ -880,7 +998,7 @@ fn verify_definite_local_initialization(
             | Instruction::FanOut {
                 slot, item_slot, ..
             } => {
-                if available.contains(item_slot) {
+                if available.contains_key(item_slot) {
                     return Err(verify("bytecode scoped local aliases a live binding"));
                 }
                 if slot == item_slot {
@@ -893,7 +1011,7 @@ fn verify_definite_local_initialization(
                 accumulator_slot,
                 ..
             } => {
-                if available.contains(item_slot) || available.contains(accumulator_slot) {
+                if available.contains_key(item_slot) || available.contains_key(accumulator_slot) {
                     return Err(verify("bytecode scoped local aliases a live binding"));
                 }
                 if slot == item_slot || slot == accumulator_slot || item_slot == accumulator_slot {
@@ -904,31 +1022,41 @@ fn verify_definite_local_initialization(
         }
         verify_instruction_loads(instruction, &available, local_count)?;
 
-        let mut propagate = |target: usize, state: BTreeSet<usize>| -> Result<(), SandboxError> {
-            if target >= code.len() {
-                return Err(verify("every reachable control path must return"));
-            }
-            match &mut states[target] {
-                Some(existing) => {
-                    let intersection = existing
-                        .intersection(&state)
-                        .copied()
-                        .collect::<BTreeSet<_>>();
-                    if *existing != intersection {
-                        *existing = intersection;
+        let mut propagate =
+            |target: usize, state: BTreeMap<usize, AbstractValue>| -> Result<(), SandboxError> {
+                if target >= code.len() {
+                    return Err(verify("every reachable control path must return"));
+                }
+                match &mut states[target] {
+                    Some(existing) => {
+                        let intersection = existing
+                            .iter()
+                            .filter_map(|(slot, existing_value)| {
+                                state.get(slot).map(|incoming_value| {
+                                    (*slot, existing_value.joined(incoming_value))
+                                })
+                            })
+                            .collect::<BTreeMap<_, _>>();
+                        if *existing != intersection {
+                            *existing = intersection;
+                            pending.push(target);
+                        }
+                    }
+                    None => {
+                        states[target] = Some(state);
                         pending.push(target);
                     }
                 }
-                None => {
-                    states[target] = Some(state);
-                    pending.push(target);
-                }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
 
         match instruction {
-            Instruction::Return { .. } => {}
+            Instruction::Return { value } => {
+                let abstract_value = analyze_expression(&value.0, limits, &available)?;
+                if abstract_value.minimum_serialized > limits.max_return_bytes {
+                    return Err(SandboxError::output_limit());
+                }
+            }
             Instruction::Branch { false_target, .. } => {
                 propagate(pc + 1, available.clone())?;
                 propagate(*false_target, available)?;
@@ -939,11 +1067,11 @@ fn verify_definite_local_initialization(
                 end_target,
                 ..
             } => {
-                if available.contains(item_slot) {
+                if available.contains_key(item_slot) {
                     return Err(verify("bytecode loop local is already initialized"));
                 }
                 let mut body = available.clone();
-                body.insert(*item_slot);
+                body.insert(*item_slot, AbstractValue::unknown());
                 propagate(pc + 1, body)?;
                 propagate(*end_target, available)?;
             }
@@ -958,23 +1086,41 @@ fn verify_definite_local_initialization(
                 for slot in locals {
                     next_body.remove(slot);
                 }
-                next_body.insert(*item_slot);
+                next_body.insert(*item_slot, AbstractValue::unknown());
                 let mut after_loop = next_body.clone();
                 after_loop.remove(item_slot);
                 propagate(*body_target, next_body)?;
                 propagate(pc + 1, after_loop)?;
             }
-            Instruction::Let { slot, .. }
-            | Instruction::Map { slot, .. }
+            Instruction::Let { slot, value } => {
+                if available.contains_key(slot) {
+                    return Err(verify("bytecode immutable local is rebound"));
+                }
+                let abstract_value = analyze_expression(&value.0, limits, &available)?;
+                let mut next = available;
+                next.insert(*slot, abstract_value);
+                propagate(pc + 1, next)?;
+            }
+            Instruction::Map { slot, .. }
             | Instruction::Filter { slot, .. }
-            | Instruction::Reduce { slot, .. }
-            | Instruction::Invoke { slot, .. }
             | Instruction::FanOut { slot, .. } => {
-                if available.contains(slot) {
+                if available.contains_key(slot) {
                     return Err(verify("bytecode immutable local is rebound"));
                 }
                 let mut next = available;
-                next.insert(*slot);
+                // These instructions always bind a JSON array, which has a
+                // two-byte serialized lower bound even when it is empty.
+                next.insert(*slot, AbstractValue::scalar(2));
+                propagate(pc + 1, next)?;
+            }
+            Instruction::Reduce { slot, .. } | Instruction::Invoke { slot, .. } => {
+                if available.contains_key(slot) {
+                    return Err(verify("bytecode immutable local is rebound"));
+                }
+                let mut next = available;
+                // A reduction or tool response can produce any accepted JSON
+                // value, whose conservative serialized lower bound is one.
+                next.insert(*slot, AbstractValue::unknown());
                 propagate(pc + 1, next)?;
             }
         }
@@ -984,13 +1130,13 @@ fn verify_definite_local_initialization(
 
 fn verify_instruction_loads(
     instruction: &Instruction,
-    available: &BTreeSet<usize>,
+    available: &BTreeMap<usize, AbstractValue>,
     local_count: usize,
 ) -> Result<(), SandboxError> {
-    let verify_loads = |expression: &ExprCode, scope: &BTreeSet<usize>| {
+    let verify_loads = |expression: &ExprCode, scope: &BTreeMap<usize, AbstractValue>| {
         for opcode in &expression.0 {
             if let ExprInstruction::Load(slot) = opcode {
-                if *slot >= local_count || !scope.contains(slot) {
+                if *slot >= local_count || !scope.contains_key(slot) {
                     return Err(verify(
                         "bytecode local load is unavailable on this control-flow path",
                     ));
@@ -1008,7 +1154,7 @@ fn verify_instruction_loads(
         } => {
             verify_loads(collection, available)?;
             let mut scoped = available.clone();
-            scoped.insert(*item_slot);
+            scoped.insert(*item_slot, AbstractValue::unknown());
             verify_loads(value, &scoped)
         }
         Instruction::Filter {
@@ -1019,7 +1165,7 @@ fn verify_instruction_loads(
         } => {
             verify_loads(collection, available)?;
             let mut scoped = available.clone();
-            scoped.insert(*item_slot);
+            scoped.insert(*item_slot, AbstractValue::unknown());
             verify_loads(predicate, &scoped)
         }
         Instruction::Reduce {
@@ -1033,8 +1179,8 @@ fn verify_instruction_loads(
             verify_loads(collection, available)?;
             verify_loads(initial, available)?;
             let mut scoped = available.clone();
-            scoped.insert(*item_slot);
-            scoped.insert(*accumulator_slot);
+            scoped.insert(*item_slot, AbstractValue::unknown());
+            scoped.insert(*accumulator_slot, AbstractValue::unknown());
             verify_loads(value, &scoped)
         }
         Instruction::FanOut {
@@ -1045,7 +1191,7 @@ fn verify_instruction_loads(
         } => {
             verify_loads(collection, available)?;
             let mut scoped = available.clone();
-            scoped.insert(*item_slot);
+            scoped.insert(*item_slot, AbstractValue::unknown());
             verify_loads(arguments, &scoped)
         }
         _ => {
@@ -1225,6 +1371,51 @@ mod tests {
                 assert_eq!(error.message(), "output byte limit exceeded");
             }
         }
+    }
+
+    #[test]
+    fn verifier_propagates_local_bounds_and_ignores_unreachable_returns() {
+        let local_return = serde_json::to_vec(&serde_json::json!({"version":1,"body":[
+            {"kind":"let","name":"payload","value":{"kind":"string","value":"x".repeat(256)}},
+            {"kind":"invoke","name":"effect","tool_id":"write","arguments":{"kind":"object","entries":[]}},
+            {"kind":"return","value":{"kind":"object","entries":[
+                {"key":"effect","value":{"kind":"variable","name":"effect"}},
+                {"key":"payload","value":{"kind":"variable","name":"payload"}}
+            ]}}
+        ]}))
+        .unwrap();
+        let selected_path_return = serde_json::to_vec(&serde_json::json!({"version":1,"body":[
+            {"kind":"let","name":"payload_container","value":{"kind":"object","entries":[
+                {"key":"large","value":{"kind":"string","value":"x".repeat(256)}},
+                {"key":"small","value":{"kind":"integer","value":0}}
+            ]}},
+            {"kind":"invoke","name":"effect","tool_id":"write","arguments":{"kind":"object","entries":[]}},
+            {"kind":"return","value":{"kind":"path","value":{"kind":"variable","name":"payload_container"},"pointer":"/large"}}
+        ]}))
+        .unwrap();
+        let limits = SandboxLimits {
+            max_return_bytes: 128,
+            ..SandboxLimits::default()
+        };
+        for source in [local_return, selected_path_return] {
+            let error = Program::from_json(&source, &limits)
+                .and_then(|program| program.compile(&limits))
+                .unwrap_err();
+            assert!(error.is_output_limit());
+        }
+
+        let unreachable = serde_json::to_vec(&serde_json::json!({"version":1,"body":[
+            {"kind":"return","value":{"kind":"integer","value":0}},
+            {"kind":"return","value":{"kind":"string","value":"x".repeat(256)}}
+        ]}))
+        .unwrap();
+        let limits = SandboxLimits {
+            max_return_bytes: 1,
+            ..SandboxLimits::default()
+        };
+        Program::from_json(&unreachable, &limits)
+            .and_then(|program| program.compile(&limits))
+            .unwrap();
     }
 
     #[test]

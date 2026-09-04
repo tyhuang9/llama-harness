@@ -2811,10 +2811,11 @@ mod tests {
 
     #[test]
     fn program_return_limit_is_independent_from_tool_response_limit() {
-        // The return goes through a local so its exact size is deliberately
-        // unknown to the verifier's conservative expression lower bound. This
-        // keeps the runtime boundary covered independently of static checks.
-        let raw = r#"{"version":1,"body":[{"kind":"let","name":"value","value":{"kind":"string","value":"abc"}},{"kind":"return","value":{"kind":"variable","name":"value"}}]}"#;
+        // A reduce result can depend on runtime collection contents, so its
+        // exact size is deliberately unknown to the verifier. The empty input
+        // selects the oversized initial value and keeps the runtime boundary
+        // covered independently of static checks.
+        let raw = r#"{"version":1,"body":[{"kind":"reduce","name":"value","item":"item","accumulator":"acc","collection":{"kind":"array","items":[]},"max_items":1,"initial":{"kind":"string","value":"abc"},"value":{"kind":"variable","name":"acc"}},{"kind":"return","value":{"kind":"variable","name":"value"}}]}"#;
         let rejected_limits = SandboxLimits {
             max_return_bytes: 4,
             ..SandboxLimits::default()

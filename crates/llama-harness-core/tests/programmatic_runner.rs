@@ -249,10 +249,15 @@ fn return_program_with_exact_serialized_bytes(bytes: usize) -> String {
 
 fn invoke_then_large_return_program(tool_id: &str, bytes: usize) -> String {
     json!({"version":1,"body":[
-        {"kind":"invoke","name":"effect","tool_id":tool_id,"arguments":{"kind":"object","entries":[]}},
+        {"kind":"let","name":"payload_container","value":{"kind":"object","entries":[
+            {"key":"large","value":{"kind":"string","value":"x".repeat(bytes)}}
+        ]}},
+        {"kind":"invoke","name":"effect","tool_id":tool_id,"arguments":{"kind":"object","entries":[
+            {"key":"value","value":{"kind":"integer","value":1}}
+        ]}},
         {"kind":"return","value":{"kind":"object","entries":[
             {"key":"effect","value":{"kind":"variable","name":"effect"}},
-            {"key":"payload","value":{"kind":"string","value":"x".repeat(bytes)}}
+            {"key":"payload","value":{"kind":"path","value":{"kind":"variable","name":"payload_container"},"pointer":"/large"}}
         ]}}
     ]})
     .to_string()
