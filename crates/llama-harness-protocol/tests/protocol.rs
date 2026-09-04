@@ -136,10 +136,13 @@ fn v1_minor_negotiation_selects_the_highest_mutual_version() {
 #[test]
 fn incompatible_major_unknown_messages_and_bounds_are_rejected() {
     let incompatible = r#"{"protocol_version":"2.0","request_id":"hello-1","type":"ping","payload":{"nonce":"ping-1"}}"#;
-    assert!(matches!(
+    assert_eq!(
         decode_line(incompatible.as_bytes()),
-        Err(ProtocolValidationError::IncompatibleVersion { .. })
-    ));
+        Err(ProtocolValidationError::IncompatibleVersion {
+            supported: ProtocolVersion::V1_1,
+            received: ProtocolVersion { major: 2, minor: 0 },
+        })
+    );
 
     let unknown =
         r#"{"protocol_version":"1.0","request_id":"hello-1","type":"future_command","payload":{}}"#;
