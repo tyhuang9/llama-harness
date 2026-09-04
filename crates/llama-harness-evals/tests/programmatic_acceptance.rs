@@ -9,7 +9,7 @@ use llama_harness_core::{
 };
 use llama_harness_evals::{
     evaluate_suite, load_suite, EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation,
-    StrategyMetrics,
+    EvaluationReport, ForcedCandidateDisposition, StrategyMetrics,
 };
 use serde_json::{json, Value};
 use std::{
@@ -19,6 +19,13 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 const SUITE: &str = include_str!("fixtures/programmatic-acceptance.yaml");
+const ADVANCED_WORKLOADS: [&str; 5] = [
+    "loop",
+    "fanout",
+    "filter",
+    "reduce-aggregate",
+    "large-intermediate-data",
+];
 
 #[derive(Default)]
 struct State {
@@ -603,8 +610,10 @@ impl EvalExecutor for AcceptanceExecutor {
                 !matches!(scenario, "repair" | "fallback") || run.status == RunStatus::Completed,
             ),
             tool_selection_accuracy: Some(if exact { 1.0 } else { 0.0 }),
-            input_tokens: None,
-            output_tokens: None,
+            // The mock provider reports no token usage. Zero is the exact
+            // fixture counter, not a production estimate.
+            input_tokens: Some(0),
+            output_tokens: Some(0),
             wasted_tool_calls: Some((!exact) as u32),
         };
         drop(state);
@@ -631,33 +640,78 @@ async fn executable_programmatic_acceptance_matrix_runs_real_strategies() {
         .results
         .iter()
         .all(|result| result.strategy_metrics.passes_readiness()));
-    for case_id in [
-        "loop",
-        "fanout",
-        "filter",
-        "reduce-aggregate",
-        "large-intermediate-data",
-    ] {
-        let adaptive = report
-            .results
-            .iter()
-            .find(|result| result.case_id == case_id && result.strategy == RunStrategy::Adaptive)
-            .expect("advanced workload has an Adaptive result");
-        for forced_strategy in [
-            RunStrategy::Direct,
-            RunStrategy::DeclarativePlan,
-            RunStrategy::Programmatic,
-        ] {
-            let forced = report
+    for case_id in ADVANCED_WORKLOADS {
+        for repetition in 1..=3 {
+            let adaptive = report
                 .results
                 .iter()
-                .find(|result| result.case_id == case_id && result.strategy == forced_strategy)
-                .expect("advanced workload has every forced comparison");
-            assert_eq!(
-                adaptive.final_state, forced.final_state,
-                "Adaptive final state diverged from {forced_strategy:?} for {case_id}"
-            );
+                .find(|result| {
+                    result.case_id == case_id
+                        && result.strategy == RunStrategy::Adaptive
+                        && result.repetition == repetition
+                })
+                .expect("advanced workload has an Adaptive result");
+            for forced_strategy in [
+                RunStrategy::Direct,
+                RunStrategy::DeclarativePlan,
+                RunStrategy::Programmatic,
+            ] {
+                let forced = report
+                    .results
+                    .iter()
+                    .find(|result| {
+                        result.case_id == case_id
+                            && result.strategy == forced_strategy
+                            && result.repetition == repetition
+                    })
+                    .expect("advanced workload has every forced comparison");
+                assert_eq!(
+                    adaptive.final_state, forced.final_state,
+                    "Adaptive final state diverged from {forced_strategy:?} for {case_id}, repetition {repetition}"
+                );
+            }
         }
+    }
+
+    // This validates deterministic cohort safety/correctness/ranking plumbing,
+    // not a real latency advantage. Production's default promotion allowlist
+    // remains empty; this fixture opts in only for acceptance coverage.
+    let advanced_report = EvaluationReport::new(
+        "programmatic-advanced-cohort-readiness",
+        report.suite_id.clone(),
+        report.suite_version,
+        report
+            .results
+            .iter()
+            .filter(|result| ADVANCED_WORKLOADS.contains(&result.case_id.as_str()))
+            .cloned()
+            .collect(),
+    );
+    let readiness = advanced_report.adaptive_readiness();
+    assert!(readiness.ready, "{readiness:#?}");
+    assert!(readiness.failures.is_empty(), "{readiness:#?}");
+    assert_eq!(readiness.comparisons.len(), ADVANCED_WORKLOADS.len());
+    for comparison in &readiness.comparisons {
+        assert_eq!(comparison.sample_count, 3, "{comparison:#?}");
+        assert_eq!(
+            comparison
+                .forced_candidates
+                .iter()
+                .map(|candidate| candidate.strategy)
+                .collect::<Vec<_>>(),
+            vec![
+                RunStrategy::Direct,
+                RunStrategy::DeclarativePlan,
+                RunStrategy::Programmatic,
+            ],
+            "{comparison:#?}"
+        );
+        assert!(comparison.forced_candidates.iter().all(|candidate| {
+            matches!(
+                candidate.disposition,
+                ForcedCandidateDisposition::Selected | ForcedCandidateDisposition::Outranked { .. }
+            )
+        }));
     }
 }
 

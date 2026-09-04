@@ -5,7 +5,7 @@ agent: fixture-agent
 models: [fixture-model]
 strategies: [direct, declarative_plan, programmatic, adaptive]
 defaults:
-  repeat: 1
+  repeat: 3
 cases:
   - id: branch
     fixture: {id: branch, data: {scenario: branch, tools: [read], expected_adaptive_selection: direct}}
