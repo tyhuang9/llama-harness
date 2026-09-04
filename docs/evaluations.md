@@ -63,22 +63,27 @@ let report = llama_harness::evals::evaluate_suite(
 
 Each call receives an owned fixture clone. Applications should create fresh sandbox state from it, register only the tools allowed for the case, run the real `AgentRunner`, return a final state snapshot, and clean up their sandbox. The standalone `llama-harness eval run` command validates input but deliberately returns a clear error until an embedding application or example adapter is configured; it never fabricates application-owned tools.
 
-## Forced strategy matrix
+## Forced and Adaptive strategy matrix
 
-Run Programmatic only as an explicitly forced strategy with the facade feature,
-host `ProgrammaticHostConfig`, and a provider that advertises strict AST V1
-conformance, nonzero program bytes, and at least two model calls. Keep the
-existing Direct and Adaptive baselines in the same suite; Adaptive must never
-select Programmatic.
+Keep forced Direct, declarative-plan, and Programmatic baselines beside
+Adaptive for every applicable workload. Forced Programmatic requires the
+facade feature, host `ProgrammaticHostConfig`, and a provider that advertises
+strict AST V1 conformance, nonzero program bytes, and at least two model calls.
+Adaptive may select Programmatic only when the host also supplies an explicit,
+evaluation-backed `adaptive_programmatic_allowlist` entry for the proposed
+workload class. That allowlist is empty by default and must not be inferred from
+fixture, request, or model metadata in production.
 
 | Forced case | Required observation |
 | --- | --- |
 | Direct baseline | Completes through the existing sequential broker path. |
-| Adaptive baseline | Executes through the real `AgentRunner`, records its actual Direct or declarative selection, and never selects Programmatic. |
+| Adaptive baseline | Executes through the real `AgentRunner` and records its actual Direct, declarative-plan, or explicitly promoted Programmatic selection. |
 | Programmatic, conforming provider | Records forced Programmatic selection, bounded lifecycle metadata, broker-audited calls, and a final result. |
-| Missing host feature/configuration or false/zero provider capability | Fails closed before a program tool call; it is not a Direct fallback. |
+| Forced Programmatic with missing host feature/configuration or false/zero provider capability | Fails closed before a program tool call; it is not a Direct fallback. |
+| Adaptive Programmatic proposal without promotion, configuration, capability, byte capacity, or two remaining model calls | Falls back to sequential, non-speculative Direct before Programmatic model or tool work. |
+| Invalid host configuration, cancellation, deadline, or saturated Programmatic admission | Remains fail-closed; admission never queues or silently shifts load to Direct. |
 | First invalid program, corrected program valid | Uses at most one pre-dispatch repair and records the repair lifecycle. |
-| Invalid program after the one repair, no dispatched effect | Continues the same run through a fresh Direct scope and records `invalid_program`; IDs, event sequence, deadline, budgets, and broker state remain continuous. Do not count it as Programmatic success. |
+| Invalid program after the one repair, no dispatched effect | Continues the same run through Direct and records `invalid_program`; forced execution selects a fresh Direct scope, while Adaptive reuses its prepared scope. IDs, event sequence, deadline, budgets, and broker state remain continuous. Do not count it as Programmatic success. |
 | Any failure after dispatch, including cancellation, deadline, invalid output, or resource limit | Ends terminally with the effect uncertain; no repair, restart, replay, fallback, or speculation. |
 | Read-only parallel-safe fan-out | Preserves source order, validates and reserves the entire bounded worst-case canonical transcript envelope before policy, approval, or dispatch, and respects the effective cap of eight. |
 | Mutation in fan-out or mixed read/write batch | Rejects the batch before dispatch; state-changing calls remain serial. |
@@ -87,9 +92,10 @@ For every Programmatic case, assert the existing tool-sequence, exact canonical
 argument, policy/approval, cancellation, limit, and final-state expectations.
 The repository acceptance matrix executes those cases through a fresh real
 `AgentRunner` with deterministic provider, tool, policy, and approval fixtures;
-it never constructs a `RunResult` or safety metric by hand. Include repair,
-pre-dispatch fallback, capability downgrade, and an Adaptive-never-Programmatic
-case alongside Direct, declarative-plan, and Programmatic comparisons.
+it never constructs a `RunResult` or bypasses broker effects. Include repair,
+pre-dispatch fallback, capability downgrade, unpromoted Programmatic proposals,
+and explicitly promoted loop, fan-out, filter, aggregation, and
+large-intermediate-data cases alongside every applicable forced strategy.
 Add privacy canaries that prove lifecycle events, SQLite export, errors, and
 debug formatting omit program source, AST, bytecode, constants, locals,
 arguments, and tool results. Evaluation artifacts retain only the explicit
@@ -100,9 +106,11 @@ Sandbox failures use a stable value-free public mapping: sandbox resource limits
 become `resource_limit`; resume or deterministic execution failures become
 `tool_error`; malformed programs, invalid sandbox limits, and verification
 failures become `invalid_output`. Direct and Adaptive retain their existing
-broker and error contracts; only a forced, explicitly configured Programmatic
-request reaches this mapping. A pre-effect invalid Programmatic generation may
-continue through Direct under the same logical run; capability failures do not.
+broker and error contracts. Both forced and explicitly promoted Adaptive
+Programmatic execution use this mapping. A pre-effect invalid Programmatic
+generation may continue through Direct under the same logical run; forced
+capability failures remain fail-closed, while Adaptive capability gates fall
+back before Programmatic generation.
 
 ## Forced guarded-speculation matrix
 
@@ -159,7 +167,8 @@ retry. See [Guarded speculative tool calling](speculative-tool-calling.md).
 audit for the deterministic compatibility matrix. Its compact runner matrix
 creates a fresh real `AgentRunner`, `ToolRegistry`, policy, and
 `ProgrammaticHostConfig` for every forced Direct, declarative-plan,
-Programmatic, and Adaptive single-call workload. It checks the broker-owned
+Programmatic, and Adaptive single-call workload. Advanced Adaptive fixtures
+also opt in only the workload class under evaluation. The matrix checks the broker-owned
 tool-call order and canonical arguments rather than constructing a result or a
 broker substitute. The no-tool workload covers Direct, Programmatic, and
 Adaptive; declarative plans have no valid empty-plan form and are therefore not
@@ -169,21 +178,30 @@ The adjacent `fixtures/acceptance-matrix.yaml` is an audited manifest, not a
 second fake execution harness. It keeps the release workload classes visible
 and ties them to executable real-boundary coverage: no-tool and ambiguous
 Direct behavior; single calls; parallel and dependent plans; recovery,
-approval, mixed read/write, loops, fan-out, and aggregation; 30, 100, and
+approval, mixed read/write, loops, fan-out, filtering, aggregation, and large
+intermediate data; 30, 100, and
 1,000-tool catalogs; capability downgrade; one-repair malformed-plan fallback;
 the sandbox's public error categories; and speculative hit, miss, race,
 privacy, exact-commit, and no-write cases. The manifest test fails if a class,
 its applicable strategy set, or its named executable evidence disappears.
 
-Every compared result must first pass these hard gates: zero unauthorized,
-duplicate, and unintended effects; task and final-state correctness; and
-deterministic accounting and effect order. Adaptive is compared with the best
-complete forced baseline for a shared workload and must pass the same safety and
-correctness gates. Eligible alternatives are then ranked by reliability
-(recovery success, then tool-selection accuracy), latency (P50, then P95), and
-cost (input/output tokens, model calls, tool calls, and wasted execution), in
-that order. Latency is retained in the normalized report for measurement and
-release analysis only, never asserted as a scheduler-dependent CI threshold.
+Results are grouped into `(case_id, model)` cohorts. Every participating
+strategy must provide the same unique, nonzero repetition set; missing,
+duplicate, or mismatched samples fail readiness closed. The cohort first
+aggregates zero unauthorized, duplicate, and unintended effects; task and
+final-state correctness; and deterministic accounting and effect order as hard
+gates. Adaptive is compared with the best complete forced baseline and must
+pass the same safety and correctness gates. Eligible alternatives are then
+ranked by recovery-success rate, mean tool-selection accuracy, nearest-rank P50
+and P95 latency, and finally total tokens, model calls, tool calls, and wasted
+execution. Latency is retained for measurement and release analysis, never as
+a scheduler-dependent wall-clock CI threshold.
+
+Passing this deterministic compatibility matrix proves the boundaries and
+ranking plumbing; it is not evidence of a production latency advantage. Keep
+the Adaptive Programmatic allowlist empty until matched measurements for the
+exact provider/model/tool deployment show unchanged correctness and safety plus
+a material outcome or efficiency benefit for that workload class.
 
 The sandbox acceptance evidence explicitly covers lexical and response-data
 escape attempts, live-capacity and fuel exhaustion, nested policy/caller

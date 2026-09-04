@@ -10,6 +10,12 @@ All notable changes to this project are documented here.
   package identity reporting and compatible v1.0 fallback.
 - Add deterministic release gates for Cargo metadata, runtime hello identity,
   protocol acceptance, SDK package contents, and matching npm/Python artifacts.
+- Make Adaptive the default quality-first dispatcher across Direct,
+  declarative DAG, and explicitly evaluation-promoted Programmatic workloads,
+  while preserving Direct as the shared broker and fallback boundary.
+- Add provider-neutral strict structured-output requests, cohort-based
+  safety/correctness readiness with P50/P95 ranking, and explicit
+  non-speculative recovery, retry, and fallback paths.
 - Document the 0.1-to-0.2 migration, release sequencing, and immutable-package
   rollback boundaries.
 

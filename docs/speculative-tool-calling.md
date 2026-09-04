@@ -24,10 +24,13 @@ continues consuming and validating the authoritative tail. Terminal provider
 failure cancels and drains a pending candidate before returning and is never
 retried.
 
-Speculation applies only to Direct execution, including Adaptive after Adaptive
-has selected its Direct path. Declarative plans and Programmatic execution do
-not speculate. Later calls in a multi-call response execute sequentially in
-authoritative index order through the ordinary broker.
+Speculation applies only to the first provider attempt of genuinely selected
+Direct execution, including Adaptive after a valid planner response selects
+Direct. Capability, planner, invalid-plan, and Programmatic fallbacks are
+sequential, as are provider retries, recovery, final synthesis, Direct
+continuations, and later reactive attempts. Declarative plans and Programmatic
+execution do not speculate. Later calls in a multi-call response execute
+sequentially in authoritative index order through the ordinary broker.
 
 The runner permits at most one candidate globally. It tries that slot without
 waiting. If the tool has a concurrency key, the keyed permit is also tried

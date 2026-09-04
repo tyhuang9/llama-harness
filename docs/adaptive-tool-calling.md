@@ -1,22 +1,28 @@
 # Adaptive tool calling
 
 `AgentRunner::run` uses `RunStrategy::Adaptive`. Hosts can use
-`run_with_strategy` to force `Direct` or `DeclarativePlan` for evaluation and
-debugging. `Programmatic` is separately sandboxed, forced-only, and unavailable
-unless the facade/core feature and explicit host configuration are both present.
+`run_with_strategy` to force `Direct`, `DeclarativePlan`, or `Programmatic` for
+evaluation and debugging. Direct execution remains the atomic broker boundary
+under every strategy and the sequential fallback when an advanced strategy
+cannot start safely.
 
 Adaptive planning is capability gated. A provider must advertise structured
 plan support and sufficient plan, catalog, and model-call limits. Otherwise the
 run emits fallback metadata and uses the existing direct reactive loop. A
 forced declarative run never silently changes its selected strategy.
+Programmatic is an Adaptive candidate only when the optional sandbox, explicit
+host configuration, provider capabilities, remaining resource budgets, and an
+evaluation-backed workload-class allowlist all agree.
 
 ## Direct speculative overlay
 
 Guarded speculation is not an Adaptive candidate or a new strategy. It can
-operate only after Adaptive selects Direct, using the same finalized index-0
-stream boundary and broker as a forced Direct run. Declarative and Programmatic
-paths never speculate. A provider without a useful final-call boundary streams
-normally but cannot overlap tool work.
+operate only on the first provider attempt after Direct was genuinely selected,
+either by the host or by a valid Adaptive planner response. Capability,
+planner, invalid-plan, and Programmatic fallbacks are sequential, as are
+provider retries, recovery, final synthesis, and later reactive attempts.
+Declarative and Programmatic paths never speculate. A provider without a useful
+final-call boundary streams normally but cannot overlap tool work.
 
 The overlay is disabled unless runner, tool, and dedicated speculative policy
 all opt in. Shadow must first accumulate at least 1,000 exact per-tool
@@ -30,20 +36,33 @@ safety and rollout contract.
 
 ## Programmatic tool calling
 
-Programmatic execution is an explicit same-process opt-in, not an Adaptive
-candidate. Compile the `programmatic` facade feature, configure
-`AgentRunnerBuilder::programmatic(ProgrammaticHostConfig { .. })`, and force
-`RunStrategy::Programmatic` only in a controlled rollout or evaluation. Omitting
-either the feature or builder configuration disables new programmatic runs;
-`Adaptive` continues to select only its existing Direct or declarative paths.
+Programmatic execution is an explicit same-process opt-in. Compile the
+`programmatic` facade feature and configure
+`AgentRunnerBuilder::programmatic(ProgrammaticHostConfig { .. })`. Forced
+`RunStrategy::Programmatic` remains available for evaluation and advanced
+hosts. Adaptive promotion additionally requires
+`AgentRunnerBuilder::adaptive_programmatic_allowlist(...)` with one or more
+`ProgrammaticWorkloadClass` values: `Loop`, `FanOut`, `Filter`, `Aggregation`,
+or `LargeIntermediateData`.
+
+The Adaptive allowlist is empty by default and is a host attestation that the
+exact provider, model, prompt, and tool deployment has passed matched forced
+strategy evaluation for that workload class. It is never inferred from request
+metadata or model output, and forced Programmatic does not consult it. A known
+but unpromoted class, missing host configuration, incompatible provider, zero
+program-byte capacity, insufficient remaining model calls, or Programmatic
+scope limit falls back to sequential Direct before Programmatic model or tool
+work. Invalid host configuration, cancellation, deadline, and saturated
+Programmatic admission remain fail-closed rather than shifting load silently.
 
 The provider must advertise tool support, `StrictJsonAstV1` programmatic
 conformance, a nonzero `max_program_bytes` capability, and at least two model
-calls. A missing, false, or zero capability fails closed before any program
-tool call; it is not silently treated as Direct. The sandbox receives a strict
-versioned AST and privately verified bytecode, has no ambient filesystem,
-network, process, provider, registry, policy, or tool capability, and only
-yields inert owned-data batches back to the host.
+calls for forced execution or two remaining calls after Adaptive planning.
+A forced request with a missing, false, or zero capability fails closed rather
+than changing strategy. The sandbox receives a strict versioned AST and
+privately verified bytecode, has no ambient filesystem, network, process,
+provider, registry, policy, or tool capability, and only yields inert
+owned-data batches back to the host.
 
 The host still owns the complete authority boundary. Every yielded call uses
 the same broker as Direct and declarative execution, including frozen caller
@@ -83,20 +102,23 @@ synthesis. A two-call budget therefore spends its second call on the approved
 zero-effect Direct fallback after an invalid initial program; a three-call
 budget can repair once and still synthesize the verified program's answer. If
 the corrected program is still invalid and no effect was issued, the runner
-enters a fresh Direct scope as a continuation of the same logical run: it
-preserves the public run and trace IDs, event sequence, deadline, cumulative
-budgets, and broker state while recording `invalid_program` fallback metadata.
-A forced run therefore never claims that Programmatic succeeded. Program
+enters Direct as a continuation of the same logical run. Forced Programmatic
+selects a fresh Direct scope; Adaptive reuses the Direct scope it prepared
+before planning. Both preserve the public run, trace and execution IDs, event
+sequence, deadline, cumulative budgets, and broker state while recording
+`invalid_program` fallback metadata. A fallback never claims that Programmatic
+succeeded. Program
 generation, repair, and final synthesis deliberately use the bounded completion
 path even when a provider advertises streaming; streaming is not a programmatic
 runtime contract yet. Cancellation, deadline, resource, invalid-output, tool,
 resume, or result failures after dispatch leave the effect uncertain and
 terminal. They never repair, restart, replay, speculate, or fall back.
 
-To roll out safely, leave the feature disabled by default, gate the builder
-configuration in the host deployment, and force Programmatic only in an
-evaluation matrix with conforming providers. Removing that configuration or
-feature stops future programmatic runs, but cannot undo an external effect
+To roll out safely, leave the Adaptive workload allowlist empty until matched
+evaluation shows unchanged safety and correctness plus a material outcome or
+efficiency advantage for the exact deployment. Removing the allowlist,
+Programmatic configuration, or feature stops future Adaptive promotions, but
+cannot undo an external effect
 already dispatched; rely on application-level idempotency and the broker's
 uncertain-effect boundary for recovery. Program lifecycle telemetry and SQLite
 kind hooks are metadata-only; source, AST, bytecode, constants, local values,
@@ -109,12 +131,10 @@ validation succeed; synthesis errors instead emit one final `failed`,
 `ProgramExecutionCompleted` also reports value-free VM telemetry: fuel,
 scheduling slices entered by the host loop, tool-yield batches, branches,
 bounded loop iterations, fan-out batches, partial failures, peak accounted
-bytes, and VM duration. These counters are persisted as local metadata and
-available to trace-store filtering/export only; the runtime wire contract does
-not project this Programmatic-only event yet. Projecting it is deferred to the
-compatibility/protocol milestone; the current runtime filters core-only events,
-so its wire sequence can have intentional filtering gaps without losing or
-reordering projected events.
+bytes, and VM duration. These counters are persisted as local metadata and are
+projected additively by protocol 1.1. Negotiated protocol 1.0 peers retain the
+legacy projection and do not receive advanced strategy, plan, or Programmatic
+event fields.
 
 ### Programmatic event-contract matrix
 
@@ -198,9 +218,13 @@ recovery safe. Cancellation, deadlines, resource limits, and transcript limits
 are terminal and never trigger recovery. Exact completed mutations are reused;
 uncertain mutations stop the run.
 
-Planner responses currently use a strict core-validated JSON envelope. Native
-provider structured-response constraints can be added as a capability-specific
-optimization later; core validation remains authoritative.
+Planner, repair, recovery, program-generation, and output-schema phases attach
+a bounded provider-neutral `StructuredOutputRequest` when the provider
+advertises support. Providers must enforce a supplied strict schema or reject
+the unsupported request; they must never silently drop it. Prompt guidance and
+authoritative core parsing, schema validation, allowlist checks, and broker
+validation remain in place, including for providers without constrained
+generation support.
 
 Planning, repair, provider retry, and execution recovery are optional phases.
 They run only when at least one model call remains reserved for direct fallback
@@ -266,9 +290,7 @@ behavior.
 
 Provider raw deltas are not persisted by this execution path. The local SQLite
 store records `PlanLifecycle` as `plan.lifecycle`; existing event kinds remain
-unchanged. Protocol runtimes intentionally filter additive core-only strategy,
-plan, and Programmatic events until the compatibility/protocol milestone
-projects them. Because the core event emitter allocates sequence numbers before
-that projection, wire consumers may observe sequence gaps; gaps are filtering
-artifacts, not lost or reordered wire events. Protocol and SDK contracts remain
-unchanged.
+unchanged. Protocol 1.1 and the first-party SDKs project additive strategy,
+plan, Programmatic, capability, and usage contracts. Negotiated protocol 1.0
+peers receive the legacy projection, so their event sequences may contain
+intentional filtering gaps without losing or reordering projected events.
