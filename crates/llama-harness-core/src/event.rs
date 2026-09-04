@@ -361,6 +361,8 @@ pub enum StrategySelectionReason {
     PlannerSelectedPlan,
     /// Provider capabilities require the direct compatibility path.
     CapabilityDowngrade,
+    /// An advanced strategy or its planner failed safely before effects began.
+    Fallback,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

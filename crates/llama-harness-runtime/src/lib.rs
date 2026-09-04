@@ -273,13 +273,9 @@ async fn run_start(
     provider_factory: Arc<dyn ProviderFactory>,
 ) {
     let mut wire_request = start.request;
+    let strategy_was_explicit = wire_request.strategy.is_some();
     let strategy = wire_request.strategy.unwrap_or_default();
-    if state.protocol_version() == ProtocolVersion::V1_0
-        && matches!(
-            strategy,
-            WireRunStrategy::DeclarativePlan | WireRunStrategy::Programmatic
-        )
-    {
+    if state.protocol_version() == ProtocolVersion::V1_0 && strategy_was_explicit {
         send_run_failed_with_code(
             &state,
             &run_id,
@@ -1469,6 +1465,9 @@ fn to_wire_strategy_selection_reason(
         llama_harness_core::StrategySelectionReason::CapabilityDowngrade => {
             WireStrategySelectionReason::CapabilityDowngrade
         }
+        llama_harness_core::StrategySelectionReason::Fallback => {
+            WireStrategySelectionReason::Fallback
+        }
         _ => WireStrategySelectionReason::CapabilityDowngrade,
     }
 }
@@ -2063,9 +2062,12 @@ mod tests {
             to_wire_event(RunEvent::StrategySelected {
                 requested: RunStrategy::Adaptive,
                 selected: RunStrategy::Direct,
-                reason: llama_harness_core::StrategySelectionReason::CapabilityDowngrade,
+                reason: llama_harness_core::StrategySelectionReason::Fallback,
             }),
-            Some(llama_harness_protocol::WireRunEvent::StrategySelected { .. })
+            Some(llama_harness_protocol::WireRunEvent::StrategySelected {
+                reason: WireStrategySelectionReason::Fallback,
+                ..
+            })
         ));
 
         let mut tool = to_wire_tool_definition(

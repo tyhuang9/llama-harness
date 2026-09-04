@@ -145,7 +145,13 @@ impl BrokerState {
 enum EffectRecord {
     Dispatched,
     Uncertain,
-    Completed(Arc<ToolResult>),
+    Completed(Option<Arc<ToolResult>>),
+}
+
+impl EffectRecord {
+    fn completed(result: &Arc<ToolResult>, retain_result: bool) -> Self {
+        Self::Completed(retain_result.then(|| Arc::clone(result)))
+    }
 }
 
 /// A completely validated and authorized invocation ready to execute.
@@ -588,7 +594,7 @@ impl<'a> ToolBroker<'a> {
             return Ok(None);
         }
         match state.effects.get(signature) {
-            Some(EffectRecord::Completed(recorded)) => {
+            Some(EffectRecord::Completed(Some(recorded))) => {
                 state.tool_reused += 1;
                 events.emit(RunEvent::ToolEffectReused {
                     call_id: call.id.clone(),
@@ -596,6 +602,10 @@ impl<'a> ToolBroker<'a> {
                 });
                 Ok(Some(recorded.clone()))
             }
+            Some(EffectRecord::Completed(None)) => Err(HarnessError::Tool(
+                "state-changing tool already completed but its result is unavailable; implicit replay is prohibited"
+                    .into(),
+            )),
             Some(EffectRecord::Dispatched | EffectRecord::Uncertain) => Err(HarnessError::Tool(
                 "state-changing tool outcome is uncertain; implicit replay is prohibited".into(),
             )),
@@ -811,7 +821,10 @@ impl<'a> ToolBroker<'a> {
         }
         if let Some(signature) = &prepared.effect_key {
             let record = if execution.result.ok && execution.validation_error.is_none() {
-                EffectRecord::Completed(Arc::clone(&execution.result))
+                EffectRecord::completed(
+                    &execution.result,
+                    state.reuse_committed_effects && prepared.caller != ToolCaller::Programmatic,
+                )
             } else {
                 EffectRecord::Uncertain
             };
@@ -1888,9 +1901,25 @@ impl InvocationKey {
 
 #[cfg(test)]
 mod speculation_tests {
-    use super::{InvocationKey, ToolConcurrencyLimiter};
-    use serde_json::Value;
-    use std::collections::{HashMap, HashSet};
+    use super::{EffectRecord, InvocationKey, ToolConcurrencyLimiter};
+    use crate::ToolResult;
+    use serde_json::{json, Value};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
+
+    #[test]
+    fn completed_effect_marker_retains_payload_only_when_reuse_is_enabled() {
+        let result = Arc::new(ToolResult::success(json!({"large": "payload"})));
+        let marker_only = EffectRecord::completed(&result, false);
+        assert!(matches!(&marker_only, EffectRecord::Completed(None)));
+        assert_eq!(Arc::strong_count(&result), 1);
+
+        let reusable = EffectRecord::completed(&result, true);
+        assert!(matches!(&reusable, EffectRecord::Completed(Some(_))));
+        assert_eq!(Arc::strong_count(&result), 2);
+    }
 
     #[tokio::test]
     async fn speculative_keyed_admission_is_nonblocking_and_never_queues() {

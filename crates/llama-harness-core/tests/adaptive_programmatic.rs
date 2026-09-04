@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use llama_harness_core::{
-    mock::{final_response, MockModelProvider},
+    mock::{final_response, MockModelProvider, MockStep},
     AgentDefinition, AgentRunner, AllowAllPolicy, HarnessError, InMemoryEventSink,
     ModelCapabilities, ProgrammaticConformance, ProgrammaticHostConfig, ProgrammaticWorkloadClass,
     ProviderCapabilityLimits, RunEvent, RunRequest, RunStatus, RunStrategy, StrategyFallbackReason,
@@ -490,12 +490,141 @@ async fn programmatic_promotion_does_not_require_declarative_plan_support() {
     assert!(!requests[0].messages[0]
         .content
         .contains("finite dependency DAG"));
+    assert!(requests[0].messages[0]
+        .content
+        .contains(r#""id":"program_only","allowed_strategies":["programmatic"]"#));
     assert!(events.events().iter().any(|record| matches!(
         record.event,
         RunEvent::StrategySelected {
             requested: RunStrategy::Adaptive,
             selected: RunStrategy::Programmatic,
             reason: StrategySelectionReason::AdaptivePlanner,
+        }
+    )));
+}
+
+#[tokio::test]
+async fn mixed_caller_planner_catalog_describes_each_eligible_strategy() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response(r#"{"strategy":"direct"}"#),
+            final_response("done"),
+        ])
+        .with_capabilities(capabilities()),
+    );
+    let declarative_only = Arc::new(TestTool::new(
+        "declarative_only",
+        [ToolCaller::DeclarativePlan],
+        false,
+    ));
+    let programmatic_only = Arc::new(TestTool::new(
+        "programmatic_only",
+        [ToolCaller::Programmatic],
+        false,
+    ));
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([
+            declarative_only as Arc<dyn Tool>,
+            programmatic_only as Arc<dyn Tool>,
+        ]))
+        .programmatic(ProgrammaticHostConfig::default())
+        .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
+        .build()
+        .run(request(&["declarative_only", "programmatic_only"], 3))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let prompt = &provider.requests()[0].messages[0].content;
+    assert!(prompt.contains(r#""id":"declarative_only","allowed_strategies":["declarative_plan"]"#));
+    assert!(prompt.contains(r#""id":"programmatic_only","allowed_strategies":["programmatic"]"#));
+}
+
+#[tokio::test]
+async fn programmatic_only_planner_failure_reports_adaptive_fallback() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            MockStep::Error(HarnessError::Provider("planner unavailable".into())),
+            final_response("fallback"),
+        ])
+        .with_capabilities(capabilities().with_structured_plans(false)),
+    );
+    let program_only = Arc::new(TestTool::new(
+        "program_only",
+        [ToolCaller::Programmatic],
+        false,
+    ));
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider)
+        .tools(registry([program_only as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
+        .build()
+        .run(request(&["program_only"], 3))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyFallback {
+            from: RunStrategy::Adaptive,
+            to: RunStrategy::Direct,
+            reason: StrategyFallbackReason::PlannerFailure,
+        }
+    )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategySelected {
+            requested: RunStrategy::Adaptive,
+            selected: RunStrategy::Direct,
+            reason: StrategySelectionReason::Fallback,
+        }
+    )));
+}
+
+#[tokio::test]
+async fn programmatic_only_invalid_envelope_reports_adaptive_fallback() {
+    let provider = Arc::new(
+        MockModelProvider::scripted([
+            final_response("not-json"),
+            final_response("still-not-json"),
+            final_response("fallback"),
+        ])
+        .with_capabilities(capabilities().with_structured_plans(false)),
+    );
+    let program_only = Arc::new(TestTool::new(
+        "program_only",
+        [ToolCaller::Programmatic],
+        false,
+    ));
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider)
+        .tools(registry([program_only as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
+        .build()
+        .run(request(&["program_only"], 3))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategyFallback {
+            from: RunStrategy::Adaptive,
+            to: RunStrategy::Direct,
+            reason: StrategyFallbackReason::InvalidPlan,
+        }
+    )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategySelected {
+            requested: RunStrategy::Adaptive,
+            selected: RunStrategy::Direct,
+            reason: StrategySelectionReason::Fallback,
         }
     )));
 }
@@ -645,7 +774,7 @@ async fn invalid_program_fallback_keeps_one_run_emitter_scope_and_counters() {
         RunEvent::StrategySelected {
             requested: RunStrategy::Adaptive,
             selected: RunStrategy::Direct,
-            reason: StrategySelectionReason::CapabilityDowngrade,
+            reason: StrategySelectionReason::Fallback,
         }
     )));
     assert!(records.iter().any(|record| matches!(

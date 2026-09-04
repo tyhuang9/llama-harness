@@ -85,7 +85,7 @@ fixture, request, or model metadata in production.
 | First invalid program, corrected program valid | Uses at most one pre-dispatch repair and records the repair lifecycle. |
 | Invalid program after the one repair, no dispatched effect | Continues the same run through Direct and records `invalid_program`; forced execution selects a fresh Direct scope, while Adaptive reuses its prepared scope. IDs, event sequence, deadline, budgets, and broker state remain continuous. Do not count it as Programmatic success. |
 | Any failure after dispatch, including cancellation, deadline, invalid output, or resource limit | Ends terminally with the effect uncertain; no repair, restart, replay, fallback, or speculation. |
-| Read-only parallel-safe fan-out | Preserves source order, validates and reserves the entire bounded worst-case canonical transcript envelope before policy, approval, or dispatch, and respects the effective cap of eight. |
+| Read-only parallel-safe fan-out | Preserves source order, reserves the bounded program-return and value-free broker-summary envelope before policy, approval, or dispatch, keeps raw intermediate arguments and results inside the sandbox/broker boundary, and respects the effective cap of eight. |
 | Mutation in fan-out or mixed read/write batch | Rejects the batch before dispatch; state-changing calls remain serial. |
 
 For every Programmatic case, assert the existing tool-sequence, exact canonical

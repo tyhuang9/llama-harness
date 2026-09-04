@@ -753,6 +753,7 @@ pub enum WireStrategySelectionReason {
     PlannerSelectedDirect,
     PlannerSelectedPlan,
     CapabilityDowngrade,
+    Fallback,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

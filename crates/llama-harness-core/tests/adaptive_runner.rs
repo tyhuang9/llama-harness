@@ -886,8 +886,9 @@ async fn malformed_plan_gets_one_repair_then_falls_back_before_effects() {
     assert!(events.events().iter().any(|record| matches!(
         record.event,
         RunEvent::StrategyFallback {
+            from: RunStrategy::Adaptive,
+            to: RunStrategy::Direct,
             reason: llama_harness_core::StrategyFallbackReason::InvalidPlan,
-            ..
         }
     )));
     assert!(events.events().iter().any(|record| matches!(
@@ -895,7 +896,7 @@ async fn malformed_plan_gets_one_repair_then_falls_back_before_effects() {
         RunEvent::StrategySelected {
             requested: RunStrategy::Adaptive,
             selected: RunStrategy::Direct,
-            reason: llama_harness_core::StrategySelectionReason::CapabilityDowngrade,
+            reason: llama_harness_core::StrategySelectionReason::Fallback,
         }
     )));
     assert!(events.events().iter().any(|record| matches!(
@@ -990,8 +991,17 @@ async fn planner_retry_cannot_consume_the_reserved_final_call() {
     assert!(events.events().iter().any(|record| matches!(
         record.event,
         RunEvent::StrategyFallback {
+            from: RunStrategy::Adaptive,
+            to: RunStrategy::Direct,
             reason: llama_harness_core::StrategyFallbackReason::PlannerFailure,
-            ..
+        }
+    )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategySelected {
+            requested: RunStrategy::Adaptive,
+            selected: RunStrategy::Direct,
+            reason: llama_harness_core::StrategySelectionReason::Fallback,
         }
     )));
     assert!(events.events().iter().any(|record| matches!(

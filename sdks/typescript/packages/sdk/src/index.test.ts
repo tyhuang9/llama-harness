@@ -9,6 +9,7 @@ import { defineTool, HarnessClient, RuntimeProtocolError } from "./index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const workspaceRoot = resolve(process.cwd(), "../../../../");
+const runtime = join(workspaceRoot, "target", "debug", process.platform === "win32" ? "llama-harness-runtime.exe" : "llama-harness-runtime");
 const scriptedRuntime = join(workspaceRoot, "target", "debug", process.platform === "win32" ? "llama-harness-scripted-runtime.exe" : "llama-harness-scripted-runtime");
 
 test("routes a typed host tool callback and ordered runtime event", async () => {
@@ -99,12 +100,14 @@ test("normalizes malformed callback safety metadata conservatively", async () =>
   } finally { await client.close(); }
 });
 
-test("performs a handshake with the workspace-built Rust runtime", { skip: !existsSync(resolve(process.cwd(), "../../../../target/debug/llama-harness-runtime.exe")) }, async () => {
-  const client = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: resolve(process.cwd(), "../../../../target/debug/llama-harness-runtime.exe") });
+test("performs a handshake with the workspace-built Rust runtime", async () => {
+  assert.ok(existsSync(runtime), `workspace runtime is missing at ${runtime}; npm test must build it first`);
+  const client = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: runtime });
   await client.close();
 });
 
-test("completes host callbacks through the workspace-built scripted Rust sidecar", { skip: !existsSync(scriptedRuntime) }, async () => {
+test("completes host callbacks through the workspace-built scripted Rust sidecar", async () => {
+  assert.ok(existsSync(scriptedRuntime), `workspace scripted runtime is missing at ${scriptedRuntime}; npm test must build it first`);
   let policyCalls = 0;
   let approvalCalls = 0;
   let toolCalls = 0;

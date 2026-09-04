@@ -100,19 +100,21 @@ fn malformed_major_and_unknown_type_preserve_structured_error_codes() {
 }
 
 #[test]
-fn forced_advanced_strategy_on_v1_0_fails_without_starting_a_tool_effect() {
-    let output = run_with_stdin(
-        "{\"protocol_version\":\"1.0\",\"request_id\":\"hello-1\",\"type\":\"client_hello\",\"payload\":{\"sdk\":{\"name\":\"runtime-test\",\"version\":\"0.1.0\"},\"capabilities\":[]}}\n{\"protocol_version\":\"1.0\",\"request_id\":\"run-1\",\"type\":\"start_run\",\"payload\":{\"request\":{\"provider\":{\"kind\":\"ollama\",\"base_url\":\"http://127.0.0.1:9\"},\"agent\":{\"id\":\"agent\",\"name\":\"Agent\",\"version\":\"1\",\"default_model\":\"model\"},\"input\":\"hello\",\"strategy\":\"declarative_plan\"}}}\n",
-    );
-    assert!(output.iter().all(|envelope| {
-        !matches!(envelope.message, ProtocolMessage::ToolExecutionRequested(_))
-    }));
-    assert!(output.iter().any(|envelope| {
-        matches!(
-            &envelope.message,
-            ProtocolMessage::RunFailed(error) if error.error.code == "unsupported_strategy"
-        )
-    }));
+fn every_explicit_strategy_on_v1_0_fails_without_starting_a_tool_effect() {
+    for strategy in ["adaptive", "direct", "declarative_plan", "programmatic"] {
+        let input = "{\"protocol_version\":\"1.0\",\"request_id\":\"hello-1\",\"type\":\"client_hello\",\"payload\":{\"sdk\":{\"name\":\"runtime-test\",\"version\":\"0.1.0\"},\"capabilities\":[]}}\n{\"protocol_version\":\"1.0\",\"request_id\":\"run-1\",\"type\":\"start_run\",\"payload\":{\"request\":{\"provider\":{\"kind\":\"ollama\",\"base_url\":\"http://127.0.0.1:9\"},\"agent\":{\"id\":\"agent\",\"name\":\"Agent\",\"version\":\"1\",\"default_model\":\"model\"},\"input\":\"hello\",\"strategy\":\"__STRATEGY__\"}}}\n"
+            .replace("__STRATEGY__", strategy);
+        let output = run_with_stdin(&input);
+        assert!(output.iter().all(|envelope| {
+            !matches!(envelope.message, ProtocolMessage::ToolExecutionRequested(_))
+        }));
+        assert!(output.iter().any(|envelope| {
+            matches!(
+                &envelope.message,
+                ProtocolMessage::RunFailed(error) if error.error.code == "unsupported_strategy"
+            )
+        }));
+    }
 }
 
 #[test]

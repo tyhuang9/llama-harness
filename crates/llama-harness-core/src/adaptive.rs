@@ -278,17 +278,59 @@ fn plan_schema_with_programmatic(
 }
 
 #[cfg(feature = "programmatic")]
+#[derive(Serialize)]
+struct PlannerToolAnnotation<'a> {
+    id: &'a str,
+    allowed_strategies: Vec<&'static str>,
+    risk: &'a crate::ToolRisk,
+    read_only: bool,
+    idempotent: bool,
+    parallel_safe: bool,
+    concurrency_key: Option<&'a str>,
+    cancellation_safety: crate::CancellationSafety,
+    expected_latency_ms: Option<u64>,
+}
+
+#[cfg(feature = "programmatic")]
 fn planner_prompt_with_programmatic(
     allow_declarative: bool,
     promoted: &BTreeSet<ProgrammaticWorkloadClass>,
-) -> String {
+    scope: &ToolScope,
+) -> Result<String, HarnessError> {
     let classes = promoted
         .iter()
         .copied()
         .map(ProgrammaticWorkloadClass::as_str)
         .collect::<Vec<_>>()
         .join(", ");
-    if allow_declarative {
+    let annotations = scope
+        .definitions()
+        .iter()
+        .map(|definition| {
+            let mut allowed_strategies = Vec::with_capacity(2);
+            if definition.allows_caller(ToolCaller::DeclarativePlan) {
+                allowed_strategies.push("declarative_plan");
+            }
+            if definition.allows_caller(ToolCaller::Programmatic) {
+                allowed_strategies.push("programmatic");
+            }
+            PlannerToolAnnotation {
+                id: &definition.id,
+                allowed_strategies,
+                risk: &definition.risk,
+                read_only: definition.read_only,
+                idempotent: definition.idempotent,
+                parallel_safe: definition.parallel_safe,
+                concurrency_key: definition.concurrency_key.as_deref(),
+                cancellation_safety: definition.cancellation_safety,
+                expected_latency_ms: definition.expected_latency_ms,
+            }
+        })
+        .collect::<Vec<_>>();
+    let annotations = serde_json::to_string(&annotations).map_err(|_| {
+        HarnessError::InvalidRequest("planner routing metadata could not be serialized".into())
+    })?;
+    let base = if allow_declarative {
         format!(
             "{PLANNER_PROMPT} You may instead return {{\"strategy\":\"programmatic\",\"workload_class\":<class>}} only when deterministic bounded orchestration materially fits one of these host-promoted workload classes: {classes}."
         )
@@ -296,7 +338,10 @@ fn planner_prompt_with_programmatic(
         format!(
             "Select the safest efficient tool strategy. Return only one strict JSON object: {{\"strategy\":\"direct\"}} when no bounded Programmatic workflow is justified, or {{\"strategy\":\"programmatic\",\"workload_class\":<class>}} only when deterministic bounded orchestration materially fits one of these host-promoted workload classes: {classes}. Use only the supplied tools. Choose direct for mutations, approval-sensitive work, ambiguity, or an uncertain next step."
         )
-    }
+    };
+    Ok(format!(
+        "{base} Value-free tool routing metadata (advisory; core revalidates every call): {annotations}."
+    ))
 }
 
 impl AgentRunner {
@@ -666,7 +711,8 @@ impl AgentRunner {
                 planner_prompt_with_programmatic(
                     run.declarative_available,
                     &run.programmatic_candidates,
-                )
+                    &run.plan_scope,
+                )?
             };
         #[cfg(not(feature = "programmatic"))]
         let planner_prompt = PLANNER_PROMPT.to_owned();
@@ -713,6 +759,7 @@ impl AgentRunner {
                     {
                         run.select_direct_fallback(
                             requested,
+                            RunStrategy::Adaptive,
                             StrategyFallbackReason::PlannerFailure,
                         );
                         run.run_reactive(ModelCallPhase::Reactive).await;
@@ -783,7 +830,11 @@ impl AgentRunner {
                         ));
                         return Ok(run.finish());
                     }
-                    run.select_direct_fallback(requested, StrategyFallbackReason::InvalidPlan);
+                    run.select_direct_fallback(
+                        requested,
+                        RunStrategy::Adaptive,
+                        StrategyFallbackReason::InvalidPlan,
+                    );
                     run.result
                         .errors
                         .retain(|record| record.code != "invalid_plan");
@@ -844,7 +895,11 @@ impl AgentRunner {
                     && !run.terminal
                     && run.has_model_call_capacity()
                 {
-                    run.select_direct_fallback(requested, StrategyFallbackReason::InvalidPlan);
+                    run.select_direct_fallback(
+                        requested,
+                        RunStrategy::DeclarativePlan,
+                        StrategyFallbackReason::InvalidPlan,
+                    );
                     run.run_reactive(ModelCallPhase::Reactive).await;
                     return Ok(run.finish());
                 }
@@ -1383,16 +1438,21 @@ impl<'a> StrategyRun<'a> {
         self.model_calls < self.request.agent.limits.max_model_calls
     }
 
-    fn select_direct_fallback(&mut self, requested: RunStrategy, reason: StrategyFallbackReason) {
+    fn select_direct_fallback(
+        &mut self,
+        requested: RunStrategy,
+        from: RunStrategy,
+        reason: StrategyFallbackReason,
+    ) {
         self.events.emit(RunEvent::StrategyFallback {
-            from: RunStrategy::DeclarativePlan,
+            from,
             to: RunStrategy::Direct,
             reason,
         });
         self.events.emit(RunEvent::StrategySelected {
             requested,
             selected: RunStrategy::Direct,
-            reason: StrategySelectionReason::CapabilityDowngrade,
+            reason: StrategySelectionReason::Fallback,
         });
         self.selected = RunStrategy::Direct;
     }

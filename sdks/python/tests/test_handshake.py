@@ -8,6 +8,19 @@ from pathlib import Path
 from llama_harness import HarnessClient, HarnessError, ProviderHealth, ProviderModel, RuntimeProtocolError, Tool
 
 
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+
+
+def workspace_runtime(name: str) -> Path:
+    suffix = ".exe" if os.name == "nt" else ""
+    runtime = WORKSPACE_ROOT / "target" / "debug" / f"{name}{suffix}"
+    if not runtime.is_file():
+        raise AssertionError(
+            f"workspace runtime is missing at {runtime}; build the Rust test sidecars first"
+        )
+    return runtime
+
+
 class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
     def fake_runtime_args(self, mode: str) -> tuple[str, list[str]]:
         return sys.executable, ["-u", str(Path(__file__).with_name("fake_runtime.py")), mode]
@@ -80,9 +93,7 @@ class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
                 await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test")
             self.assertEqual(caught.exception.code, "invalid_state")
     async def test_workspace_runtime_handshake(self) -> None:
-        runtime = Path(__file__).resolve().parents[3] / "target" / "debug" / "llama-harness-runtime.exe"
-        if not runtime.is_file():
-            self.skipTest("workspace runtime has not been built")
+        runtime = workspace_runtime("llama-harness-runtime")
         previous = os.environ.get("LLAMA_HARNESS_RUNTIME_PATH")
         os.environ["LLAMA_HARNESS_RUNTIME_PATH"] = str(runtime)
         try:
@@ -95,9 +106,7 @@ class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
                 os.environ["LLAMA_HARNESS_RUNTIME_PATH"] = previous
 
     async def test_workspace_scripted_runtime_completes_host_callbacks(self) -> None:
-        runtime = Path(__file__).resolve().parents[3] / "target" / "debug" / "llama-harness-scripted-runtime.exe"
-        if not runtime.is_file():
-            self.skipTest("workspace scripted runtime has not been built")
+        runtime = workspace_runtime("llama-harness-scripted-runtime")
         calls = {"policy": 0, "approval": 0, "tool": 0}
 
         async def search(query: str, *, context: object) -> dict[str, str]:
@@ -134,9 +143,7 @@ class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["sequence"] for event in events], sorted(event["sequence"] for event in events))
 
     async def test_workspace_scripted_runtime_exposes_provider_inspection(self) -> None:
-        runtime = Path(__file__).resolve().parents[3] / "target" / "debug" / "llama-harness-scripted-runtime.exe"
-        if not runtime.is_file():
-            self.skipTest("workspace scripted runtime has not been built")
+        runtime = workspace_runtime("llama-harness-scripted-runtime")
         async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=runtime) as client:
             self.assertEqual(await client.health(), ProviderHealth(True))
             models = await client.list_models()
@@ -144,9 +151,7 @@ class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(models[0].capabilities)
 
     async def test_workspace_scripted_runtime_rejects_external_agent_output_schema(self) -> None:
-        runtime = Path(__file__).resolve().parents[3] / "target" / "debug" / "llama-harness-scripted-runtime.exe"
-        if not runtime.is_file():
-            self.skipTest("workspace scripted runtime has not been built")
+        runtime = workspace_runtime("llama-harness-scripted-runtime")
         async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=runtime) as client:
             run = await client.run(
                 agent={"id": "scripted", "name": "Scripted", "version": "1", "default_model": "mock", "output_schema": {"$ref": "https://example.invalid/schema.json"}},

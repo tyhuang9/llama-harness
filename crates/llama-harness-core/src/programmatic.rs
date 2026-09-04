@@ -763,7 +763,7 @@ impl AgentRunner {
                 prepared_direct_scope: None,
             },
             RunStrategy::Programmatic,
-            StrategySelectionReason::Forced,
+            StrategySelectionReason::Fallback,
         )
         .await
     }
@@ -779,7 +779,7 @@ impl AgentRunner {
             prepared,
             continuation,
             RunStrategy::Adaptive,
-            StrategySelectionReason::CapabilityDowngrade,
+            StrategySelectionReason::Fallback,
         )
         .await
     }
