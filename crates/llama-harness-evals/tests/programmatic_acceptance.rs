@@ -508,6 +508,12 @@ impl EvalExecutor for AcceptanceExecutor {
         };
         let mut agent = AgentDefinition::new("fixture-agent", "Fixture Agent", "1", &request.model);
         agent.tool_allowlist = vec!["read".into(), "write".into()];
+        if scenario == "large-intermediate-data" {
+            // Forced strategies must remain runnable so this fixture can compare
+            // final-state correctness. Programmatic still proves its advantage by
+            // keeping the 768 KiB of broker results out of synthesis input below.
+            agent.limits.max_request_payload_bytes = 2 * 1024 * 1024;
+        }
         agent.limits.max_model_calls = match scenario {
             "repair" => 3,
             "fallback" => 4,
