@@ -13,14 +13,14 @@ The base crate is provider-neutral and has no default features:
 
 ```toml
 [dependencies]
-llama-harness = "0.1.0"
+llama-harness = "0.2.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Enable only the integrations your application uses:
 
 ```toml
-llama-harness = { version = "0.1.0", features = ["ollama", "observability"] }
+llama-harness = { version = "0.2.0", features = ["ollama", "observability"] }
 ```
 
 | Feature | Public module | Purpose |

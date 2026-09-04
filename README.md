@@ -34,15 +34,13 @@ uses:
 
 ```toml
 [dependencies]
-llama-harness = { version = "0.1.0", features = ["ollama"] }
+llama-harness = { version = "0.2.0", features = ["ollama"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-If crates.io indexing is still in progress, pin the reviewed `0.1.0` source:
-
-```toml
-llama-harness = { git = "https://github.com/tyhuang9/llama-harness", rev = "d9f7a84a579a36cd1987c5eeeb30764be70aa8ce", features = ["ollama"] }
-```
+For a source review before crates.io indexing completes, pin an exact reviewed
+commit rather than a branch; do not substitute a Git dependency in a release
+consumer verification.
 
 Minimum supported Rust version: **1.88**.
 
@@ -104,6 +102,7 @@ The complete end-user documentation is published with
 
 ## Project scope
 
-The `0.1` release supports Rust applications through the `llama-harness`
-facade. TypeScript, Python, and sidecar distribution remain future work and do
-not affect the Rust crate.
+The `0.2` release supports Rust applications through the `llama-harness`
+facade and managed TypeScript and Python child-sidecar SDKs. All SDKs run the
+same local runtime protocol, retain application ownership of tools and policy,
+and never expose a network service.

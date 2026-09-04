@@ -2,9 +2,9 @@
 
 `llama-harness-core` is the canonical Rust engine. Rust and Tauri hosts consume
 it through the supported `llama-harness` facade and its named optional modules.
-The protocol/runtime workspace crates remain deferred non-Rust adapter work;
-they are not part of the Rust 0.1 publication. No mode starts a daemon, HTTP
-listener, or shared control plane.
+The protocol/runtime workspace crates are the private adapter boundary for the
+matching TypeScript and Python SDKs; they are not Rust crates.io packages. No
+mode starts a daemon, HTTP listener, or shared control plane.
 
 The host supplies a `ModelProvider`, its own `Tool` implementations, a policy engine, an approval callback, and (optionally) an event sink such as the local SQLite store in `llama-harness-observability`. The sidecar is a thin process boundary around the same `AgentRunner`; it never reimplements model/tool looping or owns application authorization.
 

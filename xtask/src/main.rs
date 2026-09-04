@@ -101,6 +101,18 @@ fn protocol_check(root: &Path) -> CheckResult {
 
 fn release_check(root: &Path) -> CheckResult {
     ensure_clean_tree(root)?;
+    protocol_check(root)?;
+    run_cargo(
+        root,
+        [
+            "test",
+            "--locked",
+            "--package",
+            "llama-harness-runtime",
+            "--test",
+            "stdio",
+        ],
+    )?;
     run_cargo(root, publishable_cargo_arguments(["fmt", "--check"], []))?;
     run_cargo(
         root,
@@ -790,7 +802,7 @@ mod tests {
     #[test]
     fn release_docs_and_ci_state_the_exact_eight_crate_contract() {
         assert!(include_str!("../../docs/distribution.md")
-            .contains("These eight Rust-facing crates are the 0.1 publication set."));
+            .contains("These eight Rust-facing crates are the 0.2.0"));
         assert!(include_str!("../../docs/releasing.md")
             .contains("The preflight validates the exact eight-crate set"));
         assert!(include_str!("../../.github/workflows/release-rust.yml")
@@ -834,10 +846,10 @@ mod tests {
 
     #[test]
     fn archive_paths_reject_traversal_and_non_canonical_separators() {
-        assert!(validate_archive_path("llama-harness-0.1.0/src/lib.rs").is_ok());
+        assert!(validate_archive_path("llama-harness-0.2.0/src/lib.rs").is_ok());
         assert!(validate_archive_path("../outside").is_err());
-        assert!(validate_archive_path("llama-harness-0.1.0/../outside").is_err());
-        assert!(validate_archive_path("llama-harness-0.1.0\\src\\lib.rs").is_err());
+        assert!(validate_archive_path("llama-harness-0.2.0/../outside").is_err());
+        assert!(validate_archive_path("llama-harness-0.2.0\\src\\lib.rs").is_err());
     }
 
     #[test]

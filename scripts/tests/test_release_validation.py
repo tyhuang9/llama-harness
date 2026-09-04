@@ -254,6 +254,55 @@ class InputAndAbiTests(unittest.TestCase):
         output = "Name: GLIBC_2.17 Flags: none  Name: GLIBC_2.35 Name: GLIBCXX_3.4"
         self.assertEqual(required_glibc_versions(output), {(2, 17), (2, 35)})
 
+    def test_sdk_staging_preserves_verified_python_metadata(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        script = root / "scripts" / "prepare_sdk_runtime_packages.py"
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            runtime = temporary / "llama-harness-runtime.exe"
+            runtime.write_bytes(b"runtime")
+            output = temporary / "stage"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--runtime",
+                    str(runtime),
+                    "--platform",
+                    "win32-x64",
+                    "--version",
+                    "0.2.0",
+                    "--out",
+                    str(output),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                (output / "python-source" / "pyproject.toml").read_text(encoding="utf-8"),
+                (root / "sdks" / "python" / "pyproject.toml").read_text(encoding="utf-8"),
+            )
+
+    def test_release_gates_check_cargo_runtime_and_sdk_identities(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        validation = (root / "scripts" / "validate_release.ps1").read_text(encoding="utf-8")
+        xtask = (root / "xtask" / "src" / "main.rs").read_text(encoding="utf-8")
+        release_workflow = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+        self.assertIn("cargo metadata --locked --format-version 1 --no-deps", validation)
+        self.assertIn("runtime_hello", validation)
+        self.assertIn("runtime hello version", validation)
+        self.assertIn("npm SDK version", validation)
+        self.assertIn("Python SDK version", validation)
+        self.assertIn("protocol_check(root)?", xtask)
+        self.assertIn('"llama-harness-runtime"', xtask)
+        self.assertIn("Test and inspect the Python SDK acceptance package", release_workflow)
+        self.assertNotIn("inputs.publish", release_workflow)
+
     def test_workflows_pin_actions_and_do_not_interpolate_dispatch_version_in_scripts(self) -> None:
         root = Path(__file__).resolve().parents[2]
         workflows = list((root / ".github" / "workflows").glob("*.yml"))
@@ -306,7 +355,7 @@ class InputAndAbiTests(unittest.TestCase):
 
 class RustReleaseWorkflowTests(unittest.TestCase):
     @staticmethod
-    def run_preflight(root: Path, source_commit: str, version: str = "0.1.0") -> subprocess.CompletedProcess[str]:
+    def run_preflight(root: Path, source_commit: str, version: str = "0.2.0") -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 "pwsh",
@@ -482,7 +531,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                 "duplicate changelog",
                 lambda clone: (clone / "CHANGELOG.md").write_text(
                     (clone / "CHANGELOG.md").read_text(encoding="utf-8")
-                    + "\n## 0.1.0 — Unreleased\n\n- Duplicate.\n",
+                    + "\n## 0.2.0 — Unreleased\n\n- Duplicate.\n",
                     encoding="utf-8",
                 ),
                 "exactly one level-two heading",
@@ -490,7 +539,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
             (
                 "empty changelog",
                 lambda clone: (clone / "CHANGELOG.md").write_text(
-                    "# Changelog\n\n## 0.1.0 — Unreleased\n\n## Versioning policy\n\nPolicy.\n",
+                    "# Changelog\n\n## 0.2.0 — Unreleased\n\n## Versioning policy\n\nPolicy.\n",
                     encoding="utf-8",
                 ),
                 "must not be empty",
@@ -498,7 +547,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
             (
                 "comment-only changelog",
                 lambda clone: (clone / "CHANGELOG.md").write_text(
-                    "# Changelog\n\n## 0.1.0 — Unreleased\n\n<!--\nplaceholder\n-->\n\n"
+                    "# Changelog\n\n## 0.2.0 — Unreleased\n\n<!--\nplaceholder\n-->\n\n"
                     "## Versioning policy\n\nPolicy.\n",
                     encoding="utf-8",
                 ),

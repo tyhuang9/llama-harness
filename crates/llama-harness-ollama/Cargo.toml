@@ -17,7 +17,7 @@ publish = ["crates-io"]
 async-stream = "0.3"
 async-trait = "0.1"
 futures-util = "0.3"
-llama-harness-core = { version = "0.1.0", path = "../llama-harness-core" }
+llama-harness-core = { version = "0.2.0", path = "../llama-harness-core" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import tomllib
 from pathlib import Path
 
 
@@ -34,6 +35,15 @@ def main() -> int:
     runtime = args.runtime.resolve()
     if not runtime.is_file():
         raise SystemExit(f"runtime does not exist: {runtime}")
+    python_project = repository / "sdks" / "python" / "pyproject.toml"
+    try:
+        python_version = tomllib.loads(python_project.read_text(encoding="utf-8"))["project"]["version"]
+    except (KeyError, tomllib.TOMLDecodeError) as error:
+        raise SystemExit(f"cannot read Python SDK version from {python_project}: {error}") from error
+    if python_version != args.version:
+        raise SystemExit(
+            f"Python SDK version {python_version!r} does not match requested release version {args.version!r}"
+        )
     output = args.out.resolve()
     if output.exists():
         raise SystemExit(f"refusing to overwrite existing output directory: {output}")
@@ -71,9 +81,6 @@ def main() -> int:
     staged_runtime = python_root / "src" / "llama_harness" / "runtime" / runtime_name
     staged_runtime.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(runtime, staged_runtime)
-    pyproject = python_root / "pyproject.toml"
-    content = pyproject.read_text(encoding="utf-8").replace('version = "0.1.0"', f'version = "{args.version}"', 1)
-    pyproject.write_text(content, encoding="utf-8")
     (output / "platform.json").write_text(
         json.dumps({"platform": args.platform, "python_platform_tag": PYTHON_TAGS[args.platform], "runtime": runtime_name}, indent=2) + "\n",
         encoding="utf-8",

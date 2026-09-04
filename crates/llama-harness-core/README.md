@@ -10,7 +10,7 @@ crate directly only when implementing a lower-level integration.
 
 ```toml
 [dependencies]
-llama-harness-core = "0.1.0"
+llama-harness-core = "0.2.0"
 ```
 
 The runtime does not provide universal shell, filesystem, database, or network

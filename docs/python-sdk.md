@@ -2,8 +2,8 @@
 
 `llama_harness` is asyncio-native and starts its Rust child only from
 `await HarnessClient.start(...)`. Install the matching reviewed platform wheel
-or use `LLAMA_HARNESS_RUNTIME_PATH` with a workspace-built executable in local
-development. It never downloads a runtime.
+for `llama-harness==0.2.0`, or use `LLAMA_HARNESS_RUNTIME_PATH` with a
+workspace-built executable in local development. It never downloads a runtime.
 
 ```python
 from llama_harness import HarnessClient, tool
@@ -30,3 +30,9 @@ a tool's completed external side effect.
 Use `await client.health()` and `await client.list_models()` for typed provider
 inspection before a run. They are separate child commands and therefore do not
 allocate a run, alter a transcript, or invoke a host tool callback.
+
+The startup `client_hello` includes the installed Python package identity, and
+the child replies with its Cargo runtime identity and negotiated protocol minor.
+If that hello is malformed, major-incompatible, or reports a runtime from a
+different reviewed release, close the child and restore matching artifacts;
+never retry through an HTTP service or an arbitrary executable on `PATH`.

@@ -6,7 +6,7 @@ for application-owned event storage and applies redaction before persistence.
 
 ```toml
 [dependencies]
-llama-harness = { version = "0.1.0", features = ["observability"] }
+llama-harness = { version = "0.2.0", features = ["observability"] }
 ```
 
 The integration is available as `llama_harness::observability` through the

@@ -4,26 +4,27 @@ No package or release artifact is published by this repository's normal CI check
 
 ## Rust crates.io runbook
 
-This section is the manual runbook for the eight Rust crates. It is independent
-of the deferred sidecar/SDK artifact workflow below. Do not combine their
-authorizations or assume that a successful SDK validation publishes a crate.
+This section is the manual runbook for the eight Rust crates. It is separate
+from sidecar/SDK artifact registry authorization. Do not combine their
+authorizations or assume that successful validation publishes a crate or SDK.
 
-The initial Rust release uses the unified `0.1.0` version:
+The 0.2 release uses the unified `0.2.0` version:
 `llama-harness-programmatic-sandbox`, `llama-harness-core`,
 `llama-harness-ollama`, `llama-harness-observability`, `llama-harness-tauri`,
 `llama-harness-evals`, `llama-harness-mcp`, and the `llama-harness` facade.
 Protocol/runtime, SDKs, Promptfoo integration, scripted runtime, examples,
-developer console, CLI, and release helper are not published in this milestone.
+developer console, CLI, and release helper are not Rust crates.io packages.
+The runtime and both SDK package manifests are also `0.2.0`; their registries
+have independent manual authorization.
 
 ### Prerequisites and release gate
 
 Before publishing, record the exact reviewed commit on clean `main` as
 `SOURCE_COMMIT`. The worktree must have no unreviewed or uncommitted changes,
 and the requested version must match the workspace/package metadata and the
-changelog or prepared release notes. For `0.1.0`, recheck all eight crate names
-on crates.io immediately before the first publish; a name conflict or an
-existing `0.1.0` means stop and choose a forward version rather than trying to
-overwrite it.
+changelog or prepared release notes. For `0.2.0`, recheck all eight crate names
+on crates.io immediately before publishing; an existing `0.2.0` means stop and
+choose a forward version rather than trying to overwrite it.
 
 Use a crates.io account with the required publish access, and add or verify a
 backup owner under the project's approved ownership policy before the final
@@ -36,27 +37,33 @@ Run both validation gates against `SOURCE_COMMIT` before any publish action:
 
 ```powershell
 $SOURCE_COMMIT = (git rev-parse HEAD).Trim()
-pwsh -File scripts/release/check-rust-release.ps1 -Version 0.1.0 -SourceCommit $SOURCE_COMMIT
+pwsh -File scripts/release/check-rust-release.ps1 -Version 0.2.0 -SourceCommit $SOURCE_COMMIT
 cargo run --locked -p xtask -- release-check
 ```
 
 The preflight validates the exact eight-crate set, unified version, Rust 1.88
 MSRV, nonempty changelog entry, clean worktree, and source commit. The helper
-runs formatting, linting, tests, and Rust documentation, creates all eight
+runs formatting, linting, tests, protocol/runtime acceptance, and Rust
+documentation, creates all eight
 `.crate` archives, rejects unexpected, unsafe, or oversized archive contents,
 and checks extracted packages with the supported facade feature configurations.
 
 Manually dispatch `.github/workflows/release-rust.yml` from `main` with version
-`0.1.0` and the exact 40-character `SOURCE_COMMIT`. The workflow rejects a
+`0.2.0` and the exact 40-character `SOURCE_COMMIT`. The workflow rejects a
 different current `main` commit. Confirm every portable platform,
 publishable-crate platform, package, policy, documentation, API, and fresh Rust
 1.88 job passes against that commit. This workflow has read-only repository
 permissions, receives no registry credentials, uploads no release artifacts,
-and cannot publish, tag, create a release, or change owners. Sidecar and SDK
-validation remains in the separate `.github/workflows/release.yml` workflow and
-cannot block this Rust release gate.
+and cannot publish, tag, create a release, or change owners. The matching
+sidecar and SDK validation is in `.github/workflows/release.yml`; it has no
+registry upload or tag step.
 
-Continuous verification runs the Rust checks on Windows, macOS, and Linux; blocks Rust advisory, license, and source-policy failures; and tests, builds, and inspects both SDK packages. The developer console's npm audit is reported but does not block a runtime release: its current Vite/esbuild and nanoid findings are development-tooling-only and are tracked separately in `TODO.md`.
+Continuous verification runs the Rust checks on Windows, macOS, and Linux;
+blocks Rust advisory, license, and source-policy failures; and blocks on the
+deterministic protocol, TypeScript SDK, and Python SDK acceptance checks. The
+developer console's npm audit is reported but does not block a runtime release:
+its current Vite/esbuild and nanoid findings are development-tooling-only and
+are tracked separately in `TODO.md`.
 
 Executable GitHub Actions are pinned to reviewed 40-character commit SHAs; the
 nearby version comment is informational. Pins were resolved from each official
@@ -100,7 +107,7 @@ authority. The same-process host remains the only broker and policy authority.
 ### Publication and registry checks
 
 Publish manually in the following exact dependency order. A layer is complete only when
-the exact `0.1.0` package is resolvable from the crates.io index, its package
+the exact `0.2.0` package is resolvable from the crates.io index, its package
 page is available, and a fresh external consumer has built against it. Do not
 use workspace paths, Git dependencies, a `[patch.crates-io]` table, cached lock
 files, or `cargo update` to make a consumer pass.
@@ -109,7 +116,7 @@ Immediately before every dry-run and publish command below, rerun the preflight
 and confirm it still reports `SOURCE_COMMIT`:
 
 ```powershell
-pwsh -File scripts/release/check-rust-release.ps1 -Version 0.1.0 -SourceCommit $SOURCE_COMMIT
+pwsh -File scripts/release/check-rust-release.ps1 -Version 0.2.0 -SourceCommit $SOURCE_COMMIT
 ```
 
 #### 1. Programmatic sandbox
@@ -123,7 +130,7 @@ cargo publish --locked --package llama-harness-programmatic-sandbox
 
 #### 2. Core
 
-Wait for `llama-harness-programmatic-sandbox = 0.1.0` to appear in the index,
+Wait for `llama-harness-programmatic-sandbox = 0.2.0` to appear in the index,
 build a fresh exact-version consumer, then dry-run and publish
 `llama-harness-core`:
 
@@ -134,8 +141,8 @@ cargo publish --locked --package llama-harness-core
 
 #### 3. Direct core integrations
 
-Wait for `llama-harness-core = 0.1.0` to appear in the index, create a new
-temporary consumer with `llama-harness-core = "=0.1.0"`, and build it. Then
+Wait for `llama-harness-core = 0.2.0` to appear in the index, create a new
+temporary consumer with `llama-harness-core = "=0.2.0"`, and build it. Then
 dry-run and publish each direct integration:
 
 ```powershell
@@ -162,8 +169,8 @@ cargo publish --locked --package llama-harness-evals
 
 #### 5. Facade
 
-Wait for `llama-harness-evals = 0.1.0` to be index-visible, build a fresh
-`llama-harness-evals = "=0.1.0"` consumer, then dry-run and publish the
+Wait for `llama-harness-evals = 0.2.0` to be index-visible, build a fresh
+`llama-harness-evals = "=0.2.0"` consumer, then dry-run and publish the
 `llama-harness` facade:
 
 ```powershell
@@ -171,7 +178,7 @@ cargo publish --locked --dry-run --package llama-harness
 cargo publish --locked --package llama-harness
 ```
 
-Wait for `llama-harness = 0.1.0` to be index-visible, then run the final facade
+Wait for `llama-harness = 0.2.0` to be index-visible, then run the final facade
 consumer verification below.
 
 For every dry-run, use the exact package selected for the next layer, for
@@ -183,21 +190,21 @@ are manual commands; this repository's workflows do not perform the publication.
 ### Final facade and documentation verification
 
 Create a fresh, outside-workspace consumer for every final profile. Its manifest
-must contain only `llama-harness = "=0.1.0"`; it must not contain path, Git, or
+must contain only `llama-harness = "=0.2.0"`; it must not contain path, Git, or
 patch overrides. Generate a new lockfile and build the default configuration,
 `--no-default-features`, each individual supported feature (`ollama`,
 `observability`, `evals`, `tauri`, `programmatic`, and `mcp`), and `--all-features`.
 
-Verify the published `0.1.0` documentation pages for all eight crates:
+Verify the published `0.2.0` documentation pages for all eight crates:
 
-1. `https://docs.rs/llama-harness-programmatic-sandbox/0.1.0`
-2. `https://docs.rs/llama-harness-core/0.1.0`
-3. `https://docs.rs/llama-harness-ollama/0.1.0`
-4. `https://docs.rs/llama-harness-observability/0.1.0`
-5. `https://docs.rs/llama-harness-tauri/0.1.0`
-6. `https://docs.rs/llama-harness-evals/0.1.0`
-7. `https://docs.rs/llama-harness-mcp/0.1.0`
-8. `https://docs.rs/llama-harness/0.1.0`
+1. `https://docs.rs/llama-harness-programmatic-sandbox/0.2.0`
+2. `https://docs.rs/llama-harness-core/0.2.0`
+3. `https://docs.rs/llama-harness-ollama/0.2.0`
+4. `https://docs.rs/llama-harness-observability/0.2.0`
+5. `https://docs.rs/llama-harness-tauri/0.2.0`
+6. `https://docs.rs/llama-harness-evals/0.2.0`
+7. `https://docs.rs/llama-harness-mcp/0.2.0`
+8. `https://docs.rs/llama-harness/0.2.0`
 
 Add the approved backup crates.io login to all eight crates, then verify each
 owner list. Repeat these two commands for every crate name:
@@ -208,14 +215,14 @@ cargo owner --list llama-harness-core
 ```
 
 Only after all eight pages render, all eight owner lists are confirmed, and the
-final facade consumer passes, create the annotated `v0.1.0` tag pointing
+final facade consumer passes, create the annotated `v0.2.0` tag pointing
 exactly to `SOURCE_COMMIT`, push that tag, and create the GitHub release from
 the checked-in notes:
 
 ```powershell
-git tag --annotate v0.1.0 $SOURCE_COMMIT --message "llama-harness v0.1.0"
-git push origin v0.1.0
-gh release create v0.1.0 --verify-tag --title "llama-harness v0.1.0" --notes-file .github/releases/v0.1.0.md
+git tag --annotate v0.2.0 $SOURCE_COMMIT --message "llama-harness v0.2.0"
+git push origin v0.2.0
+gh release create v0.2.0 --verify-tag --title "llama-harness v0.2.0" --notes-file .github/releases/v0.2.0.md
 ```
 
 ### Failure handling and rollback boundaries
@@ -250,12 +257,19 @@ deferred until a separately bounded contract is released.
 
 The release workflow at `.github/workflows/release.yml` is manual-dispatch only. It builds `llama-harness-runtime` for supported Windows x64, macOS arm64, and Linux x64 targets, generates checksums and a machine-readable manifest, and stages a matching platform-specific npm runtime package plus Python wheel. It does not build model images, pull models, or package Ollama.
 
-The workflow defaults to validation mode. Set its `publish` input only after a
-reviewer confirms the version, generated manifest, checksums, package contents,
-registry credentials, and release notes. The deferred SDK sequence is separate:
-publish runtime artifacts first, then the matching npm/PyPI packages. It neither
-precedes nor blocks the Cargo sequence above. Each sequence requires its own
-explicit human authorization; no normal CI job publishes packages.
+The workflow is validation-only: it has no registry upload, tag, or GitHub
+release step. It checks that the requested version is identical in Cargo
+metadata, the built runtime's `runtime_hello`, the npm SDK package, the Python
+project, and the SDK `client_hello` tests. It also rejects package payloads that
+do not contain exactly the reviewed files. A successful workflow is evidence for
+manual review, not publication authorization.
+
+After separately reviewing the combined manifest, checksums, package contents,
+registry identities, and release notes, publish each platform runtime package
+before the matching SDK package or wheel. Do not upload a platform artifact,
+the TypeScript package, or the Python wheel if any identity check failed. This
+sequence neither precedes nor blocks the Cargo sequence above; each registry
+action needs explicit human authorization outside these workflows.
 
 For a local platform rehearsal without publishing, run:
 
@@ -264,7 +278,9 @@ python -m pip install build==1.5.0 wheel==0.48.0
 pwsh -File scripts/validate_release.ps1 -Platform win32-x64 -Target x86_64-pc-windows-msvc -Executable llama-harness-runtime.exe
 ```
 
-Inspect `release-stage/local/artifacts/release-manifest.json` and `checksums.sha256`; the helper rejects a mismatch before returning successfully.
+Inspect `release-stage/local/artifacts/release-manifest.json` and
+`checksums.sha256`; the helper rejects a mismatch before returning successfully.
+It does not publish or tag anything.
 
 Both continuous and manual release validation install cargo-deny 0.20.2 and
 block advisory, license, and source-policy failures. The narrow unmaintained
@@ -274,3 +290,20 @@ The Tauri integration maintainers own them; re-review on every Tauri or
 urlpattern upgrade and immediately if any advisory severity changes.
 
 A Tauri application receives compiled Rust dependencies inside its own installer; Ollama remains a separately installed local inference service.
+
+## Rollback and communication
+
+Registry package versions are immutable. Never attempt to overwrite or relabel a
+published `0.2.0` Cargo, npm, or Python package. Stop dependent uploads as soon
+as a platform artifact, checksum, package inspection, or hello identity check
+fails. Preserve the manifest, checksums, and exact source commit for diagnosis.
+If a published version must be discouraged, use the registry's reviewed
+yank/deprecation mechanism and communicate the forward-version remediation;
+those mechanisms neither remove cached artifacts nor repair lockfiles.
+
+Tags and GitHub releases remain last: create `v0.2.0` from the reviewed source
+only after every intended registry package is confirmed. If the source tag or
+release note needs correction before registry upload, correct the source and
+rerun validation. If a bad package is already public, publish a coordinated
+forward version rather than moving the tag or substituting a binary beneath an
+existing version.

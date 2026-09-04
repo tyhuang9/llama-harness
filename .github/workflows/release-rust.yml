@@ -7,7 +7,7 @@ on:
       version:
         description: Exact stable SemVer already recorded in Cargo metadata and CHANGELOG.md
         required: true
-        default: 0.1.0
+        default: 0.2.0
         type: string
       source_commit:
         description: Exact reviewed 40-character commit currently at main

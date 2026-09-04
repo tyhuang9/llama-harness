@@ -15,7 +15,7 @@ publish = ["crates-io"]
 
 [dependencies]
 async-trait = "0.1"
-llama-harness-core = { version = "0.1.0", path = "../llama-harness-core" }
+llama-harness-core = { version = "0.2.0", path = "../llama-harness-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -24,7 +24,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 futures-util = "0.3"
-llama-harness-core = { version = "0.1.0", path = "../llama-harness-core", features = ["programmatic"] }
-llama-harness-observability = { version = "0.1.0", path = "../llama-harness-observability" }
+llama-harness-core = { version = "0.2.0", path = "../llama-harness-core", features = ["programmatic"] }
+llama-harness-observability = { version = "0.2.0", path = "../llama-harness-observability" }
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
 tokio-util = "0.7"

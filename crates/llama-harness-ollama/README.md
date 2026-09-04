@@ -7,7 +7,7 @@ the sidecar runtime.
 
 ```toml
 [dependencies]
-llama-harness = { version = "0.1.0", features = ["ollama"] }
+llama-harness = { version = "0.2.0", features = ["ollama"] }
 ```
 
 Ollama must already be running and the requested model must already be

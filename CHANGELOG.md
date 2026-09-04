@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.0 — Unreleased
+
+- Release the unified 0.2.0 first-party Rust workspace surface and matching
+  managed TypeScript and Python SDK package metadata.
+- Stabilize the checked protocol v1.1 SDK/runtime handshake, including exact
+  package identity reporting and compatible v1.0 fallback.
+- Add deterministic release gates for Cargo metadata, runtime hello identity,
+  protocol acceptance, SDK package contents, and matching npm/Python artifacts.
+- Document the 0.1-to-0.2 migration, release sequencing, and immutable-package
+  rollback boundaries.
+
 ## 0.1.0 — Unreleased
 
 - Add the public Rust facade and release package metadata.
@@ -9,7 +20,7 @@ All notable changes to this project are documented here.
   facade modules with Rust 1.88 as the verified minimum supported version.
 - Define the eight-crate Rust publication set, including the separately
   publishable deterministic programmatic sandbox, and defer protocol/runtime SDK
-  distribution from the Cargo 0.1 release.
+  distribution from the initial Cargo release.
 - Define JSONL protocol v1 and the managed child-sidecar runtime.
 - Add TypeScript and asyncio Python SDKs with correlated host callbacks.
 - Add deterministic real-sidecar SDK integration coverage and embedded Tauri helpers.
