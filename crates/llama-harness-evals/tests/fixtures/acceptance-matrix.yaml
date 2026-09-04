@@ -1,0 +1,125 @@
+version: 1
+id: compatibility-acceptance-matrix
+name: Compatibility Release Acceptance Matrix
+execution_boundary: real_agent_runner_broker_sandbox_and_speculation
+quality_ranking:
+  hard_gates:
+    - unauthorized_effects_zero
+    - duplicate_effects_zero
+    - unintended_effects_zero
+    - task_correct
+    - final_state_correct
+    - recovery_success
+    - deterministic_accounting_and_order
+  rank_after_hard_gates:
+    - tool_selection_accuracy
+    - model_calls
+    - tool_calls
+    - wasted_tool_calls
+  latency: measured_and_reported_only
+workloads:
+  - id: no-tool
+    strategies: [direct, programmatic, adaptive]
+    evidence:
+      - {source: adaptive_runner, marker: adaptive_planner_can_choose_no_tool_direct_response}
+  - id: ambiguous-uncertain-direct
+    strategies: [direct, adaptive]
+    evidence:
+      - {source: direct_runner, marker: malformed_unknown_disallowed_and_schema_invalid_calls_feed_back_without_execution}
+  - id: single-call
+    strategies: [direct, declarative_plan, programmatic, adaptive]
+    evidence:
+      - {source: programmatic_runner, marker: forced_programmatic_runs_model_program_broker_and_final_synthesis}
+  - id: independent-parallel
+    strategies: [declarative_plan, programmatic, adaptive]
+    evidence:
+      - {source: adaptive_runner, marker: independent_safe_nodes_execute_in_one_parallel_wave}
+  - id: dependent-dag
+    strategies: [declarative_plan, adaptive]
+    evidence:
+      - {source: adaptive_runner, marker: dependent_result_binding_is_revalidated_before_execution}
+  - id: partial-failure-recovery
+    strategies: [declarative_plan, programmatic, adaptive]
+    evidence:
+      - {source: adaptive_runner, marker: partial_parallel_wave_records_success_for_recovery}
+  - id: approval
+    strategies: [direct, declarative_plan, programmatic, adaptive]
+    evidence:
+      - {source: adaptive_runner, marker: policy_required_approval_is_honored_during_whole_plan_preflight}
+  - id: mixed-read-write
+    strategies: [direct, declarative_plan, programmatic, adaptive]
+    evidence:
+      - {source: programmatic_acceptance_fixture, marker: mixed-approval}
+  - id: loop
+    strategies: [programmatic]
+    evidence:
+      - {source: programmatic_acceptance_fixture, marker: "id: loop"}
+  - id: fan-out
+    strategies: [programmatic]
+    evidence:
+      - {source: programmatic_acceptance_fixture, marker: "id: fanout"}
+      - {source: programmatic_runner, marker: programmatic_parallel_fanout_preserves_input_order_through_reverse_completion}
+  - id: aggregation
+    strategies: [programmatic]
+    evidence:
+      - {source: programmatic_acceptance_fixture, marker: reduce-aggregate}
+  - id: catalog-30
+    strategies: [direct, declarative_plan, adaptive]
+    evidence:
+      - {source: deferred_discovery, marker: planner_repair_and_final_synthesis_reuse_selected_scopes}
+      - {source: deferred_discovery, marker: "let count = 30;"}
+  - id: catalog-100
+    strategies: [direct, adaptive]
+    evidence:
+      - {source: deferred_discovery, marker: adaptive_capability_fallback_matches_forced_direct_discovery}
+      - {source: deferred_discovery, marker: "let count = 100;"}
+  - id: catalog-1000
+    strategies: [direct, adaptive]
+    evidence:
+      - {source: deferred_discovery, marker: direct_e2e_reuses_one_immutable_selected_scope_and_emits_private_counters}
+      - {source: deferred_discovery, marker: "let count = 1_000;"}
+  - id: provider-downgrade
+    strategies: [direct, adaptive, programmatic]
+    evidence:
+      - {source: programmatic_acceptance_fixture, marker: capability-downgrade}
+      - {source: programmatic_runner, marker: forced_programmatic_fails_closed_for_each_missing_or_zero_provider_declaration}
+  - id: malformed-plan-repair-and-fallback
+    strategies: [declarative_plan, programmatic, adaptive]
+    evidence:
+      - {source: adaptive_runner, marker: malformed_plan_gets_one_repair_then_falls_back_before_effects}
+      - {source: programmatic_runner, marker: invalid_program_gets_exactly_one_repair_before_dispatch}
+      - {source: programmatic_runner, marker: invalid_repaired_program_falls_back_once_to_fresh_direct_scope_before_effects}
+  - id: sandbox-safety-categories
+    strategies: [programmatic]
+    evidence:
+      - {source: programmatic_runner, marker: live_vm_admission_rejects_n_plus_one_and_reuses_released_capacity}
+      - {source: programmatic_runner, marker: invalid_vm_admission_configuration_fails_closed_when_run}
+      - {source: programmatic_runner, marker: programmatic_parser_canary_never_enters_public_result_or_events}
+  - id: speculation-hit
+    strategies: [direct]
+    evidence:
+      - {source: speculation_acceptance_fixture, marker: active-exact}
+      - {source: speculation_runner, marker: activation_requires_threshold_and_exact_active_match_commits_once}
+  - id: speculation-miss
+    strategies: [direct]
+    evidence:
+      - {source: speculation_acceptance_fixture, marker: "id: shadow"}
+      - {source: speculation_acceptance_fixture, marker: active-discard}
+  - id: speculation-race
+    strategies: [direct]
+    evidence:
+      - {source: speculation_acceptance_fixture, marker: saturated-fallback}
+      - {source: speculation_runner, marker: atomic_live_take_precedes_slow_tool_completed_publication}
+  - id: speculation-privacy
+    strategies: [direct]
+    evidence:
+      - {source: speculation_acceptance_test, marker: forced_speculation_matrix_uses_real_runner_boundaries_and_private_metrics}
+  - id: speculation-exact
+    strategies: [direct]
+    evidence:
+      - {source: speculation_acceptance_fixture, marker: active-exact}
+  - id: speculation-no-writes
+    strategies: [direct]
+    evidence:
+      - {source: speculation_acceptance_fixture, marker: ineligible-write}
+      - {source: speculation_acceptance_fixture, marker: ineligible-remote}

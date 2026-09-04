@@ -153,6 +153,37 @@ provider or tool errors, readiness streaks, modes, or counters. A terminal
 stream failure after an accepted item must show one stream attempt and no
 retry. See [Guarded speculative tool calling](speculative-tool-calling.md).
 
+## Compatibility acceptance matrix
+
+`crates/llama-harness-evals/tests/acceptance_matrix.rs` is the release-facing
+audit for the deterministic compatibility matrix. Its compact runner matrix
+creates a fresh real `AgentRunner`, `ToolRegistry`, policy, and
+`ProgrammaticHostConfig` for every forced Direct, declarative-plan,
+Programmatic, and Adaptive single-call workload. It checks the broker-owned
+tool-call order and canonical arguments rather than constructing a result or a
+broker substitute. The no-tool workload covers Direct, Programmatic, and
+Adaptive; declarative plans have no valid empty-plan form and are therefore not
+claimed for that workload.
+
+The adjacent `fixtures/acceptance-matrix.yaml` is an audited manifest, not a
+second fake execution harness. It keeps the release workload classes visible
+and ties them to executable real-boundary coverage: no-tool and ambiguous
+Direct behavior; single calls; parallel and dependent plans; recovery,
+approval, mixed read/write, loops, fan-out, and aggregation; 30, 100, and
+1,000-tool catalogs; capability downgrade; one-repair malformed-plan fallback;
+the sandbox's public error categories; and speculative hit, miss, race,
+privacy, exact-commit, and no-write cases. The manifest test fails if a class,
+its applicable strategy set, or its named executable evidence disappears.
+
+Every compared result must first pass these hard gates: zero unauthorized,
+duplicate, and unintended effects; task and final-state correctness; recovery
+success where applicable; and deterministic accounting and effect order.
+Adaptive is compared with the best complete forced baseline for a shared
+workload and must pass the same safety and correctness gates. Tool-selection
+accuracy and call efficiency rank eligible alternatives; latency is retained in
+the normalized report for measurement and release analysis only, never asserted
+as a scheduler-dependent CI threshold.
+
 Reports are serializable normalized JSON. Browse a saved report locally with:
 
 ```bash
