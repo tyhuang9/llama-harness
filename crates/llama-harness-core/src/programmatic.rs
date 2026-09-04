@@ -281,6 +281,11 @@ struct ProgrammaticBrokerSummary {
     failed: u64,
 }
 
+struct ProgramCandidateFailure {
+    error: HarnessError,
+    repairable: bool,
+}
+
 #[derive(Serialize)]
 struct ProgrammaticSynthesisInput<'a> {
     program_return: &'a Value,
@@ -965,15 +970,22 @@ impl AgentRunner {
                     HarnessError::InvalidOutput("provider returned no program".into())
                 });
                 let mut statement_count = 0u32;
-                let compiled = source.and_then(|source| {
-                    Program::from_json(source.as_bytes(), &limits)
+                let compiled = match source {
+                    Ok(source) => Program::from_json(source.as_bytes(), &limits)
                         .and_then(|program| {
                             statement_count =
                                 program.statement_count().min(u32::MAX as usize) as u32;
                             program.compile(&limits)
                         })
-                        .map_err(sandbox_error)
-                });
+                        .map_err(|error| ProgramCandidateFailure {
+                            repairable: !error.is_output_limit(),
+                            error: sandbox_error(error),
+                        }),
+                    Err(error) => Err(ProgramCandidateFailure {
+                        error,
+                        repairable: true,
+                    }),
+                };
                 match compiled {
                     Ok(program) => {
                         events.emit(RunEvent::ProgramLifecycle {
@@ -988,8 +1000,9 @@ impl AgentRunner {
                         });
                         break program;
                     }
-                    Err(_error)
-                        if program_attempt == 0
+                    Err(error)
+                        if error.repairable
+                            && program_attempt == 0
                             && request
                                 .agent
                                 .limits
@@ -1009,12 +1022,14 @@ impl AgentRunner {
                         ensure_transcript(&generation_messages, &request.agent.limits)?;
                     }
                     Err(error) => {
-                        events.emit(RunEvent::ProgramLifecycle {
-                            attempt: program_attempt.saturating_add(1),
-                            outcome: ProgramLifecycleOutcome::Invalid,
-                        });
-                        invalid_program_exhausted = true;
-                        return Err(error);
+                        if error.repairable {
+                            events.emit(RunEvent::ProgramLifecycle {
+                                attempt: program_attempt.saturating_add(1),
+                                outcome: ProgramLifecycleOutcome::Invalid,
+                            });
+                            invalid_program_exhausted = true;
+                        }
+                        return Err(error.error);
                     }
                 }
             };

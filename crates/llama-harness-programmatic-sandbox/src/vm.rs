@@ -790,7 +790,7 @@ impl Execution {
             }
             EvalPurpose::Return => {
                 if value.measurement().serialized > self.program.limits.max_return_bytes {
-                    return Err(resource("output byte limit exceeded"));
+                    return Err(SandboxError::output_limit());
                 }
                 self.start_materialize(value, MaterializePurpose::Return)?;
             }
@@ -2811,8 +2811,10 @@ mod tests {
 
     #[test]
     fn program_return_limit_is_independent_from_tool_response_limit() {
-        let raw =
-            r#"{"version":1,"body":[{"kind":"return","value":{"kind":"string","value":"abc"}}]}"#;
+        // The return goes through a local so its exact size is deliberately
+        // unknown to the verifier's conservative expression lower bound. This
+        // keeps the runtime boundary covered independently of static checks.
+        let raw = r#"{"version":1,"body":[{"kind":"let","name":"value","value":{"kind":"string","value":"abc"}},{"kind":"return","value":{"kind":"variable","name":"value"}}]}"#;
         let rejected_limits = SandboxLimits {
             max_return_bytes: 4,
             ..SandboxLimits::default()
@@ -2826,6 +2828,7 @@ mod tests {
             }
         };
         assert_eq!(error.code(), SandboxErrorCode::ResourceLimit);
+        assert!(error.is_output_limit());
 
         let admitted_limits = SandboxLimits {
             max_output_bytes: 1,

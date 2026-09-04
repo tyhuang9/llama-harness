@@ -1,5 +1,8 @@
 use crate::{
-    accounting::{key_retained_bytes, measure_value, string_retained_bytes},
+    accounting::{
+        checked_add, key_retained_bytes, measure_value, serialized_string_len,
+        string_retained_bytes,
+    },
     parser::validate_ast,
     BinaryOperator, Expression, Program, SandboxError, SandboxErrorCode, SandboxLimits, Statement,
     UnaryOperator, MAX_ATOMIC_KEY_BYTES, MAX_ATOMIC_STRING_BYTES,
@@ -753,7 +756,82 @@ fn verify_instruction_expressions(
             }
         }
     }
+    if let Instruction::Return { value } = instruction {
+        let minimum = minimum_serialized_expression_bytes(&value.0, limits)?;
+        if minimum > limits.max_return_bytes {
+            return Err(SandboxError::output_limit());
+        }
+    }
     Ok(total)
+}
+
+/// Computes a conservative serialized-size lower bound for one verified
+/// postfix expression. Dynamic values use the smallest valid JSON value, so a
+/// rejection here is safe even when the expression depends on tool results.
+fn minimum_serialized_expression_bytes(
+    code: &[ExprInstruction],
+    limits: &SandboxLimits,
+) -> Result<usize, SandboxError> {
+    let mut stack = Vec::new();
+    stack
+        .try_reserve(code.len().min(limits.max_operand_stack))
+        .map_err(|_| resource("bytecode output analysis allocation failed"))?;
+    for instruction in code {
+        let minimum = match instruction {
+            ExprInstruction::Constant(value) => measure_value(value, limits)?.serialized,
+            // A signed integer such as zero is the smallest value a dynamic
+            // expression can serialize to.
+            ExprInstruction::Load(_) => 1,
+            ExprInstruction::Path(_) | ExprInstruction::Unary(_) => {
+                stack
+                    .pop()
+                    .ok_or_else(|| verify("bytecode output expression stack is invalid"))?;
+                1
+            }
+            ExprInstruction::Binary(_) => {
+                stack
+                    .pop()
+                    .ok_or_else(|| verify("bytecode output expression stack is invalid"))?;
+                stack
+                    .pop()
+                    .ok_or_else(|| verify("bytecode output expression stack is invalid"))?;
+                1
+            }
+            ExprInstruction::Array(count) => {
+                let mut bytes = checked_add(2, count.saturating_sub(1))?;
+                for _ in 0..*count {
+                    bytes = checked_add(
+                        bytes,
+                        stack
+                            .pop()
+                            .ok_or_else(|| verify("bytecode output expression stack is invalid"))?,
+                    )?;
+                }
+                bytes
+            }
+            ExprInstruction::Object(keys) => {
+                let mut bytes = checked_add(2, keys.len().saturating_sub(1))?;
+                for key in keys {
+                    bytes = checked_add(bytes, serialized_string_len(key)?)?;
+                    bytes = checked_add(bytes, 1)?;
+                    bytes = checked_add(
+                        bytes,
+                        stack
+                            .pop()
+                            .ok_or_else(|| verify("bytecode output expression stack is invalid"))?,
+                    )?;
+                }
+                bytes
+            }
+        };
+        stack.push(minimum);
+    }
+    if stack.len() != 1 {
+        return Err(verify("bytecode output expression stack is invalid"));
+    }
+    stack
+        .pop()
+        .ok_or_else(|| verify("bytecode output expression stack is invalid"))
 }
 
 fn verify_constant_domain(value: &Value) -> Result<(), SandboxError> {
@@ -1111,6 +1189,61 @@ mod tests {
             ]),
         }];
         assert!(verify_bytecode(&code, 0, &SandboxLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn verifier_rejects_a_provably_oversized_dynamic_return() {
+        let payload = "x\"\\\n".repeat(16);
+        let dynamic_key = "effect\"\\";
+        let source = serde_json::to_vec(&serde_json::json!({"version":1,"body":[
+            {"kind":"invoke","name":"effect","tool_id":"write","arguments":{"kind":"object","entries":[]}},
+            {"kind":"return","value":{"kind":"object","entries":[
+                {"key":dynamic_key,"value":{"kind":"variable","name":"effect"}},
+                {"key":"payload","value":{"kind":"string","value":payload}}
+            ]}}
+        ]}))
+        .unwrap();
+        let minimum_value = serde_json::json!({
+            dynamic_key: 0,
+            "payload": payload,
+        });
+        let minimum = measure_value(&minimum_value, &SandboxLimits::default())
+            .unwrap()
+            .serialized;
+
+        for (max_return_bytes, accepted) in [(minimum - 1, false), (minimum, true)] {
+            let limits = SandboxLimits {
+                max_return_bytes,
+                ..SandboxLimits::default()
+            };
+            let compiled =
+                Program::from_json(&source, &limits).and_then(|program| program.compile(&limits));
+            assert_eq!(compiled.is_ok(), accepted);
+            if let Err(error) = compiled {
+                assert_eq!(error.code(), SandboxErrorCode::ResourceLimit);
+                assert!(error.is_output_limit());
+                assert_eq!(error.message(), "output byte limit exceeded");
+            }
+        }
+    }
+
+    #[test]
+    fn path_result_does_not_inherit_its_large_operand_lower_bound() {
+        let source = serde_json::to_vec(&serde_json::json!({"version":1,"body":[
+            {"kind":"return","value":{"kind":"path","value":{"kind":"object","entries":[
+                {"key":"large","value":{"kind":"string","value":"x".repeat(4096)}},
+                {"key":"selected","value":{"kind":"integer","value":0}}
+            ]},"pointer":"/selected"}}
+        ]}))
+        .unwrap();
+        let limits = SandboxLimits {
+            max_return_bytes: 1,
+            ..SandboxLimits::default()
+        };
+
+        Program::from_json(&source, &limits)
+            .and_then(|program| program.compile(&limits))
+            .unwrap();
     }
 
     #[test]

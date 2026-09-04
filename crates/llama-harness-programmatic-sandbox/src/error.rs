@@ -24,6 +24,13 @@ pub enum SandboxErrorCode {
 pub struct SandboxError {
     code: SandboxErrorCode,
     message: String,
+    kind: SandboxErrorKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SandboxErrorKind {
+    General,
+    OutputLimit,
 }
 
 impl SandboxError {
@@ -31,12 +38,27 @@ impl SandboxError {
         Self {
             code,
             message: message.into(),
+            kind: SandboxErrorKind::General,
+        }
+    }
+
+    pub(crate) fn output_limit() -> Self {
+        Self {
+            code: SandboxErrorCode::ResourceLimit,
+            message: "output byte limit exceeded".into(),
+            kind: SandboxErrorKind::OutputLimit,
         }
     }
 
     /// Returns the stable error category.
     pub const fn code(&self) -> SandboxErrorCode {
         self.code
+    }
+
+    /// Returns whether this error is specifically a program-return size
+    /// violation rather than another sandbox resource limit.
+    pub const fn is_output_limit(&self) -> bool {
+        matches!(self.kind, SandboxErrorKind::OutputLimit)
     }
 
     /// Returns a bounded, source-free diagnostic.

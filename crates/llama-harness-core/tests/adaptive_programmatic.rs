@@ -3,11 +3,11 @@
 use async_trait::async_trait;
 use llama_harness_core::{
     mock::{final_response, MockModelProvider, MockStep},
-    AgentDefinition, AgentRunner, AllowAllPolicy, HarnessError, InMemoryEventSink,
-    ModelCapabilities, ProgrammaticConformance, ProgrammaticHostConfig, ProgrammaticWorkloadClass,
-    ProviderCapabilityLimits, RunEvent, RunRequest, RunStatus, RunStrategy, StrategyFallbackReason,
-    StrategySelectionReason, Tool, ToolCaller, ToolDefinition, ToolDiscoveryLimits, ToolRegistry,
-    ToolResult, ToolRisk,
+    AgentDefinition, AgentRunner, AllowAllPolicy, ApprovalHandler, ApprovalRecord, HarnessError,
+    InMemoryEventSink, ModelCapabilities, PolicyDecision, PolicyEngine, ProgrammaticConformance,
+    ProgrammaticHostConfig, ProgrammaticWorkloadClass, ProviderCapabilityLimits, RunEvent,
+    RunRequest, RunStatus, RunStrategy, StrategyFallbackReason, StrategySelectionReason, Tool,
+    ToolCaller, ToolDefinition, ToolDiscoveryLimits, ToolRegistry, ToolResult, ToolRisk,
 };
 use serde_json::{json, Value};
 use std::sync::{
@@ -51,11 +51,62 @@ fn return_program() -> String {
     .to_string()
 }
 
-fn large_return_program(bytes: usize) -> String {
+fn invoke_then_large_return_program(tool_id: &str, bytes: usize) -> String {
     json!({"version":1,"body":[
-        {"kind":"return","value":{"kind":"string","value":"x".repeat(bytes)}}
+        {"kind":"invoke","name":"effect","tool_id":tool_id,"arguments":{"kind":"object","entries":[]}},
+        {"kind":"return","value":{"kind":"object","entries":[
+            {"key":"effect","value":{"kind":"variable","name":"effect"}},
+            {"key":"payload","value":{"kind":"string","value":"x".repeat(bytes)}}
+        ]}}
     ]})
     .to_string()
+}
+
+struct CountingApprovalPolicy {
+    policy_calls: AtomicU32,
+    approval_calls: AtomicU32,
+}
+
+impl CountingApprovalPolicy {
+    fn new() -> Self {
+        Self {
+            policy_calls: AtomicU32::new(0),
+            approval_calls: AtomicU32::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl PolicyEngine for CountingApprovalPolicy {
+    async fn decide(
+        &self,
+        _: &ToolDefinition,
+        _: &Value,
+        _: &RunRequest,
+    ) -> Result<PolicyDecision, HarnessError> {
+        self.policy_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(PolicyDecision::RequireApproval {
+            reason: "test policy requires approval".into(),
+        })
+    }
+}
+
+#[async_trait]
+impl ApprovalHandler for CountingApprovalPolicy {
+    async fn approve(
+        &self,
+        tool: &ToolDefinition,
+        _: &Value,
+        _: &RunRequest,
+    ) -> Result<ApprovalRecord, HarnessError> {
+        self.approval_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ApprovalRecord::new(
+            "unreachable-call-id",
+            tool.id.clone(),
+            true,
+            "test approval",
+        ))
+    }
 }
 
 struct TestTool {
@@ -583,7 +634,7 @@ async fn mixed_caller_planner_catalog_describes_each_eligible_strategy() {
 
 #[tokio::test]
 async fn adaptive_programmatic_reserves_synthesis_capacity_before_vm_execution() {
-    let program = large_return_program(32 * 1024);
+    let program = invoke_then_large_return_program("program_only", 32 * 1024);
     let probe_provider = Arc::new(
         MockModelProvider::scripted([
             final_response(proposal(ProgrammaticWorkloadClass::Loop)),
@@ -624,12 +675,15 @@ async fn adaptive_programmatic_reserves_synthesis_capacity_before_vm_execution()
         [ToolCaller::Programmatic],
         false,
     ));
+    let policy = Arc::new(CountingApprovalPolicy::new());
     let events = Arc::new(InMemoryEventSink::default());
     let mut run_request = request(&["program_only"], 3);
     run_request.agent.limits.max_request_payload_bytes = pre_execution_request_bytes + 512;
     let result = AgentRunner::builder(provider.clone())
         .tools(registry([tool.clone() as Arc<dyn Tool>]))
         .event_sink(events.clone())
+        .policy(policy.clone())
+        .approvals(policy.clone())
         .programmatic(ProgrammaticHostConfig::default())
         .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
         .build()
@@ -640,12 +694,20 @@ async fn adaptive_programmatic_reserves_synthesis_capacity_before_vm_execution()
     assert_eq!(result.status, RunStatus::LimitReached);
     assert_eq!(provider.requests().len(), 2);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(policy.policy_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(policy.approval_calls.load(Ordering::SeqCst), 0);
+    assert!(!events
+        .events()
+        .iter()
+        .any(|record| matches!(record.event, RunEvent::StrategyFallback { .. })));
     assert!(events.events().iter().any(|record| matches!(
         record.event,
         RunEvent::StrategyUsage {
             strategy: RunStrategy::Programmatic,
             model_calls: 2,
+            repair_model_calls: 0,
             final_synthesis_model_calls: 0,
+            tool_calls: 0,
             ..
         }
     )));
