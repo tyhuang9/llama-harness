@@ -64,6 +64,10 @@ const DIRECT_RUNNER: &str = include_str!("../../llama-harness-core/tests/agent_r
 const PROGRAMMATIC_ACCEPTANCE: &str = include_str!("fixtures/programmatic-acceptance.yaml");
 const SPECULATION_ACCEPTANCE: &str = include_str!("fixtures/speculation-acceptance.yaml");
 const SPECULATION_ACCEPTANCE_TEST: &str = include_str!("speculation_acceptance.rs");
+const SANDBOX_COMPILER: &str =
+    include_str!("../../llama-harness-programmatic-sandbox/src/compiler.rs");
+const SANDBOX_VM: &str = include_str!("../../llama-harness-programmatic-sandbox/src/vm.rs");
+const SANDBOX_LIB: &str = include_str!("../../llama-harness-programmatic-sandbox/src/lib.rs");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +84,7 @@ struct AcceptanceManifest {
 #[serde(deny_unknown_fields)]
 struct QualityRanking {
     hard_gates: Vec<String>,
+    tie_breaker_order: Vec<String>,
     rank_after_hard_gates: Vec<String>,
     latency: String,
 }
@@ -271,6 +276,9 @@ fn evidence_source(source: &str) -> Option<&'static str> {
         "programmatic_acceptance_fixture" => Some(PROGRAMMATIC_ACCEPTANCE),
         "speculation_acceptance_fixture" => Some(SPECULATION_ACCEPTANCE),
         "speculation_acceptance_test" => Some(SPECULATION_ACCEPTANCE_TEST),
+        "sandbox_compiler" => Some(SANDBOX_COMPILER),
+        "sandbox_vm" => Some(SANDBOX_VM),
+        "sandbox_lib" => Some(SANDBOX_LIB),
         _ => None,
     }
 }
@@ -446,14 +454,22 @@ fn acceptance_manifest_audits_every_required_workload_against_executable_coverag
             "unintended_effects_zero",
             "task_correct",
             "final_state_correct",
-            "recovery_success",
             "deterministic_accounting_and_order",
         ]
     );
     assert_eq!(
+        manifest.quality_ranking.tie_breaker_order,
+        vec!["reliability", "latency", "cost"]
+    );
+    assert_eq!(
         manifest.quality_ranking.rank_after_hard_gates,
         vec![
+            "recovery_success",
             "tool_selection_accuracy",
+            "p50_latency_ms",
+            "p95_latency_ms",
+            "input_tokens",
+            "output_tokens",
             "model_calls",
             "tool_calls",
             "wasted_tool_calls",
@@ -536,18 +552,17 @@ fn acceptance_manifest_audits_every_required_workload_against_executable_coverag
         ],
         "no-tool omits DeclarativePlan because an empty plan is invalid"
     );
-    for id in ["single-call"] {
-        assert_eq!(
-            by_id(id).strategies,
-            vec![
-                RunStrategy::Direct,
-                RunStrategy::DeclarativePlan,
-                RunStrategy::Programmatic,
-                RunStrategy::Adaptive,
-            ],
-            "{id} is the executable cross-strategy baseline"
-        );
-    }
+    let id = "single-call";
+    assert_eq!(
+        by_id(id).strategies,
+        vec![
+            RunStrategy::Direct,
+            RunStrategy::DeclarativePlan,
+            RunStrategy::Programmatic,
+            RunStrategy::Adaptive,
+        ],
+        "{id} is the executable cross-strategy baseline"
+    );
     assert!(by_id("speculation-no-writes")
         .strategies
         .contains(&RunStrategy::Direct));

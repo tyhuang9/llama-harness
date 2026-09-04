@@ -176,13 +176,22 @@ privacy, exact-commit, and no-write cases. The manifest test fails if a class,
 its applicable strategy set, or its named executable evidence disappears.
 
 Every compared result must first pass these hard gates: zero unauthorized,
-duplicate, and unintended effects; task and final-state correctness; recovery
-success where applicable; and deterministic accounting and effect order.
-Adaptive is compared with the best complete forced baseline for a shared
-workload and must pass the same safety and correctness gates. Tool-selection
-accuracy and call efficiency rank eligible alternatives; latency is retained in
-the normalized report for measurement and release analysis only, never asserted
-as a scheduler-dependent CI threshold.
+duplicate, and unintended effects; task and final-state correctness; and
+deterministic accounting and effect order. Adaptive is compared with the best
+complete forced baseline for a shared workload and must pass the same safety and
+correctness gates. Eligible alternatives are then ranked by reliability
+(recovery success, then tool-selection accuracy), latency (P50, then P95), and
+cost (input/output tokens, model calls, tool calls, and wasted execution), in
+that order. Latency is retained in the normalized report for measurement and
+release analysis only, never asserted as a scheduler-dependent CI threshold.
+
+The sandbox acceptance evidence explicitly covers lexical and response-data
+escape attempts, live-capacity and fuel exhaustion, nested policy/caller
+enforcement, cooperative cancellation and fan-out drain races, exact output-size
+boundaries, invalid admission configuration, privacy canaries, and the sandbox
+crate's `no_std`, unsafe-code prohibition, and zero-ambient-capability boundary.
+The full workspace test gate executes the referenced tests; the manifest fails
+if any named evidence disappears.
 
 Reports are serializable normalized JSON. Browse a saved report locally with:
 
