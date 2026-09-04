@@ -14,6 +14,7 @@ import re
 import subprocess
 from unittest import mock
 
+from scripts import prepare_sdk_runtime_packages
 from scripts.inspect_npm_package import SDK_FILES, inspect_npm_package
 from scripts.inspect_python_packages import PACKAGE_FILES, inspect_wheel
 from scripts.inspect_release_artifacts import PLATFORMS, inspect_release_artifacts
@@ -287,10 +288,27 @@ class InputAndAbiTests(unittest.TestCase):
                 (root / "sdks" / "python" / "pyproject.toml").read_text(encoding="utf-8"),
             )
 
+    def test_sdk_staging_reads_project_version_on_python_3_10(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "pyproject.toml"
+            project.write_text(
+                '[build-system]\nrequires = []\n\n[project] # SDK metadata\nname = "llama-harness"\nversion = "0.2.0" # release\n',
+                encoding="utf-8",
+            )
+            with mock.patch.object(prepare_sdk_runtime_packages, "tomllib", None):
+                self.assertEqual(
+                    prepare_sdk_runtime_packages.python_project_version(project),
+                    "0.2.0",
+                )
+                project.write_text('[project]\nversion = 2\n', encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "Python SDK version"):
+                    prepare_sdk_runtime_packages.python_project_version(project)
+
     def test_release_gates_check_cargo_runtime_and_sdk_identities(self) -> None:
         root = Path(__file__).resolve().parents[2]
         validation = (root / "scripts" / "validate_release.ps1").read_text(encoding="utf-8")
         xtask = (root / "xtask" / "src" / "main.rs").read_text(encoding="utf-8")
+        ci_workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         release_workflow = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
         self.assertIn("cargo metadata --locked --format-version 1 --no-deps", validation)
@@ -308,6 +326,8 @@ class InputAndAbiTests(unittest.TestCase):
         self.assertIn("does not match the checked-out main commit", release_workflow)
         self.assertGreaterEqual(release_workflow.count("persist-credentials: false"), 5)
         self.assertNotIn("inputs.publish", release_workflow)
+        developer_console_job = ci_workflow.split("developer-console-audit:", 1)[1]
+        self.assertIn("libwebkit2gtk-4.1-dev", developer_console_job)
 
     def test_workflows_pin_actions_and_do_not_interpolate_dispatch_version_in_scripts(self) -> None:
         root = Path(__file__).resolve().parents[2]

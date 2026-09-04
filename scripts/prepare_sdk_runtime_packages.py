@@ -8,9 +8,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 release hosts use the strict fallback below.
+    tomllib = None
 
 
 PYTHON_TAGS = {
@@ -18,6 +23,31 @@ PYTHON_TAGS = {
     "darwin-arm64": "macosx_11_0_arm64",
     "linux-x64": "manylinux_2_35_x86_64",
 }
+
+
+def python_project_version(project: Path) -> str:
+    content = project.read_text(encoding="utf-8")
+    if tomllib is not None:
+        try:
+            version = tomllib.loads(content)["project"]["version"]
+        except (KeyError, tomllib.TOMLDecodeError) as error:
+            raise ValueError(f"cannot read Python SDK version: {error}") from error
+        if not isinstance(version, str):
+            raise ValueError("Python SDK version must be a string")
+        return version
+
+    in_project = False
+    for line in content.splitlines():
+        if re.fullmatch(r"\s*\[project\]\s*(?:#.*)?", line):
+            in_project = True
+            continue
+        if re.match(r"\s*\[", line):
+            in_project = False
+        if in_project:
+            match = re.fullmatch(r'\s*version\s*=\s*"([^"]+)"\s*(?:#.*)?', line)
+            if match:
+                return match.group(1)
+    raise ValueError("cannot read Python SDK version on Python 3.10")
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,8 +67,8 @@ def main() -> int:
         raise SystemExit(f"runtime does not exist: {runtime}")
     python_project = repository / "sdks" / "python" / "pyproject.toml"
     try:
-        python_version = tomllib.loads(python_project.read_text(encoding="utf-8"))["project"]["version"]
-    except (KeyError, tomllib.TOMLDecodeError) as error:
+        python_version = python_project_version(python_project)
+    except ValueError as error:
         raise SystemExit(f"cannot read Python SDK version from {python_project}: {error}") from error
     if python_version != args.version:
         raise SystemExit(
