@@ -19,6 +19,10 @@ have independent manual authorization.
 
 ### Prerequisites and release gate
 
+SDK staging and the release-script tests require Python 3.11 or newer for
+standard-library TOML parsing; CI uses Python 3.12.10. The installed Python SDK
+continues to support Python 3.10 or newer.
+
 Before publishing, record the exact reviewed commit on clean `main` as
 `SOURCE_COMMIT`. The worktree must have no unreviewed or uncommitted changes,
 and the requested version must match the workspace/package metadata and the

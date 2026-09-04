@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 from pathlib import Path
 
 try:
     import tomllib
-except ModuleNotFoundError:  # Python 3.10 release hosts use the strict fallback below.
+except ModuleNotFoundError:  # Report the release-tool prerequisite before staging.
     tomllib = None
 
 
@@ -26,28 +25,15 @@ PYTHON_TAGS = {
 
 
 def python_project_version(project: Path) -> str:
-    content = project.read_text(encoding="utf-8")
-    if tomllib is not None:
-        try:
-            version = tomllib.loads(content)["project"]["version"]
-        except (KeyError, tomllib.TOMLDecodeError) as error:
-            raise ValueError(f"cannot read Python SDK version: {error}") from error
-        if not isinstance(version, str):
-            raise ValueError("Python SDK version must be a string")
-        return version
-
-    in_project = False
-    for line in content.splitlines():
-        if re.fullmatch(r"\s*\[project\]\s*(?:#.*)?", line):
-            in_project = True
-            continue
-        if re.match(r"\s*\[", line):
-            in_project = False
-        if in_project:
-            match = re.fullmatch(r'\s*version\s*=\s*"([^"]+)"\s*(?:#.*)?', line)
-            if match:
-                return match.group(1)
-    raise ValueError("cannot read Python SDK version on Python 3.10")
+    if tomllib is None:
+        raise ValueError("SDK release tooling requires Python 3.11 or newer (stdlib tomllib)")
+    try:
+        version = tomllib.loads(project.read_text(encoding="utf-8"))["project"]["version"]
+    except (KeyError, TypeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"cannot read Python SDK version: {error}") from error
+    if not isinstance(version, str) or not version:
+        raise ValueError("Python SDK version must be a non-empty string")
+    return version
 
 
 def parse_args() -> argparse.Namespace:

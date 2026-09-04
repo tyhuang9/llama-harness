@@ -288,21 +288,39 @@ class InputAndAbiTests(unittest.TestCase):
                 (root / "sdks" / "python" / "pyproject.toml").read_text(encoding="utf-8"),
             )
 
-    def test_sdk_staging_reads_project_version_on_python_3_10(self) -> None:
+    def test_sdk_staging_reads_authoritative_project_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "pyproject.toml"
-            project.write_text(
+            valid_documents = [
                 '[build-system]\nrequires = []\n\n[project] # SDK metadata\nname = "llama-harness"\nversion = "0.2.0" # release\n',
-                encoding="utf-8",
-            )
-            with mock.patch.object(prepare_sdk_runtime_packages, "tomllib", None):
-                self.assertEqual(
-                    prepare_sdk_runtime_packages.python_project_version(project),
-                    "0.2.0",
-                )
-                project.write_text('[project]\nversion = 2\n', encoding="utf-8")
-                with self.assertRaisesRegex(ValueError, "Python SDK version"):
-                    prepare_sdk_runtime_packages.python_project_version(project)
+                '[project]\ndescription = """\nversion = "6.6.6"\n"""\nversion = "0.2.0"\n',
+                '["project"]\n"version" = "0.2.0"\n',
+            ]
+            for document in valid_documents:
+                with self.subTest(document=document):
+                    project.write_text(document, encoding="utf-8")
+                    self.assertEqual(prepare_sdk_runtime_packages.python_project_version(project), "0.2.0")
+
+            invalid_documents = {
+                "duplicate version": '[project]\nversion = "0.2.0"\nversion = "0.2.1"\n',
+                "quoted duplicate": '[project]\nversion = "0.2.0"\n"version" = "0.2.1"\n',
+                "duplicate table": '[project]\nversion = "0.2.0"\n[project]\nname = "duplicate"\n',
+                "missing version": '[project]\nname = "llama-harness"\n',
+                "malformed version": '[project]\nversion = "0.2.0\n',
+                "numeric version": '[project]\nversion = 2\n',
+                "empty version": '[project]\nversion = ""\n',
+                "non-table project": 'project = "not a table"\n',
+            }
+            for label, document in invalid_documents.items():
+                with self.subTest(label=label):
+                    project.write_text(document, encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "Python SDK version"):
+                        prepare_sdk_runtime_packages.python_project_version(project)
+
+    def test_sdk_staging_requires_stdlib_toml_parser(self) -> None:
+        with mock.patch.object(prepare_sdk_runtime_packages, "tomllib", None):
+            with self.assertRaisesRegex(ValueError, "requires Python 3.11 or newer"):
+                prepare_sdk_runtime_packages.python_project_version(Path("unused.toml"))
 
     def test_release_gates_check_cargo_runtime_and_sdk_identities(self) -> None:
         root = Path(__file__).resolve().parents[2]
@@ -327,7 +345,15 @@ class InputAndAbiTests(unittest.TestCase):
         self.assertGreaterEqual(release_workflow.count("persist-credentials: false"), 5)
         self.assertNotIn("inputs.publish", release_workflow)
         developer_console_job = ci_workflow.split("developer-console-audit:", 1)[1]
-        self.assertIn("libwebkit2gtk-4.1-dev", developer_console_job)
+        self.assertLess(
+            developer_console_job.index("libwebkit2gtk-4.1-dev"),
+            developer_console_job.index("cargo check"),
+        )
+        release_readiness_job = ci_workflow.split("  rust-release-readiness:", 1)[1].split("\n  rust-docs:", 1)[0]
+        self.assertLess(
+            release_readiness_job.index("python-version: 3.12.10"),
+            release_readiness_job.index("python -m unittest"),
+        )
 
     def test_workflows_pin_actions_and_do_not_interpolate_dispatch_version_in_scripts(self) -> None:
         root = Path(__file__).resolve().parents[2]
