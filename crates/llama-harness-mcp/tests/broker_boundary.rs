@@ -4,9 +4,9 @@ use llama_harness_core::{
     mock::{final_response, tool_response, MockModelProvider},
     AgentDefinition, AgentRunner, ApprovalHandler, ApprovalRecord, HarnessError, MessageRole,
     ModelCapabilities, ModelEventStream, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
-    ModelStreamEvent, PolicyDecision, PolicyEngine, ProviderHealth, RunRequest, SpeculationConfig,
-    SpeculationMode, Tool, ToolCall, ToolCallContext, ToolCallDelta, ToolDefinition,
-    ToolDiscoveryMetadata, ToolRegistry, ToolResult, Usage,
+    ModelStreamEvent, PolicyDecision, PolicyEngine, ProviderHealth, RunRequest, RunStrategy,
+    SpeculationConfig, SpeculationMode, Tool, ToolCall, ToolCallContext, ToolCallDelta,
+    ToolDefinition, ToolDiscoveryMetadata, ToolRegistry, ToolResult, Usage,
 };
 use llama_harness_mcp::{
     McpCallRequest, McpCallResult, McpCatalogManager, McpContext, McpDispatchState, McpError,
@@ -237,7 +237,16 @@ impl ModelProvider for StreamingToolProvider {
     }
 
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError> {
-        Ok(ModelResponse::new(request.model).with_final_output("unexpected completion path"))
+        let output = if request
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Tool)
+        {
+            "done"
+        } else {
+            "unexpected completion path"
+        };
+        Ok(ModelResponse::new(request.model).with_final_output(output))
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelEventStream, HarnessError> {
@@ -395,7 +404,7 @@ async fn shadow_and_activation_configuration_cannot_speculatively_dispatch_impor
         SpeculationMode::Disabled
     );
     let result = runner
-        .run(request(tool_id.clone()))
+        .run_with_strategy(request(tool_id.clone()), RunStrategy::Direct)
         .await
         .expect("authoritative MCP call succeeds");
 
