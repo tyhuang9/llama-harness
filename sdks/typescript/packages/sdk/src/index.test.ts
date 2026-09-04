@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 
-import { defineTool, HarnessClient } from "./index.js";
+import { defineTool, HarnessClient, RuntimeProtocolError } from "./index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const workspaceRoot = resolve(process.cwd(), "../../../../");
@@ -14,7 +14,7 @@ test("routes a typed host tool callback and ordered runtime event", async () => 
   const client = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js")] });
   try {
     const tool = defineTool({ id: "notes.search", name: "Search", description: "Search notes", argumentsSchema: {}, risk: "low", idempotent: true, readOnly: true, execute: async (toolArguments) => ({ found: (toolArguments as { query: string }).query }) });
-    const run = await client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock", toolAllowlist: ["notes.search"] }, input: "find", tools: [tool] });
+    const run = await client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock", toolAllowlist: ["notes.search"] }, input: "find", tools: [tool], strategy: "adaptive" });
     const events = [];
     for await (const event of run.events()) events.push(event);
     const result = await run.result();
@@ -31,6 +31,41 @@ test("keeps provider health and model inventory outside agent runs", async () =>
     assert.deepEqual(await client.health(), { healthy: true, detail: "fake runtime" });
     assert.deepEqual(await client.listModels(), [{ id: "mock", capabilities: { supportsTools: true, supportsStreaming: false, supportsStructuredOutput: true } }]);
   } finally { await client.close(); }
+});
+
+test("negotiates 1.1, derives hello identity from the package version, and serializes advanced strategy metadata", async () => {
+  const client = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "modern"] });
+  try {
+    assert.equal(client.negotiatedProtocolVersion, "1.1");
+    const tool = defineTool({ id: "notes.search", name: "Search", description: "Search", argumentsSchema: {}, risk: "low", idempotent: true, readOnly: true, outputSchema: { type: "object" }, parallelSafe: true, concurrencyKey: "notes", cancellationSafety: "guaranteed", expectedLatencyMs: 5, allowedCallers: ["programmatic"], speculationPolicy: "disabled", issueSafety: "guaranteed", executionLocation: "local_private", networkEgress: "prohibited", execute: () => ({}) });
+    const run = await client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test", tools: [tool], strategy: "programmatic" });
+    const events = [];
+    for await (const event of run.events()) events.push(event);
+    assert.equal(events[0].event.type, "strategy_usage");
+  } finally { await client.close(); }
+});
+
+test("falls back to 1.0 and rejects forced advanced strategies before start_run", async () => {
+  const client = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "legacy"] });
+  try {
+    assert.equal(client.negotiatedProtocolVersion, "1.0");
+    await assert.rejects(client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test", strategy: "declarative_plan" }), RuntimeProtocolError);
+    const direct = await client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test", strategy: "direct" });
+    await direct.result();
+  } finally { await client.close(); }
+});
+
+test("fails incompatible majors, envelope drift, and structured protocol errors", async () => {
+  await assert.rejects(HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "incompatible"] }), RuntimeProtocolError);
+  const drift = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "drift"] });
+  try {
+    const run = await drift.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test" });
+    await assert.rejects(run.result(), /version drift/);
+  } finally { await drift.close(); }
+  const failure = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "protocol_error"] });
+  try {
+    await assert.rejects(failure.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test" }), (error: unknown) => error instanceof RuntimeProtocolError && error.code === "invalid_state");
+  } finally { await failure.close(); }
 });
 
 test("performs a handshake with the workspace-built Rust runtime", { skip: !existsSync(resolve(process.cwd(), "../../../../target/debug/llama-harness-runtime.exe")) }, async () => {

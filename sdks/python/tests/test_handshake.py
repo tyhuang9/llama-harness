@@ -1,12 +1,46 @@
 import asyncio
 import os
+import sys
 import unittest
 from pathlib import Path
 
-from llama_harness import HarnessClient, ProviderHealth, ProviderModel, Tool
+from llama_harness import HarnessClient, ProviderHealth, ProviderModel, RuntimeProtocolError, Tool
 
 
 class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
+    def fake_runtime_args(self, mode: str) -> tuple[str, list[str]]:
+        return sys.executable, ["-u", str(Path(__file__).with_name("fake_runtime.py")), mode]
+
+    async def test_negotiates_current_protocol_and_exposes_metadata_only_event_shapes(self) -> None:
+        path, args = self.fake_runtime_args("modern")
+        async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args) as client:
+            self.assertEqual(client.protocol_version, "1.1")
+            advanced = Tool(id="metadata", name="Metadata", description="Metadata fixture", arguments_schema={}, execute=lambda **_: {}, output_schema={"type": "object"}, parallel_safe=True, concurrency_key="fixture", cancellation_safety="guaranteed", expected_latency_ms=1, allowed_callers=("programmatic",), issue_safety="guaranteed", execution_location="local_private", network_egress="prohibited")
+            run = await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test", tools=[advanced], strategy="programmatic")
+            self.assertEqual((await run.result())["status"], "completed")
+
+    async def test_legacy_fallback_rejects_advanced_modes_before_start(self) -> None:
+        path, args = self.fake_runtime_args("legacy")
+        async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args) as client:
+            self.assertEqual(client.protocol_version, "1.0")
+            with self.assertRaises(RuntimeProtocolError):
+                await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test", strategy="declarative_plan")
+            run = await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test", strategy="direct")
+            self.assertEqual((await run.result())["status"], "completed")
+
+    async def test_rejects_incompatible_major_drift_and_structured_protocol_error(self) -> None:
+        path, args = self.fake_runtime_args("incompatible")
+        with self.assertRaises(RuntimeProtocolError):
+            await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args)
+        path, args = self.fake_runtime_args("drift")
+        async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args) as client:
+            with self.assertRaises(RuntimeProtocolError):
+                await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test")
+        path, args = self.fake_runtime_args("protocol_error")
+        async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args) as client:
+            with self.assertRaisesRegex(RuntimeProtocolError, "test protocol failure") as caught:
+                await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test")
+            self.assertEqual(caught.exception.code, "invalid_state")
     async def test_workspace_runtime_handshake(self) -> None:
         runtime = Path(__file__).resolve().parents[3] / "target" / "debug" / "llama-harness-runtime.exe"
         if not runtime.is_file():
@@ -67,4 +101,6 @@ class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
             self.skipTest("workspace scripted runtime has not been built")
         async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=runtime) as client:
             self.assertEqual(await client.health(), ProviderHealth(True))
-            self.assertEqual(await client.list_models(), [ProviderModel("mock-model", True, False, True)])
+            models = await client.list_models()
+            self.assertEqual([(model.id, model.supports_tools, model.supports_streaming, model.supports_structured_output) for model in models], [("mock-model", True, False, True)])
+            self.assertIsNotNone(models[0].capabilities)
