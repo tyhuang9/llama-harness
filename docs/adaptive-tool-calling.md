@@ -6,8 +6,12 @@ evaluation and debugging. Direct execution remains the atomic broker boundary
 under every strategy and the sequential fallback when an advanced strategy
 cannot start safely.
 
-Adaptive planning is capability gated. A provider must advertise structured
-plan support and sufficient plan, catalog, and model-call limits. Otherwise the
+Adaptive planning is capability gated per strategy. Declarative plans require
+structured-plan support and sufficient plan, catalog, and model-call limits;
+Programmatic does not depend on declarative-plan support. The planner receives
+the union of tools authorized for the strategies that are actually eligible,
+so a Programmatic-only tool is visible during selection without becoming
+authorized for a declarative node. If no advanced strategy is eligible, the
 run emits fallback metadata and uses the existing direct reactive loop. A
 forced declarative run never silently changes its selected strategy.
 Programmatic is an Adaptive candidate only when the optional sandbox, explicit
@@ -77,13 +81,14 @@ no model or tool work. An admitted slot remains held while its `Execution`
 retains state across broker, policy, approval, or tool waits, and is released
 only after final synthesis and output validation make the whole Programmatic
 run terminal. `max_active_vms` therefore bounds concurrent Programmatic-run
-state—program and model buffers, VM state, canonical tool transcript, and
-final synthesis buffers—not only sandbox VM live bytes; it is not a per-slice
-compute throttle. For conservative host capacity planning, multiply the slot
-count by the sum of the effective program-byte cap, model-response cap,
-sandbox live-byte cap, transcript cap, and the effective bounded batch count
-times the tool-result cap. This is an upper envelope rather than an exact heap
-measurement because those bounded buffers can overlap. Read-only, parallel-safe fan-out is
+state—program and model buffers, VM state and tool results, bounded synthesis
+summary, and final synthesis buffers—not only sandbox VM live bytes; it is not
+a per-slice compute throttle. For conservative host capacity planning,
+multiply the slot count by the sum of the effective program-byte cap,
+model-response cap, sandbox live-byte cap, transcript cap, and the effective
+bounded batch count times the tool-result cap. This is an upper envelope rather
+than an exact heap measurement because those bounded buffers can overlap.
+Read-only, parallel-safe fan-out is
 bounded at eight and additionally limited by the host, provider, Agent, and
 broker caps. Mutations are always serialized.
 
@@ -95,6 +100,14 @@ the effective bytecode, local, control-stack, and operand-stack limits. Operand
 stack reuse across independent resumable evaluation states is a separately
 profiled follow-up; the current VM retains its bounded stack with each active
 continuation to preserve isolation and accounting.
+
+Final synthesis receives only the program's explicitly bounded return value and
+a value-free broker summary (`total`, `succeeded`, and `failed`). Raw tool
+arguments and results are never copied into the synthesis prompt. A program
+must filter, aggregate, or otherwise reduce large intermediate values inside
+the sandbox before returning them; the acceptance suite proves that three
+256 KiB results produce a synthesis input smaller than one percent of their raw
+payload while the default transcript limit remains in force.
 
 One correction prompt is permitted only before an effect is dispatched and
 only while more than one model call remains: one call stays reserved for final

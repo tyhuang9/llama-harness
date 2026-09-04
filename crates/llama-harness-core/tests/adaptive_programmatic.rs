@@ -353,11 +353,8 @@ async fn missing_host_capability_byte_or_remaining_call_budget_falls_back_before
             provider_capabilities.limits.max_program_bytes = None;
         }
         let provider = Arc::new(
-            MockModelProvider::scripted([
-                final_response(proposal(ProgrammaticWorkloadClass::Loop)),
-                final_response("direct"),
-            ])
-            .with_capabilities(provider_capabilities),
+            MockModelProvider::scripted([final_response("direct")])
+                .with_capabilities(provider_capabilities),
         );
         let mut builder = AgentRunner::builder(provider.clone())
             .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop]);
@@ -371,8 +368,8 @@ async fn missing_host_capability_byte_or_remaining_call_budget_falls_back_before
             .unwrap();
 
         assert_eq!(result.final_output.as_deref(), Some("direct"), "{gate}");
-        assert_eq!(provider.requests().len(), 2, "{gate}");
-        assert!(provider.requests()[1].structured_output.is_none(), "{gate}");
+        assert_eq!(provider.requests().len(), 1, "{gate}");
+        assert!(provider.requests()[0].structured_output.is_none(), "{gate}");
     }
 }
 
@@ -426,7 +423,8 @@ async fn promotion_selects_a_fresh_programmatic_caller_scope() {
 
     assert_eq!(result.status, RunStatus::Completed);
     let requests = provider.requests();
-    assert!(requests[0].tools.is_empty());
+    assert_eq!(requests[0].tools.len(), 1);
+    assert_eq!(requests[0].tools[0].id, "program_only");
     assert_eq!(requests[1].tools.len(), 1);
     assert_eq!(requests[1].tools[0].id, "program_only");
     let callers = events
@@ -448,14 +446,63 @@ async fn promotion_selects_a_fresh_programmatic_caller_scope() {
 }
 
 #[tokio::test]
-async fn programmatic_scope_limit_falls_back_before_generation() {
+async fn programmatic_promotion_does_not_require_declarative_plan_support() {
     let provider = Arc::new(
         MockModelProvider::scripted([
             final_response(proposal(ProgrammaticWorkloadClass::Loop)),
-            final_response("direct"),
+            final_response(return_program()),
+            final_response("done"),
         ])
-        .with_capabilities(capabilities()),
+        .with_capabilities(capabilities().with_structured_plans(false)),
     );
+    let program_only = Arc::new(TestTool::new(
+        "program_only",
+        [ToolCaller::Programmatic],
+        false,
+    ));
+    let events = Arc::new(InMemoryEventSink::default());
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry([program_only as Arc<dyn Tool>]))
+        .event_sink(events.clone())
+        .programmatic(ProgrammaticHostConfig::default())
+        .adaptive_programmatic_allowlist([ProgrammaticWorkloadClass::Loop])
+        .build()
+        .run(request(&["program_only"], 3))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.final_output.as_deref(), Some("done"));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].tools.len(), 1);
+    assert_eq!(requests[0].tools[0].id, "program_only");
+    assert_eq!(requests[1].tools.len(), 1);
+    assert_eq!(requests[1].tools[0].id, "program_only");
+    let planner = requests[0].structured_output.as_ref().unwrap();
+    assert_eq!(
+        planner.name,
+        "llama_harness_adaptive_programmatic_envelope_v1"
+    );
+    let schema = planner.schema.to_string();
+    assert!(schema.contains("programmatic"));
+    assert!(!schema.contains("declarative_plan"));
+    assert!(!requests[0].messages[0]
+        .content
+        .contains("finite dependency DAG"));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategySelected {
+            requested: RunStrategy::Adaptive,
+            selected: RunStrategy::Programmatic,
+            reason: StrategySelectionReason::AdaptivePlanner,
+        }
+    )));
+}
+
+#[tokio::test]
+async fn programmatic_planner_scope_limit_stops_before_model_or_tool_work() {
+    let provider = Arc::new(MockModelProvider::scripted([]).with_capabilities(capabilities()));
     let one = Arc::new(TestTool::new("one", [ToolCaller::Programmatic], false));
     let two = Arc::new(TestTool::new("two", [ToolCaller::Programmatic], false));
     let result = AgentRunner::builder(provider.clone())
@@ -468,8 +515,9 @@ async fn programmatic_scope_limit_falls_back_before_generation() {
         .await
         .unwrap();
 
-    assert_eq!(result.final_output.as_deref(), Some("direct"));
-    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(result.status, RunStatus::LimitReached);
+    assert_eq!(result.final_output, None);
+    assert!(provider.requests().is_empty());
 }
 
 #[tokio::test]
@@ -590,6 +638,14 @@ async fn invalid_program_fallback_keeps_one_run_emitter_scope_and_counters() {
             from: RunStrategy::Programmatic,
             to: RunStrategy::Direct,
             reason: StrategyFallbackReason::InvalidProgram,
+        }
+    )));
+    assert!(records.iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategySelected {
+            requested: RunStrategy::Adaptive,
+            selected: RunStrategy::Direct,
+            reason: StrategySelectionReason::CapabilityDowngrade,
         }
     )));
     assert!(records.iter().any(|record| matches!(

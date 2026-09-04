@@ -106,7 +106,7 @@ const PROGRAM_PROMPT: &str = r#"Return only a strict llama-harness program JSON 
 
 const REPAIR_PROMPT: &str = "The previous program failed strict structural verification. Return one corrected version-1 program JSON object only. Do not add markdown or prose.";
 
-const SYNTHESIS_PROMPT: &str = "A verified program completed. Produce the final answer using only the inert program return and broker-audited tool transcript in the next user message.";
+const SYNTHESIS_PROMPT: &str = "A verified program completed. Produce the final answer using only the bounded program return and value-free broker call summary in the next user message.";
 
 fn program_schema(limits: &SandboxLimits) -> Value {
     serde_json::json!({
@@ -274,46 +274,31 @@ fn program_structured_output(
         .map(Some)
 }
 
-// `{"tool_id":<id>,"arguments":<args>,"ok":<bool>,"output":<output>}`
-// excluding the three serialized dynamic values and the boolean spelling.
-const TRANSCRIPT_ENTRY_FRAME_BYTES: u64 = 41;
-const TRANSCRIPT_FAILURE_BYTES: u64 = 5;
-
-#[derive(Clone, Serialize)]
-struct ProgrammaticTranscriptEntry {
-    tool_id: String,
-    arguments: Value,
-    ok: bool,
-    output: Value,
-}
-
-#[derive(Serialize)]
-struct ProgrammaticTranscriptEntryRef<'a> {
-    tool_id: &'a str,
-    arguments: &'a Value,
-    ok: bool,
-    output: &'a Value,
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct ProgrammaticBrokerSummary {
+    total: u64,
+    succeeded: u64,
+    failed: u64,
 }
 
 #[derive(Serialize)]
 struct ProgrammaticSynthesisInput<'a> {
     program_return: &'a Value,
-    broker_calls: &'a [ProgrammaticTranscriptEntry],
+    broker_calls: ProgrammaticBrokerSummary,
 }
 
-/// Bounded, canonical evidence passed to the final synthesis call.
+/// Bounded, canonical program return and value-free audit summary passed to
+/// the final synthesis call.
 ///
-/// The accounting intentionally reserves a full potential batch before the
-/// broker can issue any effect, then measures each entry without allocating a
-/// second serialized copy before retaining it. This makes a later synthesis
-/// capacity failure impossible for accepted sandbox/tool bounds.
+/// Raw tool arguments and results remain inside the broker/sandbox execution
+/// boundary. Accounting reserves the maximum program return plus bounded call
+/// counters before the broker can issue an effect, so large intermediate data
+/// is reduced by the program instead of being re-injected into the model.
 struct ProgrammaticTranscript {
-    entries: Vec<ProgrammaticTranscriptEntry>,
+    summary: ProgrammaticBrokerSummary,
     initial_message_bytes: u64,
     limit: u64,
     maximum_program_return_bytes: u64,
-    entry_bytes: u64,
-    entry_count: u64,
 }
 
 impl ProgrammaticTranscript {
@@ -323,7 +308,7 @@ impl ProgrammaticTranscript {
             .map(Message::transcript_bytes)
             .sum();
         let transcript = Self {
-            entries: Vec::new(),
+            summary: ProgrammaticBrokerSummary::default(),
             initial_message_bytes,
             limit: request.agent.limits.max_transcript_bytes,
             maximum_program_return_bytes: u64::try_from(limits.max_output_bytes).map_err(|_| {
@@ -331,91 +316,64 @@ impl ProgrammaticTranscript {
                     "program return byte limit does not fit accounting".into(),
                 )
             })?,
-            entry_bytes: 0,
-            entry_count: 0,
         };
-        transcript.ensure_projected(0, 0, transcript.maximum_program_return_bytes)?;
+        transcript.ensure_summary(transcript.summary, transcript.maximum_program_return_bytes)?;
         Ok(transcript)
     }
 
-    fn reserve_batch(&self, batch: &ToolBatch, request: &RunRequest) -> Result<(), HarnessError> {
-        let mut maximum_new_entry_bytes = 0u64;
-        for call in batch.calls() {
-            maximum_new_entry_bytes = checked_transcript_sum([
-                maximum_new_entry_bytes,
-                maximum_transcript_entry_bytes(
-                    &call.tool_id,
-                    &call.arguments,
-                    request.agent.limits.max_tool_result_bytes,
-                )?,
-            ])?;
-        }
-        self.ensure_projected(
-            maximum_new_entry_bytes,
-            u64::try_from(batch.calls().len()).map_err(|_| {
-                HarnessError::ResourceLimit(
-                    "programmatic batch length does not fit accounting".into(),
-                )
-            })?,
+    fn reserve_batch(&self, batch: &ToolBatch) -> Result<(), HarnessError> {
+        let additional = u64::try_from(batch.calls().len()).map_err(|_| {
+            HarnessError::ResourceLimit("programmatic batch length does not fit accounting".into())
+        })?;
+        let total = self.summary.total.checked_add(additional).ok_or_else(|| {
+            HarnessError::ResourceLimit("programmatic broker call count overflowed".into())
+        })?;
+        // Either outcome counter can grow to the projected total. Reserving
+        // both maxima is conservative by only a few decimal digits and keeps
+        // post-effect synthesis admission impossible.
+        self.ensure_summary(
+            ProgrammaticBrokerSummary {
+                total,
+                succeeded: total,
+                failed: total,
+            },
             self.maximum_program_return_bytes,
         )
     }
 
-    fn append(
-        &mut self,
-        tool_id: &str,
-        arguments: &Value,
-        ok: bool,
-        output: &Value,
-    ) -> Result<(), HarnessError> {
-        let entry = ProgrammaticTranscriptEntryRef {
-            tool_id,
-            arguments,
-            ok,
-            output,
+    fn record(&mut self, ok: bool) -> Result<(), HarnessError> {
+        let mut next = self.summary;
+        next.total = next.total.checked_add(1).ok_or_else(|| {
+            HarnessError::ResourceLimit("programmatic broker call count overflowed".into())
+        })?;
+        let outcome = if ok {
+            &mut next.succeeded
+        } else {
+            &mut next.failed
         };
-        let entry_bytes = count_json_bytes(&entry)?;
-        self.ensure_projected(entry_bytes, 1, self.maximum_program_return_bytes)?;
-        let next_entry_bytes = checked_transcript_sum([self.entry_bytes, entry_bytes])?;
-        let next_entry_count = self.entry_count.checked_add(1).ok_or_else(|| {
-            HarnessError::ResourceLimit("programmatic transcript entry count overflowed".into())
+        *outcome = outcome.checked_add(1).ok_or_else(|| {
+            HarnessError::ResourceLimit("programmatic broker outcome count overflowed".into())
         })?;
-        self.entries.try_reserve(1).map_err(|_| {
-            HarnessError::ResourceLimit("programmatic transcript allocation failed".into())
-        })?;
-        self.entries.push(ProgrammaticTranscriptEntry {
-            tool_id: tool_id.into(),
-            arguments: arguments.clone(),
-            ok,
-            output: output.clone(),
-        });
-        self.entry_bytes = next_entry_bytes;
-        self.entry_count = next_entry_count;
-        debug_assert_eq!(self.entry_count as usize, self.entries.len());
+        self.ensure_summary(next, self.maximum_program_return_bytes)?;
+        self.summary = next;
         Ok(())
     }
 
     fn synthesis_payload_capacity(&self, program_return: &Value) -> Result<usize, HarnessError> {
         let program_return_bytes = count_json_bytes(program_return)?;
-        self.ensure_projected(0, 0, program_return_bytes)?;
-        let payload_bytes =
-            synthesis_payload_bytes(program_return_bytes, self.entry_bytes, self.entry_count)?;
+        self.ensure_summary(self.summary, program_return_bytes)?;
+        let payload_bytes = synthesis_payload_bytes(program_return_bytes, self.summary)?;
         usize::try_from(payload_bytes).map_err(|_| {
             HarnessError::ResourceLimit("programmatic synthesis payload does not fit memory".into())
         })
     }
 
-    fn ensure_projected(
+    fn ensure_summary(
         &self,
-        additional_entry_bytes: u64,
-        additional_entries: u64,
+        summary: ProgrammaticBrokerSummary,
         program_return_bytes: u64,
     ) -> Result<(), HarnessError> {
-        let payload_bytes = synthesis_payload_bytes(
-            program_return_bytes,
-            checked_transcript_sum([self.entry_bytes, additional_entry_bytes])?,
-            checked_transcript_sum([self.entry_count, additional_entries])?,
-        )?;
+        let payload_bytes = synthesis_payload_bytes(program_return_bytes, summary)?;
         let projected = checked_transcript_sum([
             self.initial_message_bytes,
             SYNTHESIS_PROMPT.len() as u64,
@@ -431,33 +389,13 @@ impl ProgrammaticTranscript {
     }
 }
 
-fn maximum_transcript_entry_bytes(
-    tool_id: &str,
-    arguments: &Value,
-    maximum_result_bytes: u64,
-) -> Result<u64, HarnessError> {
-    checked_transcript_sum([
-        TRANSCRIPT_ENTRY_FRAME_BYTES,
-        count_json_bytes(&tool_id)?,
-        count_json_bytes(arguments)?,
-        TRANSCRIPT_FAILURE_BYTES,
-        maximum_result_bytes,
-    ])
-}
-
 fn synthesis_payload_bytes(
     program_return_bytes: u64,
-    entry_bytes: u64,
-    entry_count: u64,
+    summary: ProgrammaticBrokerSummary,
 ) -> Result<u64, HarnessError> {
-    // {"program_return":<value>,"broker_calls":[<entries>]}. The fixed
-    // punctuation and member names contribute 37 bytes.
-    checked_transcript_sum([
-        37,
-        program_return_bytes,
-        entry_bytes,
-        entry_count.saturating_sub(1),
-    ])
+    // {"program_return":<value>,"broker_calls":<summary>}. The fixed
+    // punctuation and member names contribute 35 bytes.
+    checked_transcript_sum([35, program_return_bytes, count_json_bytes(&summary)?])
 }
 
 fn checked_transcript_sum(values: impl IntoIterator<Item = u64>) -> Result<u64, HarnessError> {
@@ -507,7 +445,7 @@ fn serialize_synthesis_input(
         &mut bytes,
         &ProgrammaticSynthesisInput {
             program_return,
-            broker_calls: &transcript.entries,
+            broker_calls: transcript.summary,
         },
     )
     .map_err(|_| {
@@ -535,9 +473,9 @@ pub struct ProgrammaticHostConfig {
     /// requested, parsed, or compiled. When every slot is occupied, the run
     /// fails immediately with a resource limit rather than queueing. A held
     /// permit remains through program/model buffers, VM state, canonical tool
-    /// transcript, final synthesis, and output validation. This conservatively
-    /// bounds concurrent Programmatic-run retained memory rather than only VM
-    /// live-byte accounting.
+    /// results retained by the VM, the bounded synthesis summary, final
+    /// synthesis, and output validation. This conservatively bounds concurrent
+    /// Programmatic-run retained memory rather than only VM live-byte accounting.
     pub max_active_vms: usize,
     /// Maximum concurrent read-only, parallel-safe calls in a fan-out batch.
     pub max_fanout_concurrency: usize,
@@ -841,7 +779,7 @@ impl AgentRunner {
             prepared,
             continuation,
             RunStrategy::Adaptive,
-            StrategySelectionReason::PlannerSelectedDirect,
+            StrategySelectionReason::CapabilityDowngrade,
         )
         .await
     }
@@ -894,8 +832,8 @@ impl AgentRunner {
                 outcome: ProgramLifecycleOutcome::Started,
             });
             // This permit intentionally spans the complete Programmatic run:
-            // transcript creation, program generation and repair, parsing,
-            // compilation, VM construction, transcript retention, final
+            // synthesis-summary creation, program generation and repair,
+            // parsing, compilation, VM construction, retained VM values, final
             // synthesis, and output validation. It is a whole Programmatic
             // run-memory admission, not a per-slice compute permit. The
             // nonblocking check prevents a tool-held run from deadlocking a
@@ -1322,20 +1260,18 @@ impl AgentRunner {
             }
         }
 
-        // Reserve the full worst-case canonical broker envelope before the
-        // batch enters policy or approval. A later tool result therefore
-        // cannot make the synthesis payload exceed its budget after an effect
-        // has started.
-        transcript.reserve_batch(batch, request)?;
+        // Reserve the value-free broker summary before the batch enters policy
+        // or approval. Raw arguments and results stay inside the execution
+        // boundary and never expand the final synthesis prompt.
+        transcript.reserve_batch(batch)?;
 
         let mut prepared: Vec<(usize, Box<PreparedCall>)> = Vec::new();
         let mut responses: Vec<Option<ToolResponse>> = std::iter::repeat_with(|| None)
             .take(batch.calls().len())
             .collect();
-        let mut transcript_slots: Vec<Option<ProgrammaticTranscriptEntry>> =
-            std::iter::repeat_with(|| None)
-                .take(batch.calls().len())
-                .collect();
+        let mut transcript_slots: Vec<Option<bool>> = std::iter::repeat_with(|| None)
+            .take(batch.calls().len())
+            .collect();
         for (index, request_call) in batch.calls().iter().enumerate() {
             check_stopped(
                 &request.cancellation,
@@ -1387,12 +1323,7 @@ impl AgentRunner {
                 PrepareOutcome::Ready(call) => prepared.push((index, call)),
                 PrepareOutcome::Rejected(_) => {
                     responses[index] = Some(ToolResponse::failure(request_call));
-                    transcript_slots[index] = Some(ProgrammaticTranscriptEntry {
-                        tool_id: request_call.tool_id.clone(),
-                        arguments: request_call.arguments.clone(),
-                        ok: false,
-                        output: Value::Null,
-                    });
+                    transcript_slots[index] = Some(false);
                 }
                 PrepareOutcome::Stop => {
                     return Err(HarnessError::ResourceLimit(
@@ -1401,12 +1332,7 @@ impl AgentRunner {
                 }
                 PrepareOutcome::Reused(value) => {
                     responses[index] = Some(tool_response(request_call, value.as_ref(), limits)?);
-                    transcript_slots[index] = Some(ProgrammaticTranscriptEntry {
-                        tool_id: request_call.tool_id.clone(),
-                        arguments: request_call.arguments.clone(),
-                        ok: value.ok,
-                        output: value.output.clone(),
-                    });
+                    transcript_slots[index] = Some(value.ok);
                 }
             }
         }
@@ -1454,12 +1380,7 @@ impl AgentRunner {
                             "programmatic tool returned a failed or invalid result".into(),
                         )
                     });
-                    transcript_slots[*index] = Some(ProgrammaticTranscriptEntry {
-                        tool_id: call.call.tool_id.clone(),
-                        arguments: call.arguments.clone(),
-                        ok: false,
-                        output: Value::Null,
-                    });
+                    transcript_slots[*index] = Some(false);
                     continue;
                 }
                 Err(error) => {
@@ -1473,12 +1394,7 @@ impl AgentRunner {
                     if first_execution_error.is_none() {
                         first_execution_error = Some(error);
                     }
-                    transcript_slots[*index] = Some(ProgrammaticTranscriptEntry {
-                        tool_id: call.call.tool_id.clone(),
-                        arguments: call.arguments.clone(),
-                        ok: false,
-                        output: Value::Null,
-                    });
+                    transcript_slots[*index] = Some(false);
                     continue;
                 }
             };
@@ -1504,24 +1420,14 @@ impl AgentRunner {
                         ok: false,
                     });
                     first_execution_error.get_or_insert(error);
-                    transcript_slots[*index] = Some(ProgrammaticTranscriptEntry {
-                        tool_id: call.call.tool_id.clone(),
-                        arguments: call.arguments.clone(),
-                        ok: false,
-                        output: Value::Null,
-                    });
+                    transcript_slots[*index] = Some(false);
                     continue;
                 }
             }
-            transcript_slots[*index] = Some(ProgrammaticTranscriptEntry {
-                tool_id: call.call.tool_id.clone(),
-                arguments: call.arguments.clone(),
-                ok: true,
-                output: execution.result.output.clone(),
-            });
+            transcript_slots[*index] = Some(true);
         }
-        for entry in transcript_slots.into_iter().flatten() {
-            transcript.append(&entry.tool_id, &entry.arguments, entry.ok, &entry.output)?;
+        for ok in transcript_slots.into_iter().flatten() {
+            transcript.record(ok)?;
         }
         if let Some(error) = first_execution_error {
             return Err(error);
@@ -1575,12 +1481,10 @@ mod tests {
 
     fn transcript(limit: u64, maximum_program_return_bytes: u64) -> ProgrammaticTranscript {
         ProgrammaticTranscript {
-            entries: Vec::new(),
+            summary: ProgrammaticBrokerSummary::default(),
             initial_message_bytes: 17,
             limit,
             maximum_program_return_bytes,
-            entry_bytes: 0,
-            entry_count: 0,
         }
     }
 
@@ -1598,7 +1502,7 @@ mod tests {
     fn assert_payload_matches_serde(transcript: &ProgrammaticTranscript, program_return: &Value) {
         let expected = serde_json::to_vec(&ProgrammaticSynthesisInput {
             program_return,
-            broker_calls: &transcript.entries,
+            broker_calls: transcript.summary,
         })
         .unwrap();
         assert_eq!(
@@ -1616,171 +1520,93 @@ mod tests {
     }
 
     #[test]
-    fn incremental_transcript_accounting_matches_canonical_serialization() {
+    fn synthesis_summary_accounting_matches_canonical_serialization() {
         let program_return = json!({"value":"returned","items":[1,2,3]});
         let return_bytes = count_json_bytes(&program_return).unwrap();
         let mut transcript = transcript(u64::MAX, return_bytes);
 
         assert_payload_matches_serde(&transcript, &program_return);
 
-        transcript
-            .append("read", &json!({"value":"one"}), true, &json!({"value":1}))
-            .unwrap();
+        transcript.record(true).unwrap();
         assert_payload_matches_serde(&transcript, &program_return);
 
-        transcript
-            .append("read", &json!({"value":"two"}), false, &Value::Null)
-            .unwrap();
-        transcript
-            .append(
-                "read",
-                &json!({"value":"three"}),
-                true,
-                &json!({"value":"✓"}),
-            )
-            .unwrap();
+        transcript.record(false).unwrap();
+        transcript.record(true).unwrap();
         assert_payload_matches_serde(&transcript, &program_return);
-        assert_eq!(transcript.entry_count, 3);
-        assert_eq!(
-            transcript.entry_bytes,
-            transcript
-                .entries
-                .iter()
-                .map(count_json_bytes)
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-                .into_iter()
-                .sum::<u64>()
-        );
+        assert_eq!(transcript.summary.total, 3);
+        assert_eq!(transcript.summary.succeeded, 2);
+        assert_eq!(transcript.summary.failed, 1);
     }
 
     #[test]
-    fn incremental_transcript_enforces_exact_append_and_fanout_reservation_boundaries() {
+    fn synthesis_summary_enforces_exact_record_and_batch_boundaries() {
         let program_return = json!({"summary":"bounded"});
         let return_bytes = count_json_bytes(&program_return).unwrap();
         let mut probe = transcript(u64::MAX, return_bytes);
-        probe
-            .append("read", &json!({"value":1}), true, &json!({"value":"one"}))
-            .unwrap();
-        probe
-            .append("read", &json!({"value":2}), false, &Value::Null)
-            .unwrap();
+        for _ in 0..10 {
+            probe.record(true).unwrap();
+        }
         let limit = projected_limit(&probe, &program_return);
 
         let mut rejected = transcript(limit - 1, return_bytes);
-        rejected
-            .append("read", &json!({"value":1}), true, &json!({"value":"one"}))
-            .unwrap();
+        for _ in 0..9 {
+            rejected.record(true).unwrap();
+        }
         assert!(matches!(
-            rejected.append("read", &json!({"value":2}), false, &Value::Null),
+            rejected.record(true),
             Err(HarnessError::ResourceLimit(_))
         ));
-        assert_eq!(rejected.entry_count, 1);
+        assert_eq!(rejected.summary.total, 9);
         assert_payload_matches_serde(&rejected, &program_return);
 
         let mut at_limit = transcript(limit, return_bytes);
-        at_limit
-            .append("read", &json!({"value":1}), true, &json!({"value":"one"}))
-            .unwrap();
-        at_limit
-            .append("read", &json!({"value":2}), false, &Value::Null)
-            .unwrap();
+        for _ in 0..10 {
+            at_limit.record(true).unwrap();
+        }
         assert_payload_matches_serde(&at_limit, &program_return);
 
         let mut above_limit = transcript(limit + 1, return_bytes);
-        above_limit
-            .append("read", &json!({"value":1}), true, &json!({"value":"one"}))
-            .unwrap();
-        above_limit
-            .append("read", &json!({"value":2}), false, &Value::Null)
-            .unwrap();
+        for _ in 0..10 {
+            above_limit.record(true).unwrap();
+        }
         assert_payload_matches_serde(&above_limit, &program_return);
 
-        let maximum_result_bytes = 64;
-        let fanout_arguments = [json!({"value":1}), json!({"value":2}), json!({"value":3})];
-        let fanout_entry_bytes = fanout_arguments
-            .iter()
-            .map(|arguments| {
-                maximum_transcript_entry_bytes("read", arguments, maximum_result_bytes).unwrap()
-            })
-            .sum::<u64>();
-        let fanout_payload = synthesis_payload_bytes(
-            return_bytes,
-            fanout_entry_bytes,
-            fanout_arguments.len() as u64,
-        )
-        .unwrap();
+        let fanout_summary = ProgrammaticBrokerSummary {
+            total: 3,
+            succeeded: 3,
+            failed: 3,
+        };
+        let fanout_payload = synthesis_payload_bytes(return_bytes, fanout_summary).unwrap();
         let fanout_limit =
             checked_transcript_sum([17, SYNTHESIS_PROMPT.len() as u64, fanout_payload]).unwrap();
         assert!(matches!(
-            transcript(fanout_limit - 1, return_bytes).ensure_projected(
-                fanout_entry_bytes,
-                fanout_arguments.len() as u64,
-                return_bytes,
-            ),
+            transcript(fanout_limit - 1, return_bytes).ensure_summary(fanout_summary, return_bytes),
             Err(HarnessError::ResourceLimit(_))
         ));
         transcript(fanout_limit, return_bytes)
-            .ensure_projected(
-                fanout_entry_bytes,
-                fanout_arguments.len() as u64,
-                return_bytes,
-            )
+            .ensure_summary(fanout_summary, return_bytes)
             .unwrap();
         transcript(fanout_limit + 1, return_bytes)
-            .ensure_projected(
-                fanout_entry_bytes,
-                fanout_arguments.len() as u64,
-                return_bytes,
-            )
+            .ensure_summary(fanout_summary, return_bytes)
             .unwrap();
-
-        let output = json!({"result":"bounded"});
-        let exact_failure_entry = ProgrammaticTranscriptEntryRef {
-            tool_id: "read",
-            arguments: &fanout_arguments[0],
-            ok: false,
-            output: &output,
-        };
-        assert_eq!(
-            maximum_transcript_entry_bytes(
-                "read",
-                &fanout_arguments[0],
-                count_json_bytes(&output).unwrap(),
-            )
-            .unwrap(),
-            count_json_bytes(&exact_failure_entry).unwrap()
-        );
     }
 
     #[test]
-    fn incremental_transcript_stress_preserves_canonical_fanout_order() {
+    fn synthesis_summary_omits_raw_fanout_values() {
         let program_return = json!({"status":"complete"});
         let mut transcript = transcript(u64::MAX, count_json_bytes(&program_return).unwrap());
         for index in 0..512u64 {
-            let output = if index % 3 == 0 {
-                Value::Null
-            } else {
-                json!({"index":index,"ok":true})
-            };
-            transcript
-                .append(
-                    "fanout_read",
-                    &json!({"index":index}),
-                    index % 3 != 0,
-                    &output,
-                )
-                .unwrap();
+            transcript.record(index % 3 != 0).unwrap();
         }
         assert_payload_matches_serde(&transcript, &program_return);
-        let payload: Value =
-            serde_json::from_str(&serialize_synthesis_input(&program_return, &transcript).unwrap())
-                .unwrap();
-        let calls = payload["broker_calls"].as_array().unwrap();
-        assert_eq!(calls.len(), 512);
-        for (index, entry) in calls.iter().enumerate() {
-            assert_eq!(entry["arguments"]["index"], index as u64);
-            assert_eq!(entry["ok"], index % 3 != 0);
-        }
+        let serialized = serialize_synthesis_input(&program_return, &transcript).unwrap();
+        let payload: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(payload["broker_calls"]["total"], 512);
+        assert_eq!(payload["broker_calls"]["succeeded"], 341);
+        assert_eq!(payload["broker_calls"]["failed"], 171);
+        assert!(!serialized.contains("fanout_read"));
+        assert!(!serialized.contains("arguments"));
+        assert!(!serialized.contains("output"));
+        assert!(serialized.len() < 128);
     }
 }

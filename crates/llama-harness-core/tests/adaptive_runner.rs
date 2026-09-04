@@ -580,6 +580,14 @@ async fn adaptive_downgrades_to_direct_when_provider_cannot_plan() {
     )));
     assert!(events.events().iter().any(|record| matches!(
         record.event,
+        RunEvent::StrategySelected {
+            requested: RunStrategy::Adaptive,
+            selected: RunStrategy::Direct,
+            reason: llama_harness_core::StrategySelectionReason::CapabilityDowngrade,
+        }
+    )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
         RunEvent::StrategyUsage {
             model_calls: 1,
             planning_model_calls: 0,
@@ -880,6 +888,14 @@ async fn malformed_plan_gets_one_repair_then_falls_back_before_effects() {
         RunEvent::StrategyFallback {
             reason: llama_harness_core::StrategyFallbackReason::InvalidPlan,
             ..
+        }
+    )));
+    assert!(events.events().iter().any(|record| matches!(
+        record.event,
+        RunEvent::StrategySelected {
+            requested: RunStrategy::Adaptive,
+            selected: RunStrategy::Direct,
+            reason: llama_harness_core::StrategySelectionReason::CapabilityDowngrade,
         }
     )));
     assert!(events.events().iter().any(|record| matches!(

@@ -514,10 +514,6 @@ impl EvalExecutor for AcceptanceExecutor {
             _ if request.strategy == RunStrategy::Adaptive => 3,
             _ => 2,
         };
-        // Acceptance cases exercise a three-call large-intermediate-data
-        // fan-out with 256 KiB tool payloads. Keep its synthesis envelope
-        // independent from the general default transcript cap.
-        agent.limits.max_transcript_bytes = 16 * 1024 * 1024;
         let run = runner
             .run_with_strategy(
                 RunRequest::new(agent, request.case.input.clone()).with_run_id(format!(
@@ -550,6 +546,34 @@ impl EvalExecutor for AcceptanceExecutor {
                     "expected {expected_selected_strategy:?} strategy selection, observed {selected_strategy:?}"
                 ),
             ));
+        }
+        let provider_requests = provider.requests();
+        if scenario == "large-intermediate-data"
+            && expected_selected_strategy == RunStrategy::Programmatic
+        {
+            let synthesis_input = &provider_requests
+                .last()
+                .and_then(|model_request| model_request.messages.last())
+                .ok_or_else(|| {
+                    EvalError::Executor(
+                        "programmatic large-intermediate fixture omitted synthesis input".into(),
+                    )
+                })?
+                .content;
+            let raw_result_bytes = response_payload_bytes
+                .checked_mul(tool_ids.len())
+                .ok_or_else(|| EvalError::Executor("fixture byte count overflowed".into()))?;
+            if synthesis_input.len() >= raw_result_bytes / 100 {
+                return Err(EvalError::Executor(format!(
+                    "programmatic synthesis retained {} bytes for {raw_result_bytes} raw result bytes",
+                    synthesis_input.len()
+                )));
+            }
+            if synthesis_input.contains("\"payload\"") {
+                return Err(EvalError::Executor(
+                    "programmatic synthesis reinjected raw tool-result payloads".into(),
+                ));
+            }
         }
         for (index, call) in run.tool_calls.iter().enumerate() {
             let expected_arguments = if partial && index == 1 {
@@ -617,7 +641,7 @@ impl EvalExecutor for AcceptanceExecutor {
             wasted_tool_calls: Some((!exact) as u32),
         };
         drop(state);
-        Ok(EvalObservation::new(run, provider.requests().len() as u32)
+        Ok(EvalObservation::new(run, provider_requests.len() as u32)
             .with_strategy_metrics(metrics)
             .with_final_state(Some(final_state)))
     }

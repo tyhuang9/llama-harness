@@ -824,6 +824,38 @@ impl ToolRegistry {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn select_scope_for_run_callers(
+        &self,
+        query: &str,
+        allowlist: &[String],
+        callers: &[ToolCaller],
+        scope_caller: ToolCaller,
+        host_limits: ToolDiscoveryLimits,
+        provider_limits: &ProviderCapabilityLimits,
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> Result<ToolScopeSelection, HarnessError> {
+        debug_assert!(!callers.is_empty());
+        debug_assert!(callers.contains(&scope_caller));
+        let mut guard = || {
+            #[cfg(test)]
+            if let Some(checkpoint) = &self.discovery_checkpoint {
+                checkpoint(scope_caller);
+            }
+            check_stopped(cancellation, deadline, "run deadline reached")
+        };
+        self.select_scope_for_callers_guarded(
+            query,
+            allowlist,
+            callers,
+            scope_caller,
+            host_limits,
+            provider_limits,
+            &mut guard,
+        )
+    }
+
     fn select_scope_guarded(
         &self,
         query: &str,
@@ -833,10 +865,32 @@ impl ToolRegistry {
         provider_limits: &ProviderCapabilityLimits,
         guard: &mut impl FnMut() -> Result<(), HarnessError>,
     ) -> Result<ToolScopeSelection, HarnessError> {
+        self.select_scope_for_callers_guarded(
+            query,
+            allowlist,
+            &[caller],
+            caller,
+            host_limits,
+            provider_limits,
+            guard,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn select_scope_for_callers_guarded(
+        &self,
+        query: &str,
+        allowlist: &[String],
+        callers: &[ToolCaller],
+        scope_caller: ToolCaller,
+        host_limits: ToolDiscoveryLimits,
+        provider_limits: &ProviderCapabilityLimits,
+        guard: &mut impl FnMut() -> Result<(), HarnessError>,
+    ) -> Result<ToolScopeSelection, HarnessError> {
         let selection_started = StdInstant::now();
         guard()?;
         let limits = host_limits.effective(provider_limits);
-        let allowed = self.allowed_catalog_guarded(allowlist, caller, guard)?;
+        let allowed = self.allowed_catalog_for_callers_guarded(allowlist, callers, guard)?;
         let mut deferred_count = 0usize;
         for (position, entry) in allowed.iter().enumerate() {
             if position % DISCOVERY_GUARD_INTERVAL == 0 {
@@ -870,7 +924,7 @@ impl ToolRegistry {
             guard()?;
             finish_discovery_stats(&mut base_stats, selection_started);
             return Ok(ToolScopeSelection::Selected(
-                ToolScope::empty(caller),
+                ToolScope::empty(scope_caller),
                 base_stats,
             ));
         }
@@ -879,7 +933,7 @@ impl ToolRegistry {
             base_stats.selection = ToolDiscoverySelection::NoCapacity;
             finish_discovery_stats(&mut base_stats, selection_started);
             return Ok(ToolScopeSelection::Selected(
-                ToolScope::empty(caller),
+                ToolScope::empty(scope_caller),
                 base_stats,
             ));
         }
@@ -889,7 +943,7 @@ impl ToolRegistry {
             base_stats.selection = ToolDiscoverySelection::FullCatalog;
             return scope_with_stats(
                 self,
-                caller,
+                scope_caller,
                 selected,
                 base_stats,
                 false,
@@ -919,7 +973,7 @@ impl ToolRegistry {
             finish_discovery_stats(&mut base_stats, selection_started);
             return Ok(ToolScopeSelection::LimitReached(base_stats));
         }
-        let (index, cache_hit) = self.catalog_index_for_scope(&allowed, caller, guard)?;
+        let (index, cache_hit) = self.catalog_index_for_scope(&allowed, scope_caller, guard)?;
         base_stats.cache_hit = cache_hit;
         let selectable_deferred = limits.max_expansion.min(limits.max_tools) as usize;
         let ranked = rank(&index, query, selectable_deferred, guard)?;
@@ -1004,7 +1058,7 @@ impl ToolRegistry {
         };
         scope_with_stats(
             self,
-            caller,
+            scope_caller,
             selected,
             base_stats,
             true,

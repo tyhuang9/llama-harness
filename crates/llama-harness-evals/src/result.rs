@@ -743,8 +743,9 @@ fn aggregate_strategy<'a>(
             .ok_or(AggregateError::CounterOverflow("wasted_tool_calls"))?;
     }
 
-    let p50_latency_ms = nearest_rank_percentile(&mut latencies, 50);
-    let p95_latency_ms = nearest_rank_percentile(&mut latencies, 95);
+    latencies.sort_unstable();
+    let p50_latency_ms = nearest_rank_percentile(&latencies, 50);
+    let p95_latency_ms = nearest_rank_percentile(&latencies, 95);
     Ok(StrategyCohort {
         strategy,
         passes_readiness: samples.iter().all(|sample| sample.passes_readiness()),
@@ -764,10 +765,9 @@ fn aggregate_strategy<'a>(
     })
 }
 
-fn nearest_rank_percentile(values: &mut [u64], percentile: u8) -> u64 {
+fn nearest_rank_percentile(values: &[u64], percentile: u8) -> u64 {
     debug_assert!(!values.is_empty());
     debug_assert!((1..=100).contains(&percentile));
-    values.sort_unstable();
     let percentile = usize::from(percentile);
     let hundreds = values.len() / 100;
     let remainder = values.len() % 100;

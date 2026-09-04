@@ -174,18 +174,28 @@ impl StructuredOutputRequest {
 
     /// Validates name, size, depth, references, and JSON Schema syntax.
     pub fn validate(&self) -> Result<(), HarnessError> {
-        if self.name.is_empty() {
+        Self::validate_shape(&self.name, &self.schema)?;
+        compile_trusted_schema(&self.schema, |error| {
+            HarnessError::InvalidRequest(format!("invalid structured-output schema: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_shape(
+        name: &str,
+        schema: &serde_json::Value,
+    ) -> Result<(), HarnessError> {
+        if name.is_empty() {
             return Err(HarnessError::InvalidRequest(
                 "structured-output name must not be empty".into(),
             ));
         }
-        if self.name.len() > MAX_STRUCTURED_OUTPUT_NAME_BYTES {
+        if name.len() > MAX_STRUCTURED_OUTPUT_NAME_BYTES {
             return Err(HarnessError::InvalidRequest(format!(
                 "structured-output name exceeds {MAX_STRUCTURED_OUTPUT_NAME_BYTES} bytes"
             )));
         }
-        if !self
-            .name
+        if !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         {
@@ -193,20 +203,17 @@ impl StructuredOutputRequest {
                 "structured-output name must contain only ASCII letters, digits, '_' or '-'".into(),
             ));
         }
-        if serialized_len(&self.schema)? > MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES {
+        if serialized_len(schema)? > MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES {
             return Err(HarnessError::InvalidRequest(format!(
                 "structured-output schema exceeds {MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES} bytes"
             )));
         }
         ensure_json_depth(
             "structured-output schema",
-            &self.schema,
+            schema,
             MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH,
         )
         .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?;
-        compile_trusted_schema(&self.schema, |error| {
-            HarnessError::InvalidRequest(format!("invalid structured-output schema: {error}"))
-        })?;
         Ok(())
     }
 

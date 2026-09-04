@@ -87,6 +87,9 @@ struct StrategyRun<'a> {
     plan_attempt: u32,
     direct_scope: ToolScope,
     plan_scope: ToolScope,
+    declarative_available: bool,
+    #[cfg(feature = "programmatic")]
+    programmatic_candidates: BTreeSet<ProgrammaticWorkloadClass>,
     pending_speculative: Option<crate::speculation::ReadySpeculativeCommit>,
     speculation_eligibility: SpeculationEligibility,
 }
@@ -94,13 +97,32 @@ struct StrategyRun<'a> {
 struct PreparedPlanScope {
     scope: ToolScope,
     discovery: ToolDiscoveryStats,
+    declarative_available: bool,
+    #[cfg(feature = "programmatic")]
+    programmatic_candidates: BTreeSet<ProgrammaticWorkloadClass>,
+}
+
+impl PreparedPlanScope {
+    fn supports_programmatic(&self) -> bool {
+        #[cfg(feature = "programmatic")]
+        {
+            !self.programmatic_candidates.is_empty()
+        }
+        #[cfg(not(feature = "programmatic"))]
+        {
+            false
+        }
+    }
 }
 
 enum PlanningReadiness {
     Ready(PreparedPlanScope),
     NoTools(PreparedPlanScope),
     Downgrade(&'static str),
-    LimitReached(ToolDiscoveryStats),
+    LimitReached {
+        caller: ToolCaller,
+        stats: ToolDiscoveryStats,
+    },
 }
 
 struct PreparedNode {
@@ -133,7 +155,7 @@ enum ModelCallPhase {
     Reactive,
 }
 
-fn plan_schema(max_nodes: usize, allow_direct: bool) -> Value {
+fn plan_schema(max_nodes: usize, allow_direct: bool, allow_declarative: bool) -> Value {
     let declarative = serde_json::json!({
         "type": "object",
         "required": ["strategy", "plan"],
@@ -144,18 +166,18 @@ fn plan_schema(max_nodes: usize, allow_direct: bool) -> Value {
         "additionalProperties": false
     });
     let envelope = if allow_direct {
-        serde_json::json!({
-            "oneOf": [
-                {
-                    "type": "object",
-                    "required": ["strategy"],
-                    "properties": {"strategy": {"const": "direct"}},
-                    "additionalProperties": false
-                },
-                declarative
-            ]
-        })
+        let mut alternatives = vec![serde_json::json!({
+            "type": "object",
+            "required": ["strategy"],
+            "properties": {"strategy": {"const": "direct"}},
+            "additionalProperties": false
+        })];
+        if allow_declarative {
+            alternatives.push(declarative);
+        }
+        serde_json::json!({"oneOf": alternatives})
     } else {
+        debug_assert!(allow_declarative);
         declarative
     };
     let mut root = envelope.as_object().cloned().unwrap_or_default();
@@ -228,9 +250,10 @@ fn plan_schema(max_nodes: usize, allow_direct: bool) -> Value {
 #[cfg(feature = "programmatic")]
 fn plan_schema_with_programmatic(
     max_nodes: usize,
+    allow_declarative: bool,
     promoted: &BTreeSet<ProgrammaticWorkloadClass>,
 ) -> Value {
-    let mut schema = plan_schema(max_nodes, true);
+    let mut schema = plan_schema(max_nodes, true, allow_declarative);
     let programmatic = serde_json::json!({
         "type": "object",
         "required": ["strategy", "workload_class"],
@@ -255,16 +278,25 @@ fn plan_schema_with_programmatic(
 }
 
 #[cfg(feature = "programmatic")]
-fn planner_prompt_with_programmatic(promoted: &BTreeSet<ProgrammaticWorkloadClass>) -> String {
+fn planner_prompt_with_programmatic(
+    allow_declarative: bool,
+    promoted: &BTreeSet<ProgrammaticWorkloadClass>,
+) -> String {
     let classes = promoted
         .iter()
         .copied()
         .map(ProgrammaticWorkloadClass::as_str)
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "{PLANNER_PROMPT} You may instead return {{\"strategy\":\"programmatic\",\"workload_class\":<class>}} only when deterministic bounded orchestration materially fits one of these host-promoted workload classes: {classes}."
-    )
+    if allow_declarative {
+        format!(
+            "{PLANNER_PROMPT} You may instead return {{\"strategy\":\"programmatic\",\"workload_class\":<class>}} only when deterministic bounded orchestration materially fits one of these host-promoted workload classes: {classes}."
+        )
+    } else {
+        format!(
+            "Select the safest efficient tool strategy. Return only one strict JSON object: {{\"strategy\":\"direct\"}} when no bounded Programmatic workflow is justified, or {{\"strategy\":\"programmatic\",\"workload_class\":<class>}} only when deterministic bounded orchestration materially fits one of these host-promoted workload classes: {classes}. Use only the supplied tools. Choose direct for mutations, approval-sensitive work, ambiguity, or an uncertain next step."
+        )
+    }
 }
 
 impl AgentRunner {
@@ -324,7 +356,11 @@ impl AgentRunner {
             #[cfg(not(feature = "programmatic"))]
             RunStrategy::Programmatic => unreachable!("programmatic strategy returned above"),
             RunStrategy::DeclarativePlan => {
-                let readiness = match self.prepare_plan_scope(&request, preflight.deadline) {
+                let readiness = match self.prepare_plan_scope(
+                    &request,
+                    preflight.deadline,
+                    RunStrategy::DeclarativePlan,
+                ) {
                     Ok(readiness) => readiness,
                     Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
                         return Ok(pre_event_terminal_result(
@@ -349,25 +385,31 @@ impl AgentRunner {
                     PlanningReadiness::Downgrade(reason) => {
                         Err(HarnessError::UnsupportedCapability(reason.into()))
                     }
-                    PlanningReadiness::LimitReached(stats) => Ok(discovery_limit_terminal_result(
-                        &request,
-                        ToolCaller::DeclarativePlan,
-                        stats,
-                        &self.events,
-                        RunStrategy::DeclarativePlan,
-                        preflight.started,
-                        Some(DirectStrategyEvents {
-                            requested: RunStrategy::DeclarativePlan,
-                            reason: StrategySelectionReason::Forced,
-                            fallback: None,
-                            fallback_from: None,
-                            prior_discovery: None,
-                        }),
-                    )),
+                    PlanningReadiness::LimitReached { caller, stats } => {
+                        Ok(discovery_limit_terminal_result(
+                            &request,
+                            caller,
+                            stats,
+                            &self.events,
+                            RunStrategy::DeclarativePlan,
+                            preflight.started,
+                            Some(DirectStrategyEvents {
+                                requested: RunStrategy::DeclarativePlan,
+                                reason: StrategySelectionReason::Forced,
+                                fallback: None,
+                                fallback_from: None,
+                                prior_discovery: None,
+                            }),
+                        ))
+                    }
                 }
             }
             RunStrategy::Adaptive => {
-                let readiness = match self.prepare_plan_scope(&request, preflight.deadline) {
+                let readiness = match self.prepare_plan_scope(
+                    &request,
+                    preflight.deadline,
+                    RunStrategy::Adaptive,
+                ) {
                     Ok(readiness) => readiness,
                     Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
                         return Ok(pre_event_terminal_result(
@@ -401,10 +443,11 @@ impl AgentRunner {
                             .await
                     }
                     PlanningReadiness::NoTools(prepared) => {
-                        if self.adaptive_programmatic_enabled() {
+                        if prepared.supports_programmatic() {
                             self.run_planned(request, RunStrategy::Adaptive, prepared, preflight)
                                 .await
                         } else {
+                            let planner_caller = prepared.scope.caller();
                             self.run_direct(
                                 request,
                                 Some(DirectStrategyEvents {
@@ -412,10 +455,7 @@ impl AgentRunner {
                                     reason: StrategySelectionReason::CapabilityDowngrade,
                                     fallback: Some(StrategyFallbackReason::UnsupportedCapability),
                                     fallback_from: None,
-                                    prior_discovery: Some((
-                                        ToolCaller::DeclarativePlan,
-                                        prepared.discovery,
-                                    )),
+                                    prior_discovery: Some((planner_caller, prepared.discovery)),
                                 }),
                                 preflight,
                                 SpeculationEligibility::SequentialOnly,
@@ -423,15 +463,17 @@ impl AgentRunner {
                             .await
                         }
                     }
-                    PlanningReadiness::LimitReached(stats) => Ok(discovery_limit_terminal_result(
-                        &request,
-                        ToolCaller::DeclarativePlan,
-                        stats,
-                        &self.events,
-                        RunStrategy::Adaptive,
-                        preflight.started,
-                        None,
-                    )),
+                    PlanningReadiness::LimitReached { caller, stats } => {
+                        Ok(discovery_limit_terminal_result(
+                            &request,
+                            caller,
+                            stats,
+                            &self.events,
+                            RunStrategy::Adaptive,
+                            preflight.started,
+                            None,
+                        ))
+                    }
                 }
             }
         }
@@ -441,6 +483,7 @@ impl AgentRunner {
         &self,
         request: &RunRequest,
         deadline: Option<Instant>,
+        requested: RunStrategy,
     ) -> Result<PlanningReadiness, HarnessError> {
         let capabilities = self.provider.capabilities();
         if request.agent.limits.max_model_calls < 2 {
@@ -448,22 +491,51 @@ impl AgentRunner {
                 "run model-call budget cannot support planning and finalization",
             ));
         }
-        if !capabilities.supports_tools || !capabilities.supports_structured_plans {
+        if !capabilities.supports_tools {
             return Ok(PlanningReadiness::Downgrade(
-                "provider does not support structured plans",
+                "provider does not support tool calling",
             ));
         }
-        if capabilities.limits.max_plan_nodes == Some(0)
-            || capabilities.limits.max_plan_bytes == Some(0)
+        let declarative_available = capabilities.supports_structured_plans
+            && capabilities.limits.max_plan_nodes != Some(0)
+            && capabilities.limits.max_plan_bytes != Some(0);
+        #[cfg(feature = "programmatic")]
+        let programmatic_candidates = if requested == RunStrategy::Adaptive
+            && self.adaptive_programmatic_planning_ready(request, &capabilities)
         {
+            self.adaptive_programmatic_allowlist.clone()
+        } else {
+            BTreeSet::new()
+        };
+        #[cfg(feature = "programmatic")]
+        let programmatic_available = !programmatic_candidates.is_empty();
+        #[cfg(not(feature = "programmatic"))]
+        let programmatic_available = false;
+
+        if requested == RunStrategy::DeclarativePlan && !declarative_available {
             return Ok(PlanningReadiness::Downgrade(
-                "provider advertises no structured-plan capacity",
+                "provider does not support structured plans with nonzero capacity",
             ));
         }
-        let selection = self.tools.select_scope_for_run(
+        if requested == RunStrategy::Adaptive && !declarative_available && !programmatic_available {
+            return Ok(PlanningReadiness::Downgrade(
+                "provider supports no eligible advanced strategy",
+            ));
+        }
+
+        let mut callers = Vec::with_capacity(2);
+        if declarative_available {
+            callers.push(ToolCaller::DeclarativePlan);
+        }
+        if programmatic_available {
+            callers.push(ToolCaller::Programmatic);
+        }
+        let scope_caller = callers[0];
+        let selection = self.tools.select_scope_for_run_callers(
             &request.input,
             &request.agent.tool_allowlist,
-            ToolCaller::DeclarativePlan,
+            &callers,
+            scope_caller,
             self.discovery_limits,
             &capabilities.limits,
             &request.cancellation,
@@ -472,30 +544,46 @@ impl AgentRunner {
         let (scope, discovery) = match selection {
             ToolScopeSelection::Selected(scope, stats) => (scope, stats),
             ToolScopeSelection::LimitReached(stats) => {
-                return Ok(PlanningReadiness::LimitReached(stats));
+                return Ok(PlanningReadiness::LimitReached {
+                    caller: scope_caller,
+                    stats,
+                });
             }
         };
         if scope.is_empty() {
             return Ok(PlanningReadiness::NoTools(PreparedPlanScope {
                 scope,
                 discovery,
+                declarative_available,
+                #[cfg(feature = "programmatic")]
+                programmatic_candidates,
             }));
         }
         Ok(PlanningReadiness::Ready(PreparedPlanScope {
             scope,
             discovery,
+            declarative_available,
+            #[cfg(feature = "programmatic")]
+            programmatic_candidates,
         }))
     }
 
-    fn adaptive_programmatic_enabled(&self) -> bool {
-        #[cfg(feature = "programmatic")]
-        {
-            !self.adaptive_programmatic_allowlist.is_empty()
-        }
-        #[cfg(not(feature = "programmatic"))]
-        {
-            false
-        }
+    #[cfg(feature = "programmatic")]
+    fn adaptive_programmatic_planning_ready(
+        &self,
+        request: &RunRequest,
+        capabilities: &crate::ModelCapabilities,
+    ) -> bool {
+        !self.adaptive_programmatic_allowlist.is_empty()
+            && self.programmatic.is_some()
+            && request.agent.limits.max_model_calls >= 3
+            && capabilities.supports_programmatic_calling
+            && capabilities.programmatic_conformance
+                == Some(crate::ProgrammaticConformance::StrictJsonAstV1)
+            && capabilities
+                .limits
+                .max_program_bytes
+                .is_some_and(|bytes| bytes > 0)
     }
 
     async fn run_planned(
@@ -506,6 +594,7 @@ impl AgentRunner {
         preflight: RunPreflight,
     ) -> Result<RunResult, HarnessError> {
         let started = preflight.started;
+        let planner_caller = prepared_plan.scope.caller();
         let direct_selection = self.tools.select_scope_for_run(
             &request.input,
             &request.agent.tool_allowlist,
@@ -529,7 +618,7 @@ impl AgentRunner {
                 return Ok(discovery_limit_terminal_result_with_scopes(
                     &request,
                     &[
-                        (ToolCaller::DeclarativePlan, prepared_plan.discovery),
+                        (planner_caller, prepared_plan.discovery),
                         (ToolCaller::Direct, stats),
                     ],
                     &self.events,
@@ -545,7 +634,7 @@ impl AgentRunner {
                     &self.events,
                     requested,
                     started,
-                    &[(ToolCaller::DeclarativePlan, prepared_plan.discovery)],
+                    &[(planner_caller, prepared_plan.discovery)],
                 ));
             }
             Err(error) => return Err(error),
@@ -570,13 +659,15 @@ impl AgentRunner {
         let plan_scope = run.plan_scope.clone();
         let mut planner_messages = run.messages.clone();
         #[cfg(feature = "programmatic")]
-        let planner_prompt = if requested != RunStrategy::Adaptive
-            || self.adaptive_programmatic_allowlist.is_empty()
-        {
-            PLANNER_PROMPT.to_owned()
-        } else {
-            planner_prompt_with_programmatic(&self.adaptive_programmatic_allowlist)
-        };
+        let planner_prompt =
+            if requested != RunStrategy::Adaptive || run.programmatic_candidates.is_empty() {
+                PLANNER_PROMPT.to_owned()
+            } else {
+                planner_prompt_with_programmatic(
+                    run.declarative_available,
+                    &run.programmatic_candidates,
+                )
+            };
         #[cfg(not(feature = "programmatic"))]
         let planner_prompt = PLANNER_PROMPT.to_owned();
         planner_messages.insert(0, Message::system(planner_prompt));
@@ -908,9 +999,7 @@ impl AgentRunner {
             #[cfg(feature = "programmatic")]
             PlannerEnvelope::Programmatic { workload_class } => {
                 if requested != RunStrategy::Adaptive
-                    || !self
-                        .adaptive_programmatic_allowlist
-                        .contains(&workload_class)
+                    || !run.programmatic_candidates.contains(&workload_class)
                 {
                     run.select_programmatic_fallback(
                         requested,
@@ -993,7 +1082,7 @@ impl<'a> StrategyRun<'a> {
         });
         emit_discovery(
             &mut events,
-            ToolCaller::DeclarativePlan,
+            prepared_plan.scope.caller(),
             prepared_plan.discovery,
         );
         emit_discovery(&mut events, ToolCaller::Direct, direct_discovery);
@@ -1020,6 +1109,9 @@ impl<'a> StrategyRun<'a> {
             plan_attempt: 0,
             direct_scope,
             plan_scope: prepared_plan.scope,
+            declarative_available: prepared_plan.declarative_available,
+            #[cfg(feature = "programmatic")]
+            programmatic_candidates: prepared_plan.programmatic_candidates,
             pending_speculative: None,
             speculation_eligibility: SpeculationEligibility::SequentialOnly,
         }
@@ -1226,20 +1318,27 @@ impl<'a> StrategyRun<'a> {
                 let allow_direct = self.selected == RunStrategy::Adaptive;
                 #[cfg(feature = "programmatic")]
                 let promoted = allow_direct
-                    .then_some(&self.runner.adaptive_programmatic_allowlist)
+                    .then_some(&self.programmatic_candidates)
                     .filter(|allowlist| !allowlist.is_empty());
                 #[cfg(feature = "programmatic")]
                 let schema = promoted.map_or_else(
-                    || plan_schema(max_nodes, allow_direct),
-                    |allowlist| plan_schema_with_programmatic(max_nodes, allowlist),
+                    || plan_schema(max_nodes, allow_direct, self.declarative_available),
+                    |allowlist| {
+                        plan_schema_with_programmatic(
+                            max_nodes,
+                            self.declarative_available,
+                            allowlist,
+                        )
+                    },
                 );
                 #[cfg(not(feature = "programmatic"))]
-                let schema = plan_schema(max_nodes, allow_direct);
+                let schema = plan_schema(max_nodes, allow_direct, self.declarative_available);
+                #[cfg(feature = "programmatic")]
+                let has_programmatic_candidates = !self.programmatic_candidates.is_empty();
+                #[cfg(not(feature = "programmatic"))]
+                let has_programmatic_candidates = false;
                 StructuredOutputRequest::new(
-                    if cfg!(feature = "programmatic")
-                        && allow_direct
-                        && self.runner.adaptive_programmatic_enabled()
-                    {
+                    if allow_direct && has_programmatic_candidates {
                         "llama_harness_adaptive_programmatic_envelope_v1"
                     } else if allow_direct {
                         "llama_harness_planner_envelope_v1"
@@ -1260,7 +1359,7 @@ impl<'a> StrategyRun<'a> {
                     .min(MAX_EXECUTION_PLAN_NODES);
                 StructuredOutputRequest::new(
                     "llama_harness_recovery_plan_v1",
-                    plan_schema(max_nodes, false),
+                    plan_schema(max_nodes, false, true),
                     true,
                 )
                 .map(Some)
@@ -1293,7 +1392,7 @@ impl<'a> StrategyRun<'a> {
         self.events.emit(RunEvent::StrategySelected {
             requested,
             selected: RunStrategy::Direct,
-            reason: StrategySelectionReason::PlannerSelectedDirect,
+            reason: StrategySelectionReason::CapabilityDowngrade,
         });
         self.selected = RunStrategy::Direct;
     }
@@ -1350,16 +1449,6 @@ impl<'a> StrategyRun<'a> {
         let output = response.final_output.ok_or_else(|| {
             HarnessError::InvalidOutput("planner omitted the strategy envelope".into())
         })?;
-        let capabilities = self.runner.provider.capabilities();
-        if capabilities
-            .limits
-            .max_plan_bytes
-            .is_some_and(|limit| output.len() as u64 > limit)
-        {
-            return Err(HarnessError::ResourceLimit(
-                "planner envelope exceeds provider plan-byte limit".into(),
-            ));
-        }
         let envelope: PlannerEnvelope = serde_json::from_str(&output).map_err(|_| {
             HarnessError::InvalidOutput("planner returned an invalid strategy envelope".into())
         })?;
@@ -1375,6 +1464,13 @@ impl<'a> StrategyRun<'a> {
         {
             return Err(HarnessError::InvalidOutput(
                 "forced declarative planning cannot select programmatic execution".into(),
+            ));
+        }
+        if !self.declarative_available
+            && matches!(envelope, PlannerEnvelope::DeclarativePlan { .. })
+        {
+            return Err(HarnessError::InvalidOutput(
+                "provider cannot execute declarative plans".into(),
             ));
         }
         if let PlannerEnvelope::DeclarativePlan { plan } = &envelope {

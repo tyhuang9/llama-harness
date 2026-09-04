@@ -776,10 +776,20 @@ impl ToolRegistry {
             .expect("the unguarded catalog traversal cannot fail")
     }
 
+    #[cfg(test)]
     pub(crate) fn allowed_catalog_guarded(
         &self,
         allowlist: &[String],
         caller: ToolCaller,
+        guard: &mut impl FnMut() -> Result<(), HarnessError>,
+    ) -> Result<Vec<AllowedCatalogEntry<'_>>, HarnessError> {
+        self.allowed_catalog_for_callers_guarded(allowlist, &[caller], guard)
+    }
+
+    pub(crate) fn allowed_catalog_for_callers_guarded(
+        &self,
+        allowlist: &[String],
+        callers: &[ToolCaller],
         guard: &mut impl FnMut() -> Result<(), HarnessError>,
     ) -> Result<Vec<AllowedCatalogEntry<'_>>, HarnessError> {
         let mut seen = BTreeSet::new();
@@ -794,7 +804,10 @@ impl ToolRegistry {
             if !seen.insert(entry.definition.id.as_str()) {
                 continue;
             }
-            if entry.definition.allows_caller(caller) {
+            if callers
+                .iter()
+                .any(|caller| entry.definition.allows_caller(*caller))
+            {
                 allowed.push(AllowedCatalogEntry {
                     definition: &entry.definition,
                     metadata: &entry.discovery,

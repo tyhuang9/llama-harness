@@ -96,6 +96,9 @@ it never constructs a `RunResult` or bypasses broker effects. Include repair,
 pre-dispatch fallback, capability downgrade, unpromoted Programmatic proposals,
 and explicitly promoted loop, fan-out, filter, aggregation, and
 large-intermediate-data cases alongside every applicable forced strategy.
+The large-intermediate case also asserts that Programmatic final synthesis
+contains no raw result payload and remains below one percent of the three
+256 KiB broker results under the default transcript limit.
 Add privacy canaries that prove lifecycle events, SQLite export, errors, and
 debug formatting omit program source, AST, bytecode, constants, locals,
 arguments, and tool results. Evaluation artifacts retain only the explicit

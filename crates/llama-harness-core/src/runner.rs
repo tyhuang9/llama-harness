@@ -1194,7 +1194,7 @@ pub(crate) fn validate_request(request: &RunRequest) -> Result<Option<Validator>
         .map(|schema| {
             ensure_json_depth("output schema", schema, limits.max_json_depth)
                 .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?;
-            StructuredOutputRequest::new("llama_harness_agent_output", schema.clone(), true)?;
+            StructuredOutputRequest::validate_shape("llama_harness_agent_output", schema)?;
             compile_trusted_schema(schema, |error| {
                 HarnessError::InvalidRequest(format!("invalid output schema: {error}"))
             })

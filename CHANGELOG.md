@@ -16,6 +16,9 @@ All notable changes to this project are documented here.
 - Add provider-neutral strict structured-output requests, cohort-based
   safety/correctness readiness with P50/P95 ranking, and explicit
   non-speculative recovery, retry, and fallback paths.
+- Keep Programmatic selection independent from declarative-plan capability and
+  reduce final synthesis to a bounded program return plus value-free broker
+  counts instead of reinjecting raw intermediate tool data.
 - Document the 0.1-to-0.2 migration, release sequencing, and immutable-package
   rollback boundaries.
 
