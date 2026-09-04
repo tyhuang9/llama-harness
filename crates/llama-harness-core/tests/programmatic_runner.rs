@@ -1994,9 +1994,13 @@ async fn empty_programmatic_fanout_completes_without_broker_or_tool_calls() {
 }
 
 #[tokio::test]
-async fn transcript_envelope_rejects_a_fanout_before_policy_or_dispatch() {
+async fn value_free_summary_does_not_reserve_max_tool_result_bytes() {
     let provider = Arc::new(
-        MockModelProvider::scripted([final_response(two_read_fanout_program())]).with_capabilities(
+        MockModelProvider::scripted([
+            final_response(two_read_fanout_program()),
+            final_response("done"),
+        ])
+        .with_capabilities(
             capabilities().with_parallel_tool_calls(true).with_limits(
                 ProviderCapabilityLimits::new()
                     .with_max_program_bytes(64 * 1024)
@@ -2008,9 +2012,9 @@ async fn transcript_envelope_rejects_a_fanout_before_policy_or_dispatch() {
     let mut registry = ToolRegistry::default();
     registry.register(tool.clone()).unwrap();
     let mut run_request = request(&["read"]);
-    // One potential 1 MiB program return fits, but reserving two possible
-    // 1 MiB canonical tool responses does not. This must stop before policy,
-    // approval, or a tool dispatch can begin.
+    // One potential 1 MiB program return fits. The two possible 1 MiB broker
+    // results are not copied into final synthesis, so their maximum sizes do
+    // not consume this transcript budget.
     run_request.agent.limits.max_transcript_bytes = 2 * 1024 * 1024;
     let result = AgentRunner::builder(provider.clone())
         .tools(registry)
@@ -2021,9 +2025,10 @@ async fn transcript_envelope_rejects_a_fanout_before_policy_or_dispatch() {
         .await
         .unwrap();
 
-    assert_eq!(result.status, RunStatus::LimitReached);
-    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.final_output.as_deref(), Some("done"));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -2048,10 +2053,6 @@ async fn programmatic_parallel_fanout_preserves_input_order_through_reverse_comp
     };
     let mut run_request = request(&["read"]);
     run_request.agent.limits.max_programmatic_fanout_concurrency = 3;
-    // This test isolates ordering rather than the bounded final-synthesis
-    // envelope. Three possible 1 MiB responses plus a 1 MiB program return
-    // require more than the default 4 MiB transcript allowance.
-    run_request.agent.limits.max_transcript_bytes = 16 * 1024 * 1024;
     let runner = Arc::new(
         AgentRunner::builder(provider.clone())
             .tools(registry)
@@ -2085,17 +2086,11 @@ async fn programmatic_parallel_fanout_preserves_input_order_through_reverse_comp
     let synthesis = requests[1]
         .messages
         .last()
-        .expect("final synthesis receives the canonical broker transcript");
+        .expect("final synthesis receives the bounded program return and broker summary");
     let canonical: Value = serde_json::from_str(&synthesis.content).unwrap();
-    assert_eq!(
-        canonical["broker_calls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|call| call["arguments"]["value"].as_u64().unwrap())
-            .collect::<Vec<_>>(),
-        vec![1, 2, 3]
-    );
+    assert_eq!(canonical["broker_calls"]["total"], 3);
+    assert_eq!(canonical["broker_calls"]["succeeded"], 3);
+    assert_eq!(canonical["broker_calls"]["failed"], 0);
     assert_eq!(
         canonical["program_return"]
             .as_array()
