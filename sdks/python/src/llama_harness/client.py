@@ -189,19 +189,18 @@ class HarnessClient:
         except OSError as error:
             raise RuntimeUnavailableError(f"Could not start {path}: {error}") from error
         client = cls(process, provider=provider, stderr=on_stderr)
-        response = await client._request("client_hello", {"sdk": {"name": "llama-harness-python", "version": SDK_VERSION}, "capabilities": ["async_callbacks"]})
-        if response["type"] != "runtime_hello":
-            await client.close()
-            raise RuntimeProtocolError(f"Expected runtime_hello, received {response['type']}")
         try:
+            response = await client._request("client_hello", {"sdk": {"name": "llama-harness-python", "version": SDK_VERSION}, "capabilities": ["async_callbacks"]})
+            if response["type"] != "runtime_hello":
+                raise RuntimeProtocolError(f"Expected runtime_hello, received {response['type']}")
             client._negotiated_protocol_version = _selected_protocol_version(str(response["protocol_version"]))
             runtime_version = response["payload"].get("runtime_version")
             if runtime_version != SDK_VERSION:
                 raise RuntimeProtocolError(f"Runtime version mismatch: SDK {SDK_VERSION}, runtime {runtime_version}")
+            return client
         except BaseException:
-            await client.close()
+            await client._abort_startup()
             raise
-        return client
 
     @property
     def protocol_version(self) -> str | None:
@@ -221,6 +220,22 @@ class HarnessClient:
             if self._process.stdin: self._process.stdin.close()
             await self._process.wait()
             self._reader_task.cancel(); self._stderr_task.cancel()
+
+    async def _abort_startup(self) -> None:
+        """Bound cleanup when no trustworthy protocol session was established."""
+        self._closed = True
+        if self._process.stdin:
+            self._process.stdin.close()
+        try:
+            await asyncio.wait_for(self._process.wait(), timeout=0.5)
+        except asyncio.TimeoutError:
+            if self._process.returncode is None:
+                self._process.kill()
+            await self._process.wait()
+        finally:
+            self._reader_task.cancel()
+            self._stderr_task.cancel()
+            await asyncio.gather(self._reader_task, self._stderr_task, return_exceptions=True)
 
     async def run(self, *, agent: Mapping[str, Any], input: str, tools: list[Tool] | None = None,
                   policy: PolicyCallback | None = None, approve: ApprovalCallback | None = None,
@@ -374,6 +389,11 @@ def _selected_protocol_version(value: str) -> Literal["1.0", "1.1"]:
     raise RuntimeProtocolError(f"Unsupported runtime protocol version {value}", "incompatible_version", False)
 def _protocol_error(payload: Mapping[str, Any]) -> RuntimeProtocolError:
     return RuntimeProtocolError(str(payload.get("message", "Runtime protocol error")), str(payload["code"]) if payload.get("code") is not None else None, bool(payload["retryable"]) if payload.get("retryable") is not None else None)
+def _wire_bool(value: Any, default: bool = False) -> bool: return value if isinstance(value, bool) else default
+def _wire_enum(value: Any, allowed: set[str], default: str) -> str: return value if isinstance(value, str) and value in allowed else default
+def _wire_callers(value: Any) -> tuple[ToolCaller, ...]:
+    if not isinstance(value, list): return ("direct",)
+    return tuple(entry for entry in value if entry in {"direct", "declarative_plan", "programmatic", "speculative"})
 def _tool(value: Tool, include_v11_metadata: bool) -> dict[str, Json]:
     result: dict[str, Json] = {"id": value.id, "name": value.name or value.id, "description": value.description, "arguments_schema": value.arguments_schema, "risk": value.risk, "read_only": value.read_only, "idempotent": value.idempotent}
     if include_v11_metadata:
@@ -396,5 +416,5 @@ def _agent(value: Mapping[str, Any]) -> dict[str, Json]:
     return {"id": str(value["id"]), "name": str(value["name"]), "version": str(value["version"]), "system_instructions": str(value.get("instructions", "")), "default_model": str(value.get("default_model", value.get("defaultModel"))), "tool_allowlist": list(value.get("tool_allowlist", value.get("toolAllowlist", []))), "limits": value.get("limits", {}), "generation": value.get("generation", {}), "metadata": value.get("metadata", {})}
 def _result(value: Mapping[str, Any]) -> dict[str, Any]: return {**value, "final_output": value.get("final_output"), "trace_id": value.get("trace_id")}
 def _callback_request(state: _RunState, payload: Mapping[str, Any]) -> PolicyRequest:
-    wire = payload["tool"]; value = Tool(id=str(wire["id"]), name=str(wire["name"]), description=str(wire["description"]), arguments_schema=wire["arguments_schema"], risk=wire["risk"], read_only=wire["read_only"], idempotent=wire["idempotent"], output_schema=wire.get("output_schema"), parallel_safe=bool(wire.get("parallel_safe", False)), concurrency_key=wire.get("concurrency_key"), cancellation_safety=wire.get("cancellation_safety", "unknown"), expected_latency_ms=wire.get("expected_latency_ms"), allowed_callers=tuple(wire.get("allowed_callers", ["direct"])), speculation_policy=wire.get("speculation_policy", "disabled"), issue_safety=wire.get("issue_safety", "unknown"), execution_location=wire.get("execution_location", "unknown"), network_egress=wire.get("network_egress", "unknown"), execute=lambda: None)
+    wire = payload["tool"]; value = Tool(id=str(wire["id"]), name=str(wire["name"]), description=str(wire["description"]), arguments_schema=wire["arguments_schema"], risk=_wire_enum(wire.get("risk"), {"low", "medium", "high"}, "high"), read_only=_wire_bool(wire.get("read_only")), idempotent=_wire_bool(wire.get("idempotent")), output_schema=wire.get("output_schema"), parallel_safe=_wire_bool(wire.get("parallel_safe")), concurrency_key=wire.get("concurrency_key") if isinstance(wire.get("concurrency_key"), str) else None, cancellation_safety=_wire_enum(wire.get("cancellation_safety"), {"unknown", "cooperative", "guaranteed"}, "unknown"), expected_latency_ms=wire.get("expected_latency_ms") if isinstance(wire.get("expected_latency_ms"), int) else None, allowed_callers=_wire_callers(wire.get("allowed_callers")), speculation_policy=_wire_enum(wire.get("speculation_policy"), {"disabled", "enabled"}, "disabled"), issue_safety=_wire_enum(wire.get("issue_safety"), {"unknown", "guaranteed"}, "unknown"), execution_location=_wire_enum(wire.get("execution_location"), {"unknown", "local_private", "remote"}, "unknown"), network_egress=_wire_enum(wire.get("network_egress"), {"unknown", "prohibited", "permitted"}, "unknown"), execute=lambda: None)
     return PolicyRequest(state.run_id, str(payload["trace_id"]), str(payload["call_id"]), value, payload["arguments"], payload.get("deadline_ms"))

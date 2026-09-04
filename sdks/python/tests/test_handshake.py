@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -27,6 +28,27 @@ class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
                 await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test", strategy="declarative_plan")
             run = await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test", strategy="direct")
             self.assertEqual((await run.result())["status"], "completed")
+
+    async def test_normalizes_malformed_callback_safety_metadata_conservatively(self) -> None:
+        path, args = self.fake_runtime_args("malformed_metadata")
+        observed = None
+        async def policy(request: object) -> dict[str, str]:
+            nonlocal observed
+            observed = request.tool
+            return {"outcome": "deny", "reason": "fixture"}
+        async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args) as client:
+            run = await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test", policy=policy)
+            await run.result()
+        self.assertEqual((observed.risk, observed.read_only, observed.idempotent, observed.parallel_safe, observed.cancellation_safety, observed.allowed_callers, observed.speculation_policy, observed.issue_safety, observed.execution_location, observed.network_egress), ("high", False, False, False, "unknown", (), "disabled", "unknown", "unknown", "unknown"))
+
+    async def test_terminates_child_when_handshake_request_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "closed"
+            path, args = self.fake_runtime_args("hello_error")
+            args.append(str(marker))
+            with self.assertRaisesRegex(RuntimeProtocolError, "hello rejected"):
+                await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args)
+            self.assertTrue(marker.is_file())
 
     async def test_rejects_incompatible_major_drift_and_structured_protocol_error(self) -> None:
         path, args = self.fake_runtime_args("incompatible")

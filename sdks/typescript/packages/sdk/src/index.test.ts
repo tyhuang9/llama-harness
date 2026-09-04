@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import test from "node:test";
 
 import { defineTool, HarnessClient, RuntimeProtocolError } from "./index.js";
@@ -67,6 +68,25 @@ test("fails incompatible majors, envelope drift, and structured protocol errors"
   try {
     await assert.rejects(failure.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test" }), (error: unknown) => error instanceof RuntimeProtocolError && error.code === "invalid_state");
   } finally { await failure.close(); }
+});
+
+test("terminates the child when the handshake request is rejected", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "llama-harness-sdk-hello-"));
+  const marker = join(directory, "closed");
+  try {
+    await assert.rejects(HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "hello_error", marker] }), /hello rejected/);
+    assert.equal(existsSync(marker), true);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("normalizes malformed callback safety metadata conservatively", async () => {
+  const client = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "malformed_metadata"] });
+  try {
+    let observed: unknown;
+    const run = await client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test", policy: (request) => { observed = request.tool; return { outcome: "deny", reason: "fixture" }; } });
+    await run.result();
+    assert.deepEqual(observed, { id: "notes.search", name: "Search", description: "Search", argumentsSchema: {}, risk: "high", idempotent: false, readOnly: false, outputSchema: undefined, parallelSafe: false, concurrencyKey: undefined, cancellationSafety: "unknown", expectedLatencyMs: undefined, allowedCallers: [], speculationPolicy: "disabled", issueSafety: "unknown", executionLocation: "unknown", networkEgress: "unknown" });
+  } finally { await client.close(); }
 });
 
 test("performs a handshake with the workspace-built Rust runtime", { skip: !existsSync(resolve(process.cwd(), "../../../../target/debug/llama-harness-runtime.exe")) }, async () => {
