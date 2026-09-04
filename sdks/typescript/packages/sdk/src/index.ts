@@ -191,8 +191,8 @@ export class HarnessClient {
   async run(options: RunOptions): Promise<HarnessRun> {
     if (this.terminalError) throw this.terminalError;
     const strategy = options.strategy;
-    if ((strategy === "declarative_plan" || strategy === "programmatic") && this._negotiatedProtocolVersion !== "1.1") {
-      throw new RuntimeProtocolError(`${strategy} requires negotiated protocol version 1.1`);
+    if (strategy !== undefined && this._negotiatedProtocolVersion !== "1.1") {
+      throw new RuntimeProtocolError(`explicit strategy ${strategy} requires negotiated protocol version 1.1`);
     }
     const tools = options.tools ?? [];
     const payload = {

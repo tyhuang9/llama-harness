@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 mode = sys.argv[1] if len(sys.argv) > 1 else "legacy"
-selected = "2.0" if mode == "incompatible" else "1.1" if mode in {"modern", "drift", "protocol_error", "version_mismatch", "malformed_metadata", "hello_error"} else "1.0"
+selected = "2.0" if mode == "incompatible" else "1.1" if mode in {"modern", "agent_schema", "drift", "protocol_error", "version_mismatch", "malformed_metadata", "hello_error"} else "1.0"
 shutdown_marker = Path(sys.argv[2]) if len(sys.argv) > 2 else None
 
 for line in sys.stdin:
@@ -26,8 +26,13 @@ for line in sys.stdin:
         request = message["payload"]["request"]
         tools = request.get("tools", [])
         first_tool = tools[0] if tools else None
+        agent_schema = request.get("agent", {}).get("output_schema")
         if mode == "modern" and (request.get("strategy") != "programmatic" or not first_tool or first_tool.get("output_schema") is None or first_tool.get("parallel_safe") is not True or first_tool.get("execution_location") != "local_private"):
             response = {"protocol_version": selected, "request_id": message["request_id"], "type": "protocol_error", "payload": {"code": "invalid_message", "message": "1.1 metadata was not serialized", "retryable": False}}
+            print(json.dumps(response), flush=True)
+            continue
+        if mode == "agent_schema" and agent_schema != {"type": "object", "additionalProperties": False}:
+            response = {"protocol_version": selected, "request_id": message["request_id"], "type": "protocol_error", "payload": {"code": "invalid_message", "message": "agent output schema was not serialized", "retryable": False}}
             print(json.dumps(response), flush=True)
             continue
         if mode == "legacy" and ((first_tool and ("output_schema" in first_tool or "parallel_safe" in first_tool)) or "strategy" in request):
@@ -40,6 +45,8 @@ for line in sys.stdin:
             response = {"protocol_version": selected, "request_id": "policy-request", "run_id": "test-run", "type": "policy_decision_requested", "payload": {"callback_id": "policy-1", "trace_id": "trace", "call_id": "call-1", "tool": {"id": "notes.search", "name": "Search", "description": "Search", "arguments_schema": {}, "risk": "invalid", "idempotent": "true", "read_only": "true", "parallel_safe": "true", "cancellation_safety": "invalid", "allowed_callers": ["invalid"], "speculation_policy": "invalid", "issue_safety": "invalid", "execution_location": "invalid", "network_egress": "invalid"}, "arguments": {}}}
         elif mode == "drift":
             response = {"protocol_version": "1.0", "request_id": "drift", "run_id": "test-run", "type": "run_event", "payload": {"trace_id": "trace", "sequence": 1, "timestamp_ms": 1, "event": {"type": "model_responded", "call_number": 1}}}
+        elif mode == "agent_schema":
+            response = {"protocol_version": selected, "request_id": "complete", "run_id": "test-run", "type": "run_completed", "payload": {"result": {"status": "completed", "final_output": "ok", "model": "mock", "trace_id": "trace", "duration_ms": 1}}}
         else:
             response = {"protocol_version": selected, "request_id": "complete", "run_id": "test-run", "type": "run_completed", "payload": {"result": {"status": "completed", "final_output": "ok", "model": "mock", "trace_id": "trace", "duration_ms": 1}}}
     elif kind == "policy_decision" and mode == "malformed_metadata":

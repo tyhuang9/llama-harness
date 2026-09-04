@@ -50,6 +50,7 @@ Minimum supported Rust version: **1.88**.
 | `observability` | Redacted, local SQLite run and event storage |
 | `evals` | Deterministic evaluation and replay contracts |
 | `tauri` | Tauri event, approval, cancellation, and trace helpers |
+| `programmatic` | Deterministic sandbox contracts for explicitly configured embedded Rust hosts; unavailable in the managed SDK sidecar |
 | `mcp` | Transport-neutral MCP tool catalog adapters; hosts own transport and credentials |
 
 ## Quick start with Ollama

@@ -243,8 +243,10 @@ class HarnessClient:
                   evaluation: Mapping[str, Json] | None = None, model: str | None = None,
                   generation: Mapping[str, Json] | None = None, strategy: RunStrategy | None = None) -> HarnessRun:
         if self._terminal_error: raise self._terminal_error
-        if strategy in {"declarative_plan", "programmatic"} and self._negotiated_protocol_version != "1.1":
-            raise RuntimeProtocolError(f"{strategy} requires negotiated protocol version 1.1")
+        if strategy is not None and self._negotiated_protocol_version != "1.1":
+            raise RuntimeProtocolError(
+                f"explicit strategy {strategy} requires negotiated protocol version 1.1"
+            )
         selected_tools = tools or []
         request: dict[str, Any] = {"provider": _provider(self._provider), "agent": _agent(agent), "input": input,
             "tools": [_tool(value, self._negotiated_protocol_version == "1.1") for value in selected_tools], "application_context": application_context or {}, "metadata": metadata or {},
@@ -413,7 +415,21 @@ def _provider(value: Mapping[str, Any]) -> dict[str, Json]:
     if value.get("kind") != "ollama": raise HarnessError("Only the ollama provider is supported by sidecar v1")
     return {"kind": "ollama", "base_url": str(value.get("base_url", value.get("baseUrl", "http://127.0.0.1:11434")))}
 def _agent(value: Mapping[str, Any]) -> dict[str, Json]:
-    return {"id": str(value["id"]), "name": str(value["name"]), "version": str(value["version"]), "system_instructions": str(value.get("instructions", "")), "default_model": str(value.get("default_model", value.get("defaultModel"))), "tool_allowlist": list(value.get("tool_allowlist", value.get("toolAllowlist", []))), "limits": value.get("limits", {}), "generation": value.get("generation", {}), "metadata": value.get("metadata", {})}
+    result: dict[str, Json] = {
+        "id": str(value["id"]),
+        "name": str(value["name"]),
+        "version": str(value["version"]),
+        "system_instructions": str(value.get("instructions", "")),
+        "default_model": str(value.get("default_model", value.get("defaultModel"))),
+        "tool_allowlist": list(value.get("tool_allowlist", value.get("toolAllowlist", []))),
+        "limits": value.get("limits", {}),
+        "generation": value.get("generation", {}),
+        "metadata": value.get("metadata", {}),
+    }
+    output_schema = value.get("output_schema", value.get("outputSchema"))
+    if output_schema is not None:
+        result["output_schema"] = output_schema
+    return result
 def _result(value: Mapping[str, Any]) -> dict[str, Any]: return {**value, "final_output": value.get("final_output"), "trace_id": value.get("trace_id")}
 def _callback_request(state: _RunState, payload: Mapping[str, Any]) -> PolicyRequest:
     wire = payload["tool"]; value = Tool(id=str(wire["id"]), name=str(wire["name"]), description=str(wire["description"]), arguments_schema=wire["arguments_schema"], risk=_wire_enum(wire.get("risk"), {"low", "medium", "high"}, "high"), read_only=_wire_bool(wire.get("read_only")), idempotent=_wire_bool(wire.get("idempotent")), output_schema=wire.get("output_schema"), parallel_safe=_wire_bool(wire.get("parallel_safe")), concurrency_key=wire.get("concurrency_key") if isinstance(wire.get("concurrency_key"), str) else None, cancellation_safety=_wire_enum(wire.get("cancellation_safety"), {"unknown", "cooperative", "guaranteed"}, "unknown"), expected_latency_ms=wire.get("expected_latency_ms") if isinstance(wire.get("expected_latency_ms"), int) else None, allowed_callers=_wire_callers(wire.get("allowed_callers")), speculation_policy=_wire_enum(wire.get("speculation_policy"), {"disabled", "enabled"}, "disabled"), issue_safety=_wire_enum(wire.get("issue_safety"), {"unknown", "guaranteed"}, "unknown"), execution_location=_wire_enum(wire.get("execution_location"), {"unknown", "local_private", "remote"}, "unknown"), network_egress=_wire_enum(wire.get("network_egress"), {"unknown", "prohibited", "permitted"}, "unknown"), execute=lambda: None)

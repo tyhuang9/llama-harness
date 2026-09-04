@@ -35,6 +35,18 @@ Use `await client.health()` and `await client.listModels()` for typed provider
 inspection before a run. Those calls are separate JSONL commands: they do not
 start an agent loop, create a run ID, or request a host tool callback.
 
+`client.run({ strategy })` accepts `adaptive`, `direct`, `declarative_plan`, or
+`programmatic` after protocol 1.1 is negotiated. Protocol 1.0 cannot represent
+an explicit strategy, so omit the field when using that fallback; the SDK
+rejects every explicit value instead of silently changing its meaning. The
+managed sidecar has no configured programmatic sandbox and rejects
+`programmatic`. Programmatic execution is available only to explicitly
+configured embedded Rust hosts.
+
+Set `agent.outputSchema` to request structured output. The schema is transported
+unchanged to the Rust runtime, which enforces its size and depth bounds, compiles
+it as JSON Schema, and rejects external references before any model call.
+
 At startup the SDK sends its package name and version in `client_hello`; the
 runtime responds with its own version and negotiated protocol minor. A missing,
 malformed, major-incompatible, or version-mismatched hello means the local

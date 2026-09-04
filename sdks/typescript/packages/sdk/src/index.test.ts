@@ -15,7 +15,7 @@ test("routes a typed host tool callback and ordered runtime event", async () => 
   const client = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js")] });
   try {
     const tool = defineTool({ id: "notes.search", name: "Search", description: "Search notes", argumentsSchema: {}, risk: "low", idempotent: true, readOnly: true, execute: async (toolArguments) => ({ found: (toolArguments as { query: string }).query }) });
-    const run = await client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock", toolAllowlist: ["notes.search"] }, input: "find", tools: [tool], strategy: "adaptive" });
+    const run = await client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock", toolAllowlist: ["notes.search"] }, input: "find", tools: [tool] });
     const events = [];
     for await (const event of run.events()) events.push(event);
     const result = await run.result();
@@ -46,13 +46,18 @@ test("negotiates 1.1, derives hello identity from the package version, and seria
   } finally { await client.close(); }
 });
 
-test("falls back to 1.0 and rejects forced advanced strategies before start_run", async () => {
+test("falls back to 1.0 and rejects every explicit strategy before start_run", async () => {
   const client = await HarnessClient.start({ provider: { kind: "ollama" }, runtimePath: process.execPath, runtimeArgs: [join(here, "fake-runtime.js"), "legacy"] });
   try {
     assert.equal(client.negotiatedProtocolVersion, "1.0");
-    await assert.rejects(client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test", strategy: "declarative_plan" }), RuntimeProtocolError);
-    const direct = await client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test", strategy: "direct" });
-    await direct.result();
+    for (const strategy of ["adaptive", "direct", "declarative_plan", "programmatic"] as const) {
+      await assert.rejects(
+        client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test", strategy }),
+        (error: unknown) => error instanceof RuntimeProtocolError && /requires negotiated protocol version 1\.1/.test(error.message),
+      );
+    }
+    const legacyDefault = await client.run({ agent: { id: "agent", name: "Agent", version: "1", defaultModel: "mock" }, input: "test" });
+    await legacyDefault.result();
   } finally { await client.close(); }
 });
 

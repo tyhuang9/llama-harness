@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from llama_harness import HarnessClient, ProviderHealth, ProviderModel, RuntimeProtocolError, Tool
+from llama_harness import HarnessClient, HarnessError, ProviderHealth, ProviderModel, RuntimeProtocolError, Tool
 
 
 class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
@@ -20,14 +20,27 @@ class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
             run = await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test", tools=[advanced], strategy="programmatic")
             self.assertEqual((await run.result())["status"], "completed")
 
-    async def test_legacy_fallback_rejects_advanced_modes_before_start(self) -> None:
+    async def test_legacy_fallback_rejects_every_explicit_strategy_before_start(self) -> None:
         path, args = self.fake_runtime_args("legacy")
         async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args) as client:
             self.assertEqual(client.protocol_version, "1.0")
-            with self.assertRaises(RuntimeProtocolError):
-                await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test", strategy="declarative_plan")
-            run = await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test", strategy="direct")
+            for strategy in ("adaptive", "direct", "declarative_plan", "programmatic"):
+                with self.subTest(strategy=strategy), self.assertRaisesRegex(RuntimeProtocolError, "requires negotiated protocol version 1.1"):
+                    await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test", strategy=strategy)
+            run = await client.run(agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock"}, input="test")
             self.assertEqual((await run.result())["status"], "completed")
+
+    async def test_serializes_agent_output_schema_from_snake_and_camel_case(self) -> None:
+        path, args = self.fake_runtime_args("agent_schema")
+        schema = {"type": "object", "additionalProperties": False}
+        async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=path, runtime_args=args) as client:
+            for field in ("output_schema", "outputSchema"):
+                with self.subTest(field=field):
+                    run = await client.run(
+                        agent={"id": "agent", "name": "Agent", "version": "1", "default_model": "mock", field: schema},
+                        input="test",
+                    )
+                    self.assertEqual((await run.result())["status"], "completed")
 
     async def test_normalizes_malformed_callback_safety_metadata_conservatively(self) -> None:
         path, args = self.fake_runtime_args("malformed_metadata")
@@ -129,3 +142,15 @@ class RuntimeHandshakeTests(unittest.IsolatedAsyncioTestCase):
             models = await client.list_models()
             self.assertEqual([(model.id, model.supports_tools, model.supports_streaming, model.supports_structured_output) for model in models], [("mock-model", True, False, True)])
             self.assertIsNotNone(models[0].capabilities)
+
+    async def test_workspace_scripted_runtime_rejects_external_agent_output_schema(self) -> None:
+        runtime = Path(__file__).resolve().parents[3] / "target" / "debug" / "llama-harness-scripted-runtime.exe"
+        if not runtime.is_file():
+            self.skipTest("workspace scripted runtime has not been built")
+        async with await HarnessClient.start(provider={"kind": "ollama"}, runtime_path=runtime) as client:
+            run = await client.run(
+                agent={"id": "scripted", "name": "Scripted", "version": "1", "default_model": "mock", "output_schema": {"$ref": "https://example.invalid/schema.json"}},
+                input="test",
+            )
+            with self.assertRaisesRegex(HarnessError, "external schema reference is disabled"):
+                await run.result()
