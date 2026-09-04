@@ -44,11 +44,11 @@ cases:
     expected: {status: completed, final_output_contains: [done], tool_sequence: [], max_model_calls: 3, max_tool_calls: 0}
   - id: no-tool-adaptive
     strategy: adaptive
-    fixture: {id: no-tool, data: {scenario: no-tool, tools: []}}
+    fixture: {id: no-tool, data: {scenario: no-tool, expected_adaptive_selection: direct, tools: []}}
     input: Answer without tools.
     expected: {status: completed, final_output_contains: [done], tool_sequence: [], max_model_calls: 3, max_tool_calls: 0}
   - id: single-call
-    fixture: {id: single-call, data: {scenario: single-call, tools: [read]}}
+    fixture: {id: single-call, data: {scenario: single-call, expected_adaptive_selection: direct, tools: [read]}}
     input: Read one deterministic value.
     expected: {status: completed, final_output_contains: [done], required_tools: [read], tool_sequence: [read], expected_tool_arguments: [{tool_id: read, arguments_subset: {}}], max_model_calls: 3, max_tool_calls: 1}
 "#;
@@ -283,6 +283,30 @@ fn evidence_source(source: &str) -> Option<&'static str> {
     }
 }
 
+fn expected_selected_strategy(
+    fixture: &llama_harness_evals::EvalFixture,
+    requested_strategy: RunStrategy,
+) -> Result<RunStrategy, EvalError> {
+    if requested_strategy != RunStrategy::Adaptive {
+        return Ok(requested_strategy);
+    }
+
+    match fixture
+        .data
+        .get("expected_adaptive_selection")
+        .and_then(Value::as_str)
+    {
+        Some("direct") => Ok(RunStrategy::Direct),
+        Some("programmatic") => Ok(RunStrategy::Programmatic),
+        Some(other) => Err(EvalError::Executor(format!(
+            "unknown expected Adaptive selection: {other}"
+        ))),
+        None => Err(EvalError::Executor(
+            "Adaptive fixtures must declare expected_adaptive_selection".into(),
+        )),
+    }
+}
+
 #[async_trait]
 impl EvalExecutor for RunnerMatrixExecutor {
     async fn execute(&self, request: EvalExecutionRequest) -> Result<EvalObservation, EvalError> {
@@ -332,23 +356,12 @@ impl EvalExecutor for RunnerMatrixExecutor {
                 RunEvent::StrategySelected { selected, .. } => Some(selected),
                 _ => None,
             });
-        let expected_selected = if request.strategy == RunStrategy::Adaptive {
-            RunStrategy::Direct
-        } else {
-            request.strategy
-        };
+        let expected_selected = expected_selected_strategy(fixture, request.strategy)?;
         if selected != Some(expected_selected) {
             return Err(EvalError::Executor(format!(
                 "expected {expected_selected:?} strategy selection, observed {selected:?}"
             )));
         }
-        if request.strategy == RunStrategy::Adaptive && selected == Some(RunStrategy::Programmatic)
-        {
-            return Err(EvalError::Executor(
-                "Adaptive selected Programmatic in a compatibility workload".into(),
-            ));
-        }
-
         let state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -487,7 +500,9 @@ fn acceptance_manifest_audits_every_required_workload_against_executable_coverag
         "mixed-read-write",
         "loop",
         "fan-out",
+        "filter",
         "aggregation",
+        "large-intermediate-data",
         "catalog-30",
         "catalog-100",
         "catalog-1000",
@@ -563,6 +578,24 @@ fn acceptance_manifest_audits_every_required_workload_against_executable_coverag
         ],
         "{id} is the executable cross-strategy baseline"
     );
+    for id in [
+        "loop",
+        "fan-out",
+        "filter",
+        "aggregation",
+        "large-intermediate-data",
+    ] {
+        assert_eq!(
+            by_id(id).strategies,
+            vec![
+                RunStrategy::Direct,
+                RunStrategy::DeclarativePlan,
+                RunStrategy::Programmatic,
+                RunStrategy::Adaptive,
+            ],
+            "{id} must compare Adaptive with every forced strategy"
+        );
+    }
     assert!(by_id("speculation-no-writes")
         .strategies
         .contains(&RunStrategy::Direct));

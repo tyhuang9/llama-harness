@@ -8,27 +8,31 @@ defaults:
   repeat: 1
 cases:
   - id: branch
-    fixture: {id: branch, data: {scenario: branch, tools: [read]}}
+    fixture: {id: branch, data: {scenario: branch, tools: [read], expected_adaptive_selection: direct}}
     input: Execute a conditional read.
     expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 1}
   - id: loop
-    fixture: {id: loop, data: {scenario: loop, tools: [read, read]}}
+    fixture: {id: loop, data: {scenario: loop, workload_class: loop, expected_adaptive_selection: programmatic, tools: [read, read]}}
     input: Execute two bounded reads.
     expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 2}
   - id: fanout
-    fixture: {id: fanout, data: {scenario: fanout, tools: [read, read, read]}}
+    fixture: {id: fanout, data: {scenario: fanout, workload_class: fan_out, expected_adaptive_selection: programmatic, tools: [read, read, read]}}
     input: Execute bounded parallel reads.
     expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 3}
   - id: filter
-    fixture: {id: filter, data: {scenario: filter, tools: [read]}}
+    fixture: {id: filter, data: {scenario: filter, workload_class: filter, expected_adaptive_selection: programmatic, tools: [read]}}
     input: Filter the read results.
     expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 1}
   - id: reduce-aggregate
-    fixture: {id: reduce-aggregate, data: {scenario: reduce-aggregate, tools: [read, read]}}
+    fixture: {id: reduce-aggregate, data: {scenario: reduce-aggregate, workload_class: aggregation, expected_adaptive_selection: programmatic, tools: [read, read]}}
     input: Reduce and aggregate read results.
     expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 2}
+  - id: large-intermediate-data
+    fixture: {id: large-intermediate-data, data: {scenario: large-intermediate-data, workload_class: large_intermediate_data, expected_adaptive_selection: programmatic, response_payload_bytes: 262144, tools: [read, read, read]}}
+    input: Fan out bounded reads that retain large intermediate payloads.
+    expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 3, final_state_subset: {result_payload_bytes: 786432}}
   - id: mixed-approval
-    fixture: {id: mixed-approval, data: {scenario: mixed-approval, tools: [read, write], approval_tools: [write]}}
+    fixture: {id: mixed-approval, data: {scenario: mixed-approval, expected_adaptive_selection: direct, tools: [read, write], approval_tools: [write]}}
     input: Read then approve a write.
     expected: {status: completed, required_tools: [read, write], required_approval_tools: [write], max_model_calls: 3, max_tool_calls: 2}
   - id: partial-failure
@@ -43,11 +47,11 @@ cases:
     expected: {status: completed, max_model_calls: 3, max_tool_calls: 0}
   - id: fallback
     strategy: programmatic
-    fixture: {id: fallback, data: {scenario: fallback, tools: [read]}}
+    fixture: {id: fallback, data: {scenario: fallback, expected_forced_selection: direct, tools: [read]}}
     input: Fall back to Direct after invalid program repair fails.
     expected: {status: completed, required_tools: [read], max_model_calls: 4, max_tool_calls: 1}
   - id: capability-downgrade
-    strategy: direct
-    fixture: {id: capability-downgrade, data: {scenario: capability-downgrade, tools: [read], programmatic_available: false}}
+    strategy: adaptive
+    fixture: {id: capability-downgrade, data: {scenario: capability-downgrade, workload_class: loop, expected_adaptive_selection: direct, tools: [read], programmatic_available: false}}
     input: Safely run after Programmatic capability downgrade.
-    expected: {status: completed, required_tools: [read], max_model_calls: 2, max_tool_calls: 1}
+    expected: {status: completed, required_tools: [read], max_model_calls: 3, max_tool_calls: 1}

@@ -3,8 +3,9 @@ use llama_harness_core::{
     mock::{final_response, MockModelProvider, MockStep},
     AgentDefinition, AgentRunner, ApprovalHandler, ApprovalRecord, HarnessError, InMemoryEventSink,
     ModelCapabilities, ModelResponse, PolicyDecision, PolicyEngine, ProgrammaticConformance,
-    ProgrammaticHostConfig, ProviderCapabilityLimits, RunEvent, RunRequest, RunStatus, RunStrategy,
-    Tool, ToolCaller, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    ProgrammaticHostConfig, ProgrammaticWorkloadClass, ProviderCapabilityLimits, RunEvent,
+    RunRequest, RunStatus, RunStrategy, Tool, ToolCaller, ToolDefinition, ToolRegistry, ToolResult,
+    ToolRisk,
 };
 use llama_harness_evals::{
     evaluate_suite, load_suite, EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation,
@@ -25,15 +26,22 @@ struct State {
     policy_calls: Vec<String>,
     approval_calls: Vec<(String, bool)>,
     approvals: u32,
+    result_payload_bytes: u64,
 }
 
 struct FixtureTool {
     definition: ToolDefinition,
     state: Arc<Mutex<State>>,
+    response_payload_bytes: usize,
 }
 
 impl FixtureTool {
-    fn new(id: &str, read_only: bool, state: Arc<Mutex<State>>) -> Self {
+    fn new(
+        id: &str,
+        read_only: bool,
+        state: Arc<Mutex<State>>,
+        response_payload_bytes: usize,
+    ) -> Self {
         Self {
             definition: ToolDefinition::new(
                 id,
@@ -60,6 +68,7 @@ impl FixtureTool {
                 ToolCaller::Programmatic,
             ]),
             state,
+            response_payload_bytes,
         }
     }
 }
@@ -75,17 +84,33 @@ impl Tool for FixtureTool {
         arguments: Value,
         _: CancellationToken,
     ) -> Result<ToolResult, HarnessError> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .effects
-            .push((self.definition.id.clone(), arguments.clone()));
-        if arguments["fail"] == Value::Bool(true) {
+        let failed = arguments["fail"] == Value::Bool(true);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .effects
+                .push((self.definition.id.clone(), arguments.clone()));
+            if !failed {
+                state.result_payload_bytes = state
+                    .result_payload_bytes
+                    .saturating_add(self.response_payload_bytes as u64);
+            }
+        }
+        if failed {
             Ok(ToolResult::failure("fixture partial failure"))
-        } else {
+        } else if self.response_payload_bytes == 0 {
             Ok(ToolResult::success(
                 json!({"tool": self.definition.id, "value": arguments["value"]}),
             ))
+        } else {
+            Ok(ToolResult::success(json!({
+                "tool": self.definition.id,
+                "value": arguments["value"],
+                "payload": "x".repeat(self.response_payload_bytes),
+            })))
         }
     }
 }
@@ -209,6 +234,48 @@ fn ret(scenario: &str) -> Value {
     json!({"kind": "return", "value": {"kind": "string", "value": scenario}})
 }
 
+fn fixture_workload_class(data: &Value) -> Result<Option<ProgrammaticWorkloadClass>, EvalError> {
+    match data.get("workload_class").and_then(Value::as_str) {
+        None => Ok(None),
+        Some("loop") => Ok(Some(ProgrammaticWorkloadClass::Loop)),
+        Some("fan_out") => Ok(Some(ProgrammaticWorkloadClass::FanOut)),
+        Some("filter") => Ok(Some(ProgrammaticWorkloadClass::Filter)),
+        Some("aggregation") => Ok(Some(ProgrammaticWorkloadClass::Aggregation)),
+        Some("large_intermediate_data") => {
+            Ok(Some(ProgrammaticWorkloadClass::LargeIntermediateData))
+        }
+        Some(other) => Err(EvalError::Executor(format!(
+            "unknown fixture Programmatic workload class: {other}"
+        ))),
+    }
+}
+
+fn expected_selected_strategy(
+    data: &Value,
+    requested_strategy: RunStrategy,
+) -> Result<RunStrategy, EvalError> {
+    if requested_strategy != RunStrategy::Adaptive {
+        if data["expected_forced_selection"].as_str() == Some("direct") {
+            return Ok(RunStrategy::Direct);
+        }
+        return Ok(requested_strategy);
+    }
+
+    match data
+        .get("expected_adaptive_selection")
+        .and_then(Value::as_str)
+    {
+        Some("direct") => Ok(RunStrategy::Direct),
+        Some("programmatic") => Ok(RunStrategy::Programmatic),
+        Some(other) => Err(EvalError::Executor(format!(
+            "unknown expected Adaptive selection: {other}"
+        ))),
+        None => Err(EvalError::Executor(
+            "Adaptive fixtures must declare expected_adaptive_selection".into(),
+        )),
+    }
+}
+
 fn program(scenario: &str, tool_ids: &[String]) -> String {
     let body = match scenario {
         "branch" => vec![
@@ -223,6 +290,12 @@ fn program(scenario: &str, tool_ids: &[String]) -> String {
             ret(scenario),
         ],
         "fanout" => vec![
+            json!({"kind": "fan_out", "name": "results", "tool_id": "read", "item": "item", "max_calls": 3,
+                "collection": {"kind": "array", "items": [{"kind": "integer", "value": 1}, {"kind": "integer", "value": 2}, {"kind": "integer", "value": 3}]},
+                "arguments": {"kind": "object", "entries": [{"key": "value", "value": {"kind": "variable", "name": "item"}}]}}),
+            ret(scenario),
+        ],
+        "large-intermediate-data" => vec![
             json!({"kind": "fan_out", "name": "results", "tool_id": "read", "item": "item", "max_calls": 3,
                 "collection": {"kind": "array", "items": [{"kind": "integer", "value": 1}, {"kind": "integer", "value": 2}, {"kind": "integer", "value": 3}]},
                 "arguments": {"kind": "object", "entries": [{"key": "value", "value": {"kind": "variable", "name": "item"}}]}}),
@@ -301,6 +374,8 @@ fn steps(
     strategy: RunStrategy,
     tool_ids: &[String],
     partial: bool,
+    workload_class: Option<&str>,
+    programmatic_available: bool,
 ) -> Vec<MockStep> {
     match scenario {
         "repair" => vec![
@@ -330,13 +405,35 @@ fn steps(
                 final_response(program(scenario, tool_ids)),
                 final_response(format!("{scenario} done")),
             ],
-            RunStrategy::Adaptive => vec![
-                final_response(r#"{"strategy":"direct"}"#),
-                MockStep::Response(
-                    ModelResponse::new("fixture-model").with_tool_calls(calls(tool_ids, partial)),
-                ),
-                final_response(format!("{scenario} done")),
-            ],
+            RunStrategy::Adaptive => match workload_class {
+                Some(workload_class) => {
+                    let mut responses = vec![final_response(
+                        json!({
+                            "strategy": "programmatic",
+                            "workload_class": workload_class,
+                        })
+                        .to_string(),
+                    )];
+                    if programmatic_available {
+                        responses.push(final_response(program(scenario, tool_ids)));
+                    } else {
+                        responses.push(MockStep::Response(
+                            ModelResponse::new("fixture-model")
+                                .with_tool_calls(calls(tool_ids, partial)),
+                        ));
+                    }
+                    responses.push(final_response(format!("{scenario} done")));
+                    responses
+                }
+                None => vec![
+                    final_response(r#"{"strategy":"direct"}"#),
+                    MockStep::Response(
+                        ModelResponse::new("fixture-model")
+                            .with_tool_calls(calls(tool_ids, partial)),
+                    ),
+                    final_response(format!("{scenario} done")),
+                ],
+            },
         },
     }
 }
@@ -358,28 +455,50 @@ impl EvalExecutor for AcceptanceExecutor {
             .collect::<Vec<_>>();
         let partial = data["partial_failure"] == Value::Bool(true);
         let programmatic_available = data["programmatic_available"].as_bool().unwrap_or(true);
+        let response_payload_bytes = data["response_payload_bytes"]
+            .as_u64()
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| EvalError::Executor("fixture payload does not fit usize".into()))?
+            .unwrap_or(0);
+        let workload_class = fixture_workload_class(data)?;
         let state = Arc::new(Mutex::new(State::default()));
         let mut registry = ToolRegistry::default();
         registry
-            .register(Arc::new(FixtureTool::new("read", true, state.clone())))
+            .register(Arc::new(FixtureTool::new(
+                "read",
+                true,
+                state.clone(),
+                response_payload_bytes,
+            )))
             .map_err(|error| EvalError::Executor(error.to_string()))?;
         registry
-            .register(Arc::new(FixtureTool::new("write", false, state.clone())))
+            .register(Arc::new(FixtureTool::new("write", false, state.clone(), 0)))
             .map_err(|error| EvalError::Executor(error.to_string()))?;
         let provider = Arc::new(
-            MockModelProvider::scripted(steps(scenario, request.strategy, &tool_ids, partial))
-                .with_capabilities(
-                    capabilities().with_programmatic_calling(programmatic_available),
-                ),
+            MockModelProvider::scripted(steps(
+                scenario,
+                request.strategy,
+                &tool_ids,
+                partial,
+                data["workload_class"].as_str(),
+                programmatic_available,
+            ))
+            .with_capabilities(capabilities().with_programmatic_calling(programmatic_available)),
         );
         let events = Arc::new(InMemoryEventSink::default());
-        let runner = AgentRunner::builder(provider.clone())
+        let runner_builder = AgentRunner::builder(provider.clone())
             .tools(registry)
             .policy(Arc::new(FixturePolicy(state.clone())))
             .approvals(Arc::new(FixtureApprovals(state.clone())))
             .event_sink(events.clone())
-            .programmatic(ProgrammaticHostConfig::default())
-            .build();
+            .programmatic(ProgrammaticHostConfig::default());
+        let runner = match workload_class {
+            Some(workload_class) => runner_builder
+                .adaptive_programmatic_allowlist([workload_class])
+                .build(),
+            None => runner_builder.build(),
+        };
         let mut agent = AgentDefinition::new("fixture-agent", "Fixture Agent", "1", &request.model);
         agent.tool_allowlist = vec!["read".into(), "write".into()];
         agent.limits.max_model_calls = match scenario {
@@ -388,9 +507,9 @@ impl EvalExecutor for AcceptanceExecutor {
             _ if request.strategy == RunStrategy::Adaptive => 3,
             _ => 2,
         };
-        // Acceptance cases exercise the strategy matrix, including a
-        // three-call fan-out. Keep its 1 MiB-per-response worst-case synthesis
-        // envelope independent from the general default transcript cap.
+        // Acceptance cases exercise a three-call large-intermediate-data
+        // fan-out with 256 KiB tool payloads. Keep its synthesis envelope
+        // independent from the general default transcript cap.
         agent.limits.max_transcript_bytes = 16 * 1024 * 1024;
         let run = runner
             .run_with_strategy(
@@ -417,11 +536,12 @@ impl EvalExecutor for AcceptanceExecutor {
                     RunEvent::StrategySelected { selected, .. } => Some(*selected),
                     _ => None,
                 });
-        if request.strategy == RunStrategy::Adaptive
-            && matches!(selected_strategy, Some(RunStrategy::Programmatic))
-        {
+        let expected_selected_strategy = expected_selected_strategy(data, request.strategy)?;
+        if selected_strategy != Some(expected_selected_strategy) {
             return Err(EvalError::Executor(
-                "Adaptive selected Programmatic despite the compatibility contract".into(),
+                format!(
+                    "expected {expected_selected_strategy:?} strategy selection, observed {selected_strategy:?}"
+                ),
             ));
         }
         for (index, call) in run.tool_calls.iter().enumerate() {
@@ -455,6 +575,7 @@ impl EvalExecutor for AcceptanceExecutor {
             "scenario": scenario,
             "effects": state.effects.iter().map(|(id, args)| json!({"tool_id": id, "arguments": args})).collect::<Vec<_>>(),
             "approvals": state.approvals,
+            "result_payload_bytes": state.result_payload_bytes,
         });
         let unauthorized_effects = state
             .effects
@@ -510,49 +631,34 @@ async fn executable_programmatic_acceptance_matrix_runs_real_strategies() {
         .results
         .iter()
         .all(|result| result.strategy_metrics.passes_readiness()));
-}
-
-#[tokio::test]
-async fn adaptive_never_selects_programmatic_even_when_advertised() {
-    let state = Arc::new(Mutex::new(State::default()));
-    let mut registry = ToolRegistry::default();
-    registry
-        .register(Arc::new(FixtureTool::new("read", true, state.clone())))
-        .unwrap();
-    let provider = Arc::new(
-        MockModelProvider::scripted([
-            MockStep::Response(
-                ModelResponse::new("fixture-model").with_tool_calls(calls(&["read".into()], false)),
-            ),
-            final_response("adaptive done"),
-        ])
-        .with_capabilities(
-            ModelCapabilities::new(true, false, true)
-                .with_programmatic_conformance(ProgrammaticConformance::StrictJsonAstV1)
-                .with_limits(ProviderCapabilityLimits::new().with_max_program_bytes(64 * 1024)),
-        ),
-    );
-    let events = Arc::new(InMemoryEventSink::default());
-    let mut agent = AgentDefinition::new("fixture-agent", "Fixture Agent", "1", "fixture-model");
-    agent.tool_allowlist = vec!["read".into()];
-    agent.limits.max_model_calls = 2;
-    let result = AgentRunner::builder(provider)
-        .tools(registry)
-        .policy(Arc::new(FixturePolicy(state)))
-        .event_sink(events.clone())
-        .programmatic(ProgrammaticHostConfig::default())
-        .build()
-        .run(RunRequest::new(agent, "adaptive compatibility"))
-        .await
-        .unwrap();
-    assert_eq!(result.status, RunStatus::Completed);
-    assert!(events.events().iter().all(|record| !matches!(
-        record.event,
-        RunEvent::StrategySelected {
-            selected: RunStrategy::Programmatic,
-            ..
+    for case_id in [
+        "loop",
+        "fanout",
+        "filter",
+        "reduce-aggregate",
+        "large-intermediate-data",
+    ] {
+        let adaptive = report
+            .results
+            .iter()
+            .find(|result| result.case_id == case_id && result.strategy == RunStrategy::Adaptive)
+            .expect("advanced workload has an Adaptive result");
+        for forced_strategy in [
+            RunStrategy::Direct,
+            RunStrategy::DeclarativePlan,
+            RunStrategy::Programmatic,
+        ] {
+            let forced = report
+                .results
+                .iter()
+                .find(|result| result.case_id == case_id && result.strategy == forced_strategy)
+                .expect("advanced workload has every forced comparison");
+            assert_eq!(
+                adaptive.final_state, forced.final_state,
+                "Adaptive final state diverged from {forced_strategy:?} for {case_id}"
+            );
         }
-    )));
+    }
 }
 
 #[test]
@@ -572,11 +678,45 @@ fn programmatic_acceptance_fixture_declares_required_real_scenarios() {
             "fanout",
             "filter",
             "reduce-aggregate",
+            "large-intermediate-data",
             "mixed-approval",
             "partial-failure",
             "repair",
             "fallback",
             "capability-downgrade",
+        ]
+    );
+
+    let adaptive_expectations = suite
+        .cases
+        .iter()
+        .filter(|case| case.strategy != Some(RunStrategy::Programmatic))
+        .map(|case| {
+            let data = &case.fixture.as_ref().expect("fixture").data;
+            (
+                data["scenario"].as_str().expect("scenario"),
+                data["workload_class"].as_str(),
+                data["expected_adaptive_selection"]
+                    .as_str()
+                    .expect("Adaptive selection"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        adaptive_expectations,
+        vec![
+            ("branch", None, "direct"),
+            ("loop", Some("loop"), "programmatic"),
+            ("fanout", Some("fan_out"), "programmatic"),
+            ("filter", Some("filter"), "programmatic"),
+            ("reduce-aggregate", Some("aggregation"), "programmatic"),
+            (
+                "large-intermediate-data",
+                Some("large_intermediate_data"),
+                "programmatic",
+            ),
+            ("mixed-approval", None, "direct"),
+            ("capability-downgrade", Some("loop"), "direct"),
         ]
     );
 }

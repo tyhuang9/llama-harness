@@ -59,18 +59,26 @@ workloads:
     evidence:
       - {source: programmatic_acceptance_fixture, marker: mixed-approval}
   - id: loop
-    strategies: [programmatic]
+    strategies: [direct, declarative_plan, programmatic, adaptive]
     evidence:
-      - {source: programmatic_acceptance_fixture, marker: "id: loop"}
+      - {source: programmatic_acceptance_fixture, marker: "workload_class: loop"}
   - id: fan-out
-    strategies: [programmatic]
+    strategies: [direct, declarative_plan, programmatic, adaptive]
     evidence:
-      - {source: programmatic_acceptance_fixture, marker: "id: fanout"}
+      - {source: programmatic_acceptance_fixture, marker: "workload_class: fan_out"}
       - {source: programmatic_runner, marker: programmatic_parallel_fanout_preserves_input_order_through_reverse_completion}
-  - id: aggregation
-    strategies: [programmatic]
+  - id: filter
+    strategies: [direct, declarative_plan, programmatic, adaptive]
     evidence:
-      - {source: programmatic_acceptance_fixture, marker: reduce-aggregate}
+      - {source: programmatic_acceptance_fixture, marker: "workload_class: filter"}
+  - id: aggregation
+    strategies: [direct, declarative_plan, programmatic, adaptive]
+    evidence:
+      - {source: programmatic_acceptance_fixture, marker: "workload_class: aggregation"}
+  - id: large-intermediate-data
+    strategies: [direct, declarative_plan, programmatic, adaptive]
+    evidence:
+      - {source: programmatic_acceptance_fixture, marker: "workload_class: large_intermediate_data"}
   - id: catalog-30
     strategies: [direct, declarative_plan, adaptive]
     evidence:
