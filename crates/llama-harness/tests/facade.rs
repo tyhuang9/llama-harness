@@ -8,6 +8,12 @@ use llama_harness::{
 };
 use serde_json::json;
 
+const _: () = {
+    assert!(MAX_STRUCTURED_OUTPUT_NAME_BYTES > 0);
+    assert!(MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES > 0);
+    assert!(MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH > 0);
+};
+
 #[tokio::test]
 async fn facade_runs_the_canonical_core_runner() {
     let provider = Arc::new(MockModelProvider::scripted([final_response(
@@ -53,7 +59,4 @@ fn facade_exports_the_structured_output_contract() {
 
     assert_eq!(request.name, "facade_output");
     assert!(request.strict);
-    assert!(MAX_STRUCTURED_OUTPUT_NAME_BYTES > 0);
-    assert!(MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES > 0);
-    assert!(MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH > 0);
 }
