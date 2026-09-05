@@ -25,6 +25,11 @@ It uses the existing `EvalExecutor` and `AgentRunner`; model responses are
 not scripted during a live run. Deterministic tests separately verify the
 evaluator's assertions and fixture wiring.
 
+Use `--ollama-url "http://[::1]:11434"` when selecting an IPv6 loopback service.
+Check `/api/version` and `/api/tags` on that exact endpoint: different local
+listeners can expose different Ollama installations. Build measured runners in
+a target directory that is not shared with a different source worktree.
+
 The JSON artifact retains the requested strategy, actual strategy from runner
 events, provider-reported usage, generation settings, source provenance,
 synthetic transcripts and ordered application audits. Optional
@@ -47,6 +52,8 @@ fallback to Direct is recorded as Direct execution. Read the
 [September 5 local results](../evals/local-task-agent/live-ollama-2026-09-05.md)
 and the [follow-up benchmark protocol](../evals/local-task-agent/strategy-benchmark-plan.md)
 before interpreting live results as production or promotion evidence.
+The [0.2 readiness assessment](../evals/local-task-agent/release-readiness-0.2.md)
+separates package verification from model-specific and advanced-strategy gaps.
 
 ## Suite format
 

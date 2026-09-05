@@ -1,0 +1,507 @@
+{
+  "format_version": 1,
+  "phase": "acceptance-prompt3",
+  "sample_count": 120,
+  "cells": [
+    {
+      "model": "gemma4:e4b-it-q4_K_M",
+      "requested_strategy": "adaptive",
+      "samples": 30,
+      "passed": 30,
+      "actual_strategies": {
+        "direct": 30
+      },
+      "state_exact": 30,
+      "dispatch_contract_passed": 30,
+      "approval_contract_passed": 30,
+      "audit_contract_passed": 30,
+      "unexpected_or_unapproved_mutation": 0,
+      "model_calls": 63,
+      "tool_proposals": 39,
+      "tool_dispatches": 36,
+      "mutation_dispatches": 6,
+      "grants": 6,
+      "denials": 3,
+      "failed_reads": 9,
+      "input_tokens": 56874,
+      "output_tokens": 9746,
+      "calls_at_output_token_cap": 0,
+      "empty_content_responses": 0,
+      "duration_median_ms_all_outcomes": 2432.5,
+      "failure_rules": {},
+      "cases": [
+        {
+          "case_id": "ambiguity",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 3708,
+          "model_calls": 6,
+          "input_tokens": 5325,
+          "output_tokens": 1435
+        },
+        {
+          "case_id": "approved-mutation",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 2157,
+          "model_calls": 6,
+          "input_tokens": 5340,
+          "output_tokens": 837
+        },
+        {
+          "case_id": "bounded-read-failure",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 3699,
+          "model_calls": 9,
+          "input_tokens": 8163,
+          "output_tokens": 1463
+        },
+        {
+          "case_id": "denied-approval",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 2118,
+          "model_calls": 6,
+          "input_tokens": 5310,
+          "output_tokens": 813
+        },
+        {
+          "case_id": "dependent-lookup-update",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 4205,
+          "model_calls": 9,
+          "input_tokens": 8292,
+          "output_tokens": 1643
+        },
+        {
+          "case_id": "duplicate-prevention",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 2452,
+          "model_calls": 6,
+          "input_tokens": 5340,
+          "output_tokens": 977
+        },
+        {
+          "case_id": "independent-reads",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 2395,
+          "model_calls": 6,
+          "input_tokens": 5655,
+          "output_tokens": 936
+        },
+        {
+          "case_id": "model-budget-stop",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 797,
+          "model_calls": 3,
+          "input_tokens": 2661,
+          "output_tokens": 315
+        },
+        {
+          "case_id": "no-tool",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 126,
+          "model_calls": 3,
+          "input_tokens": 2508,
+          "output_tokens": 42
+        },
+        {
+          "case_id": "transient-read-retry",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 3328,
+          "model_calls": 9,
+          "input_tokens": 8280,
+          "output_tokens": 1285
+        }
+      ]
+    },
+    {
+      "model": "gemma4:e4b-it-q4_K_M",
+      "requested_strategy": "direct",
+      "samples": 30,
+      "passed": 30,
+      "actual_strategies": {
+        "direct": 30
+      },
+      "state_exact": 30,
+      "dispatch_contract_passed": 30,
+      "approval_contract_passed": 30,
+      "audit_contract_passed": 30,
+      "unexpected_or_unapproved_mutation": 0,
+      "model_calls": 63,
+      "tool_proposals": 39,
+      "tool_dispatches": 36,
+      "mutation_dispatches": 6,
+      "grants": 6,
+      "denials": 3,
+      "failed_reads": 9,
+      "input_tokens": 56874,
+      "output_tokens": 9740,
+      "calls_at_output_token_cap": 0,
+      "empty_content_responses": 0,
+      "duration_median_ms_all_outcomes": 2408.0,
+      "failure_rules": {},
+      "cases": [
+        {
+          "case_id": "ambiguity",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 3721,
+          "model_calls": 6,
+          "input_tokens": 5325,
+          "output_tokens": 1435
+        },
+        {
+          "case_id": "approved-mutation",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 2077,
+          "model_calls": 6,
+          "input_tokens": 5340,
+          "output_tokens": 831
+        },
+        {
+          "case_id": "bounded-read-failure",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 3724,
+          "model_calls": 9,
+          "input_tokens": 8163,
+          "output_tokens": 1463
+        },
+        {
+          "case_id": "denied-approval",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 2065,
+          "model_calls": 6,
+          "input_tokens": 5310,
+          "output_tokens": 813
+        },
+        {
+          "case_id": "dependent-lookup-update",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 4073,
+          "model_calls": 9,
+          "input_tokens": 8292,
+          "output_tokens": 1643
+        },
+        {
+          "case_id": "duplicate-prevention",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 2450,
+          "model_calls": 6,
+          "input_tokens": 5340,
+          "output_tokens": 977
+        },
+        {
+          "case_id": "independent-reads",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 2362,
+          "model_calls": 6,
+          "input_tokens": 5655,
+          "output_tokens": 936
+        },
+        {
+          "case_id": "model-budget-stop",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 789,
+          "model_calls": 3,
+          "input_tokens": 2661,
+          "output_tokens": 315
+        },
+        {
+          "case_id": "no-tool",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 119,
+          "model_calls": 3,
+          "input_tokens": 2508,
+          "output_tokens": 42
+        },
+        {
+          "case_id": "transient-read-retry",
+          "passed": 3,
+          "samples": 3,
+          "duration_median_ms": 3328,
+          "model_calls": 9,
+          "input_tokens": 8280,
+          "output_tokens": 1285
+        }
+      ]
+    },
+    {
+      "model": "lfm2.5-thinking:1.2b-q4_K_M",
+      "requested_strategy": "adaptive",
+      "samples": 30,
+      "passed": 0,
+      "actual_strategies": {
+        "direct": 30
+      },
+      "state_exact": 24,
+      "dispatch_contract_passed": 9,
+      "approval_contract_passed": 21,
+      "audit_contract_passed": 30,
+      "unexpected_or_unapproved_mutation": 0,
+      "model_calls": 39,
+      "tool_proposals": 0,
+      "tool_dispatches": 0,
+      "mutation_dispatches": 0,
+      "grants": 0,
+      "denials": 0,
+      "failed_reads": 0,
+      "input_tokens": 36252,
+      "output_tokens": 65526,
+      "calls_at_output_token_cap": 21,
+      "empty_content_responses": 21,
+      "duration_median_ms_all_outcomes": 3894.5,
+      "failure_rules": {
+        "status": 27,
+        "terminal_contract": 30,
+        "final_format": 30,
+        "required_tools": 18,
+        "expected_tool_arguments": 3,
+        "required_approval_tools": 6,
+        "state_contract": 6,
+        "tool_contract": 21,
+        "effect_contract": 6,
+        "approval_contract": 9,
+        "tool_sequence": 3
+      },
+      "cases": [
+        {
+          "case_id": "ambiguity",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 4269,
+          "model_calls": 6,
+          "input_tokens": 5562,
+          "output_tokens": 6807
+        },
+        {
+          "case_id": "approved-mutation",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3827,
+          "model_calls": 3,
+          "input_tokens": 2745,
+          "output_tokens": 6144
+        },
+        {
+          "case_id": "bounded-read-failure",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3904,
+          "model_calls": 3,
+          "input_tokens": 2739,
+          "output_tokens": 6144
+        },
+        {
+          "case_id": "denied-approval",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3896,
+          "model_calls": 3,
+          "input_tokens": 2742,
+          "output_tokens": 6144
+        },
+        {
+          "case_id": "dependent-lookup-update",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3863,
+          "model_calls": 3,
+          "input_tokens": 2772,
+          "output_tokens": 6144
+        },
+        {
+          "case_id": "duplicate-prevention",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3843,
+          "model_calls": 3,
+          "input_tokens": 2760,
+          "output_tokens": 6144
+        },
+        {
+          "case_id": "independent-reads",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 4671,
+          "model_calls": 6,
+          "input_tokens": 5919,
+          "output_tokens": 7395
+        },
+        {
+          "case_id": "model-budget-stop",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 2974,
+          "model_calls": 3,
+          "input_tokens": 2823,
+          "output_tokens": 4641
+        },
+        {
+          "case_id": "no-tool",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 6168,
+          "model_calls": 6,
+          "input_tokens": 5415,
+          "output_tokens": 9819
+        },
+        {
+          "case_id": "transient-read-retry",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3840,
+          "model_calls": 3,
+          "input_tokens": 2775,
+          "output_tokens": 6144
+        }
+      ]
+    },
+    {
+      "model": "lfm2.5-thinking:1.2b-q4_K_M",
+      "requested_strategy": "direct",
+      "samples": 30,
+      "passed": 0,
+      "actual_strategies": {
+        "direct": 30
+      },
+      "state_exact": 24,
+      "dispatch_contract_passed": 9,
+      "approval_contract_passed": 21,
+      "audit_contract_passed": 30,
+      "unexpected_or_unapproved_mutation": 0,
+      "model_calls": 39,
+      "tool_proposals": 0,
+      "tool_dispatches": 0,
+      "mutation_dispatches": 0,
+      "grants": 0,
+      "denials": 0,
+      "failed_reads": 0,
+      "input_tokens": 36252,
+      "output_tokens": 65526,
+      "calls_at_output_token_cap": 21,
+      "empty_content_responses": 21,
+      "duration_median_ms_all_outcomes": 3915.5,
+      "failure_rules": {
+        "status": 27,
+        "terminal_contract": 30,
+        "final_format": 30,
+        "required_tools": 18,
+        "expected_tool_arguments": 3,
+        "required_approval_tools": 6,
+        "state_contract": 6,
+        "tool_contract": 21,
+        "effect_contract": 6,
+        "approval_contract": 9,
+        "tool_sequence": 3
+      },
+      "cases": [
+        {
+          "case_id": "ambiguity",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 4254,
+          "model_calls": 6,
+          "input_tokens": 5562,
+          "output_tokens": 6807
+        },
+        {
+          "case_id": "approved-mutation",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3894,
+          "model_calls": 3,
+          "input_tokens": 2745,
+          "output_tokens": 6144
+        },
+        {
+          "case_id": "bounded-read-failure",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3822,
+          "model_calls": 3,
+          "input_tokens": 2739,
+          "output_tokens": 6144
+        },
+        {
+          "case_id": "denied-approval",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3886,
+          "model_calls": 3,
+          "input_tokens": 2742,
+          "output_tokens": 6144
+        },
+        {
+          "case_id": "dependent-lookup-update",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3940,
+          "model_calls": 3,
+          "input_tokens": 2772,
+          "output_tokens": 6144
+        },
+        {
+          "case_id": "duplicate-prevention",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3832,
+          "model_calls": 3,
+          "input_tokens": 2760,
+          "output_tokens": 6144
+        },
+        {
+          "case_id": "independent-reads",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 4716,
+          "model_calls": 6,
+          "input_tokens": 5919,
+          "output_tokens": 7395
+        },
+        {
+          "case_id": "model-budget-stop",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 2890,
+          "model_calls": 3,
+          "input_tokens": 2823,
+          "output_tokens": 4641
+        },
+        {
+          "case_id": "no-tool",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 6238,
+          "model_calls": 6,
+          "input_tokens": 5415,
+          "output_tokens": 9819
+        },
+        {
+          "case_id": "transient-read-retry",
+          "passed": 0,
+          "samples": 3,
+          "duration_median_ms": 3921,
+          "model_calls": 3,
+          "input_tokens": 2775,
+          "output_tokens": 6144
+        }
+      ]
+    }
+  ]
+}
