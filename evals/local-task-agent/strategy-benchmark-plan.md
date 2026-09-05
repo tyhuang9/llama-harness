@@ -90,8 +90,11 @@ stops admission before measured runs if any discovery or warmup row fails.
 The fixed schedule has four discovery rows, four separate warmup rows, then 30
 pairs per workload (120 measured samples): odd pairs run Direct then Adaptive;
 even pairs reverse both strategy and case order. A configurable 40-minute
-cohort deadline bounds each child by the remaining time and records every
-unstarted row as missing before exiting nonzero.
+cohort deadline reserves one second of the remaining budget for bounded
+post-timeout cleanup; it does not start a child when that reserve is
+unavailable. A timed-out child is killed immediately and output collection is
+bounded by the reserved second. The driver records every unstarted row as
+missing before exiting nonzero.
 
 The reducer reports failures before all planned, completed, and missing rows,
 then separate discovery, warmup, and measured summaries. Headline metrics use

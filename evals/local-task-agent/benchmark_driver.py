@@ -24,6 +24,7 @@ BENCHMARK_SUITE_ID = "local-task-agent-strategy-benchmark"
 CASES = ("dependent-lookup-update", "independent-reads-8")
 STRATEGIES = ("direct", "adaptive")
 MEASURED_PAIRS_PER_CASE = 30
+POST_TIMEOUT_CLEANUP_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -162,8 +163,8 @@ def run_benchmark(
     assert frozen_identity is not None
     for index, slot in enumerate(planned):
         remaining = deadline - monotonic()
-        if remaining <= 0:
-            reason = "cohort wall deadline elapsed before this invocation"
+        if remaining <= POST_TIMEOUT_CLEANUP_SECONDS:
+            reason = "remaining cohort budget could not reserve bounded post-timeout cleanup"
             records.append(not_started_record(slot, reason, frozen_identity))
             records.extend(
                 not_started_record(later, reason, frozen_identity)
@@ -198,6 +199,14 @@ def run_benchmark(
                 for later in planned[index + 1 :]
             )
             break
+        if remaining <= POST_TIMEOUT_CLEANUP_SECONDS:
+            reason = "remaining cohort budget could not reserve bounded post-timeout cleanup"
+            records.append(not_started_record(slot, reason, current_identity))
+            records.extend(
+                not_started_record(later, reason, current_identity)
+                for later in planned[index + 1 :]
+            )
+            break
 
         record = run_one_invocation(
             config,
@@ -205,7 +214,7 @@ def run_benchmark(
             environment,
             current_identity,
             process_runner,
-            max(0.001, remaining),
+            deadline,
             monotonic,
         )
         records.append(record)
@@ -217,6 +226,13 @@ def run_benchmark(
             file=sys.stderr,
             flush=True,
         )
+        if record["execution_state"] == "not_started":
+            reason = record["failure_reasons"][0]
+            records.extend(
+                not_started_record(later, reason, frozen_identity)
+                for later in planned[index + 1 :]
+            )
+            break
         if slot["phase"] in {"discovery", "warmup"} and not record["fully_passed"]:
             reason = (
                 f"{slot['phase']} admission failed at {record['planned_key']}; "
@@ -237,14 +253,29 @@ def run_one_invocation(
     environment: Any,
     identity: dict[str, Any],
     process_runner: Callable[[Sequence[str], Path, float], ProcessResult],
-    timeout_seconds: float,
+    cohort_deadline: float,
     monotonic: Callable[[], float],
 ) -> dict[str, Any]:
+    started = monotonic()
     invocation_dir = invocation_directory(config.output_dir, slot)
-    invocation_dir.mkdir(parents=True, exist_ok=False)
     report_path = invocation_dir / "report.json"
     command = build_cli_command(config, slot, report_path)
-    started = monotonic()
+    remaining = cohort_deadline - monotonic()
+    if remaining <= POST_TIMEOUT_CLEANUP_SECONDS:
+        return not_started_record(
+            slot,
+            "remaining cohort budget could not reserve bounded post-timeout cleanup",
+            identity,
+        )
+    invocation_dir.mkdir(parents=True, exist_ok=False)
+    remaining = cohort_deadline - monotonic()
+    if remaining <= POST_TIMEOUT_CLEANUP_SECONDS:
+        return not_started_record(
+            slot,
+            "remaining cohort budget could not reserve bounded post-timeout cleanup",
+            identity,
+        )
+    timeout_seconds = remaining - POST_TIMEOUT_CLEANUP_SECONDS
     try:
         process = process_runner(command, config.source_root, timeout_seconds)
     except Exception as error:
@@ -261,6 +292,7 @@ def run_one_invocation(
         "invocation_identity": identity,
         "command": list(command),
         "child_timeout_seconds": timeout_seconds,
+        "post_timeout_cleanup_allowance_seconds": POST_TIMEOUT_CLEANUP_SECONDS,
         "outer_subprocess_elapsed_ms": outer_elapsed_ms,
         "execution_state": "timed_out" if process.timed_out else "completed",
         "exit_code": process.returncode,
@@ -340,7 +372,7 @@ def build_cli_command(
 
 
 def run_child_process(command: Sequence[str], cwd: Path, timeout_seconds: float) -> ProcessResult:
-    """Run one child with a bounded deadline and retain both output streams."""
+    """Run one child and use only a bounded, already-reserved timeout cleanup."""
 
     try:
         child = subprocess.Popen(
@@ -358,14 +390,54 @@ def run_child_process(command: Sequence[str], cwd: Path, timeout_seconds: float)
     try:
         stdout, stderr = child.communicate(timeout=timeout_seconds)
         return ProcessResult(child.returncode, stdout, stderr)
-    except subprocess.TimeoutExpired:
-        child.terminate()
+    except subprocess.TimeoutExpired as timed_out:
+        partial_stdout = timeout_text(timed_out.output)
+        partial_stderr = timeout_text(timed_out.stderr)
+        cleanup_errors: list[str] = []
+        cleanup_deadline = time.monotonic() + POST_TIMEOUT_CLEANUP_SECONDS
         try:
-            stdout, stderr = child.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
             child.kill()
-            stdout, stderr = child.communicate()
+        except OSError as error:
+            cleanup_errors.append(f"could not kill timed-out child: {error}")
+        cleanup_remaining = cleanup_deadline - time.monotonic()
+        if cleanup_remaining <= 0:
+            cleanup_errors.append("post-kill output collection had no remaining cleanup budget")
+            return ProcessResult(
+                child.returncode,
+                partial_stdout,
+                partial_stderr,
+                timed_out=True,
+                error="; ".join(cleanup_errors),
+            )
+        try:
+            stdout, stderr = child.communicate(timeout=cleanup_remaining)
+        except subprocess.TimeoutExpired as cleanup_timed_out:
+            cleanup_errors.append(
+                "post-kill output collection exceeded the reserved cleanup budget"
+            )
+            stdout = timeout_text(cleanup_timed_out.output) or partial_stdout
+            stderr = timeout_text(cleanup_timed_out.stderr) or partial_stderr
+        except Exception as error:
+            cleanup_errors.append(f"could not collect post-kill output: {error}")
+            stdout = partial_stdout
+            stderr = partial_stderr
+        if cleanup_errors:
+            return ProcessResult(
+                child.returncode,
+                stdout,
+                stderr,
+                timed_out=True,
+                error="; ".join(cleanup_errors),
+            )
         return ProcessResult(child.returncode, stdout, stderr, timed_out=True)
+
+
+def timeout_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def capture_invocation_identity(config: BenchmarkConfig) -> dict[str, Any]:
@@ -756,6 +828,7 @@ def not_started_record(
         "invocation_identity": identity,
         "command": None,
         "child_timeout_seconds": None,
+        "post_timeout_cleanup_allowance_seconds": None,
         "outer_subprocess_elapsed_ms": None,
         "execution_state": "not_started",
         "exit_code": None,

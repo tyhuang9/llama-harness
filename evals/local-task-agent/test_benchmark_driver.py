@@ -1,9 +1,11 @@
 import contextlib
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import benchmark_driver as driver
 
@@ -283,9 +285,9 @@ class BenchmarkDriverTests(unittest.TestCase):
                 output_dir=root / "results",
                 model="gemma4:e4b-it-q4_K_M",
                 ollama_url="http://[::1]:11434",
-                cohort_wall_seconds=1,
+                cohort_wall_seconds=3,
             )
-            timestamps = iter((0.0, 0.0, 2.0, 2.0))
+            timestamps = iter((0.0, 0.0, 4.0, 4.0))
             summary = driver.run_benchmark(
                 config,
                 schedule=[slot()],
@@ -298,6 +300,48 @@ class BenchmarkDriverTests(unittest.TestCase):
                 "cohort wall deadline elapsed while capturing invocation identity",
                 summary["records"][0]["failure_reasons"],
             )
+
+    def test_timeout_kills_immediately_and_never_uses_an_unbounded_post_kill_wait(self):
+        class TimedOutChild:
+            def __init__(self):
+                self.returncode = None
+                self.killed = False
+                self.timeouts = []
+
+            def communicate(self, timeout):
+                self.timeouts.append(timeout)
+                if len(self.timeouts) == 1:
+                    raise subprocess.TimeoutExpired(
+                        "live-task-agent-eval",
+                        timeout,
+                        output="initial stdout",
+                        stderr="initial stderr",
+                    )
+                raise subprocess.TimeoutExpired(
+                    "live-task-agent-eval",
+                    timeout,
+                    output="cleanup stdout",
+                    stderr="cleanup stderr",
+                )
+
+            def kill(self):
+                self.killed = True
+
+        child = TimedOutChild()
+        with mock.patch.object(driver.subprocess, "Popen", return_value=child):
+            result = driver.run_child_process(["live-task-agent-eval"], Path("."), 0.25)
+
+        self.assertTrue(child.killed)
+        self.assertEqual(child.timeouts[0], 0.25)
+        self.assertEqual(len(child.timeouts), 2)
+        self.assertGreater(child.timeouts[1], 0)
+        self.assertLessEqual(
+            child.timeouts[1], driver.POST_TIMEOUT_CLEANUP_SECONDS
+        )
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.stdout, "cleanup stdout")
+        self.assertEqual(result.stderr, "cleanup stderr")
+        self.assertIn("post-kill output collection exceeded", result.error)
 
 
 if __name__ == "__main__":
