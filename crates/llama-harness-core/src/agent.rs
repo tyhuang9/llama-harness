@@ -12,6 +12,21 @@ use tokio_util::sync::CancellationToken;
 /// A JSON object map used for application-defined metadata and context.
 pub type JsonMap = serde_json::Map<String, Value>;
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+/// Strategy identifier used by planning and evaluation contracts.
+pub enum RunStrategy {
+    /// Evaluates adaptive strategy selection.
+    #[default]
+    Adaptive,
+    /// Evaluates direct model-and-tool execution.
+    Direct,
+    /// Evaluates declarative plan execution.
+    DeclarativePlan,
+    /// Evaluates programmatic orchestration.
+    Programmatic,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 /// Describes an agent and its runtime defaults.
 pub struct AgentDefinition {

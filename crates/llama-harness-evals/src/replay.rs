@@ -2,6 +2,7 @@ use crate::{
     executor::execute_case, EvalCase, EvalError, EvalExecutionRequest, EvalExecutor,
     EvaluationCaseResult,
 };
+use llama_harness_core::RunStrategy;
 use serde::{Deserialize, Serialize};
 
 /// A replayable, explicit regression input. It deliberately contains no payload read
@@ -101,7 +102,11 @@ pub fn export_regression_case(
         prompt_override: source.prompt_override,
         model: source.model,
         source_trace_id: result.trace_id.clone(),
-        case: case.clone(),
+        case: {
+            let mut case = case.clone();
+            case.strategy = Some(result.strategy);
+            case
+        },
     };
     regression.validate()?;
     Ok(regression)
@@ -124,6 +129,7 @@ pub async fn replay_regression(
             case: regression.case.clone(),
             fixture: regression.case.fixture.clone(),
             model: regression.model.clone(),
+            strategy: regression.case.strategy.unwrap_or(RunStrategy::Adaptive),
             repetition: 1,
         },
     )

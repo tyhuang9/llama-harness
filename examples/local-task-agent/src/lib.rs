@@ -5,7 +5,7 @@
 
 use llama_harness::{
     async_trait,
-    evals::{EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation},
+    evals::{EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation, StrategyMetrics},
     load_agent_manifest,
     mock::{final_response, tool_response, MockModelProvider},
     AgentDefinition, AgentRunner, ApprovalHandler, ApprovalRecord, CancellationToken, EventSink,
@@ -447,16 +447,19 @@ impl EvalExecutor for TaskAgentEvalExecutor {
             .run(request.case.input, Some(request.model))
             .await
             .map_err(|error| EvalError::Executor(error.to_string()))?;
-        Ok(EvalObservation {
-            model_calls: provider.requests().len() as u32,
-            final_state: Some(
-                json!({"tasks": store.snapshot().map_err(|error| EvalError::Executor(error.to_string()))?}),
-            ),
-            unresolved_items: (scenario == MockScenario::Ambiguous)
-                .then(|| json!(["task action is ambiguous"])),
-            agent_version: Some(runtime.agent.version.clone()),
-            prompt_version: Some("local-task-agent-prompt-1".into()),
+        Ok(EvalObservation::new(
             run,
-        })
+            provider.requests().len() as u32,
+        )
+        .with_strategy_metrics(StrategyMetrics::default())
+        .with_final_state(Some(
+                json!({"tasks": store.snapshot().map_err(|error| EvalError::Executor(error.to_string()))?}),
+            ))
+        .with_unresolved_items(
+            (scenario == MockScenario::Ambiguous)
+                .then(|| json!(["task action is ambiguous"])),
+        )
+        .with_agent_version(Some(runtime.agent.version.clone()))
+        .with_prompt_version(Some("local-task-agent-prompt-1".into())))
     }
 }

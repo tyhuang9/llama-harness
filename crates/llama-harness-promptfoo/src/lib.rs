@@ -230,14 +230,11 @@ pub fn normalize_observations(
             })?;
         let result = match observation.response {
             Some(response) => {
-                let harness_observation = EvalObservation {
-                    model_calls: response.model_calls,
-                    final_state: Some(response.final_state),
-                    unresolved_items: response.unresolved_items,
-                    agent_version: Some(response.agent_version),
-                    prompt_version: Some(response.prompt_version),
-                    run: response.run,
-                };
+                let harness_observation = EvalObservation::new(response.run, response.model_calls)
+                    .with_final_state(Some(response.final_state))
+                    .with_unresolved_items(response.unresolved_items)
+                    .with_agent_version(Some(response.agent_version))
+                    .with_prompt_version(Some(response.prompt_version));
                 let failures = evaluate_expectations(&case.expected, &harness_observation);
                 let mut result = EvaluationCaseResult::new(
                     suite.id.clone(),
@@ -253,6 +250,7 @@ pub fn normalize_observations(
                 result.duration_ms = Some(harness_observation.run.duration_ms);
                 result.model_calls = Some(harness_observation.model_calls);
                 result.tool_calls = Some(harness_observation.run.tool_calls.len() as u32);
+                result.strategy_metrics = harness_observation.strategy_metrics;
                 result.agent_version = harness_observation.agent_version;
                 result.prompt_version = harness_observation.prompt_version;
                 result.final_state = harness_observation.final_state;

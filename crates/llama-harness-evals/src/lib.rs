@@ -15,7 +15,12 @@ mod suite;
 pub use assertions::{evaluate_expectations, is_json_subset};
 pub use executor::{evaluate_suite, EvalExecutionRequest, EvalExecutor, EvalObservation};
 pub use replay::{export_regression_case, replay_regression, RegressionCase, RegressionSource};
-pub use result::{AssertionFailure, EvaluationCaseResult, EvaluationReport};
+pub use result::{
+    AdaptiveComparison, AdaptiveReadiness, AdaptiveReadinessFailure, AssertionFailure,
+    EvaluationCaseResult, EvaluationReport, ForcedCandidateComparison, ForcedCandidateDisposition,
+    StrategyComparisonMetrics, StrategyMetrics, StrategyMetricsValidationError,
+    StrategySelectionCriterion,
+};
 pub use suite::{
     load_suite, load_suite_path, EvalCase, EvalDefaults, EvalExpected, EvalFixture, EvalSuite,
     ExpectedFailure, ExpectedToolCall, SUPPORTED_SUITE_VERSION,

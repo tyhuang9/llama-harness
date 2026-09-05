@@ -1,8 +1,10 @@
 use async_trait::async_trait;
-use llama_harness_core::{EventRecord, RunEvent, RunResult, RunStatus, ToolCall};
+use llama_harness_core::{EventRecord, RunEvent, RunResult, RunStatus, RunStrategy, ToolCall};
 use llama_harness_evals::{
     evaluate_suite, export_regression_case, is_json_subset, load_suite, replay_regression,
-    EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation, RegressionSource,
+    AssertionFailure, EvalError, EvalExecutionRequest, EvalExecutor, EvalObservation,
+    EvaluationCaseResult, EvaluationReport, ForcedCandidateDisposition, RegressionSource,
+    StrategyMetrics, StrategySelectionCriterion,
 };
 use llama_harness_observability::{SqliteEventSink, TraceStoreConfig};
 use serde_json::{json, Value};
@@ -76,16 +78,13 @@ impl EvalExecutor for RecordingExecutor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(request.clone());
-        Ok(EvalObservation {
-            run: run_result(&request.model),
-            model_calls: 2,
-            final_state: Some(json!({
+        Ok(EvalObservation::new(run_result(&request.model), 2)
+            .with_final_state(Some(json!({
                 "tasks": [{"id": "task-123", "status": "completed", "extra": true}]
-            })),
-            unresolved_items: Some(json!([])),
-            agent_version: request.agent_version,
-            prompt_version: request.prompt_version,
-        })
+            })))
+            .with_unresolved_items(Some(json!([])))
+            .with_agent_version(request.agent_version)
+            .with_prompt_version(request.prompt_version))
     }
 }
 
@@ -112,6 +111,7 @@ fn yaml_and_json_suites_validate_strictly_and_round_trip() {
     let suite = load_suite(SUITE, Some("yaml")).unwrap();
     assert_eq!(suite.id, "task-agent-core");
     assert_eq!(suite.defaults.repeat, 2);
+    assert_eq!(suite.strategies, vec![RunStrategy::Adaptive]);
     let json = serde_json::to_string(&suite).unwrap();
     assert_eq!(load_suite(&json, Some("json")).unwrap(), suite);
     assert!(matches!(
@@ -128,6 +128,356 @@ fn yaml_and_json_suites_validate_strictly_and_round_trip() {
         ),
         Err(EvalError::InvalidSuite(message)) if message.contains("at least one case")
     ));
+}
+
+#[tokio::test]
+async fn strategy_matrix_preserves_order_and_case_override_takes_precedence() {
+    let mut suite = load_suite(SUITE, Some("yaml")).unwrap();
+    suite.defaults.repeat = 1;
+    suite.strategies = vec![
+        RunStrategy::Programmatic,
+        RunStrategy::Direct,
+        RunStrategy::DeclarativePlan,
+    ];
+    let executor = RecordingExecutor::default();
+    let report = evaluate_suite(&suite, &executor, &[], None).await.unwrap();
+    assert_eq!(
+        report
+            .results
+            .iter()
+            .map(|result| result.strategy)
+            .collect::<Vec<_>>(),
+        suite.strategies
+    );
+
+    suite.cases[0].strategy = Some(RunStrategy::Direct);
+    let executor = RecordingExecutor::default();
+    let report = evaluate_suite(&suite, &executor, &[], None).await.unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].strategy, RunStrategy::Direct);
+}
+
+#[test]
+fn suite_rejects_empty_and_duplicate_strategy_matrices() {
+    let mut suite = load_suite(SUITE, Some("yaml")).unwrap();
+    suite.strategies.clear();
+    assert!(matches!(
+        suite.validate(),
+        Err(EvalError::InvalidSuite(message)) if message == "at least one strategy is required"
+    ));
+
+    suite.strategies = vec![RunStrategy::Direct, RunStrategy::Direct];
+    assert!(matches!(
+        suite.validate(),
+        Err(EvalError::InvalidSuite(message)) if message == "duplicate suite strategy: direct"
+    ));
+}
+
+#[test]
+fn strategy_metrics_round_trip_without_inventing_unknown_values() {
+    let metrics = StrategyMetrics::default();
+    assert_eq!(metrics.unauthorized_effects, None);
+    assert_eq!(metrics.duplicate_effects, None);
+    assert_eq!(metrics.unintended_effects, None);
+    assert_eq!(metrics.task_correct, None);
+    assert_eq!(metrics.final_state_correct, None);
+    assert_eq!(metrics.recovery_success, None);
+    assert_eq!(metrics.tool_selection_accuracy, None);
+    assert_eq!(metrics.input_tokens, None);
+    assert_eq!(metrics.output_tokens, None);
+    assert_eq!(metrics.wasted_tool_calls, None);
+    assert!(!metrics.passes_readiness());
+
+    let value = serde_json::to_value(&metrics).unwrap();
+    assert_eq!(
+        serde_json::from_value::<StrategyMetrics>(value).unwrap(),
+        metrics
+    );
+    let ready = StrategyMetrics {
+        unauthorized_effects: Some(0),
+        duplicate_effects: Some(0),
+        unintended_effects: Some(0),
+        task_correct: Some(true),
+        final_state_correct: Some(true),
+        ..StrategyMetrics::default()
+    };
+    assert!(ready.passes_readiness());
+
+    let unknown_safety = StrategyMetrics {
+        task_correct: Some(true),
+        final_state_correct: Some(true),
+        ..StrategyMetrics::default()
+    };
+    assert!(!unknown_safety.passes_readiness());
+}
+
+#[test]
+fn strategy_metrics_reject_invalid_tool_selection_accuracy() {
+    for accuracy in [f64::NAN, f64::INFINITY, -0.01, 1.01] {
+        let metrics = StrategyMetrics {
+            tool_selection_accuracy: Some(accuracy),
+            ..StrategyMetrics::default()
+        };
+        assert!(metrics.validate().is_err());
+        assert!(!metrics.passes_readiness());
+    }
+    for accuracy in [0.0, 0.5, 1.0] {
+        let metrics = StrategyMetrics {
+            tool_selection_accuracy: Some(accuracy),
+            ..StrategyMetrics::default()
+        };
+        assert_eq!(metrics.validate(), Ok(()));
+    }
+}
+
+fn readiness_result(
+    strategy: RunStrategy,
+    recovery_success: bool,
+    duration_ms: u64,
+    tokens: u64,
+) -> EvaluationCaseResult {
+    let mut result = EvaluationCaseResult::new("suite", "case", "model", 1);
+    result.strategy = strategy;
+    result.passed = true;
+    result.status = Some(RunStatus::Completed);
+    result.duration_ms = Some(duration_ms);
+    result.model_calls = Some(2);
+    result.tool_calls = Some(1);
+    result.strategy_metrics = StrategyMetrics {
+        unauthorized_effects: Some(0),
+        duplicate_effects: Some(0),
+        unintended_effects: Some(0),
+        task_correct: Some(true),
+        final_state_correct: Some(true),
+        recovery_success: Some(recovery_success),
+        tool_selection_accuracy: Some(0.9),
+        input_tokens: Some(tokens / 2),
+        output_tokens: Some(tokens - tokens / 2),
+        wasted_tool_calls: Some(0),
+    };
+    result
+}
+
+#[test]
+fn adaptive_readiness_is_input_order_independent_and_efficiency_is_nonblocking() {
+    let adaptive = readiness_result(RunStrategy::Adaptive, false, 1_200, 1_200);
+    let direct = readiness_result(RunStrategy::Direct, false, 50, 50);
+    let declarative = readiness_result(RunStrategy::DeclarativePlan, true, 900, 900);
+    let mut programmatic = readiness_result(RunStrategy::Programmatic, true, 10, 10);
+    programmatic.strategy_metrics.unauthorized_effects = Some(1);
+    assert!(adaptive.passes_readiness());
+
+    let forward = EvaluationReport::new(
+        "report-a",
+        "suite",
+        1,
+        vec![
+            adaptive.clone(),
+            direct.clone(),
+            declarative.clone(),
+            programmatic.clone(),
+        ],
+    )
+    .adaptive_readiness();
+    let reverse = EvaluationReport::new(
+        "report-b",
+        "suite",
+        1,
+        vec![programmatic, declarative, direct, adaptive],
+    )
+    .adaptive_readiness();
+    assert_eq!(forward, reverse);
+    assert!(forward.ready);
+    assert_eq!(forward.comparisons.len(), 1);
+    assert_eq!(
+        forward.comparisons[0].best_forced_strategy,
+        RunStrategy::DeclarativePlan
+    );
+    assert!(
+        forward.comparisons[0].adaptive.duration_ms
+            > forward.comparisons[0].best_forced.duration_ms
+    );
+    assert!(!forward.comparisons[0].adaptive.recovery_success);
+    assert_eq!(forward.comparisons[0].adaptive.tool_selection_accuracy, 0.9);
+    assert!(forward.comparisons[0].best_forced.recovery_success);
+    assert_eq!(forward.comparisons[0].adaptive.total_tokens, 1_200);
+    assert_eq!(forward.comparisons[0].adaptive.model_calls, 2);
+    assert_eq!(forward.comparisons[0].adaptive.tool_calls, 1);
+    assert_eq!(forward.comparisons[0].adaptive.wasted_tool_calls, 0);
+    assert_eq!(forward.comparisons[0].best_forced.model_calls, 2);
+    assert_eq!(forward.comparisons[0].best_forced.tool_calls, 1);
+    assert_eq!(forward.comparisons[0].best_forced.wasted_tool_calls, 0);
+    let candidates = &forward.comparisons[0].forced_candidates;
+    assert_eq!(candidates.len(), 3);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.strategy)
+            .collect::<Vec<_>>(),
+        vec![
+            RunStrategy::Direct,
+            RunStrategy::DeclarativePlan,
+            RunStrategy::Programmatic,
+        ]
+    );
+    assert!(matches!(
+        candidates[0].disposition,
+        ForcedCandidateDisposition::Outranked {
+            decisive_criterion: StrategySelectionCriterion::RecoverySuccess
+        }
+    ));
+    assert_eq!(
+        candidates[1].disposition,
+        ForcedCandidateDisposition::Selected
+    );
+    assert!(matches!(
+        &candidates[2].disposition,
+        ForcedCandidateDisposition::Ineligible { code, .. }
+            if code == "safety_hard_gate_failed"
+    ));
+}
+
+fn selected_forced(direct: EvaluationCaseResult, declarative: EvaluationCaseResult) -> RunStrategy {
+    EvaluationReport::new(
+        "ranking",
+        "suite",
+        1,
+        vec![
+            readiness_result(RunStrategy::Adaptive, true, 100, 100),
+            direct,
+            declarative,
+        ],
+    )
+    .adaptive_readiness()
+    .comparisons[0]
+        .best_forced_strategy
+}
+
+#[test]
+fn forced_ranking_applies_every_tie_break_in_contract_order() {
+    let mut direct = readiness_result(RunStrategy::Direct, true, 1_000, 1_000);
+    let declarative = readiness_result(RunStrategy::DeclarativePlan, true, 1, 1);
+    direct.strategy_metrics.tool_selection_accuracy = Some(0.95);
+    assert_eq!(
+        selected_forced(direct, declarative),
+        RunStrategy::Direct,
+        "higher accuracy must beat lower latency and cost"
+    );
+
+    let direct = readiness_result(RunStrategy::Direct, true, 10, 100);
+    let declarative = readiness_result(RunStrategy::DeclarativePlan, true, 20, 1);
+    assert_eq!(selected_forced(direct, declarative), RunStrategy::Direct);
+
+    let direct = readiness_result(RunStrategy::Direct, true, 10, 10);
+    let declarative = readiness_result(RunStrategy::DeclarativePlan, true, 10, 20);
+    assert_eq!(selected_forced(direct, declarative), RunStrategy::Direct);
+
+    let mut direct = readiness_result(RunStrategy::Direct, true, 10, 10);
+    let mut declarative = readiness_result(RunStrategy::DeclarativePlan, true, 10, 10);
+    direct.model_calls = Some(1);
+    declarative.model_calls = Some(2);
+    assert_eq!(selected_forced(direct, declarative), RunStrategy::Direct);
+
+    let mut direct = readiness_result(RunStrategy::Direct, true, 10, 10);
+    let mut declarative = readiness_result(RunStrategy::DeclarativePlan, true, 10, 10);
+    direct.tool_calls = Some(1);
+    declarative.tool_calls = Some(2);
+    assert_eq!(selected_forced(direct, declarative), RunStrategy::Direct);
+
+    let direct = readiness_result(RunStrategy::Direct, true, 10, 10);
+    let mut declarative = readiness_result(RunStrategy::DeclarativePlan, true, 10, 10);
+    declarative.strategy_metrics.wasted_tool_calls = Some(1);
+    assert_eq!(selected_forced(direct, declarative), RunStrategy::Direct);
+
+    let direct = readiness_result(RunStrategy::Direct, true, 10, 10);
+    let declarative = readiness_result(RunStrategy::DeclarativePlan, true, 10, 10);
+    assert_eq!(
+        selected_forced(direct, declarative),
+        RunStrategy::Direct,
+        "stable enum rank must resolve a complete tie"
+    );
+}
+
+#[test]
+fn adaptive_readiness_fails_on_safety_or_correctness_regression() {
+    let mut adaptive = readiness_result(RunStrategy::Adaptive, true, 100, 100);
+    adaptive.strategy_metrics.unauthorized_effects = Some(1);
+    let forced = readiness_result(RunStrategy::Direct, true, 100, 100);
+    let readiness =
+        EvaluationReport::new("report", "suite", 1, vec![adaptive, forced]).adaptive_readiness();
+    assert!(!readiness.ready);
+    assert!(readiness
+        .failures
+        .iter()
+        .any(|failure| failure.code == "adaptive_hard_gate_failed"));
+}
+
+#[test]
+fn complete_result_readiness_requires_passed_completed_and_failure_free() {
+    let mut result = readiness_result(RunStrategy::Adaptive, true, 100, 100);
+    result.passed = false;
+    assert!(!result.passes_readiness());
+    result.passed = true;
+    result.status = Some(RunStatus::Failed);
+    assert!(!result.passes_readiness());
+    result.status = Some(RunStatus::Completed);
+    result
+        .failures
+        .push(AssertionFailure::new("test", "failure"));
+    assert!(!result.passes_readiness());
+}
+
+#[test]
+fn adaptive_readiness_fails_closed_on_unknown_or_invalid_metrics() {
+    let mut unknown = readiness_result(RunStrategy::Adaptive, true, 100, 100);
+    unknown.strategy_metrics.unauthorized_effects = None;
+    let forced = readiness_result(RunStrategy::Direct, true, 100, 100);
+    let readiness = EvaluationReport::new("report", "suite", 1, vec![unknown, forced.clone()])
+        .adaptive_readiness();
+    assert!(!readiness.ready);
+    assert!(readiness
+        .failures
+        .iter()
+        .any(|failure| failure.code == "unknown_metrics"));
+
+    let mut invalid = readiness_result(RunStrategy::Adaptive, true, 100, 100);
+    invalid.strategy_metrics.tool_selection_accuracy = Some(1.5);
+    let readiness =
+        EvaluationReport::new("report", "suite", 1, vec![invalid, forced]).adaptive_readiness();
+    assert!(!readiness.ready);
+    assert!(readiness
+        .failures
+        .iter()
+        .any(|failure| failure.code == "invalid_metrics"));
+}
+
+#[test]
+fn adaptive_readiness_fails_closed_on_missing_or_duplicate_baselines() {
+    let adaptive = readiness_result(RunStrategy::Adaptive, true, 100, 100);
+    let forced = readiness_result(RunStrategy::Direct, true, 100, 100);
+
+    let missing_forced =
+        EvaluationReport::new("report", "suite", 1, vec![adaptive.clone()]).adaptive_readiness();
+    assert!(!missing_forced.ready);
+    assert_eq!(missing_forced.failures[0].code, "missing_forced_baseline");
+
+    let missing_adaptive =
+        EvaluationReport::new("report", "suite", 1, vec![forced.clone()]).adaptive_readiness();
+    assert!(!missing_adaptive.ready);
+    assert_eq!(
+        missing_adaptive.failures[0].code,
+        "missing_adaptive_baseline"
+    );
+
+    let duplicate = EvaluationReport::new(
+        "report",
+        "suite",
+        1,
+        vec![adaptive.clone(), adaptive, forced],
+    )
+    .adaptive_readiness();
+    assert!(!duplicate.ready);
+    assert_eq!(duplicate.failures[0].code, "duplicate_baseline");
 }
 
 #[tokio::test]
@@ -188,7 +538,8 @@ async fn failed_deterministic_assertion_is_reported_without_stopping_other_cases
 
 #[tokio::test]
 async fn regression_export_and_replay_use_explicit_fixture_data_not_trace_payloads() {
-    let suite = load_suite(SUITE, Some("yaml")).unwrap();
+    let mut suite = load_suite(SUITE, Some("yaml")).unwrap();
+    suite.cases[0].strategy = Some(RunStrategy::Programmatic);
     let executor = RecordingExecutor::default();
     let report = evaluate_suite(&suite, &executor, &[], Some(1))
         .await
@@ -206,6 +557,7 @@ async fn regression_export_and_replay_use_explicit_fixture_data_not_trace_payloa
         &report.results[0],
     )
     .unwrap();
+    assert_eq!(regression.case.strategy, Some(RunStrategy::Programmatic));
 
     let serialized = serde_json::to_string(&regression).unwrap();
     assert!(serialized.contains("trace-1"));
@@ -234,6 +586,7 @@ async fn regression_export_and_replay_use_explicit_fixture_data_not_trace_payloa
     assert!(!serialized.contains("private trace payload"));
     let replayed = replay_regression(&regression, &executor).await.unwrap();
     assert!(replayed.passed);
+    assert_eq!(replayed.strategy, RunStrategy::Programmatic);
     assert_eq!(replayed.trace_id.as_deref(), Some("trace-1"));
 }
 
