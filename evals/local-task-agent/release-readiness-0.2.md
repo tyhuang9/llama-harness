@@ -1,43 +1,73 @@
 # 0.2 release-readiness assessment — September 5, 2026
 
-The current implementation has demonstrated real, audited task-tool round trips
-with the installed Gemma model. It is ready for review of this validation PR.
-The evidence does not establish general model compatibility or production
-readiness for advanced strategies. This assessment does not authorize a merge,
-tag, release, publication, or strategy activation.
+Release rehearsals passed on main `f545bd524c622689fc92daf51e6c0e7f17c63175`
+after the user-approved merge of [PR #38](https://github.com/tyhuang9/llama-harness/pull/38).
+The initial manual rehearsal exposed missing Rust formatter/linter components;
+that one-line workflow fix passed 34 CI jobs before merge. No registry upload,
+tag, or GitHub release was performed. The user's manual crates.io setup and
+first publication remain pending.
 
 | Surface | Verified evidence | Remaining condition |
 | --- | --- | --- |
-| Current main integration | PRs #28–#35 merged; exact main `8e52758` continuous verification and docs workflows passed | Verify the validation PR's own head checks before merge |
-| Rust 0.2 contracts and packaging | Canonical `release-check` passed: 492 tests, two ignored, docs, archive validation and extracted consumers | Explicit approval for a specific PR merge; separate release approval |
-| Live evaluation infrastructure | 20 deterministic example tests; strict state, dispatch, approval, output and audit assertions; missing prerequisites exit nonzero | Keep live inference opt-in and outside ordinary CI |
-| Gemma Direct | 30/30 strict live passes across ten cases, including approval denial and recovery | More task diversity, larger fixtures, production failure injection and larger cohorts |
-| Gemma Adaptive | 30/30 strict passes; all 30 actually executed Direct | No inference of DAG, Programmatic, or speed improvement |
-| LFM under the measured profile | 0/30 Direct and 0/30 Adaptive; all stores safe, zero tool proposals | Qualify a prompt/catalog/sampling profile in a new matched cohort before deployment |
-| Ollama adapter | Real Gemma dependent and multiple-call round trips; IPv6 loopback defect fixed and regression-tested; LFM identical-payload native replay reproduced its failure | Broader provider/model and streaming workload evidence remains separate |
-| DAG and Programmatic | Four explicit admission checks rejected unsupported configurations before any model/tool calls | Conforming provider, configured sandbox where required, workload evidence, then specific promotion approval |
-| Speculation | Disabled throughout; no writes speculated | Existing per-tool Shadow and activation gates plus matched evidence, with explicit approval |
-| SDK and protocol compatibility | No SDK/protocol changes in this PR; current-main SDK CI passed; canonical protocol contract checks passed | Production embedding, services and deployment were not exercised by these local fixtures |
+| Main integration | PR #37 live validation and PR #38 workflow fix merged; final-main [continuous verification](https://github.com/tyhuang9/llama-harness/actions/runs/33990319828) passed 13/13 jobs | Recheck the exact approved release source before publication |
+| Rust 0.2 contracts and packaging | Final-main [Rust release rehearsal](https://github.com/tyhuang9/llama-harness/actions/runs/33990339151) passed 8/8 jobs: three-platform crate checks, Rust 1.88 resolution, API/docs, policy and consumers | Initial publication, dependency indexing, exact-version registry consumers, owners and docs.rs |
+| Runtime and SDK artifacts | Final-main [manual rehearsal](https://github.com/tyhuang9/llama-harness/actions/runs/33990343206) passed 7/7 jobs; ten downloaded payloads passed manifest, content and checksum inspection | Authorized npm/PyPI identity and publication, if those channels are intended |
+| Installed Windows SDKs | Fresh offline Node and Python installations used their packaged runtime, verified matching bytes, and completed protocol 1.1 as version 0.2.0 without an override | Registry installation and production embedding remain separate checks |
+| Live evaluation infrastructure | 23 deterministic example tests and seven driver regressions; canonical gate passed 492 tests, two ignored, docs, archives and extracted consumers on frozen code `51d0a60` | Review the benchmark PR and its final-head CI; keep inference opt-in |
+| Gemma functional suite | 30/30 Direct and 30/30 requested Adaptive strict passes across ten guided cases, including denial and recovery | Broader tasks and deployment-specific failure injection |
+| Gemma workload screening | 120/120 measured passes across an approved dependent update and eight independent reads; four discovery and four warmup samples separate | Two synthetic workloads do not establish general reliability or tail latency |
+| Actual strategy | Every live and benchmark Adaptive sample executed Direct | No DAG, Programmatic, speculative execution, or strategy speedup claim |
+| LFM under the earlier profile | 0/30 Direct and 0/30 Adaptive; safe unchanged stores and zero proposals | Qualify a new profile before deployment; not admitted to the benchmark |
+| DAG and Programmatic | Four earlier explicit admission checks rejected unsupported configurations before model/tool calls | Conforming provider, sandbox where required, workload evidence and promotion approval |
+| Speculation | Disabled throughout; Programmatic promotion list empty | Existing per-tool Shadow and activation gates plus matched evidence and approval |
 
-The [results and retained artifacts](live-ollama-2026-09-05.md) establish a
-limited functional result: Gemma, Ollama 0.33.3, prompt v3, a four-tool synthetic
-catalog, fixed generation limits, and a local in-memory store. The instructions
-explicitly name required tools and the output protocol; this is a guided tool
-integration test, not a benchmark of open-ended planning. Three repetitions
-per case do not establish reliability rates or tail-latency bounds.
+The [functional results](live-ollama-2026-09-05.md) and
+[bounded benchmark results](benchmark-ollama-2026-09-05.md) use installed Gemma,
+Ollama 0.33.3, explicit tool/output instructions, a four-tool catalog and fresh
+in-memory fixtures. All 120 measured benchmark samples passed an independent
+raw-evidence audit: 720 model calls, 600 tool dispatches, and 60 intended writes
+with correctly bound approvals. Unauthorized, duplicate and unintended effects
+were zero. The eight-read workload used nine serial model calls per sample;
+its timings establish a Direct baseline only. Thirty matched pairs per case
+do not establish P95 bounds or production reliability.
 
-Unauthorized, duplicate, and unintended writes were zero across the 120 matched
-samples. That includes 60 LFM failures that made no tool requests: absence of
-effects in those trials does not validate LFM approval-denial or recovery
-competence. The same ten cases do establish those behaviors for Gemma.
+Benchmark code was frozen at `51d0a60a1f29231e5762d8b2f830e74c6a972962`,
+which descends from release-rehearsal source `f545bd5`. Source, binary, suite
+and environment hashes were checked before every invocation; final source,
+binary, Ollama version and model digest matched the pre-cohort snapshot.
+The additions are opt-in evaluation tooling, deterministic tests and docs.
+Release artifacts were built from `f545bd5`, not a later evidence commit.
+Select and revalidate the final approved source before immutable publication.
 
-The [production-like benchmark plan](strategy-benchmark-plan.md) is prepared
-with exact workload sizes, correctness gates, matched settings, balancing,
-measurement and rollback conditions. It has not been run. Keep the Adaptive
-Programmatic allowlist empty and speculation Disabled. No benchmark or package
-publication is justified by these timings alone.
+## Publication work still required
 
-The PR is opt-in evaluation work plus a narrow loopback URL fix. Rollback is to
-stop invoking the evaluation binary and, if necessary, revert the IPv6 parsing
-change. No user data migration, service reconfiguration, persistent task-store
-write, or deployment is part of this change.
+Follow the [release runbook](../../docs/releasing.md), including ownership and
+backup-owner requirements. Complete the user-owned crates.io step, publish in
+dependency order and wait for indexing between layers. Core and upper-layer
+registry dry runs and fresh exact-version consumers depend on those first
+publications. Verify packages, owners and docs.rs before tagging. npm/PyPI
+access and distribution must be confirmed separately if included. A name's
+404 response does not prove namespace ownership.
+
+Eight clean-main Rust archives and the runtime/SDK artifact set are prepared
+locally with checksums. The sandbox's final-source
+`cargo publish --locked --dry-run` passed and explicitly aborted upload.
+Cargo retained a warning for an unselected yanked `chacha20 0.10.1` lock entry;
+the all-feature/all-target inverse tree found no selected path and the existing
+policy gate passed without an exemption. Recheck registry/advisory state before
+upload.
+
+On Windows, the downloaded wheel was installed into a new Python 3.12.10 venv
+with `pip install --no-index --no-deps`; downloaded SDK/runtime tarballs were
+installed into fresh Node 24.15.0/npm 12.0.1 dependencies with
+`npm install --offline --ignore-scripts --omit=dev --no-audit --no-fund`.
+Both SDKs resolved their installed runtime, matched Windows runtime SHA-256
+`5d07a3c49c9ec676df567fef00ced1d721f0f329d5c7d2e73c7fab9e29fcbc03`,
+started, negotiated protocol 1.1 and closed. These checks made no model calls
+and do not substitute for registry-consumer or deployed application checks.
+
+Rollback of the evaluation work is to stop invoking the opt-in driver. No
+service configuration, user store, library strategy gate or release version
+was changed. Immutable package recovery follows the runbook's new-version
+policy. These results do not authorize merging a new PR, publication, a tag,
+or advanced-strategy activation.

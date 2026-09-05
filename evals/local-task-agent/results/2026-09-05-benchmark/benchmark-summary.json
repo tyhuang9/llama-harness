@@ -1,0 +1,419 @@
+{
+  "format_version": 1,
+  "failures": [],
+  "cohort": {
+    "model": "gemma4:e4b-it-q4_K_M",
+    "ollama_url": "http://[::1]:11434",
+    "cohort_wall_seconds": 2400.0,
+    "outer_cohort_elapsed_ms": 1061016.0,
+    "frozen_identity": {
+      "executable_sha256": "03ede7b272b3fe26111b66bee8a768ee11e685ecf568fe0d85bc1d84d7d80f42",
+      "source_commit": "51d0a60a1f29231e5762d8b2f830e74c6a972962",
+      "source_dirty": false,
+      "source_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "suite_sha256": "f32f971006e80c75fcb25d8116513dc289606dbfb8ea5bc16b1bc97161816530",
+      "environment_sha256": "caf06dd5f6a8e1efdd5545b65064a7997c0e1eb21cd77f8240e745c04d93fcb8"
+    },
+    "environment": {
+      "checked_at_utc": "2026-09-05T20:11:52.4752195Z",
+      "endpoint": "http://[::1]:11434",
+      "server_version": "0.33.3",
+      "models": [
+        {
+          "name": "gemma4:e4b-it-q4_K_M",
+          "digest": "c6eb396dbd5992bbe3f5cdb947e8bbc0ee413d7c17e2beaae69f5d569cf982eb",
+          "size": 9608350718,
+          "details": {
+            "parent_model": "",
+            "format": "gguf",
+            "family": "gemma4",
+            "families": [
+              "gemma4"
+            ],
+            "parameter_size": "8.0B",
+            "quantization_level": "Q4_K_M"
+          }
+        },
+        {
+          "name": "lfm2.5-thinking:1.2b-q4_K_M",
+          "digest": "95bd9d45385f33bfe96d8b3651c8569e152f21f5bdb7c19894ffde650e9cf140",
+          "size": 731163903,
+          "details": {
+            "parent_model": "",
+            "format": "gguf",
+            "family": "lfm2",
+            "families": [
+              "lfm2"
+            ],
+            "parameter_size": "1.2B",
+            "quantization_level": "Q4_K_M",
+            "context_length": 128000,
+            "embedding_length": 2048
+          }
+        }
+      ],
+      "resident": [],
+      "machine": {
+        "gpu": [
+          "NVIDIA GeForce RTX 4080 SUPER, 16376 MiB, 610.88"
+        ],
+        "cpu": [
+          {
+            "Name": "AMD Ryzen 7 7800X3D 8-Core Processor           ",
+            "NumberOfCores": 8,
+            "NumberOfLogicalProcessors": 16
+          }
+        ],
+        "physical_memory_bytes": 33488437248
+      },
+      "benchmark": {
+        "model": "gemma4:e4b-it-q4_K_M",
+        "measured_pairs_per_workload": 30,
+        "seed": "not exposed by provider",
+        "top_p": 1,
+        "thinking": "provider default",
+        "speculation": "Disabled",
+        "programmatic_promotion_classes": [],
+        "prompt_version": "local-task-agent-benchmark-prompt-1",
+        "workloads": [
+          "dependent-lookup-update",
+          "independent-reads-8"
+        ],
+        "temperature": 0,
+        "top_k": "model default",
+        "max_output_tokens": 2048
+      }
+    }
+  },
+  "totals": {
+    "model_calls": 720,
+    "model_call_evidence": 720,
+    "input_tokens": 567000,
+    "output_tokens": 123090,
+    "tool_attempts": 600,
+    "tool_dispatches": 600,
+    "audit_violations": 0,
+    "mutation_dispatches": 60,
+    "rows": 120,
+    "fully_passed_rows": 120
+  },
+  "per_case": {
+    "dependent-lookup-update": {
+      "requested_strategy_counts": {
+        "adaptive": 30,
+        "direct": 30
+      },
+      "actual_strategy_counts": {
+        "direct": 60
+      },
+      "fallback_sequences": {
+        "[{\"from\": \"adaptive\", \"reason\": \"UnsupportedCapability\", \"to\": \"direct\"}]": 30
+      },
+      "fully_passed": 60,
+      "metrics": {
+        "model_calls": 180,
+        "model_call_evidence": 180,
+        "input_tokens": 165840,
+        "output_tokens": 31470,
+        "tool_attempts": 120,
+        "tool_dispatches": 120,
+        "audit_violations": 0,
+        "mutation_dispatches": 60,
+        "rows": 60,
+        "fully_passed_rows": 60
+      }
+    },
+    "independent-reads-8": {
+      "requested_strategy_counts": {
+        "adaptive": 30,
+        "direct": 30
+      },
+      "actual_strategy_counts": {
+        "direct": 60
+      },
+      "fallback_sequences": {
+        "[{\"from\": \"adaptive\", \"reason\": \"UnsupportedCapability\", \"to\": \"direct\"}]": 30
+      },
+      "fully_passed": 60,
+      "metrics": {
+        "model_calls": 540,
+        "model_call_evidence": 540,
+        "input_tokens": 401160,
+        "output_tokens": 91620,
+        "tool_attempts": 480,
+        "tool_dispatches": 480,
+        "audit_violations": 0,
+        "mutation_dispatches": 0,
+        "rows": 60,
+        "fully_passed_rows": 60
+      }
+    }
+  },
+  "all_phase_totals": {
+    "model_calls": 768,
+    "model_call_evidence": 768,
+    "input_tokens": 604800,
+    "output_tokens": 131298,
+    "tool_attempts": 640,
+    "tool_dispatches": 640,
+    "audit_violations": 0,
+    "mutation_dispatches": 64,
+    "rows": 128,
+    "fully_passed_rows": 128
+  },
+  "phases": {
+    "discovery": {
+      "planned": 4,
+      "completed": 4,
+      "missing": 0,
+      "fully_passed": 4,
+      "totals": {
+        "model_calls": 24,
+        "model_call_evidence": 24,
+        "input_tokens": 18900,
+        "output_tokens": 4105,
+        "tool_attempts": 20,
+        "tool_dispatches": 20,
+        "audit_violations": 0,
+        "mutation_dispatches": 2,
+        "rows": 4,
+        "fully_passed_rows": 4
+      },
+      "per_case": {
+        "dependent-lookup-update": {
+          "requested_strategy_counts": {
+            "adaptive": 1,
+            "direct": 1
+          },
+          "actual_strategy_counts": {
+            "direct": 2
+          },
+          "fallback_sequences": {
+            "[{\"from\": \"adaptive\", \"reason\": \"UnsupportedCapability\", \"to\": \"direct\"}]": 1
+          },
+          "fully_passed": 2,
+          "metrics": {
+            "model_calls": 6,
+            "model_call_evidence": 6,
+            "input_tokens": 5528,
+            "output_tokens": 1095,
+            "tool_attempts": 4,
+            "tool_dispatches": 4,
+            "audit_violations": 0,
+            "mutation_dispatches": 2,
+            "rows": 2,
+            "fully_passed_rows": 2
+          }
+        },
+        "independent-reads-8": {
+          "requested_strategy_counts": {
+            "adaptive": 1,
+            "direct": 1
+          },
+          "actual_strategy_counts": {
+            "direct": 2
+          },
+          "fallback_sequences": {
+            "[{\"from\": \"adaptive\", \"reason\": \"UnsupportedCapability\", \"to\": \"direct\"}]": 1
+          },
+          "fully_passed": 2,
+          "metrics": {
+            "model_calls": 18,
+            "model_call_evidence": 18,
+            "input_tokens": 13372,
+            "output_tokens": 3010,
+            "tool_attempts": 16,
+            "tool_dispatches": 16,
+            "audit_violations": 0,
+            "mutation_dispatches": 0,
+            "rows": 2,
+            "fully_passed_rows": 2
+          }
+        }
+      }
+    },
+    "warmup": {
+      "planned": 4,
+      "completed": 4,
+      "missing": 0,
+      "fully_passed": 4,
+      "totals": {
+        "model_calls": 24,
+        "model_call_evidence": 24,
+        "input_tokens": 18900,
+        "output_tokens": 4103,
+        "tool_attempts": 20,
+        "tool_dispatches": 20,
+        "audit_violations": 0,
+        "mutation_dispatches": 2,
+        "rows": 4,
+        "fully_passed_rows": 4
+      },
+      "per_case": {
+        "dependent-lookup-update": {
+          "requested_strategy_counts": {
+            "adaptive": 1,
+            "direct": 1
+          },
+          "actual_strategy_counts": {
+            "direct": 2
+          },
+          "fallback_sequences": {
+            "[{\"from\": \"adaptive\", \"reason\": \"UnsupportedCapability\", \"to\": \"direct\"}]": 1
+          },
+          "fully_passed": 2,
+          "metrics": {
+            "model_calls": 6,
+            "model_call_evidence": 6,
+            "input_tokens": 5528,
+            "output_tokens": 1049,
+            "tool_attempts": 4,
+            "tool_dispatches": 4,
+            "audit_violations": 0,
+            "mutation_dispatches": 2,
+            "rows": 2,
+            "fully_passed_rows": 2
+          }
+        },
+        "independent-reads-8": {
+          "requested_strategy_counts": {
+            "adaptive": 1,
+            "direct": 1
+          },
+          "actual_strategy_counts": {
+            "direct": 2
+          },
+          "fallback_sequences": {
+            "[{\"from\": \"adaptive\", \"reason\": \"UnsupportedCapability\", \"to\": \"direct\"}]": 1
+          },
+          "fully_passed": 2,
+          "metrics": {
+            "model_calls": 18,
+            "model_call_evidence": 18,
+            "input_tokens": 13372,
+            "output_tokens": 3054,
+            "tool_attempts": 16,
+            "tool_dispatches": 16,
+            "audit_violations": 0,
+            "mutation_dispatches": 0,
+            "rows": 2,
+            "fully_passed_rows": 2
+          }
+        }
+      }
+    },
+    "measured": {
+      "planned": 120,
+      "completed": 120,
+      "missing": 0,
+      "fully_passed": 120,
+      "totals": {
+        "model_calls": 720,
+        "model_call_evidence": 720,
+        "input_tokens": 567000,
+        "output_tokens": 123090,
+        "tool_attempts": 600,
+        "tool_dispatches": 600,
+        "audit_violations": 0,
+        "mutation_dispatches": 60,
+        "rows": 120,
+        "fully_passed_rows": 120
+      },
+      "per_case": {
+        "dependent-lookup-update": {
+          "requested_strategy_counts": {
+            "adaptive": 30,
+            "direct": 30
+          },
+          "actual_strategy_counts": {
+            "direct": 60
+          },
+          "fallback_sequences": {
+            "[{\"from\": \"adaptive\", \"reason\": \"UnsupportedCapability\", \"to\": \"direct\"}]": 30
+          },
+          "fully_passed": 60,
+          "metrics": {
+            "model_calls": 180,
+            "model_call_evidence": 180,
+            "input_tokens": 165840,
+            "output_tokens": 31470,
+            "tool_attempts": 120,
+            "tool_dispatches": 120,
+            "audit_violations": 0,
+            "mutation_dispatches": 60,
+            "rows": 60,
+            "fully_passed_rows": 60
+          }
+        },
+        "independent-reads-8": {
+          "requested_strategy_counts": {
+            "adaptive": 30,
+            "direct": 30
+          },
+          "actual_strategy_counts": {
+            "direct": 60
+          },
+          "fallback_sequences": {
+            "[{\"from\": \"adaptive\", \"reason\": \"UnsupportedCapability\", \"to\": \"direct\"}]": 30
+          },
+          "fully_passed": 60,
+          "metrics": {
+            "model_calls": 540,
+            "model_call_evidence": 540,
+            "input_tokens": 401160,
+            "output_tokens": 91620,
+            "tool_attempts": 480,
+            "tool_dispatches": 480,
+            "audit_violations": 0,
+            "mutation_dispatches": 0,
+            "rows": 60,
+            "fully_passed_rows": 60
+          }
+        }
+      }
+    }
+  },
+  "paired_measurements": {
+    "total_paired_n": 60,
+    "per_case": {
+      "dependent-lookup-update": {
+        "total_pairs": 30,
+        "paired_n": 30,
+        "excluded_pair_count": 0,
+        "excluded_pair_indexes": [],
+        "median_adaptive_minus_direct": {
+          "evaluator_duration_ms": 43.5,
+          "model_calls": 0.0,
+          "input_tokens": 0.0,
+          "output_tokens": 0.0,
+          "tool_attempts": 0.0,
+          "tool_dispatches": 0.0,
+          "mutation_dispatches": 0.0
+        },
+        "latency_metric": "evaluator_duration_ms",
+        "outer_subprocess_elapsed_ms_is_not_used_for_paired_latency": true
+      },
+      "independent-reads-8": {
+        "total_pairs": 30,
+        "paired_n": 30,
+        "excluded_pair_count": 0,
+        "excluded_pair_indexes": [],
+        "median_adaptive_minus_direct": {
+          "evaluator_duration_ms": -19.5,
+          "model_calls": 0.0,
+          "input_tokens": 0.0,
+          "output_tokens": 0.0,
+          "tool_attempts": 0.0,
+          "tool_dispatches": 0.0,
+          "mutation_dispatches": 0.0
+        },
+        "latency_metric": "evaluator_duration_ms",
+        "outer_subprocess_elapsed_ms_is_not_used_for_paired_latency": true
+      }
+    }
+  },
+  "planned_count": 128,
+  "completed_count": 128,
+  "missing_count": 0,
+  "full_summary": "evidence.zip:benchmark-gemma-v1/summary.json"
+}

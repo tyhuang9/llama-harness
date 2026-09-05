@@ -50,8 +50,12 @@ The current Ollama integration lacks the structured-plan and Programmatic
 contracts. Explicit requests for those strategies fail admission; Adaptive
 fallback to Direct is recorded as Direct execution. Read the
 [September 5 local results](../evals/local-task-agent/live-ollama-2026-09-05.md)
-and the [follow-up benchmark protocol](../evals/local-task-agent/strategy-benchmark-plan.md)
+and the [bounded benchmark results](../evals/local-task-agent/benchmark-ollama-2026-09-05.md)
 before interpreting live results as production or promotion evidence.
+The [benchmark protocol](../evals/local-task-agent/strategy-benchmark-plan.md)
+includes a separate opt-in driver with a frozen, balanced schedule, warmups,
+strict effect checks and paired measurements. Its two-workload Gemma screening
+passed 120/120 measured samples; all requested Adaptive runs used Direct.
 The [0.2 readiness assessment](../evals/local-task-agent/release-readiness-0.2.md)
 separates package verification from model-specific and advanced-strategy gaps.
 
