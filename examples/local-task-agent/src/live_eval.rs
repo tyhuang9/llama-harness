@@ -516,7 +516,7 @@ impl EvalExecutor for LiveEvalExecutor {
             .with_prompt_version(
                 request
                     .prompt_version
-                    .or_else(|| Some("local-task-agent-live-prompt-2".into())),
+                    .or_else(|| Some("local-task-agent-live-prompt-3".into())),
             ))
     }
 }
@@ -1314,17 +1314,49 @@ fn task_record_schema() -> Value {
 }
 
 fn final_output_instruction(case_id: &str, _contract: &CaseContract) -> String {
-    match case_id {
-        "no-tool" => " Finish with only JSON with status and details.outcome. Do not add fields.".into(),
-        "approved-mutation" | "dependent-lookup-update" | "transient-read-retry" => " Finish with only JSON whose details contains exactly id, title, and status from the actual task result. Do not add fields.".into(),
-        "duplicate-prevention" => " Finish with only JSON whose details contains exactly outcome, id, title, and status from the observed existing task. Do not add fields.".into(),
-        "independent-reads" => " Finish with only JSON whose details contains exactly a two-item tasks array. Each item must contain only id, title, and status from an actual get_task result.".into(),
-        "ambiguity" => " Finish with only JSON whose details contains exactly outcome and one nonempty question. Do not add claims or fields.".into(),
-        "denied-approval" => " Finish with only JSON whose details contains exactly outcome, id, and changed. Report the actual approval result.".into(),
-        "bounded-read-failure" => " Finish with only JSON whose details contains exactly outcome and id. Report the failed read honestly.".into(),
-        "model-budget-stop" => " The run has a one-call model budget. If a terminal answer is produced, it must not claim a successful task result.".into(),
-        _ => String::new(),
-    }
+    let case_shape = match case_id {
+        "no-tool" => " For a requested no-action result, details contains only outcome.",
+        "approved-mutation" | "dependent-lookup-update" | "transient-read-retry" => {
+            " For an actual successful task result, details contains only id, title, and status from that result."
+        }
+        "duplicate-prevention" => {
+            " For an observed duplicate, details contains only outcome, id, title, and status from the existing task."
+        }
+        "independent-reads" => {
+            " For independent reads, details contains only a two-item tasks array; each item contains only id, title, and status from an actual get_task result."
+        }
+        "ambiguity" => {
+            " For ambiguity, details contains only outcome and one nonempty question."
+        }
+        "denied-approval" => {
+            " For a denied approval, details contains only outcome, id, and changed."
+        }
+        "bounded-read-failure" => {
+            " For a failed read, details contains only outcome and id."
+        }
+        "model-budget-stop" => {
+            " A model-call limit may end the run without final JSON; if final JSON is produced, it must not claim success."
+        }
+        _ => "",
+    };
+    format!(
+        r#"
+Final output protocol: after the runtime has finished handling tools and approvals, return only one JSON object and no Markdown fence. `details` is always a nested JSON object: never write a dotted literal key such as `details.outcome`, and never flatten fields from details (id, title, task status, outcome, question, or changed) into the top level.
+
+Choose a status and nested shape only when its condition is actually observed:
+- No requested action: {{"status":"ok","details":{{"outcome":"no_action"}}}}
+- Successful create_task: {{"status":"created","details":{{"id":"<id from create result>","title":"<title from create result>","status":"<status from create result>"}}}}
+- Successful update_task: {{"status":"completed","details":{{"id":"<id from update result>","title":"<title from update result>","status":"<status from update result>"}}}}
+- Successful single get_task read: {{"status":"ok","details":{{"id":"<id from get result>","title":"<title from get result>","status":"<status from get result>"}}}}
+- Successful independent reads: {{"status":"ok","details":{{"tasks":[{{"id":"<first id from get result>","title":"<first title from get result>","status":"<first status from get result>"}},{{"id":"<second id from get result>","title":"<second title from get result>","status":"<second status from get result>"}}]}}}}
+- Existing duplicate found by a read: {{"status":"not_created","details":{{"outcome":"already_exists","id":"<id from existing task>","title":"<title from existing task>","status":"<status from existing task>"}}}}
+- Ambiguous request: {{"status":"clarification_needed","details":{{"outcome":"unchanged","question":"<nonempty clarification question>"}}}}
+- Runtime denied approval: {{"status":"not_changed","details":{{"outcome":"approval_denied","id":"<proposed id>","changed":false}}}}
+- Allowed reads exhausted without a result: {{"status":"unavailable","details":{{"outcome":"read_failed","id":"<requested id>"}}}}
+
+When a runtime limit stops the run, do not use any success status (`ok`, `created`, `completed`, `not_created`, or `not_changed`) and do not invent task facts. Task records (id, title, and task status) must come from actual successful tool results. An id supplied in the request may be used only for approval_denied or read_failed details.
+{case_shape}"#
+    )
 }
 
 fn fixture_tasks(
@@ -2403,7 +2435,52 @@ mod tests {
             assert!(artifact.report.results[0].passed, "{case_id}");
 
             let requests = provider.requests();
-            let first = serde_json::to_string(&requests[0].messages).unwrap();
+            let first = requests[0]
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<String>();
+            for protocol_text in [
+                "Final output protocol",
+                "nested JSON object",
+                "dotted literal key",
+                "fields from details",
+                r#"{"status":"ok","details":{"outcome":"no_action"}}"#,
+                r#"{"status":"created","details":{"id":"<id from create result>""#,
+                r#"{"status":"completed","details":{"id":"<id from update result>""#,
+                r#"{"status":"ok","details":{"id":"<id from get result>""#,
+                r#"{"status":"ok","details":{"tasks":[{"id":"<first id from get result>""#,
+                r#"{"status":"not_created","details":{"outcome":"already_exists""#,
+                r#"{"status":"clarification_needed","details":{"outcome":"unchanged","question":"<nonempty clarification question>"}}"#,
+                r#"{"status":"not_changed","details":{"outcome":"approval_denied","id":"<proposed id>","changed":false}}"#,
+                r#"{"status":"unavailable","details":{"outcome":"read_failed","id":"<requested id>"}}"#,
+                "No requested action",
+                "Successful create_task",
+                "Successful update_task",
+                "Successful single get_task read",
+                "Successful independent reads",
+                "Existing duplicate found by a read",
+                "Ambiguous request",
+                "Runtime denied approval",
+                "Allowed reads exhausted without a result",
+                "no_action",
+                "already_exists",
+                "unchanged",
+                "approval_denied",
+                "read_failed",
+                "clarification_needed",
+                "not_created",
+                "not_changed",
+                "unavailable",
+                "created",
+                "completed",
+                "approval_denied or read_failed details",
+            ] {
+                assert!(
+                    first.contains(protocol_text),
+                    "first {case_id} request omitted output protocol text {protocol_text:?}: {first}"
+                );
+            }
             for fact in absent {
                 assert!(
                     !first.contains(fact),
