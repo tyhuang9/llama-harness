@@ -105,7 +105,7 @@ no P95 or production-performance claim.
 The deterministic driver tests require no model or service:
 
 ```text
-python -m unittest discover -s evals/local-task-agent -p "test_*.py" -v
+python evals/local-task-agent/run_benchmark_driver_tests.py
 ```
 
 ## Promotion and rollback

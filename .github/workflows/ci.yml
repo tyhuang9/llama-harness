@@ -87,7 +87,7 @@ jobs:
       - name: Verify release validation scripts
         run: python -m unittest discover -s scripts/tests -v
       - name: Verify local task-agent benchmark driver
-        run: python -m unittest discover -s evals/local-task-agent -p "test_*.py" -v
+        run: python evals/local-task-agent/run_benchmark_driver_tests.py
       - name: Verify Rust release, package archives, and extracted consumers
         run: cargo run --locked -p xtask -- release-check
       - name: Verify workspace consumers
