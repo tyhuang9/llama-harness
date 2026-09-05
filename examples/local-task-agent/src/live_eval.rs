@@ -1145,6 +1145,30 @@ fn case_contract(id: &str) -> Result<CaseContract, EvalError> {
             contract.exact_final_json = None;
             contract
         }
+        "independent-reads-8" => {
+            let mut contract = no_write(vec![
+                task("crux-17", "Pack bag", "queued"),
+                task("mist-28", "Pay bill", "blocked"),
+                task("amber-39", "Book table", "open"),
+                task("nova-44", "Send draft", "review"),
+                task("pulse-56", "Water plants", "paused"),
+                task("orbit-63", "Read brief", "ready"),
+                task("sable-72", "Call mentor", "waiting"),
+                task("ember-84", "File receipt", "done"),
+            ]);
+            contract.expected_dispatches = contract
+                .initial
+                .iter()
+                .map(|task| ExpectedDispatch {
+                    tool_id: GET_TASK_TOOL,
+                    arguments: json!({"id": task.id}),
+                })
+                .collect();
+            contract.max_model_calls = 9;
+            contract.max_tool_calls = 8;
+            contract.exact_final_json = None;
+            contract
+        }
         "ambiguity" => {
             let mut contract = no_write(vec![
                 task("alpha-1", "Follow up with client", "open"),
@@ -1258,6 +1282,14 @@ fn final_output_schema(case_id: &str, contract: &CaseContract) -> Option<Value> 
                 "items": task_record_schema()
             }
         }))),
+        "independent-reads-8" => Some(output_shape(json!({
+            "tasks": {
+                "type": "array",
+                "minItems": 8,
+                "maxItems": 8,
+                "items": task_record_schema()
+            }
+        }))),
         "ambiguity" => Some(json!({
             "type": "object",
             "required": ["status", "details"],
@@ -1314,6 +1346,9 @@ fn task_record_schema() -> Value {
 }
 
 fn final_output_instruction(case_id: &str, _contract: &CaseContract) -> String {
+    if case_id == "independent-reads-8" {
+        return benchmark_eight_read_output_instruction();
+    }
     let case_shape = match case_id {
         "no-tool" => " For a requested no-action result, details contains only outcome.",
         "approved-mutation" | "dependent-lookup-update" | "transient-read-retry" => {
@@ -1357,6 +1392,20 @@ Choose a status and nested shape only when its condition is actually observed:
 When a runtime limit stops the run, do not use any success status (`ok`, `created`, `completed`, `not_created`, or `not_changed`) and do not invent task facts. Task records (id, title, and task status) must come from actual successful tool results. An id supplied in the request may be used only for approval_denied or read_failed details.
 {case_shape}"#
     )
+}
+
+fn benchmark_eight_read_output_instruction() -> String {
+    r#"
+Benchmark final output protocol: after all eight get_task calls have completed,
+return only one JSON object and no Markdown fence. Use this exact envelope:
+{"status":"ok","details":{"tasks":[{"id":"<id from get result>","title":"<title from get result>","status":"<status from get result>"}]}}
+
+Replace the one displayed task object with exactly eight task records, one for
+each actual get_task result. Every object contains only id, title, and status.
+Do not duplicate, omit, swap, invent, or add task facts. Do not add top-level
+fields or fields inside details. Do not claim a task change or approval.
+"#
+    .to_owned()
 }
 
 fn fixture_tasks(
@@ -1521,7 +1570,7 @@ fn evaluate_live_contract(
                 "bounded read failure did not make one or two failed get_task attempts with exact arguments",
             ));
         }
-    } else if case_id == "independent-reads" {
+    } else if matches!(case_id, "independent-reads" | "independent-reads-8") {
         let mut expected: Vec<_> = contract
             .expected_dispatches
             .iter()
@@ -1663,6 +1712,13 @@ fn evaluate_live_contract(
                     "independent reads did not return exactly the two requested task records",
                 ));
             }
+            if case_id == "independent-reads-8" && !is_exact_read_output(&output, &contract.initial)
+            {
+                failures.push(assertion(
+                    "final_consistency",
+                    "benchmark independent reads did not return exactly the eight requested task records",
+                ));
+            }
             if case_id == "ambiguity" && !is_valid_ambiguity_output(&output) {
                 failures.push(assertion(
                     "final_consistency",
@@ -1712,6 +1768,39 @@ fn is_exact_independent_output(output: &Value) -> bool {
     let mut expected = expected.to_vec();
     expected.sort_by_key(Value::to_string);
     actual == expected
+}
+
+fn is_exact_read_output(output: &Value, expected_tasks: &[Task]) -> bool {
+    let Some(root) = output.as_object() else {
+        return false;
+    };
+    let Some(tasks) = root
+        .get("details")
+        .and_then(Value::as_object)
+        .filter(|details| details.len() == 1)
+        .and_then(|details| details.get("tasks"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    if root.len() != 2
+        || root.get("status").and_then(Value::as_str) != Some("ok")
+        || tasks.len() != expected_tasks.len()
+    {
+        return false;
+    }
+    let mut actual = tasks.clone();
+    actual.sort_by_key(Value::to_string);
+    let mut expected = expected_task_records(expected_tasks);
+    expected.sort_by_key(Value::to_string);
+    actual == expected
+}
+
+fn expected_task_records(tasks: &[Task]) -> Vec<Value> {
+    tasks
+        .iter()
+        .map(|task| json!({"id": task.id, "title": task.title, "status": task.status}))
+        .collect()
 }
 
 fn is_valid_ambiguity_output(output: &Value) -> bool {
@@ -1927,6 +2016,10 @@ mod tests {
                     {"id": "alpha-41", "title": "Call dentist", "status": "open"},
                     {"id": "beta-92", "title": "Evening medication", "status": "completed"}
                 ]}
+            })),
+            "independent-reads-8" => Some(json!({
+                "status": "ok",
+                "details": {"tasks": expected_task_records(&contract.initial)}
             })),
             "ambiguity" => Some(json!({
                 "status": "clarification_needed",
@@ -2230,6 +2323,39 @@ mod tests {
         assert!(suite.is_ok(), "{suite:?}");
     }
 
+    #[test]
+    fn every_final_output_protocol_example_is_valid_json() {
+        let instruction = final_output_instruction(
+            "independent-reads",
+            &case_contract("independent-reads").unwrap(),
+        );
+        for prefix in [
+            "- No requested action: ",
+            "- Successful create_task: ",
+            "- Successful update_task: ",
+            "- Successful single get_task read: ",
+            "- Successful independent reads: ",
+            "- Existing duplicate found by a read: ",
+            "- Ambiguous request: ",
+            "- Runtime denied approval: ",
+            "- Allowed reads exhausted without a result: ",
+        ] {
+            let line = instruction
+                .lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing protocol example {prefix:?}"));
+            serde_json::from_str::<Value>(line.strip_prefix(prefix).unwrap())
+                .unwrap_or_else(|error| panic!("invalid protocol example {line:?}: {error}"));
+        }
+        let benchmark = benchmark_eight_read_output_instruction();
+        let envelope = benchmark
+            .lines()
+            .find(|line| line.starts_with('{'))
+            .expect("benchmark protocol must contain its JSON envelope");
+        serde_json::from_str::<Value>(envelope)
+            .unwrap_or_else(|error| panic!("invalid benchmark envelope {envelope:?}: {error}"));
+    }
+
     #[tokio::test]
     async fn unsupported_forced_strategy_records_zero_contact_and_fails() {
         for strategy in [RunStrategy::DeclarativePlan, RunStrategy::Programmatic] {
@@ -2265,7 +2391,11 @@ mod tests {
 
     fn live_suite_with_case(case_id: &str) -> llama_harness::evals::EvalSuite {
         let mut suite = llama_harness::evals::load_suite(
-            include_str!("../../../evals/local-task-agent/live-suite.yaml"),
+            if case_id == "independent-reads-8" {
+                include_str!("../../../evals/local-task-agent/benchmark-suite.yaml")
+            } else {
+                include_str!("../../../evals/local-task-agent/live-suite.yaml")
+            },
             Some("yaml"),
         )
         .unwrap();
@@ -2320,6 +2450,25 @@ mod tests {
                 ])),
                 final_step(),
             ],
+            "independent-reads-8" => vec![
+                MockStep::Response(
+                    ModelResponse::new("mock-model").with_tool_calls(
+                        [7, 1, 5, 0, 6, 2, 4, 3]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(call_index, task_index)| {
+                                let task = &contract.initial[task_index];
+                                llama_harness::ToolCall::new(
+                                    format!("get-{}", call_index + 1),
+                                    GET_TASK_TOOL,
+                                    json!({"id": task.id}).to_string(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                ),
+                final_step(),
+            ],
             "denied-approval" => vec![
                 tool_response(tool_call(
                     "update-1",
@@ -2349,7 +2498,12 @@ mod tests {
 
     async fn scripted_sample(case_id: &str, strategy: RunStrategy) -> LiveSampleEvidence {
         let provider = Arc::new(MockModelProvider::scripted(scripted_steps(case_id)));
-        let executor = LiveEvalExecutor::new(LiveEvalConfig::new(provider));
+        let mut config = LiveEvalConfig::new(provider);
+        if case_id == "independent-reads-8" {
+            config.limits.max_model_calls = 9;
+            config.limits.max_tool_calls = 8;
+        }
+        let executor = LiveEvalExecutor::new(config);
         let mut suite = live_suite_with_case(case_id);
         suite.strategies = vec![strategy];
         let artifact = evaluate_live_suite(&suite, &executor, &[], None)
@@ -2407,6 +2561,122 @@ mod tests {
                         .all(|execution| execution.context.tool_id == GET_TASK_TOOL));
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn benchmark_eight_independent_reads_run_through_the_real_runner_for_both_strategies() {
+        for strategy in [RunStrategy::Direct, RunStrategy::Adaptive] {
+            let provider = Arc::new(MockModelProvider::scripted(scripted_steps(
+                "independent-reads-8",
+            )));
+            let mut config = LiveEvalConfig::new(provider);
+            config.limits.max_model_calls = 9;
+            config.limits.max_tool_calls = 8;
+            let executor = LiveEvalExecutor::new(config);
+            let mut suite = live_suite_with_case("independent-reads-8");
+            suite.strategies = vec![strategy];
+            let artifact = evaluate_live_suite(&suite, &executor, &[], None)
+                .await
+                .unwrap();
+            assert_eq!(artifact.report.results.len(), 1);
+            assert!(
+                artifact.report.results[0].passed,
+                "{strategy:?}: {:#?}",
+                artifact.report.results[0].failures
+            );
+            let evidence = &artifact.evidence[0];
+            assert_eq!(evidence.strategy.actual, Some(RunStrategy::Direct));
+            assert_eq!(evidence.tool_executions.len(), 8);
+            assert!(evidence.approvals.is_empty());
+            assert!(evidence.tool_executions.iter().all(|execution| {
+                execution.context.tool_id == GET_TASK_TOOL
+                    && execution
+                        .returned_result
+                        .as_ref()
+                        .is_some_and(|result| result.ok)
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn benchmark_eight_independent_reads_prompt_keeps_fixture_facts_out_of_the_first_request()
+    {
+        let provider = Arc::new(MockModelProvider::scripted(scripted_steps(
+            "independent-reads-8",
+        )));
+        let mut config = LiveEvalConfig::new(provider.clone());
+        config.limits.max_model_calls = 9;
+        config.limits.max_tool_calls = 8;
+        let executor = LiveEvalExecutor::new(config);
+        let artifact = evaluate_live_suite(
+            &live_suite_with_case("independent-reads-8"),
+            &executor,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(artifact.report.results[0].passed);
+
+        let requests = provider.requests();
+        let first = requests[0]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<String>();
+        assert!(first.contains("Benchmark final output protocol"));
+        assert!(first.contains("exactly eight task records"));
+        assert!(!first.contains("two-item tasks array"));
+        assert!(!first.contains("<first id from get result>"));
+        for fact in [
+            "Pack bag",
+            "Pay bill",
+            "Book table",
+            "Send draft",
+            "Water plants",
+            "Read brief",
+            "Call mentor",
+            "File receipt",
+            "queued",
+            "blocked",
+            "review",
+            "paused",
+            "ready",
+            "waiting",
+            "done",
+        ] {
+            assert!(
+                !first.contains(fact),
+                "first request leaked benchmark fixture fact {fact:?}: {first}"
+            );
+        }
+        let later = requests
+            .iter()
+            .skip(1)
+            .map(|request| serde_json::to_string(&request.messages).unwrap())
+            .collect::<String>();
+        for fact in [
+            "Pack bag",
+            "Pay bill",
+            "Book table",
+            "Send draft",
+            "Water plants",
+            "Read brief",
+            "Call mentor",
+            "File receipt",
+            "queued",
+            "blocked",
+            "review",
+            "paused",
+            "ready",
+            "waiting",
+            "done",
+        ] {
+            assert!(
+                later.contains(fact),
+                "later request omitted {fact:?}: {later}"
+            );
         }
     }
 
@@ -2530,6 +2800,86 @@ mod tests {
         assert!(has_rule(
             &evaluate_live_contract("independent-reads", &swapped_read),
             "final_consistency"
+        ));
+
+        let mut missing_benchmark_read =
+            scripted_sample("independent-reads-8", RunStrategy::Direct).await;
+        let mut missing_output: Value = serde_json::from_str(
+            missing_benchmark_read
+                .run
+                .as_ref()
+                .unwrap()
+                .final_output
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        missing_output["details"]["tasks"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        missing_benchmark_read.run.as_mut().unwrap().final_output =
+            Some(missing_output.to_string());
+        assert!(has_rule(
+            &evaluate_live_contract("independent-reads-8", &missing_benchmark_read),
+            "final_consistency"
+        ));
+
+        let mut duplicate_benchmark_read =
+            scripted_sample("independent-reads-8", RunStrategy::Direct).await;
+        let mut duplicate_output: Value = serde_json::from_str(
+            duplicate_benchmark_read
+                .run
+                .as_ref()
+                .unwrap()
+                .final_output
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        let duplicate = duplicate_output["details"]["tasks"][0].clone();
+        duplicate_output["details"]["tasks"][1] = duplicate;
+        duplicate_benchmark_read.run.as_mut().unwrap().final_output =
+            Some(duplicate_output.to_string());
+        assert!(has_rule(
+            &evaluate_live_contract("independent-reads-8", &duplicate_benchmark_read),
+            "final_consistency"
+        ));
+
+        let mut wrong_benchmark_read =
+            scripted_sample("independent-reads-8", RunStrategy::Direct).await;
+        let mut wrong_output: Value = serde_json::from_str(
+            wrong_benchmark_read
+                .run
+                .as_ref()
+                .unwrap()
+                .final_output
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        wrong_output["details"]["tasks"][0]["title"] = json!("invented title");
+        wrong_benchmark_read.run.as_mut().unwrap().final_output = Some(wrong_output.to_string());
+        assert!(has_rule(
+            &evaluate_live_contract("independent-reads-8", &wrong_benchmark_read),
+            "final_consistency"
+        ));
+
+        let mut duplicate_benchmark_dispatch =
+            scripted_sample("independent-reads-8", RunStrategy::Direct).await;
+        let repeated = duplicate_benchmark_dispatch.tool_executions[0].clone();
+        duplicate_benchmark_dispatch.tool_executions.push(repeated);
+        assert!(has_rule(
+            &evaluate_live_contract("independent-reads-8", &duplicate_benchmark_dispatch),
+            "tool_contract"
+        ));
+
+        let mut missing_benchmark_dispatch =
+            scripted_sample("independent-reads-8", RunStrategy::Direct).await;
+        missing_benchmark_dispatch.tool_executions.pop();
+        assert!(has_rule(
+            &evaluate_live_contract("independent-reads-8", &missing_benchmark_dispatch),
+            "tool_contract"
         ));
 
         let mut false_denial = scripted_sample("denied-approval", RunStrategy::Direct).await;

@@ -1,0 +1,53 @@
+version: 1
+id: local-task-agent-strategy-benchmark
+name: Local Task Agent Strategy Benchmark
+agent: local-task-agent
+agent_version: "1"
+prompt_version: local-task-agent-benchmark-prompt-1
+models: [installed-model-required]
+strategies: [direct, adaptive]
+defaults:
+  repeat: 1
+cases:
+  - id: dependent-lookup-update
+    fixture:
+      id: opaque-dentist
+      data:
+        tasks:
+          - {id: opaque-7, title: Call dentist, status: open}
+    input: >-
+      First list tasks to find the opaque ID for the task titled Call dentist.
+      Then update the returned ID to status completed exactly once. The update
+      requires approval. Follow the final output protocol using only the actual
+      update result.
+    expected:
+      status: completed
+      tool_sequence: [list_tasks, update_task]
+      required_approval_tools: [update_task]
+  - id: independent-reads-8
+    fixture:
+      id: eight-opaque-read-only-tasks
+      data:
+        tasks:
+          - {id: crux-17, title: Pack bag, status: queued}
+          - {id: mist-28, title: Pay bill, status: blocked}
+          - {id: amber-39, title: Book table, status: open}
+          - {id: nova-44, title: Send draft, status: review}
+          - {id: pulse-56, title: Water plants, status: paused}
+          - {id: orbit-63, title: Read brief, status: ready}
+          - {id: sable-72, title: Call mentor, status: waiting}
+          - {id: ember-84, title: File receipt, status: done}
+    input: >-
+      Read these eight task IDs with get_task exactly once each, in any order:
+      crux-17, mist-28, amber-39, nova-44, pulse-56, orbit-63, sable-72, and
+      ember-84. Do not change anything or request approval. Return the
+      benchmark JSON envelope only after all eight actual get_task results are
+      available. It must contain exactly eight id, title, and status records,
+      with no duplicate, omitted, swapped, or invented facts.
+    expected:
+      status: completed
+      required_tools: [get_task]
+      forbidden_tools: [create_task, update_task]
+      forbidden_approval_tools: [create_task, update_task]
+      max_model_calls: 9
+      max_tool_calls: 8
