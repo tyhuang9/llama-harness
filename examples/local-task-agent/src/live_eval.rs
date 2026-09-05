@@ -6,7 +6,7 @@
 
 use super::{
     default_tasks, task_agent_definition, Task, TaskPolicy, TaskStore, TaskTool, TaskToolKind,
-    GET_TASK_TOOL, LIST_TASKS_TOOL, UPDATE_TASK_TOOL,
+    CREATE_TASK_TOOL, GET_TASK_TOOL, LIST_TASKS_TOOL, UPDATE_TASK_TOOL,
 };
 use llama_harness::{
     async_trait,
@@ -23,7 +23,7 @@ use llama_harness::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -126,6 +126,10 @@ impl From<&ToolCallContext> for ToolContextEvidence {
 pub struct PolicyEvidence {
     /// One-based policy decision occurrence.
     pub occurrence: u32,
+    /// Unique local proposal nonce assigned at the policy boundary.
+    pub proposal_nonce: u64,
+    /// Shared audit-ledger sequence for policy, approval, and execution ordering.
+    pub audit_sequence: u64,
     /// Correlation information supplied by the runner.
     pub context: ToolContextEvidence,
     /// Canonical JSON arguments seen by policy.
@@ -139,6 +143,10 @@ pub struct PolicyEvidence {
 pub struct ApprovalEvidence {
     /// One-based approval decision occurrence.
     pub occurrence: u32,
+    /// Unique local proposal nonce assigned at the policy boundary.
+    pub proposal_nonce: u64,
+    /// Shared audit-ledger sequence for policy, approval, and execution ordering.
+    pub audit_sequence: u64,
     /// Correlation information supplied by the runner.
     pub context: ToolContextEvidence,
     /// Canonical JSON arguments seen by approval.
@@ -152,6 +160,10 @@ pub struct ApprovalEvidence {
 pub struct ToolExecutionEvidence {
     /// One-based dispatched-tool occurrence.
     pub occurrence: u32,
+    /// Unique local proposal nonce assigned at the policy boundary.
+    pub proposal_nonce: u64,
+    /// Shared audit-ledger sequence for policy, approval, and execution ordering.
+    pub audit_sequence: u64,
     /// Correlation information supplied by the runner.
     pub context: ToolContextEvidence,
     /// Canonical JSON arguments dispatched to the application tool.
@@ -244,7 +256,7 @@ pub struct LiveSampleEvidence {
     pub tool_executions: Vec<ToolExecutionEvidence>,
     /// Requested, selected, actual, fallback, and usage data from events.
     pub strategy: StrategyEvidence,
-    /// Capability-gate or runner error when no normalized run was available.
+    /// Core-runner error when no normalized run was available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -331,41 +343,6 @@ impl EvalExecutor for LiveEvalExecutor {
             .prompt_override
             .clone()
             .unwrap_or_else(|| request.case.input.clone());
-        let capabilities = self.config.provider.capabilities();
-        if !strategy_supported(request.strategy, &capabilities) {
-            let message = format!(
-                "capability gate: requested {:?} is unsupported by provider {}",
-                request.strategy,
-                self.config.provider.id()
-            );
-            self.record(LiveSampleEvidence {
-                suite_id: request.suite_id,
-                case_id: request.case.id,
-                model: request.model,
-                requested_strategy: request.strategy,
-                repetition: request.repetition,
-                fixture: request.fixture.map(|fixture| fixture.data),
-                prompt,
-                prompt_version: request.prompt_version,
-                agent_version: request.agent_version,
-                generation: self.config.generation.clone(),
-                initial_state,
-                final_state: None,
-                run: None,
-                events: Vec::new(),
-                model_calls: Vec::new(),
-                policy_decisions: Vec::new(),
-                approvals: Vec::new(),
-                tool_executions: Vec::new(),
-                strategy: StrategyEvidence {
-                    requested: request.strategy,
-                    ..StrategyEvidence::default()
-                },
-                error: Some(message.clone()),
-            });
-            return Err(EvalError::Executor(message));
-        }
-
         let store = Arc::new(
             TaskStore::new(initial_tasks.clone())
                 .map_err(|error| EvalError::Executor(error.to_string()))?,
@@ -378,6 +355,7 @@ impl EvalExecutor for LiveEvalExecutor {
         let policy_audit = Arc::new(Mutex::new(Vec::new()));
         let approval_audit = Arc::new(Mutex::new(Vec::new()));
         let tool_audit = Arc::new(Mutex::new(Vec::new()));
+        let audit_ledger = Arc::new(Mutex::new(AuditLedger::default()));
         let read_fault = Arc::new(ReadFault::new(contract.read_fault));
         let events = Arc::new(InMemoryEventSink::default());
 
@@ -393,6 +371,7 @@ impl EvalExecutor for LiveEvalExecutor {
                 .register(Arc::new(AuditedTaskTool {
                     inner,
                     audit: Arc::clone(&tool_audit),
+                    ledger: Arc::clone(&audit_ledger),
                     read_fault: Arc::clone(&read_fault),
                 }))
                 .map_err(|error| EvalError::Executor(error.to_string()))?;
@@ -401,7 +380,10 @@ impl EvalExecutor for LiveEvalExecutor {
         let mut agent = task_agent_definition(request.model.clone())
             .map_err(|error| EvalError::Executor(error.to_string()))?;
         agent.tool_allowlist.push(GET_TASK_TOOL.into());
-        agent.system_instructions.push_str("\nFor this evaluation, use only registered task tools. A mutation proposal is sent to the runtime, which then applies policy and records approval; propose the requested tool call when appropriate, but never assume it was approved or executed. Finish with one JSON object only, with string field `status` and field `details`; do not use Markdown fences. Report only actual tool results and never claim a change that did not occur.");
+        agent.system_instructions.push_str("\nFor this evaluation, use only registered task tools. A mutation proposal is sent to the runtime, which then applies policy and records approval; propose the requested tool call when appropriate, but never assume it was approved or executed. Report only actual tool results and never claim a change that did not occur. Do not use Markdown fences.");
+        agent
+            .system_instructions
+            .push_str(&final_output_instruction(&request.case.id, &contract));
         agent.generation = self.config.generation.clone();
         agent.limits.max_model_calls = self
             .config
@@ -412,28 +394,23 @@ impl EvalExecutor for LiveEvalExecutor {
             .config
             .limits
             .max_tool_calls
-            .min(contract.max_tool_calls);
+            .min(contract.max_tool_calls)
+            .max(1);
         agent.limits.max_run_duration_ms = Some(self.config.limits.max_run_duration_ms);
         agent.limits.max_model_call_duration_ms =
             Some(self.config.limits.max_model_call_duration_ms);
-        agent.output_schema = Some(json!({
-            "type": "object",
-            "required": ["status", "details"],
-            "properties": {
-                "status": {"type": "string"},
-                "details": {}
-            },
-            "additionalProperties": false
-        }));
+        agent.output_schema = final_output_schema(&request.case.id, &contract);
 
         let runner = AgentRunner::builder(provider)
             .tools(tools)
             .policy(Arc::new(AuditedTaskPolicy {
                 audit: Arc::clone(&policy_audit),
+                ledger: Arc::clone(&audit_ledger),
             }))
             .approvals(Arc::new(AuditedStaticApproval {
                 grant: contract.grant_approval,
                 audit: Arc::clone(&approval_audit),
+                ledger: Arc::clone(&audit_ledger),
             }))
             .event_sink(Arc::clone(&events) as Arc<dyn EventSink>)
             .build();
@@ -515,7 +492,7 @@ impl EvalExecutor for LiveEvalExecutor {
             .with_prompt_version(
                 request
                     .prompt_version
-                    .or_else(|| Some("local-task-agent-live-prompt-1".into())),
+                    .or_else(|| Some("local-task-agent-live-prompt-2".into())),
             ))
     }
 }
@@ -624,9 +601,111 @@ impl ReadFault {
     }
 }
 
+#[derive(Default)]
+struct AuditLedger {
+    next_nonce: u64,
+    next_sequence: u64,
+    proposals: Vec<AuditProposal>,
+}
+
+struct AuditProposal {
+    nonce: u64,
+    context: ToolContextEvidence,
+    arguments: Value,
+    decision: PolicyDecision,
+    approval: Option<(bool, u64)>,
+    execution_sequence: Option<u64>,
+}
+
+impl AuditLedger {
+    fn record_policy(
+        &mut self,
+        context: ToolContextEvidence,
+        arguments: Value,
+        decision: PolicyDecision,
+    ) -> (u64, u64) {
+        self.next_nonce += 1;
+        self.next_sequence += 1;
+        let nonce = self.next_nonce;
+        let sequence = self.next_sequence;
+        self.proposals.push(AuditProposal {
+            nonce,
+            context,
+            arguments,
+            decision,
+            approval: None,
+            execution_sequence: None,
+        });
+        (nonce, sequence)
+    }
+
+    fn record_approval(
+        &mut self,
+        context: &ToolContextEvidence,
+        arguments: &Value,
+        granted: bool,
+    ) -> Result<(u64, u64), HarnessError> {
+        let proposal = self
+            .proposals
+            .iter_mut()
+            .rev()
+            .find(|proposal| {
+                same_context(&proposal.context, context)
+                    && proposal.arguments == *arguments
+                    && matches!(proposal.decision, PolicyDecision::RequireApproval { .. })
+                    && proposal.approval.is_none()
+                    && proposal.execution_sequence.is_none()
+            })
+            .ok_or_else(|| {
+                HarnessError::Policy(
+                    "approval could not be bound to one unmatched policy proposal".into(),
+                )
+            })?;
+        self.next_sequence += 1;
+        let sequence = self.next_sequence;
+        proposal.approval = Some((granted, sequence));
+        Ok((proposal.nonce, sequence))
+    }
+
+    fn record_execution(
+        &mut self,
+        context: &ToolContextEvidence,
+        arguments: &Value,
+    ) -> Result<(u64, u64), HarnessError> {
+        let proposal = self
+            .proposals
+            .iter_mut()
+            .rev()
+            .find(|proposal| {
+                same_context(&proposal.context, context)
+                    && proposal.arguments == *arguments
+                    && proposal.execution_sequence.is_none()
+                    && (matches!(proposal.decision, PolicyDecision::Allow { .. })
+                        || proposal.approval.is_some_and(|(granted, _)| granted))
+            })
+            .ok_or_else(|| {
+                HarnessError::Policy(
+                    "tool execution could not be bound to one authorized policy proposal".into(),
+                )
+            })?;
+        self.next_sequence += 1;
+        let sequence = self.next_sequence;
+        proposal.execution_sequence = Some(sequence);
+        Ok((proposal.nonce, sequence))
+    }
+}
+
+fn same_context(left: &ToolContextEvidence, right: &ToolContextEvidence) -> bool {
+    left.run_id == right.run_id
+        && left.trace_id == right.trace_id
+        && left.call_id == right.call_id
+        && left.tool_id == right.tool_id
+}
+
 struct AuditedTaskTool {
     inner: Arc<dyn Tool>,
     audit: Arc<Mutex<Vec<ToolExecutionEvidence>>>,
+    ledger: Arc<Mutex<AuditLedger>>,
     read_fault: Arc<ReadFault>,
 }
 
@@ -650,6 +729,12 @@ impl Tool for AuditedTaskTool {
         arguments: Value,
         cancellation: CancellationToken,
     ) -> Result<ToolResult, HarnessError> {
+        let context_evidence = ToolContextEvidence::from(context);
+        let (proposal_nonce, audit_sequence) = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_execution(&context_evidence, &arguments)?;
         let underlying = self
             .inner
             .execute_with_context(context, arguments.clone(), cancellation)
@@ -669,7 +754,9 @@ impl Tool for AuditedTaskTool {
         let occurrence = audit.len() as u32 + 1;
         audit.push(ToolExecutionEvidence {
             occurrence,
-            context: context.into(),
+            proposal_nonce,
+            audit_sequence,
+            context: context_evidence,
             arguments,
             underlying_result: underlying.as_ref().ok().cloned(),
             returned_result: returned.as_ref().ok().cloned(),
@@ -682,6 +769,7 @@ impl Tool for AuditedTaskTool {
 
 struct AuditedTaskPolicy {
     audit: Arc<Mutex<Vec<PolicyEvidence>>>,
+    ledger: Arc<Mutex<AuditLedger>>,
 }
 
 #[async_trait]
@@ -705,6 +793,16 @@ impl PolicyEngine for AuditedTaskPolicy {
         let decision = TaskPolicy
             .decide_with_context(context, tool, arguments, request)
             .await?;
+        let context_evidence = ToolContextEvidence::from(context);
+        let (proposal_nonce, audit_sequence) = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_policy(
+                context_evidence.clone(),
+                arguments.clone(),
+                decision.clone(),
+            );
         let mut audit = self
             .audit
             .lock()
@@ -712,7 +810,9 @@ impl PolicyEngine for AuditedTaskPolicy {
         let occurrence = audit.len() as u32 + 1;
         audit.push(PolicyEvidence {
             occurrence,
-            context: context.into(),
+            proposal_nonce,
+            audit_sequence,
+            context: context_evidence,
             arguments: arguments.clone(),
             decision: decision.clone(),
         });
@@ -723,6 +823,7 @@ impl PolicyEngine for AuditedTaskPolicy {
 struct AuditedStaticApproval {
     grant: bool,
     audit: Arc<Mutex<Vec<ApprovalEvidence>>>,
+    ledger: Arc<Mutex<AuditLedger>>,
 }
 
 #[async_trait]
@@ -748,6 +849,12 @@ impl ApprovalHandler for AuditedStaticApproval {
         let record = super::StaticApproval { grant: self.grant }
             .approve_with_context(context, tool, arguments, request)
             .await?;
+        let context_evidence = ToolContextEvidence::from(context);
+        let (proposal_nonce, audit_sequence) = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_approval(&context_evidence, arguments, record.granted)?;
         let mut audit = self
             .audit
             .lock()
@@ -755,7 +862,9 @@ impl ApprovalHandler for AuditedStaticApproval {
         let occurrence = audit.len() as u32 + 1;
         audit.push(ApprovalEvidence {
             occurrence,
-            context: context.into(),
+            proposal_nonce,
+            audit_sequence,
+            context: context_evidence,
             arguments: arguments.clone(),
             record: record.clone(),
         });
@@ -868,6 +977,7 @@ struct CaseContract {
     max_tool_calls: u32,
     expected_final_status: Option<&'static str>,
     exact_final_json: Option<Value>,
+    allow_missing_final: bool,
     terminal_status: Option<RunStatus>,
 }
 
@@ -888,6 +998,7 @@ fn case_contract(id: &str) -> Result<CaseContract, EvalError> {
         max_tool_calls: 2,
         expected_final_status: Some("ok"),
         exact_final_json: None,
+        allow_missing_final: false,
         terminal_status: Some(RunStatus::Completed),
     };
     let contract = match id {
@@ -895,29 +1006,33 @@ fn case_contract(id: &str) -> Result<CaseContract, EvalError> {
             let mut contract = no_write(vec![task("task-1", "Evening medication", "open")]);
             contract.exact_final_json = Some(json!({
                 "status": "ok",
-                "details": "No task action was requested."
+                "details": {"outcome": "no_action"}
             }));
             contract.max_tool_calls = 0;
             contract
         }
         "approved-mutation" => CaseContract {
-            initial: vec![task("task-1", "Evening medication", "open")],
-            expected_final: vec![task("task-1", "Evening medication", "completed")],
+            initial: Vec::new(),
+            expected_final: vec![task("task-1", "Schedule annual checkup", "open")],
             expected_dispatches: vec![ExpectedDispatch {
-                tool_id: UPDATE_TASK_TOOL,
-                arguments: json!({"id": "task-1", "status": "completed"}),
+                tool_id: CREATE_TASK_TOOL,
+                arguments: json!({"title": "Schedule annual checkup"}),
             }],
             expected_approvals: vec![(
-                UPDATE_TASK_TOOL.into(),
-                json!({"id": "task-1", "status": "completed"}),
+                CREATE_TASK_TOOL.into(),
+                json!({"title": "Schedule annual checkup"}),
                 true,
             )],
             read_fault: ReadFaultMode::None,
             grant_approval: true,
             max_model_calls: 3,
             max_tool_calls: 1,
-            expected_final_status: Some("completed"),
-            exact_final_json: None,
+            expected_final_status: Some("created"),
+            exact_final_json: Some(json!({
+                "status": "created",
+                "details": {"id": "task-1", "title": "Schedule annual checkup", "status": "open"}
+            })),
+            allow_missing_final: false,
             terminal_status: Some(RunStatus::Completed),
         },
         "duplicate-prevention" => {
@@ -927,6 +1042,11 @@ fn case_contract(id: &str) -> Result<CaseContract, EvalError> {
                 arguments: json!({}),
             }];
             contract.max_tool_calls = 1;
+            contract.expected_final_status = Some("not_created");
+            contract.exact_final_json = Some(json!({
+                "status": "not_created",
+                "details": {"outcome": "already_exists", "id": "task-1", "title": "Call dentist", "status": "open"}
+            }));
             contract
         }
         "dependent-lookup-update" => CaseContract {
@@ -952,7 +1072,11 @@ fn case_contract(id: &str) -> Result<CaseContract, EvalError> {
             max_model_calls: 4,
             max_tool_calls: 2,
             expected_final_status: Some("completed"),
-            exact_final_json: None,
+            exact_final_json: Some(json!({
+                "status": "completed",
+                "details": {"id": "opaque-7", "title": "Call dentist", "status": "completed"}
+            })),
+            allow_missing_final: false,
             terminal_status: Some(RunStatus::Completed),
         },
         "independent-reads" => {
@@ -972,12 +1096,18 @@ fn case_contract(id: &str) -> Result<CaseContract, EvalError> {
             ];
             contract.max_model_calls = 3;
             contract.max_tool_calls = 2;
+            contract.exact_final_json = None;
             contract
         }
-        "ambiguity" => no_write(vec![
-            task("alpha-1", "Follow up with client", "open"),
-            task("beta-2", "Follow up with clinician", "open"),
-        ]),
+        "ambiguity" => {
+            let mut contract = no_write(vec![
+                task("alpha-1", "Follow up with client", "open"),
+                task("beta-2", "Follow up with clinician", "open"),
+            ]);
+            contract.expected_final_status = Some("clarification_needed");
+            contract.exact_final_json = None;
+            contract
+        }
         "denied-approval" => CaseContract {
             initial: vec![task("task-1", "Evening medication", "open")],
             expected_final: vec![task("task-1", "Evening medication", "open")],
@@ -992,7 +1122,11 @@ fn case_contract(id: &str) -> Result<CaseContract, EvalError> {
             max_model_calls: 3,
             max_tool_calls: 1,
             expected_final_status: Some("not_changed"),
-            exact_final_json: None,
+            exact_final_json: Some(json!({
+                "status": "not_changed",
+                "details": {"outcome": "approval_denied", "id": "task-1", "changed": false}
+            })),
+            allow_missing_final: false,
             terminal_status: Some(RunStatus::Completed),
         },
         "transient-read-retry" => {
@@ -1011,6 +1145,10 @@ fn case_contract(id: &str) -> Result<CaseContract, EvalError> {
             contract.max_model_calls = 3;
             contract.max_tool_calls = 2;
             contract.expected_final_status = Some("ok");
+            contract.exact_final_json = Some(json!({
+                "status": "ok",
+                "details": {"id": "task-1", "title": "Evening medication", "status": "open"}
+            }));
             contract
         }
         "bounded-read-failure" => {
@@ -1020,11 +1158,127 @@ fn case_contract(id: &str) -> Result<CaseContract, EvalError> {
             contract.max_tool_calls = 2;
             contract.terminal_status = None;
             contract.expected_final_status = Some("unavailable");
+            contract.exact_final_json = Some(json!({
+                "status": "unavailable",
+                "details": {"outcome": "read_failed", "id": "task-1"}
+            }));
+            contract
+        }
+        "model-budget-stop" => {
+            let mut contract = no_write(vec![task("task-1", "Evening medication", "open")]);
+            contract.expected_dispatches = vec![ExpectedDispatch {
+                tool_id: GET_TASK_TOOL,
+                arguments: json!({"id": "task-1"}),
+            }];
+            contract.max_model_calls = 1;
+            contract.max_tool_calls = 1;
+            contract.expected_final_status = None;
+            contract.allow_missing_final = true;
+            contract.terminal_status = Some(RunStatus::LimitReached);
             contract
         }
         _ => return Err(EvalError::Executor(format!("unsupported live case: {id}"))),
     };
     Ok(contract)
+}
+
+fn final_output_schema(case_id: &str, contract: &CaseContract) -> Option<Value> {
+    match case_id {
+        "model-budget-stop" if contract.allow_missing_final => None,
+        "no-tool" => Some(output_shape(json!({"outcome": {"type": "string"}}))),
+        "approved-mutation" | "dependent-lookup-update" | "transient-read-retry" => {
+            Some(output_shape(task_details_shape()))
+        }
+        "duplicate-prevention" => Some(output_shape(json!({
+            "outcome": {"type": "string"},
+            "id": {"type": "string"},
+            "title": {"type": "string"},
+            "status": {"type": "string"}
+        }))),
+        "denied-approval" => Some(output_shape(json!({
+            "outcome": {"type": "string"},
+            "id": {"type": "string"},
+            "changed": {"type": "boolean"}
+        }))),
+        "bounded-read-failure" => Some(output_shape(json!({
+            "outcome": {"type": "string"},
+            "id": {"type": "string"}
+        }))),
+        "independent-reads" => Some(output_shape(json!({
+            "tasks": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": task_record_schema()
+            }
+        }))),
+        "ambiguity" => Some(json!({
+            "type": "object",
+            "required": ["status", "details"],
+            "properties": {
+                "status": {"type": "string"},
+                "details": {
+                    "type": "object",
+                    "required": ["outcome", "question"],
+                    "properties": {
+                        "outcome": {"type": "string"},
+                        "question": {"type": "string", "minLength": 1}
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        })),
+        _ => None,
+    }
+}
+
+fn output_shape(details_properties: Value) -> Value {
+    json!({
+        "type": "object",
+        "required": ["status", "details"],
+        "properties": {
+            "status": {"type": "string"},
+            "details": {
+                "type": "object",
+                "required": details_properties.as_object().map(|properties| properties.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+                "properties": details_properties,
+                "additionalProperties": false
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_details_shape() -> Value {
+    json!({
+        "id": {"type": "string"},
+        "title": {"type": "string"},
+        "status": {"type": "string"}
+    })
+}
+
+fn task_record_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["id", "title", "status"],
+        "properties": task_details_shape(),
+        "additionalProperties": false
+    })
+}
+
+fn final_output_instruction(case_id: &str, _contract: &CaseContract) -> String {
+    match case_id {
+        "no-tool" => " Finish with only JSON with status and details.outcome. Do not add fields.".into(),
+        "approved-mutation" | "dependent-lookup-update" | "transient-read-retry" => " Finish with only JSON whose details contains exactly id, title, and status from the actual task result. Do not add fields.".into(),
+        "duplicate-prevention" => " Finish with only JSON whose details contains exactly outcome, id, title, and status from the observed existing task. Do not add fields.".into(),
+        "independent-reads" => " Finish with only JSON whose details contains exactly a two-item tasks array. Each item must contain only id, title, and status from an actual get_task result.".into(),
+        "ambiguity" => " Finish with only JSON whose details contains exactly outcome and one nonempty question. Do not add claims or fields.".into(),
+        "denied-approval" => " Finish with only JSON whose details contains exactly outcome, id, and changed. Report the actual approval result.".into(),
+        "bounded-read-failure" => " Finish with only JSON whose details contains exactly outcome and id. Report the failed read honestly.".into(),
+        "model-budget-stop" => " The run has a one-call model budget. If a terminal answer is produced, it must not claim a successful task result.".into(),
+        _ => String::new(),
+    }
 }
 
 fn fixture_tasks(
@@ -1047,20 +1301,6 @@ fn snapshot<T: Clone>(audit: &Arc<Mutex<Vec<T>>>) -> Vec<T> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
-}
-
-fn strategy_supported(strategy: RunStrategy, capabilities: &ModelCapabilities) -> bool {
-    match strategy {
-        RunStrategy::Direct | RunStrategy::Adaptive => capabilities.supports_tools,
-        RunStrategy::DeclarativePlan => {
-            capabilities.supports_tools && capabilities.supports_structured_plans
-        }
-        RunStrategy::Programmatic => {
-            capabilities.supports_tools
-                && capabilities.supports_programmatic_calling
-                && capabilities.programmatic_conformance.is_some()
-        }
-    }
 }
 
 fn strategy_evidence(requested: RunStrategy, events: &[EventRecord]) -> StrategyEvidence {
@@ -1116,6 +1356,7 @@ fn evaluate_live_contract(
             "sample did not start from the exact case fixture",
         ));
     }
+    failures.extend(validate_audit_chain(run, sample));
     if sample.model_calls.is_empty() {
         failures.push(assertion(
             "model_contact",
@@ -1171,15 +1412,15 @@ fn evaluate_live_contract(
         })
         .collect();
     if case_id == "ambiguity" {
-        if sample.tool_executions.iter().any(|execution| {
-            !matches!(
-                execution.context.tool_id.as_str(),
-                LIST_TASKS_TOOL | GET_TASK_TOOL
-            )
-        }) {
+        if sample.tool_executions.len() > 1
+            || sample
+                .tool_executions
+                .iter()
+                .any(|execution| execution.context.tool_id != LIST_TASKS_TOOL)
+        {
             failures.push(assertion(
                 "tool_contract",
-                "ambiguous request dispatched a non-read-only tool",
+                "ambiguous request may dispatch at most one list_tasks read and no other tool",
             ));
         }
     } else if case_id == "bounded-read-failure" {
@@ -1207,8 +1448,8 @@ fn evaluate_live_contract(
             .map(|dispatch| (dispatch.tool_id, dispatch.arguments.clone()))
             .collect();
         let mut actual = actual_dispatches.clone();
-        expected.sort_by(|left, right| left.1.to_string().cmp(&right.1.to_string()));
-        actual.sort_by(|left, right| left.1.to_string().cmp(&right.1.to_string()));
+        expected.sort_by_key(|entry| entry.1.to_string());
+        actual.sort_by_key(|entry| entry.1.to_string());
         if actual != expected {
             failures.push(assertion(
                 "tool_contract",
@@ -1294,6 +1535,18 @@ fn evaluate_live_contract(
             "denied update crossed the execution boundary",
         ));
     }
+    if contract.allow_missing_final
+        && run.final_output.is_some()
+        && run
+            .final_output
+            .as_deref()
+            .is_some_and(|output| serde_json::from_str::<Value>(output).is_err())
+    {
+        failures.push(assertion(
+            "final_format",
+            "terminal final output was present but not valid JSON",
+        ));
+    }
     match run
         .final_output
         .as_deref()
@@ -1301,7 +1554,7 @@ fn evaluate_live_contract(
     {
         Some(output) => {
             if output.get("status").and_then(Value::as_str).is_none()
-                || !output.get("details").is_some()
+                || output.get("details").is_none()
             {
                 failures.push(assertion(
                     "final_format",
@@ -1320,33 +1573,238 @@ fn evaluate_live_contract(
                 if &output != expected {
                     failures.push(assertion(
                         "final_consistency",
-                        "final JSON did not exactly match the harmless no-tool answer",
+                        "final JSON did not exactly match the required observed facts",
                     ));
                 }
             }
-            if case_id == "denied-approval"
-                && output.get("status").and_then(Value::as_str) == Some("completed")
-            {
+            if case_id == "independent-reads" && !is_exact_independent_output(&output) {
                 failures.push(assertion(
                     "final_consistency",
-                    "denied approval answer claimed completion",
+                    "independent reads did not return exactly the two requested task records",
                 ));
             }
-            if case_id == "bounded-read-failure"
-                && output.get("status").and_then(Value::as_str) == Some("ok")
+            if case_id == "ambiguity" && !is_valid_ambiguity_output(&output) {
+                failures.push(assertion(
+                    "final_consistency",
+                    "ambiguity answer did not contain only unchanged outcome and a nonempty question",
+                ));
+            }
+            if case_id == "model-budget-stop"
+                && output
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_success_status)
             {
                 failures.push(assertion(
                     "final_consistency",
-                    "failed read answer claimed an ordinary successful result",
+                    "model-budget terminal answer claimed a successful task result",
                 ));
             }
         }
-        None => failures.push(assertion(
+        None if !contract.allow_missing_final => failures.push(assertion(
             "final_format",
             "final output was not valid machine-checkable JSON",
         )),
+        None => {}
     }
     failures
+}
+
+fn is_exact_independent_output(output: &Value) -> bool {
+    let expected = [
+        json!({"id": "alpha-41", "title": "Call dentist", "status": "open"}),
+        json!({"id": "beta-92", "title": "Evening medication", "status": "completed"}),
+    ];
+    let Some(tasks) = output
+        .get("details")
+        .and_then(Value::as_object)
+        .filter(|details| details.len() == 1)
+        .and_then(|details| details.get("tasks"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    if output.get("status").and_then(Value::as_str) != Some("ok") || tasks.len() != expected.len() {
+        return false;
+    }
+    let mut actual = tasks.clone();
+    actual.sort_by_key(Value::to_string);
+    let mut expected = expected.to_vec();
+    expected.sort_by_key(Value::to_string);
+    actual == expected
+}
+
+fn is_valid_ambiguity_output(output: &Value) -> bool {
+    let Some(root) = output.as_object() else {
+        return false;
+    };
+    let Some(details) = root.get("details").and_then(Value::as_object) else {
+        return false;
+    };
+    root.len() == 2
+        && root.get("status").and_then(Value::as_str) == Some("clarification_needed")
+        && details.len() == 2
+        && details.get("outcome").and_then(Value::as_str) == Some("unchanged")
+        && details
+            .get("question")
+            .and_then(Value::as_str)
+            .is_some_and(|question| !question.trim().is_empty())
+}
+
+fn is_success_status(status: &str) -> bool {
+    matches!(
+        status,
+        "ok" | "completed" | "created" | "not_created" | "not_changed"
+    )
+}
+
+fn validate_audit_chain(
+    run: &RunResult,
+    sample: &LiveSampleEvidence,
+) -> Vec<llama_harness::evals::AssertionFailure> {
+    let mut failures = Vec::new();
+    let mut sequences = HashSet::new();
+    let mut policies = HashMap::new();
+    for policy in &sample.policy_decisions {
+        if !sequences.insert(policy.audit_sequence) {
+            failures.push(assertion("audit_chain", "duplicate audit sequence"));
+        }
+        if policies.insert(policy.proposal_nonce, policy).is_some() {
+            failures.push(assertion("audit_chain", "duplicate policy proposal nonce"));
+        }
+        if !context_matches_run(&policy.context, run) {
+            failures.push(assertion(
+                "audit_chain",
+                "policy context did not match the recorded run and trace",
+            ));
+        }
+    }
+    let mut approvals = HashMap::new();
+    for approval in &sample.approvals {
+        if !sequences.insert(approval.audit_sequence) {
+            failures.push(assertion("audit_chain", "duplicate audit sequence"));
+        }
+        if approvals
+            .insert(approval.proposal_nonce, approval)
+            .is_some()
+        {
+            failures.push(assertion(
+                "audit_chain",
+                "duplicate approval proposal nonce",
+            ));
+        }
+        match policies.get(&approval.proposal_nonce) {
+            Some(policy)
+                if same_context(&policy.context, &approval.context)
+                    && policy.arguments == approval.arguments
+                    && matches!(policy.decision, PolicyDecision::RequireApproval { .. })
+                    && policy.audit_sequence < approval.audit_sequence => {}
+            _ => failures.push(assertion(
+                "audit_chain",
+                "approval did not follow its exact approval-required policy proposal",
+            )),
+        }
+        if !context_matches_run(&approval.context, run) {
+            failures.push(assertion(
+                "audit_chain",
+                "approval context did not match the recorded run and trace",
+            ));
+        }
+    }
+    let mut executions = HashMap::new();
+    for execution in &sample.tool_executions {
+        if !sequences.insert(execution.audit_sequence) {
+            failures.push(assertion("audit_chain", "duplicate audit sequence"));
+        }
+        if executions
+            .insert(execution.proposal_nonce, execution)
+            .is_some()
+        {
+            failures.push(assertion(
+                "audit_chain",
+                "duplicate execution proposal nonce",
+            ));
+        }
+        let valid = match policies.get(&execution.proposal_nonce) {
+            Some(policy)
+                if same_context(&policy.context, &execution.context)
+                    && policy.arguments == execution.arguments
+                    && policy.audit_sequence < execution.audit_sequence =>
+            {
+                match &policy.decision {
+                    PolicyDecision::Allow { .. } => {
+                        !approvals.contains_key(&execution.proposal_nonce)
+                    }
+                    PolicyDecision::RequireApproval { .. } => approvals
+                        .get(&execution.proposal_nonce)
+                        .is_some_and(|approval| {
+                            approval.record.granted
+                                && approval.audit_sequence < execution.audit_sequence
+                        }),
+                    PolicyDecision::Deny { .. } => false,
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if !valid {
+            failures.push(assertion(
+                "audit_chain",
+                "execution did not follow one matching authorized policy and approval chain",
+            ));
+        }
+        if !context_matches_run(&execution.context, run) {
+            failures.push(assertion(
+                "audit_chain",
+                "execution context did not match the recorded run and trace",
+            ));
+        }
+    }
+    for policy in &sample.policy_decisions {
+        let approval = approvals.get(&policy.proposal_nonce);
+        let execution = executions.get(&policy.proposal_nonce);
+        match &policy.decision {
+            PolicyDecision::Allow { .. } if approval.is_some() || execution.is_none() => failures
+                .push(assertion(
+                    "audit_chain",
+                    "allow policy did not map one-to-one to one execution without approval",
+                )),
+            PolicyDecision::RequireApproval { .. } => {
+                match approval {
+                    Some(approval) if approval.record.granted && execution.is_none() => failures
+                        .push(assertion(
+                            "audit_chain",
+                            "granted approval did not map to one execution",
+                        )),
+                    Some(approval) if !approval.record.granted && execution.is_some() => failures
+                        .push(assertion(
+                            "audit_chain",
+                            "denied approval crossed the execution boundary",
+                        )),
+                    Some(_) => {}
+                    None => failures.push(assertion(
+                        "audit_chain",
+                        "approval-required policy did not map to one approval",
+                    )),
+                }
+            }
+            PolicyDecision::Deny { .. } if approval.is_some() || execution.is_some() => failures
+                .push(assertion(
+                    "audit_chain",
+                    "denied policy unexpectedly had approval or execution evidence",
+                )),
+            PolicyDecision::Allow { .. } | PolicyDecision::Deny { .. } => {}
+            _ => failures.push(assertion(
+                "audit_chain",
+                "unknown policy decision cannot certify execution evidence",
+            )),
+        }
+    }
+    failures
+}
+
+fn context_matches_run(context: &ToolContextEvidence, run: &RunResult) -> bool {
+    context.run_id == run.id && context.trace_id == run.trace_id && !context.tool_id.is_empty()
 }
 
 fn assertion(rule: &str, message: impl Into<String>) -> llama_harness::evals::AssertionFailure {
@@ -1356,24 +1814,39 @@ fn assertion(rule: &str, message: impl Into<String>) -> llama_harness::evals::As
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llama_harness::mock::{final_response, MockModelProvider};
+    use llama_harness::mock::{final_response, tool_response, MockModelProvider, MockStep};
+
+    fn expected_final_output(case_id: &str, contract: &CaseContract) -> Option<Value> {
+        contract.exact_final_json.clone().or_else(|| match case_id {
+            "independent-reads" => Some(json!({
+                "status": "ok",
+                "details": {"tasks": [
+                    {"id": "alpha-41", "title": "Call dentist", "status": "open"},
+                    {"id": "beta-92", "title": "Evening medication", "status": "completed"}
+                ]}
+            })),
+            "ambiguity" => Some(json!({
+                "status": "clarification_needed",
+                "details": {"outcome": "unchanged", "question": "Which follow-up task should change?"}
+            })),
+            "model-budget-stop" => None,
+            _ => None,
+        })
+    }
 
     fn fixture(case_id: &str) -> LiveSampleEvidence {
         let contract = case_contract(case_id).unwrap();
         let mut run = RunResult::new("run", RunStatus::Completed, "mock", "trace");
-        let output = contract.exact_final_json.clone().unwrap_or_else(|| {
-            json!({
-                "status": contract.expected_final_status.unwrap_or("ok"),
-                "details": "deterministic test"
-            })
-        });
-        run.final_output = Some(serde_json::to_string(&output).unwrap());
+        run.final_output = expected_final_output(case_id, &contract)
+            .map(|output| serde_json::to_string(&output).unwrap());
         let tool_executions = contract
             .expected_dispatches
             .iter()
             .enumerate()
             .map(|(index, dispatch)| ToolExecutionEvidence {
                 occurrence: index as u32 + 1,
+                proposal_nonce: index as u64 + 1,
+                audit_sequence: index as u64 * 3 + 3,
                 context: ToolContextEvidence {
                     run_id: "run".into(),
                     trace_id: "trace".into(),
@@ -1393,6 +1866,8 @@ mod tests {
             .enumerate()
             .map(|(index, (tool_id, arguments, granted))| ApprovalEvidence {
                 occurrence: index as u32 + 1,
+                proposal_nonce: index as u64 + 1,
+                audit_sequence: index as u64 * 3 + 2,
                 context: ToolContextEvidence {
                     run_id: "run".into(),
                     trace_id: "trace".into(),
@@ -1407,6 +1882,8 @@ mod tests {
             .iter()
             .map(|approval| PolicyEvidence {
                 occurrence: approval.occurrence,
+                proposal_nonce: approval.proposal_nonce,
+                audit_sequence: approval.audit_sequence - 1,
                 context: approval.context.clone(),
                 arguments: approval.arguments.clone(),
                 decision: PolicyDecision::RequireApproval {
@@ -1468,6 +1945,8 @@ mod tests {
         let mut extra_effect = fixture("no-tool");
         extra_effect.tool_executions.push(ToolExecutionEvidence {
             occurrence: 1,
+            proposal_nonce: 1,
+            audit_sequence: 2,
             context: ToolContextEvidence {
                 run_id: "run".into(),
                 trace_id: "trace".into(),
@@ -1517,27 +1996,349 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_forced_strategy_records_zero_contact_and_fails() {
-        let provider = Arc::new(MockModelProvider::scripted([final_response("unused")]));
-        let executor = LiveEvalExecutor::new(LiveEvalConfig::new(provider));
+        for strategy in [RunStrategy::DeclarativePlan, RunStrategy::Programmatic] {
+            let provider = Arc::new(MockModelProvider::scripted([final_response("unused")]));
+            let model_provider: Arc<dyn ModelProvider> = provider.clone();
+            let executor = LiveEvalExecutor::new(LiveEvalConfig::new(model_provider));
+            let mut suite = llama_harness::evals::load_suite(
+                include_str!("../../../evals/local-task-agent/live-suite.yaml"),
+                Some("yaml"),
+            )
+            .unwrap();
+            suite.models = vec!["mock".into()];
+            suite.strategies = vec![strategy];
+            suite.defaults.repeat = 1;
+            suite.cases.retain(|case| case.id == "no-tool");
+            let artifact = evaluate_live_suite(&suite, &executor, &[], None)
+                .await
+                .unwrap();
+            assert!(!artifact.report.results[0].passed, "{strategy:?}");
+            let evidence = executor.evidence();
+            assert_eq!(evidence.len(), 1);
+            assert!(evidence[0].model_calls.is_empty(), "{strategy:?}");
+            assert!(provider.requests().is_empty(), "{strategy:?}");
+            assert!(
+                evidence[0].error.as_deref().is_some_and(
+                    |error| error.contains("unsupported") || error.contains("programmatic")
+                ),
+                "{strategy:?}: {:#?}",
+                evidence[0].error
+            );
+        }
+    }
+
+    fn live_suite_with_case(case_id: &str) -> llama_harness::evals::EvalSuite {
         let mut suite = llama_harness::evals::load_suite(
             include_str!("../../../evals/local-task-agent/live-suite.yaml"),
             Some("yaml"),
         )
         .unwrap();
-        suite.models = vec!["mock".into()];
-        suite.strategies = vec![RunStrategy::Programmatic];
+        suite.models = vec!["mock-model".into()];
+        suite.strategies = vec![RunStrategy::Direct];
         suite.defaults.repeat = 1;
-        suite.cases.retain(|case| case.id == "no-tool");
+        suite.cases.retain(|case| case.id == case_id);
+        suite
+    }
+
+    fn tool_call(id: &str, tool_id: &str, arguments: &str) -> llama_harness::ToolCall {
+        llama_harness::ToolCall::new(id, tool_id, arguments)
+    }
+
+    fn scripted_steps(case_id: &str) -> Vec<MockStep> {
+        let contract = case_contract(case_id).unwrap();
+        let final_step = || {
+            final_response(
+                serde_json::to_string(
+                    &expected_final_output(case_id, &contract).expect("final response expected"),
+                )
+                .unwrap(),
+            )
+        };
+        match case_id {
+            "no-tool" | "ambiguity" => vec![final_step()],
+            "approved-mutation" => vec![
+                tool_response(tool_call(
+                    "create-1",
+                    CREATE_TASK_TOOL,
+                    r#"{"title":"Schedule annual checkup"}"#,
+                )),
+                final_step(),
+            ],
+            "duplicate-prevention" => vec![
+                tool_response(tool_call("list-1", LIST_TASKS_TOOL, "{}")),
+                final_step(),
+            ],
+            "dependent-lookup-update" => vec![
+                tool_response(tool_call("list-1", LIST_TASKS_TOOL, "{}")),
+                tool_response(tool_call(
+                    "update-1",
+                    UPDATE_TASK_TOOL,
+                    r#"{"id":"opaque-7","status":"completed"}"#,
+                )),
+                final_step(),
+            ],
+            "independent-reads" => vec![
+                MockStep::Response(ModelResponse::new("mock-model").with_tool_calls(vec![
+                    tool_call("get-1", GET_TASK_TOOL, r#"{"id":"alpha-41"}"#),
+                    tool_call("get-2", GET_TASK_TOOL, r#"{"id":"beta-92"}"#),
+                ])),
+                final_step(),
+            ],
+            "denied-approval" => vec![
+                tool_response(tool_call(
+                    "update-1",
+                    UPDATE_TASK_TOOL,
+                    r#"{"id":"task-1","status":"completed"}"#,
+                )),
+                final_step(),
+            ],
+            "transient-read-retry" => vec![
+                tool_response(tool_call("get-1", GET_TASK_TOOL, r#"{"id":"task-1"}"#)),
+                tool_response(tool_call("get-2", GET_TASK_TOOL, r#"{"id":"task-1"}"#)),
+                final_step(),
+            ],
+            "bounded-read-failure" => vec![
+                tool_response(tool_call("get-1", GET_TASK_TOOL, r#"{"id":"task-1"}"#)),
+                tool_response(tool_call("get-2", GET_TASK_TOOL, r#"{"id":"task-1"}"#)),
+                final_step(),
+            ],
+            "model-budget-stop" => vec![tool_response(tool_call(
+                "get-1",
+                GET_TASK_TOOL,
+                r#"{"id":"task-1"}"#,
+            ))],
+            _ => unreachable!("unknown live case"),
+        }
+    }
+
+    async fn scripted_sample(case_id: &str, strategy: RunStrategy) -> LiveSampleEvidence {
+        let provider = Arc::new(MockModelProvider::scripted(scripted_steps(case_id)));
+        let executor = LiveEvalExecutor::new(LiveEvalConfig::new(provider));
+        let mut suite = live_suite_with_case(case_id);
+        suite.strategies = vec![strategy];
         let artifact = evaluate_live_suite(&suite, &executor, &[], None)
             .await
             .unwrap();
-        assert!(!artifact.report.results[0].passed);
-        let evidence = executor.evidence();
-        assert_eq!(evidence.len(), 1);
-        assert!(evidence[0].model_calls.is_empty());
-        assert!(evidence[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("capability gate")));
+        assert!(
+            artifact.report.results[0].passed,
+            "{strategy:?}/{case_id}: {:#?}",
+            artifact.report.results[0].failures
+        );
+        artifact.evidence.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_live_suite_case_runs_through_the_real_runner_with_scripted_models() {
+        let case_ids = [
+            "no-tool",
+            "approved-mutation",
+            "duplicate-prevention",
+            "dependent-lookup-update",
+            "independent-reads",
+            "ambiguity",
+            "denied-approval",
+            "transient-read-retry",
+            "bounded-read-failure",
+            "model-budget-stop",
+        ];
+        for strategy in [RunStrategy::Direct, RunStrategy::Adaptive] {
+            for case_id in case_ids {
+                let provider = Arc::new(MockModelProvider::scripted(scripted_steps(case_id)));
+                let executor = LiveEvalExecutor::new(LiveEvalConfig::new(provider));
+                let mut suite = live_suite_with_case(case_id);
+                suite.strategies = vec![strategy];
+                let artifact = evaluate_live_suite(&suite, &executor, &[], None)
+                    .await
+                    .unwrap();
+                assert_eq!(artifact.report.results.len(), 1);
+                assert!(
+                    artifact.report.results[0].passed,
+                    "{strategy:?}/{case_id}: {:#?}",
+                    artifact.report.results[0].failures
+                );
+                assert_eq!(
+                    artifact.evidence[0].strategy.actual,
+                    Some(RunStrategy::Direct)
+                );
+                if matches!(
+                    case_id,
+                    "independent-reads" | "transient-read-retry" | "model-budget-stop"
+                ) {
+                    assert!(artifact.evidence[0].approvals.is_empty(), "{case_id}");
+                    assert!(artifact.evidence[0]
+                        .tool_executions
+                        .iter()
+                        .all(|execution| execution.context.tool_id == GET_TASK_TOOL));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_facing_prompt_does_not_leak_fixture_oracle_facts() {
+        for (case_id, absent, present_after_tool) in [
+            ("approved-mutation", &["task-1"][..], &["task-1"][..]),
+            (
+                "dependent-lookup-update",
+                &["opaque-7"][..],
+                &["opaque-7"][..],
+            ),
+            (
+                "independent-reads",
+                &["Call dentist", "Evening medication"][..],
+                &["Call dentist", "Evening medication"][..],
+            ),
+        ] {
+            let provider = Arc::new(MockModelProvider::scripted(scripted_steps(case_id)));
+            let model_provider: Arc<dyn ModelProvider> = provider.clone();
+            let executor = LiveEvalExecutor::new(LiveEvalConfig::new(model_provider));
+            let artifact =
+                evaluate_live_suite(&live_suite_with_case(case_id), &executor, &[], None)
+                    .await
+                    .unwrap();
+            assert!(artifact.report.results[0].passed, "{case_id}");
+
+            let requests = provider.requests();
+            let first = serde_json::to_string(&requests[0].messages).unwrap();
+            for fact in absent {
+                assert!(
+                    !first.contains(fact),
+                    "first {case_id} request leaked evaluator fact {fact:?}: {first}"
+                );
+            }
+            let later = requests
+                .iter()
+                .skip(1)
+                .map(|request| serde_json::to_string(&request.messages).unwrap())
+                .collect::<String>();
+            for fact in present_after_tool {
+                assert!(
+                    later.contains(fact),
+                    "later {case_id} request omitted real tool result fact {fact:?}: {later}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluator_rejects_wrong_observed_final_facts_and_negative_case_claims() {
+        let mut wrong_create = scripted_sample("approved-mutation", RunStrategy::Direct).await;
+        wrong_create.run.as_mut().unwrap().final_output = Some(
+            json!({
+                "status": "created",
+                "details": {"id": "wrong", "title": "Schedule annual checkup", "status": "open"}
+            })
+            .to_string(),
+        );
+        assert!(has_rule(
+            &evaluate_live_contract("approved-mutation", &wrong_create),
+            "final_consistency"
+        ));
+
+        let mut swapped_read = scripted_sample("independent-reads", RunStrategy::Direct).await;
+        swapped_read.run.as_mut().unwrap().final_output = Some(
+            json!({
+                "status": "ok",
+                "details": {"tasks": [
+                    {"id": "alpha-41", "title": "Evening medication", "status": "completed"},
+                    {"id": "beta-92", "title": "Call dentist", "status": "open"}
+                ]}
+            })
+            .to_string(),
+        );
+        assert!(has_rule(
+            &evaluate_live_contract("independent-reads", &swapped_read),
+            "final_consistency"
+        ));
+
+        let mut false_denial = scripted_sample("denied-approval", RunStrategy::Direct).await;
+        false_denial.run.as_mut().unwrap().final_output = Some(
+            json!({
+                "status": "not_changed",
+                "details": {"outcome": "approval_denied", "id": "task-1", "changed": true}
+            })
+            .to_string(),
+        );
+        assert!(has_rule(
+            &evaluate_live_contract("denied-approval", &false_denial),
+            "final_consistency"
+        ));
+
+        let mut false_ambiguity = scripted_sample("ambiguity", RunStrategy::Direct).await;
+        false_ambiguity.run.as_mut().unwrap().final_output = Some(
+            json!({
+                "status": "clarification_needed",
+                "details": {"outcome": "unchanged", "question": "Which task?", "claimed": "completed"}
+            })
+            .to_string(),
+        );
+        assert!(has_rule(
+            &evaluate_live_contract("ambiguity", &false_ambiguity),
+            "final_consistency"
+        ));
+
+        let mut false_budget_stop = scripted_sample("model-budget-stop", RunStrategy::Direct).await;
+        false_budget_stop.run.as_mut().unwrap().final_output = Some(
+            json!({
+                "status": "created",
+                "details": {"outcome": "task_created"}
+            })
+            .to_string(),
+        );
+        assert!(has_rule(
+            &evaluate_live_contract("model-budget-stop", &false_budget_stop),
+            "final_consistency"
+        ));
+    }
+
+    #[tokio::test]
+    async fn evaluator_rejects_mismatched_or_reused_audit_occurrences() {
+        let mut reused_call = scripted_sample("transient-read-retry", RunStrategy::Direct).await;
+        for policy in &mut reused_call.policy_decisions {
+            policy.context.call_id = "ollama-0".into();
+        }
+        for execution in &mut reused_call.tool_executions {
+            execution.context.call_id = "ollama-0".into();
+        }
+        reused_call.tool_executions[1].proposal_nonce =
+            reused_call.tool_executions[0].proposal_nonce;
+        assert!(has_rule(
+            &evaluate_live_contract("transient-read-retry", &reused_call),
+            "audit_chain"
+        ));
+
+        let mut mismatched_trace =
+            scripted_sample("duplicate-prevention", RunStrategy::Direct).await;
+        mismatched_trace.tool_executions[0].context.trace_id = "other-trace".into();
+        assert!(has_rule(
+            &evaluate_live_contract("duplicate-prevention", &mismatched_trace),
+            "audit_chain"
+        ));
+
+        let mut after_execution = scripted_sample("approved-mutation", RunStrategy::Direct).await;
+        after_execution.approvals[0].audit_sequence =
+            after_execution.tool_executions[0].audit_sequence + 1;
+        assert!(has_rule(
+            &evaluate_live_contract("approved-mutation", &after_execution),
+            "audit_chain"
+        ));
+
+        let mut duplicate_approval =
+            scripted_sample("approved-mutation", RunStrategy::Direct).await;
+        duplicate_approval
+            .approvals
+            .push(duplicate_approval.approvals[0].clone());
+        assert!(has_rule(
+            &evaluate_live_contract("approved-mutation", &duplicate_approval),
+            "audit_chain"
+        ));
+
+        let mut unmatched_approval =
+            scripted_sample("approved-mutation", RunStrategy::Direct).await;
+        unmatched_approval.approvals[0].proposal_nonce += 100;
+        assert!(has_rule(
+            &evaluate_live_contract("approved-mutation", &unmatched_approval),
+            "audit_chain"
+        ));
     }
 }

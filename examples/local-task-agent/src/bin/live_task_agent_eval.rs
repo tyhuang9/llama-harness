@@ -89,7 +89,8 @@ struct OutputArtifact {
 
 #[derive(Serialize)]
 struct InvocationMetadata {
-    source_commit: Option<String>,
+    source_commit: String,
+    source_dirty: bool,
     ollama_base_url: String,
     ollama_health: llama_harness::ProviderHealth,
     selected_models: Vec<String>,
@@ -108,6 +109,7 @@ async fn main() {
 }
 
 async fn run(arguments: Arguments) -> Result<(), String> {
+    let source_revision = source_revision()?;
     if arguments.repeat == 0 {
         return Err("--repeat must be greater than zero".into());
     }
@@ -164,18 +166,7 @@ async fn run(arguments: Arguments) -> Result<(), String> {
             arguments.suite.display()
         )
     })?;
-    if !arguments.case.is_empty() {
-        let unknown: Vec<_> = arguments
-            .case
-            .iter()
-            .filter(|requested| !suite.cases.iter().any(|case| &case.id == *requested))
-            .cloned()
-            .collect();
-        if !unknown.is_empty() {
-            return Err(format!("unknown live case ID(s): {}", unknown.join(", ")));
-        }
-        suite.cases.retain(|case| arguments.case.contains(&case.id));
-    }
+    filter_requested_cases(&mut suite, &arguments.case)?;
     suite.strategies = arguments.strategy.iter().copied().map(Into::into).collect();
     suite.models = arguments.model.clone();
     suite
@@ -207,7 +198,8 @@ async fn run(arguments: Arguments) -> Result<(), String> {
     let output = OutputArtifact {
         format_version: 1,
         invocation: InvocationMetadata {
-            source_commit: source_commit(),
+            source_commit: source_revision.commit,
+            source_dirty: source_revision.dirty,
             ollama_base_url: arguments.ollama_url,
             ollama_health: health,
             selected_models: arguments.model,
@@ -255,15 +247,37 @@ fn read_json(path: &PathBuf) -> Result<Value, String> {
     })
 }
 
-fn source_commit() -> Option<String> {
+struct SourceRevision {
+    commit: String,
+    dirty: bool,
+}
+
+fn source_revision() -> Result<SourceRevision, String> {
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = Command::new("git")
+        .current_dir(&source_root)
         .args(["rev-parse", "HEAD"])
         .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .map_err(|error| format!("could not capture source commit: {error}"))?;
+    if !output.status.success() {
+        return Err("could not capture source commit from repository".into());
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if commit.is_empty() {
+        return Err("source repository returned an empty commit ID".into());
+    }
+    let status = Command::new("git")
+        .current_dir(source_root)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|error| format!("could not capture source dirty state: {error}"))?;
+    if !status.status.success() {
+        return Err("could not capture source dirty state from repository".into());
+    }
+    Ok(SourceRevision {
+        commit,
+        dirty: !status.stdout.is_empty(),
+    })
 }
 
 fn reject_duplicates(values: &[String], flag: &str) -> Result<(), String> {
@@ -280,5 +294,50 @@ fn reject_duplicates(values: &[String], flag: &str) -> Result<(), String> {
             "{flag} contains duplicate value(s): {}",
             duplicates.join(", ")
         ))
+    }
+}
+
+fn filter_requested_cases(
+    suite: &mut llama_harness::evals::EvalSuite,
+    requested: &[String],
+) -> Result<(), String> {
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let unknown: Vec<_> = requested
+        .iter()
+        .filter(|requested| !suite.cases.iter().any(|case| &case.id == *requested))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!("unknown live case ID(s): {}", unknown.join(", ")));
+    }
+    suite.cases.retain(|case| requested.contains(&case.id));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_cli_cohorts_are_rejected() {
+        assert!(reject_duplicates(&["model".into(), "model".into()], "--model").is_err());
+        assert!(reject_duplicates(&["Direct".into(), "Direct".into()], "--strategy").is_err());
+        assert!(reject_duplicates(&["no-tool".into(), "no-tool".into()], "--case").is_err());
+    }
+
+    #[test]
+    fn case_filter_rejects_partial_unknown_selection_without_dropping_known_cases() {
+        let mut suite = llama_harness::evals::load_suite(
+            include_str!("../../../../evals/local-task-agent/live-suite.yaml"),
+            Some("yaml"),
+        )
+        .unwrap();
+        let original_count = suite.cases.len();
+        let error = filter_requested_cases(&mut suite, &["no-tool".into(), "mistyped-case".into()])
+            .unwrap_err();
+        assert!(error.contains("mistyped-case"));
+        assert_eq!(suite.cases.len(), original_count);
     }
 }

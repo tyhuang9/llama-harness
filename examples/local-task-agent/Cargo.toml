@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
+default-run = "local-task-agent"
 
 [[bin]]
 name = "local-task-agent"

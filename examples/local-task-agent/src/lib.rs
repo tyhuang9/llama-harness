@@ -254,9 +254,9 @@ impl PolicyEngine for TaskPolicy {
         _: &Value,
         _: &RunRequest,
     ) -> Result<PolicyDecision, HarnessError> {
-        if tool.id == LIST_TASKS_TOOL {
+        if matches!(tool.id.as_str(), LIST_TASKS_TOOL | GET_TASK_TOOL) {
             Ok(PolicyDecision::Allow {
-                reason: "read-only task listing".into(),
+                reason: "read-only task access".into(),
             })
         } else {
             Ok(PolicyDecision::RequireApproval {
@@ -322,7 +322,6 @@ pub fn build_runtime(
     let mut tools = ToolRegistry::default();
     for kind in [
         TaskToolKind::List,
-        TaskToolKind::Get,
         TaskToolKind::Create,
         TaskToolKind::Update,
     ] {
