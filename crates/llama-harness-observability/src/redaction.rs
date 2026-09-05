@@ -6,7 +6,8 @@ pub const REDACTED_VALUE: &str = "[REDACTED]";
 /// Redaction rules applied before any event or raw payload is serialized for persistence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RedactionConfig {
-    /// Case-insensitive key fragments whose values must be redacted recursively.
+    /// Case-insensitive exact key names or delimited token sequences whose
+    /// values must be redacted recursively.
     pub key_fragments: Vec<String>,
     /// Literal secret values to remove anywhere they occur in a string.
     pub secret_values: Vec<String>,
@@ -23,8 +24,18 @@ impl Default for RedactionConfig {
                 "password".into(),
                 "secret".into(),
                 "token".into(),
+                "accesstoken".into(),
+                "authtoken".into(),
+                "sessiontoken".into(),
+                "apitoken".into(),
                 "api_key".into(),
                 "apikey".into(),
+                "program".into(),
+                "ast".into(),
+                "bytecode".into(),
+                "constant".into(),
+                "locals".into(),
+                "source".into(),
             ],
             secret_values: vec![],
             replacement: REDACTED_VALUE.into(),
@@ -59,9 +70,20 @@ impl RedactionConfig {
 
     fn redacts_key(&self, key: &str) -> bool {
         let normalized = key.to_ascii_lowercase();
-        self.key_fragments.iter().any(|fragment| {
-            let fragment = fragment.trim().to_ascii_lowercase();
-            !fragment.is_empty() && normalized.contains(&fragment)
+        let tokens = key_tokens(key);
+        self.key_fragments.iter().any(|configured| {
+            let configured = configured.trim().to_ascii_lowercase();
+            if configured.is_empty() {
+                return false;
+            }
+            if normalized == configured {
+                return true;
+            }
+            let configured_tokens = key_tokens(&configured);
+            !configured_tokens.is_empty()
+                && tokens
+                    .windows(configured_tokens.len())
+                    .any(|candidate| candidate == configured_tokens.as_slice())
         })
     }
 
@@ -72,5 +94,58 @@ impl RedactionConfig {
             .fold(value.to_owned(), |value, secret| {
                 value.replace(secret, &self.replacement)
             })
+    }
+}
+
+fn key_tokens(key: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for component in key
+        .split(|character: char| character == '_' || !character.is_ascii_alphanumeric())
+        .filter(|component| !component.is_empty())
+    {
+        let bytes = component.as_bytes();
+        let mut start = 0;
+        for index in 1..bytes.len() {
+            let previous = bytes[index - 1];
+            let current = bytes[index];
+            let next = bytes.get(index + 1).copied();
+            let camel_case = previous.is_ascii_lowercase() && current.is_ascii_uppercase();
+            let acronym = previous.is_ascii_uppercase()
+                && current.is_ascii_uppercase()
+                && next.is_some_and(|next| next.is_ascii_lowercase());
+            if camel_case || acronym {
+                tokens.push(component[start..index].to_ascii_lowercase());
+                start = index;
+            }
+        }
+        tokens.push(component[start..].to_ascii_lowercase());
+    }
+    tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn default_redaction_matches_targeted_lower_concatenated_secret_keys() {
+        let redacted = RedactionConfig::default().redact(&json!({
+            "accesstoken": "access",
+            "AUTHTOKEN": "auth",
+            "sessionToken": "session",
+            "apiTOKEN": "api",
+            "accesstokenized": "visible",
+            "resourceapitoken": "visible",
+            "sessiontokenizer": "visible"
+        }));
+
+        assert_eq!(redacted["accesstoken"], REDACTED_VALUE);
+        assert_eq!(redacted["AUTHTOKEN"], REDACTED_VALUE);
+        assert_eq!(redacted["sessionToken"], REDACTED_VALUE);
+        assert_eq!(redacted["apiTOKEN"], REDACTED_VALUE);
+        assert_eq!(redacted["accesstokenized"], "visible");
+        assert_eq!(redacted["resourceapitoken"], "visible");
+        assert_eq!(redacted["sessiontokenizer"], "visible");
     }
 }

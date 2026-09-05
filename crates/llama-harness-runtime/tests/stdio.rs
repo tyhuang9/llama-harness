@@ -3,7 +3,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use llama_harness_protocol::{ProtocolErrorCode, ProtocolMessage};
+use llama_harness_protocol::{ProtocolErrorCode, ProtocolMessage, ProtocolVersion};
 
 fn run_with_stdin(line: &str) -> Vec<llama_harness_protocol::Envelope> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_llama-harness-runtime"))
@@ -43,6 +43,78 @@ fn stdio_handshake_uses_protocol_stdout_only() {
     assert!(
         matches!(output.as_slice(), [envelope] if matches!(envelope.message, ProtocolMessage::RuntimeHello(_)))
     );
+}
+
+#[test]
+fn stdio_negotiates_the_client_offered_minor_and_pins_runtime_hello() {
+    for (offered, selected) in [
+        ("1.0", ProtocolVersion::V1_0),
+        ("1.99", ProtocolVersion::V1_1),
+    ] {
+        let output = run_with_stdin(&format!(
+            "{{\"protocol_version\":\"{offered}\",\"request_id\":\"hello-1\",\"type\":\"client_hello\",\"payload\":{{\"sdk\":{{\"name\":\"runtime-test\",\"version\":\"0.1.0\"}},\"capabilities\":[]}}}}\n"
+        ));
+        assert!(matches!(
+            output.as_slice(),
+            [envelope]
+                if envelope.protocol_version == selected
+                    && matches!(envelope.message, ProtocolMessage::RuntimeHello(_))
+        ));
+    }
+}
+
+#[test]
+fn post_handshake_version_drift_is_rejected_before_the_command_is_processed() {
+    let output = run_with_stdin(
+        "{\"protocol_version\":\"1.1\",\"request_id\":\"hello-1\",\"type\":\"client_hello\",\"payload\":{\"sdk\":{\"name\":\"runtime-test\",\"version\":\"0.1.0\"},\"capabilities\":[]}}\n{\"protocol_version\":\"1.0\",\"request_id\":\"ping-1\",\"type\":\"ping\",\"payload\":{\"nonce\":\"n\"}}\n",
+    );
+    assert!(matches!(
+        output.as_slice(),
+        [hello, error]
+            if hello.protocol_version == ProtocolVersion::V1_1
+                && matches!(hello.message, ProtocolMessage::RuntimeHello(_))
+                && matches!(
+                    &error.message,
+                    ProtocolMessage::ProtocolError(payload)
+                        if payload.code == ProtocolErrorCode::IncompatibleVersion
+                )
+    ));
+}
+
+#[test]
+fn malformed_major_and_unknown_type_preserve_structured_error_codes() {
+    let major = run_with_stdin(
+        "{\"protocol_version\":\"2.0\",\"request_id\":\"major-1\",\"type\":\"ping\",\"payload\":{\"nonce\":\"n\"}}\n",
+    );
+    let unknown = run_with_stdin(
+        "{\"protocol_version\":\"1.0\",\"request_id\":\"unknown-1\",\"type\":\"future_command\",\"payload\":{}}\n",
+    );
+    assert!(matches!(
+        major.as_slice(),
+        [envelope] if matches!(&envelope.message, ProtocolMessage::ProtocolError(error) if error.code == ProtocolErrorCode::IncompatibleVersion)
+    ));
+    assert!(matches!(
+        unknown.as_slice(),
+        [envelope] if matches!(&envelope.message, ProtocolMessage::ProtocolError(error) if error.code == ProtocolErrorCode::UnknownMessageType)
+    ));
+}
+
+#[test]
+fn every_explicit_strategy_on_v1_0_fails_without_starting_a_tool_effect() {
+    for strategy in ["adaptive", "direct", "declarative_plan", "programmatic"] {
+        let input = "{\"protocol_version\":\"1.0\",\"request_id\":\"hello-1\",\"type\":\"client_hello\",\"payload\":{\"sdk\":{\"name\":\"runtime-test\",\"version\":\"0.1.0\"},\"capabilities\":[]}}\n{\"protocol_version\":\"1.0\",\"request_id\":\"run-1\",\"type\":\"start_run\",\"payload\":{\"request\":{\"provider\":{\"kind\":\"ollama\",\"base_url\":\"http://127.0.0.1:9\"},\"agent\":{\"id\":\"agent\",\"name\":\"Agent\",\"version\":\"1\",\"default_model\":\"model\"},\"input\":\"hello\",\"strategy\":\"__STRATEGY__\"}}}\n"
+            .replace("__STRATEGY__", strategy);
+        let output = run_with_stdin(&input);
+        assert!(output.iter().all(|envelope| {
+            !matches!(envelope.message, ProtocolMessage::ToolExecutionRequested(_))
+        }));
+        assert!(output.iter().any(|envelope| {
+            matches!(
+                &envelope.message,
+                ProtocolMessage::RunFailed(error) if error.error.code == "unsupported_strategy"
+            )
+        }));
+    }
 }
 
 #[test]

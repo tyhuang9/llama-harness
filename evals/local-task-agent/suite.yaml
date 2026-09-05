@@ -99,7 +99,6 @@ cases:
     input: Create an invalid task request.
     expected:
       status: completed
-      required_tools: [create_task]
       expected_failure: {code: tool_rejected}
       final_state_subset:
         tasks: [{id: task-1, status: open}]

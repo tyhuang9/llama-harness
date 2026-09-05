@@ -19,14 +19,17 @@ ollama = ["dep:llama-harness-ollama"]
 observability = ["dep:llama-harness-observability"]
 evals = ["dep:llama-harness-evals"]
 tauri = ["dep:llama-harness-tauri"]
+programmatic = ["llama-harness-core/programmatic"]
+mcp = ["dep:llama-harness-mcp"]
 
 [dependencies]
 async-trait = "0.1"
-llama-harness-core = { version = "0.1.0", path = "../llama-harness-core" }
-llama-harness-evals = { version = "0.1.0", path = "../llama-harness-evals", optional = true }
-llama-harness-observability = { version = "0.1.0", path = "../llama-harness-observability", optional = true }
-llama-harness-ollama = { version = "0.1.0", path = "../llama-harness-ollama", optional = true }
-llama-harness-tauri = { version = "0.1.0", path = "../llama-harness-tauri", optional = true }
+llama-harness-core = { version = "0.2.0", path = "../llama-harness-core" }
+llama-harness-evals = { version = "0.2.0", path = "../llama-harness-evals", optional = true }
+llama-harness-observability = { version = "0.2.0", path = "../llama-harness-observability", optional = true }
+llama-harness-ollama = { version = "0.2.0", path = "../llama-harness-ollama", optional = true }
+llama-harness-tauri = { version = "0.2.0", path = "../llama-harness-tauri", optional = true }
+llama-harness-mcp = { version = "0.2.0", path = "../llama-harness-mcp", optional = true }
 serde_json = "1"
 tokio-util = "0.7"
 

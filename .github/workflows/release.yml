@@ -6,20 +6,44 @@ on:
       version:
         description: Exact stable SemVer already reflected in package metadata
         required: true
-        default: 0.1.0
+        default: 0.2.0
         type: string
-      publish:
-        description: Publish only after manual artifact and package review
+      source_commit:
+        description: Exact reviewed 40-character commit currently at main
         required: true
-        default: false
-        type: boolean
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  preflight:
+    name: Reviewed main source gate
+    runs-on: ubuntu-22.04
+    env:
+      REVIEWED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+      SOURCE_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reject validation away from the reviewed main commit
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -ne "refs/heads/main") {
+            throw "Manual sidecar release validation must run from refs/heads/main."
+          }
+          if ($env:REVIEWED_SOURCE_COMMIT -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "The reviewed source commit must be an exact 40-character Git SHA."
+          }
+          if ($env:REVIEWED_SOURCE_COMMIT.ToLowerInvariant() -cne $env:SOURCE_COMMIT) {
+            throw "The reviewed source commit does not match the checked-out main commit."
+          }
+
   runtime:
     name: Runtime ${{ matrix.platform }}
+    needs: preflight
     runs-on: ${{ matrix.runner }}
     env:
       RELEASE_VERSION: ${{ inputs.version }}
@@ -41,6 +65,8 @@ jobs:
             executable: llama-harness-runtime
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action, reviewed 2026-08-13
         with:
           toolchain: 1.96.0
@@ -67,17 +93,23 @@ jobs:
 
   sdk:
     name: SDK package validation
+    needs: preflight
     runs-on: ubuntu-22.04
     env:
       RELEASE_VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20.19.5
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: 3.12.10
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action, reviewed 2026-08-13
+        with:
+          toolchain: 1.96.0
       - name: Validate release input
         shell: pwsh
         run: python scripts/validate_release_version.py "$env:RELEASE_VERSION"
@@ -90,6 +122,15 @@ jobs:
           npm --prefix sdks/typescript test
           npm --prefix sdks/typescript pack --workspace @llama-harness/sdk
           python scripts/inspect_npm_package.py --package "llama-harness-sdk-$($env:RELEASE_VERSION).tgz" --name @llama-harness/sdk --version "$env:RELEASE_VERSION"
+      - name: Test and inspect the Python SDK acceptance package
+        shell: pwsh
+        run: |
+          cargo build --locked -p llama-harness-runtime -p llama-harness-scripted-runtime
+          $env:PYTHONPATH = "sdks/python/src"
+          python -m unittest discover -s sdks/python/tests -v
+          python -m pip install --disable-pip-version-check build==1.5.0
+          python -m build --wheel --outdir sdk-dist sdks/python
+          python scripts/inspect_python_packages.py --dist sdk-dist --version "$env:RELEASE_VERSION"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: llama-harness-npm-sdk
@@ -98,9 +139,12 @@ jobs:
 
   rust-release-check:
     name: Rust release validation
+    needs: preflight
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install Linux Tauri build dependencies
         run: sudo apt-get update && sudo apt-get install --yes libwebkit2gtk-4.1-dev
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action, reviewed 2026-08-13
@@ -119,6 +163,8 @@ jobs:
       RELEASE_VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-artifacts
@@ -139,8 +185,3 @@ jobs:
           name: llama-harness-release-manifest
           path: release-artifacts/
           if-no-files-found: error
-      - name: Publication gate
-        if: ${{ inputs.publish }}
-        run: |
-          echo "Publication remains a separate, human-approved operation."
-          echo "Review checksums, package contents, registry credentials, and ordered publish dry-runs before enabling registry upload steps."

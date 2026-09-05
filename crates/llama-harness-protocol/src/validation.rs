@@ -64,9 +64,9 @@ pub fn decode_line(line: &[u8]) -> Result<Envelope, ProtocolValidationError> {
 }
 
 pub fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolValidationError> {
-    if !ProtocolVersion::V1.is_compatible_with(envelope.protocol_version) {
+    if !ProtocolVersion::CURRENT.is_compatible_with(envelope.protocol_version) {
         return Err(ProtocolValidationError::IncompatibleVersion {
-            supported: ProtocolVersion::V1,
+            supported: ProtocolVersion::CURRENT,
             received: envelope.protocol_version,
         });
     }

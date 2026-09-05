@@ -277,7 +277,7 @@ function RunsScreen({ api, initialState }: { api: ConsoleApi; initialState: Load
   useEffect(() => {
     if (!selected) return;
     setEvents({ loading: true });
-    api.listRunEvents(selected.runId)
+    api.listRunEvents(selected.executionId)
       .then((value) => setEvents({ value, loading: false }))
       .catch((error: unknown) => setEvents({ loading: false, error: describeError(error) }));
   }, [api, selected]);
@@ -304,7 +304,7 @@ function RunsScreen({ api, initialState }: { api: ConsoleApi; initialState: Load
         {state.loading && <Loading label="Reading local trace database" />}
         {state.error && <Notice kind="error">{state.error}</Notice>}
         {state.value && state.value.length === 0 && <EmptyState title="No matching runs" detail="This trace database has no runs matching the current filter." />}
-        {state.value && state.value.length > 0 && <RunTable runs={state.value} selected={selected?.runId} onSelect={setSelected} />}
+        {state.value && state.value.length > 0 && <RunTable runs={state.value} selected={selected?.executionId} onSelect={setSelected} />}
       </div>
       <aside className="run-detail panel" aria-live="polite">
         {selected ? <RunDetail run={selected} events={events} /> : <EmptyState title="Select a run" detail="Choose a local trace run to inspect its redacted event timeline." />}
@@ -386,7 +386,7 @@ function SettingsScreen({ api, preferences, onSaved }: { api: ConsoleApi; prefer
 }
 
 function RunTable({ runs, selected, onSelect }: { runs: ConsoleRun[]; selected?: string; onSelect: (run: ConsoleRun) => void }) {
-  return <div className="table-wrap"><table><caption className="sr-only">Local redacted trace runs</caption><thead><tr><th>Run</th><th>Trace</th><th>Status</th><th>Events</th><th>Updated</th></tr></thead><tbody>{runs.map((run) => <tr className={selected === run.runId ? "selected" : ""} key={run.runId}><td><button type="button" className="table-link" onClick={() => onSelect(run)}>{run.runId}</button></td><td>{run.traceId}</td><td><Status value={run.status} /></td><td>{run.eventCount}</td><td>{formatTime(run.updatedAtMs)}</td></tr>)}</tbody></table></div>;
+  return <div className="table-wrap"><table><caption className="sr-only">Local redacted trace runs</caption><thead><tr><th>Run</th><th>Trace</th><th>Status</th><th>Events</th><th>Updated</th></tr></thead><tbody>{runs.map((run) => <tr className={selected === run.executionId ? "selected" : ""} key={run.executionId}><td><button type="button" className="table-link" onClick={() => onSelect(run)}>{run.runId}</button></td><td>{run.traceId}</td><td><Status value={run.status} /></td><td>{run.eventCount}</td><td>{formatTime(run.updatedAtMs)}</td></tr>)}</tbody></table></div>;
 }
 
 function RunDetail({ run, events }: { run: ConsoleRun; events: LoadState<ConsoleEvent[]> }) {

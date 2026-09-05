@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://llama-harness.dev/protocol/v1/envelope.schema.json",
   "title": "llama-harness protocol v1 envelope",
-  "description": "The outer JSONL frame. Rust types in llama-harness-protocol define the typed command payloads; unknown optional fields are tolerated within a compatible major version.",
+  "description": "The outer JSONL frame. Rust types in llama-harness-protocol define the typed command payloads; unknown optional fields are tolerated within a compatible major version. The client_hello envelope offers its highest supported v1 minor, runtime_hello selects the negotiated minor, and later frames are pinned to that selection.",
   "type": "object",
   "required": ["protocol_version", "request_id", "type", "payload"],
   "properties": {

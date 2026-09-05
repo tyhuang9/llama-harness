@@ -7,7 +7,7 @@ sidecar runtime or start a listener.
 
 ```toml
 [dependencies]
-llama-harness = { version = "0.1.0", features = ["tauri"] }
+llama-harness = { version = "0.2.0", features = ["tauri"] }
 ```
 
 The integration is available as `llama_harness::tauri` through the facade, or

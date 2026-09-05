@@ -14,9 +14,10 @@ use std::{
 
 use async_trait::async_trait;
 use llama_harness_core::{
-    AgentDefinition, AgentLimits, AgentRunner, ApprovalHandler, ApprovalRecord, EventRecord,
-    EventSink, GenerationOptions, HarnessError, Message, MessageRole, ModelProvider,
-    PolicyDecision, PolicyEngine, RunEvent, RunOverrides, RunRequest, Tool, ToolCallContext,
+    AgentDefinition, AgentLimits, AgentRunner, ApprovalHandler, ApprovalRecord, CancellationSafety,
+    EventRecord, EventSink, ExecutionLocation, GenerationOptions, HarnessError, IssueSafety,
+    Message, MessageRole, ModelProvider, NetworkEgress, PolicyDecision, PolicyEngine, RunEvent,
+    RunOverrides, RunRequest, RunStrategy, SpeculationPolicy, Tool, ToolCallContext, ToolCaller,
     ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
 };
 use llama_harness_ollama::OllamaProvider;
@@ -24,13 +25,17 @@ use llama_harness_protocol::{
     decode_line, ApprovalDecisionResponse, ApprovalRequest, CancelRun, ClientHello,
     CommandAcknowledged, Envelope, ModelInfo as WireModelInfo, ModelInventoryResponse, Ping,
     PolicyDecisionRequest, PolicyDecisionResponse, Pong, ProtocolErrorCode, ProtocolErrorPayload,
-    ProtocolMessage, ProviderConfiguration, ProviderHealthResponse, ProviderInspectionRequest,
-    RunCancelled, RunCompleted, RunEventPayload, RunFailed, RunStarted, RuntimeCapabilities,
-    RuntimeHello, StartRun, ToolExecutionRequest, ToolResultResponse, WireAgentDefinition,
-    WireAgentLimits, WireApprovalRecord, WireGenerationOptions, WireMessage, WireMessageRole,
-    WirePolicyDecision, WireRunError, WireRunOverrides, WireRunRequest, WireRunResult,
-    WireRunStatus, WireToolDefinition, WireToolResult, WireToolRisk, MAX_CONCURRENT_RUNS,
-    MAX_MESSAGE_BYTES, MAX_PENDING_CALLBACKS, MAX_QUEUE_DEPTH,
+    ProtocolMessage, ProtocolVersion, ProviderConfiguration, ProviderHealthResponse,
+    ProviderInspectionRequest, RunCancelled, RunCompleted, RunEventPayload, RunFailed, RunStarted,
+    RuntimeCapabilities, RuntimeHello, StartRun, ToolExecutionRequest, ToolResultResponse,
+    WireAgentDefinition, WireAgentLimits, WireApprovalRecord, WireCancellationSafety,
+    WireExecutionLocation, WireGenerationOptions, WireIssueSafety, WireMessage, WireMessageRole,
+    WireNetworkEgress, WirePlanLifecycleOutcome, WirePlanNodeOutcome, WirePlanPhase,
+    WirePolicyDecision, WireProgramLifecycleOutcome, WireProviderCapabilityLimits, WireRunError,
+    WireRunOverrides, WireRunRequest, WireRunResult, WireRunStatus, WireRunStrategy,
+    WireSpeculationPolicy, WireStrategyFallbackReason, WireStrategySelectionReason, WireToolCaller,
+    WireToolDefinition, WireToolDiscoveryOutcome, WireToolDiscoverySelection, WireToolResult,
+    WireToolRisk, MAX_CONCURRENT_RUNS, MAX_MESSAGE_BYTES, MAX_PENDING_CALLBACKS, MAX_QUEUE_DEPTH,
 };
 use tokio::{
     io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -112,12 +117,21 @@ pub async fn serve_stdio_with_factory(
                 send_protocol_error(
                     &state,
                     "unavailable",
-                    ProtocolErrorCode::InvalidMessage,
+                    protocol_error_code(&error),
                     error.to_string(),
                 )?;
                 continue;
             }
         };
+        if handshake_complete && envelope.protocol_version != state.protocol_version() {
+            send_protocol_error(
+                &state,
+                &envelope.request_id,
+                ProtocolErrorCode::IncompatibleVersion,
+                "protocol_version must remain pinned after client_hello",
+            )?;
+            continue;
+        }
         if envelope.message.direction() != llama_harness_protocol::MessageDirection::ClientToRuntime
         {
             send_protocol_error(
@@ -138,6 +152,7 @@ pub async fn serve_stdio_with_factory(
                         "client_hello is only valid once",
                     )?;
                 } else {
+                    state.select_protocol(envelope.protocol_version);
                     handshake_complete = true;
                     send_runtime_hello(
                         &state,
@@ -257,6 +272,32 @@ async fn run_start(
     cancellation: CancellationToken,
     provider_factory: Arc<dyn ProviderFactory>,
 ) {
+    let mut wire_request = start.request;
+    let strategy_was_explicit = wire_request.strategy.is_some();
+    let strategy = wire_request.strategy.unwrap_or_default();
+    if state.protocol_version() == ProtocolVersion::V1_0 && strategy_was_explicit {
+        send_run_failed_with_code(
+            &state,
+            &run_id,
+            "unsupported_strategy",
+            "selected protocol version 1.0 does not support the requested strategy",
+        );
+        state.remove_run(&run_id);
+        return;
+    }
+    if strategy == WireRunStrategy::Programmatic {
+        send_run_failed_with_code(
+            &state,
+            &run_id,
+            "unsupported_strategy",
+            "programmatic execution is unavailable because this sidecar has no configured sandbox",
+        );
+        state.remove_run(&run_id);
+        return;
+    }
+    if state.protocol_version() == ProtocolVersion::V1_0 {
+        project_v1_0_request(&mut wire_request);
+    }
     let trace_id = Uuid::new_v4().to_string();
     let run_sequence = state.next_sequence(&run_id);
     let _ = state.send(Envelope::new(
@@ -271,13 +312,16 @@ async fn run_start(
     let result = build_runner(
         &state,
         &run_id,
-        start.request,
+        wire_request,
         cancellation.clone(),
         trace_id.clone(),
         provider_factory.as_ref(),
     );
     match result {
-        Ok((runner, request)) => match runner.run(request).await {
+        Ok((runner, request)) => match runner
+            .run_with_strategy(request, to_core_strategy(strategy))
+            .await
+        {
             Ok(result) => {
                 let sequence = state.next_sequence(&run_id);
                 let message = match result.status {
@@ -373,6 +417,7 @@ fn build_runner(
 
 struct RuntimeState {
     writer: mpsc::Sender<Envelope>,
+    protocol_version: Mutex<ProtocolVersion>,
     runs: Mutex<HashMap<String, RunControl>>,
     callbacks: Mutex<HashMap<String, PendingCallback>>,
 }
@@ -402,11 +447,32 @@ impl RuntimeState {
     fn new(writer: mpsc::Sender<Envelope>) -> Self {
         Self {
             writer,
+            protocol_version: Mutex::new(ProtocolVersion::CURRENT),
             runs: Mutex::new(HashMap::new()),
             callbacks: Mutex::new(HashMap::new()),
         }
     }
-    fn send(&self, envelope: Envelope) -> Result<(), RuntimeError> {
+    fn select_protocol(&self, offered: ProtocolVersion) {
+        let selected = ProtocolVersion::CURRENT
+            .negotiate(offered)
+            .expect("validated v1 protocol major must negotiate");
+        *self
+            .protocol_version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = selected;
+    }
+    fn protocol_version(&self) -> ProtocolVersion {
+        *self
+            .protocol_version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn send(&self, mut envelope: Envelope) -> Result<(), RuntimeError> {
+        let version = self.protocol_version();
+        envelope.protocol_version = version;
+        if version == ProtocolVersion::V1_0 && !project_v1_0(&mut envelope.message) {
+            return Ok(());
+        }
         self.writer
             .try_send(envelope)
             .map_err(|_| RuntimeError::WriterStopped)
@@ -904,17 +970,101 @@ fn send_protocol_error(
     ))
 }
 fn send_run_failed(state: &RuntimeState, run_id: &str, message: String) {
+    send_run_failed_with_code(state, run_id, "runtime_error", message);
+}
+fn send_run_failed_with_code(
+    state: &RuntimeState,
+    run_id: &str,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) {
     let _ = state.send(Envelope::new(
         Uuid::new_v4().to_string(),
         Some(run_id.into()),
         ProtocolMessage::RunFailed(RunFailed {
             run_sequence: state.next_sequence(run_id),
             error: WireRunError {
-                code: "runtime_error".into(),
-                message,
+                code: code.into(),
+                message: message.into(),
             },
         }),
     ));
+}
+
+fn protocol_error_code(
+    error: &llama_harness_protocol::ProtocolValidationError,
+) -> ProtocolErrorCode {
+    match error {
+        llama_harness_protocol::ProtocolValidationError::IncompatibleVersion { .. } => {
+            ProtocolErrorCode::IncompatibleVersion
+        }
+        llama_harness_protocol::ProtocolValidationError::UnknownMessageType(_) => {
+            ProtocolErrorCode::UnknownMessageType
+        }
+        llama_harness_protocol::ProtocolValidationError::MessageTooLarge => {
+            ProtocolErrorCode::MessageTooLarge
+        }
+        llama_harness_protocol::ProtocolValidationError::JsonTooDeep => {
+            ProtocolErrorCode::JsonTooDeep
+        }
+        _ => ProtocolErrorCode::InvalidMessage,
+    }
+}
+
+fn project_v1_0(message: &mut ProtocolMessage) -> bool {
+    match message {
+        ProtocolMessage::RunEvent(payload) => {
+            if !matches!(
+                payload.event,
+                llama_harness_protocol::WireRunEvent::Started { .. }
+                    | llama_harness_protocol::WireRunEvent::ModelRequested { .. }
+                    | llama_harness_protocol::WireRunEvent::ModelRetrying { .. }
+                    | llama_harness_protocol::WireRunEvent::ModelResponded { .. }
+                    | llama_harness_protocol::WireRunEvent::ToolRejected { .. }
+                    | llama_harness_protocol::WireRunEvent::PolicyDecided { .. }
+                    | llama_harness_protocol::WireRunEvent::ApprovalRequested { .. }
+                    | llama_harness_protocol::WireRunEvent::ToolCompleted { .. }
+                    | llama_harness_protocol::WireRunEvent::Completed { .. }
+            ) {
+                return false;
+            }
+        }
+        ProtocolMessage::PolicyDecisionRequested(request) => project_v1_0_tool(&mut request.tool),
+        ProtocolMessage::ApprovalRequested(request) => project_v1_0_tool(&mut request.tool),
+        ProtocolMessage::ToolExecutionRequested(request) => project_v1_0_tool(&mut request.tool),
+        ProtocolMessage::ModelInventory(response) => {
+            for model in &mut response.models {
+                model.capabilities.supports_strict_tool_schemas = false;
+                model.capabilities.supports_streaming_tool_arguments = false;
+                model.capabilities.supports_parallel_tool_calls = false;
+                model.capabilities.supports_structured_plans = false;
+                model.capabilities.supports_programmatic_calling = false;
+                model.capabilities.programmatic_conformance = None;
+                model.capabilities.limits = WireProviderCapabilityLimits::default();
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn project_v1_0_tool(tool: &mut WireToolDefinition) {
+    tool.output_schema = None;
+    tool.parallel_safe = false;
+    tool.concurrency_key = None;
+    tool.cancellation_safety = WireCancellationSafety::Unknown;
+    tool.expected_latency_ms = None;
+    tool.allowed_callers = std::collections::BTreeSet::from([WireToolCaller::Direct]);
+    tool.speculation_policy = WireSpeculationPolicy::Disabled;
+    tool.issue_safety = WireIssueSafety::Unknown;
+    tool.execution_location = WireExecutionLocation::Unknown;
+    tool.network_egress = WireNetworkEgress::Unknown;
+}
+
+fn project_v1_0_request(request: &mut WireRunRequest) {
+    for tool in &mut request.tools {
+        project_v1_0_tool(tool);
+    }
 }
 
 fn start_writer() -> (
@@ -1003,6 +1153,7 @@ fn to_core_limits(limits: WireAgentLimits) -> AgentLimits {
         max_tool_result_bytes: limits.max_tool_result_bytes.min(1024 * 1024),
         max_transcript_bytes: limits.max_transcript_bytes.min(4 * 1024 * 1024),
         max_json_depth: limits.max_json_depth.min(64),
+        ..AgentLimits::default()
     }
 }
 fn to_core_generation(generation: WireGenerationOptions) -> GenerationOptions {
@@ -1048,19 +1199,42 @@ fn to_core_message(message: WireMessage) -> Message {
     }
 }
 fn to_core_tool_definition(definition: WireToolDefinition) -> ToolDefinition {
-    ToolDefinition {
-        id: definition.id,
-        name: definition.name,
-        description: definition.description,
-        arguments_schema: definition.arguments_schema,
-        risk: match definition.risk {
-            WireToolRisk::Low => ToolRisk::Low,
-            WireToolRisk::Medium => ToolRisk::Medium,
-            WireToolRisk::High => ToolRisk::High,
-        },
-        idempotent: definition.idempotent,
-        read_only: definition.read_only,
+    let risk = match definition.risk {
+        WireToolRisk::Low => ToolRisk::Low,
+        WireToolRisk::Medium => ToolRisk::Medium,
+        WireToolRisk::High => ToolRisk::High,
+    };
+    let mut tool = ToolDefinition::new(
+        definition.id,
+        definition.name,
+        definition.description,
+        definition.arguments_schema,
+    )
+    .with_risk(risk)
+    .with_idempotent(definition.idempotent)
+    .with_read_only(definition.read_only)
+    .with_parallel_safe(definition.parallel_safe)
+    .with_cancellation_safety(to_core_cancellation_safety(definition.cancellation_safety))
+    .with_allowed_callers(
+        definition
+            .allowed_callers
+            .into_iter()
+            .map(to_core_tool_caller),
+    )
+    .with_speculation_policy(to_core_speculation_policy(definition.speculation_policy))
+    .with_issue_safety(to_core_issue_safety(definition.issue_safety))
+    .with_execution_location(to_core_execution_location(definition.execution_location))
+    .with_network_egress(to_core_network_egress(definition.network_egress));
+    if let Some(output_schema) = definition.output_schema {
+        tool = tool.with_output_schema(output_schema);
     }
+    if let Some(concurrency_key) = definition.concurrency_key {
+        tool = tool.with_concurrency_key(concurrency_key);
+    }
+    if let Some(expected_latency_ms) = definition.expected_latency_ms {
+        tool = tool.with_expected_latency_ms(expected_latency_ms);
+    }
+    tool
 }
 fn to_wire_tool_definition(definition: ToolDefinition) -> WireToolDefinition {
     WireToolDefinition {
@@ -1076,6 +1250,20 @@ fn to_wire_tool_definition(definition: ToolDefinition) -> WireToolDefinition {
         },
         idempotent: definition.idempotent,
         read_only: definition.read_only,
+        output_schema: definition.output_schema,
+        parallel_safe: definition.parallel_safe,
+        concurrency_key: definition.concurrency_key,
+        cancellation_safety: to_wire_cancellation_safety(definition.cancellation_safety),
+        expected_latency_ms: definition.expected_latency_ms,
+        allowed_callers: definition
+            .allowed_callers
+            .into_iter()
+            .map(to_wire_tool_caller)
+            .collect(),
+        speculation_policy: to_wire_speculation_policy(definition.speculation_policy),
+        issue_safety: to_wire_issue_safety(definition.issue_safety),
+        execution_location: to_wire_execution_location(definition.execution_location),
+        network_egress: to_wire_network_egress(definition.network_egress),
     }
 }
 fn to_wire_model_info(info: llama_harness_core::ModelInfo) -> WireModelInfo {
@@ -1085,7 +1273,296 @@ fn to_wire_model_info(info: llama_harness_core::ModelInfo) -> WireModelInfo {
             supports_tools: info.capabilities.supports_tools,
             supports_streaming: info.capabilities.supports_streaming,
             supports_structured_output: info.capabilities.supports_structured_output,
+            supports_strict_tool_schemas: info.capabilities.supports_strict_tool_schemas,
+            supports_streaming_tool_arguments: info.capabilities.supports_streaming_tool_arguments,
+            supports_parallel_tool_calls: info.capabilities.supports_parallel_tool_calls,
+            supports_structured_plans: info.capabilities.supports_structured_plans,
+            // This sidecar does not configure a programmatic sandbox, so it
+            // must not advertise provider support it cannot safely honor.
+            supports_programmatic_calling: false,
+            programmatic_conformance: None,
+            limits: to_wire_provider_limits(info.capabilities.limits),
         },
+    }
+}
+fn to_core_strategy(strategy: WireRunStrategy) -> RunStrategy {
+    match strategy {
+        WireRunStrategy::Adaptive => RunStrategy::Adaptive,
+        WireRunStrategy::Direct => RunStrategy::Direct,
+        WireRunStrategy::DeclarativePlan => RunStrategy::DeclarativePlan,
+        WireRunStrategy::Programmatic => RunStrategy::Programmatic,
+    }
+}
+fn to_core_cancellation_safety(value: WireCancellationSafety) -> CancellationSafety {
+    match value {
+        WireCancellationSafety::Unknown => CancellationSafety::Unknown,
+        WireCancellationSafety::Cooperative => CancellationSafety::Cooperative,
+        WireCancellationSafety::Guaranteed => CancellationSafety::Guaranteed,
+    }
+}
+fn to_wire_cancellation_safety(value: CancellationSafety) -> WireCancellationSafety {
+    match value {
+        CancellationSafety::Unknown => WireCancellationSafety::Unknown,
+        CancellationSafety::Cooperative => WireCancellationSafety::Cooperative,
+        CancellationSafety::Guaranteed => WireCancellationSafety::Guaranteed,
+        _ => WireCancellationSafety::Unknown,
+    }
+}
+fn to_core_tool_caller(value: WireToolCaller) -> ToolCaller {
+    match value {
+        WireToolCaller::Direct => ToolCaller::Direct,
+        WireToolCaller::DeclarativePlan => ToolCaller::DeclarativePlan,
+        WireToolCaller::Programmatic => ToolCaller::Programmatic,
+        WireToolCaller::Speculative => ToolCaller::Speculative,
+    }
+}
+fn to_wire_tool_caller(value: ToolCaller) -> WireToolCaller {
+    match value {
+        ToolCaller::Direct => WireToolCaller::Direct,
+        ToolCaller::DeclarativePlan => WireToolCaller::DeclarativePlan,
+        ToolCaller::Programmatic => WireToolCaller::Programmatic,
+        ToolCaller::Speculative => WireToolCaller::Speculative,
+        _ => WireToolCaller::Direct,
+    }
+}
+fn to_core_speculation_policy(value: WireSpeculationPolicy) -> SpeculationPolicy {
+    match value {
+        WireSpeculationPolicy::Disabled => SpeculationPolicy::Disabled,
+        WireSpeculationPolicy::Enabled => SpeculationPolicy::Enabled,
+    }
+}
+fn to_wire_speculation_policy(value: SpeculationPolicy) -> WireSpeculationPolicy {
+    match value {
+        SpeculationPolicy::Disabled => WireSpeculationPolicy::Disabled,
+        SpeculationPolicy::Enabled => WireSpeculationPolicy::Enabled,
+        _ => WireSpeculationPolicy::Disabled,
+    }
+}
+fn to_core_issue_safety(value: WireIssueSafety) -> IssueSafety {
+    match value {
+        WireIssueSafety::Unknown => IssueSafety::Unknown,
+        WireIssueSafety::Guaranteed => IssueSafety::Guaranteed,
+    }
+}
+fn to_wire_issue_safety(value: IssueSafety) -> WireIssueSafety {
+    match value {
+        IssueSafety::Unknown => WireIssueSafety::Unknown,
+        IssueSafety::Guaranteed => WireIssueSafety::Guaranteed,
+        _ => WireIssueSafety::Unknown,
+    }
+}
+fn to_core_execution_location(value: WireExecutionLocation) -> ExecutionLocation {
+    match value {
+        WireExecutionLocation::Unknown => ExecutionLocation::Unknown,
+        WireExecutionLocation::LocalPrivate => ExecutionLocation::LocalPrivate,
+        WireExecutionLocation::Remote => ExecutionLocation::Remote,
+    }
+}
+fn to_wire_execution_location(value: ExecutionLocation) -> WireExecutionLocation {
+    match value {
+        ExecutionLocation::Unknown => WireExecutionLocation::Unknown,
+        ExecutionLocation::LocalPrivate => WireExecutionLocation::LocalPrivate,
+        ExecutionLocation::Remote => WireExecutionLocation::Remote,
+        _ => WireExecutionLocation::Unknown,
+    }
+}
+fn to_core_network_egress(value: WireNetworkEgress) -> NetworkEgress {
+    match value {
+        WireNetworkEgress::Unknown => NetworkEgress::Unknown,
+        WireNetworkEgress::Prohibited => NetworkEgress::Prohibited,
+        WireNetworkEgress::Permitted => NetworkEgress::Permitted,
+    }
+}
+fn to_wire_network_egress(value: NetworkEgress) -> WireNetworkEgress {
+    match value {
+        NetworkEgress::Unknown => WireNetworkEgress::Unknown,
+        NetworkEgress::Prohibited => WireNetworkEgress::Prohibited,
+        NetworkEgress::Permitted => WireNetworkEgress::Permitted,
+        _ => WireNetworkEgress::Unknown,
+    }
+}
+fn to_wire_provider_limits(
+    limits: llama_harness_core::ProviderCapabilityLimits,
+) -> WireProviderCapabilityLimits {
+    WireProviderCapabilityLimits {
+        max_tools: limits.max_tools,
+        max_tool_schema_bytes: limits.max_tool_schema_bytes,
+        max_parallel_tool_calls: limits.max_parallel_tool_calls,
+        max_streamed_argument_bytes: limits.max_streamed_argument_bytes,
+        max_streamed_tool_calls: limits.max_streamed_tool_calls,
+        max_plan_bytes: limits.max_plan_bytes,
+        max_plan_nodes: limits.max_plan_nodes,
+        max_program_bytes: limits.max_program_bytes,
+    }
+}
+fn to_wire_strategy(strategy: RunStrategy) -> WireRunStrategy {
+    match strategy {
+        RunStrategy::Adaptive => WireRunStrategy::Adaptive,
+        RunStrategy::Direct => WireRunStrategy::Direct,
+        RunStrategy::DeclarativePlan => WireRunStrategy::DeclarativePlan,
+        RunStrategy::Programmatic => WireRunStrategy::Programmatic,
+    }
+}
+fn to_wire_discovery_outcome(
+    outcome: llama_harness_core::ToolDiscoveryOutcome,
+) -> WireToolDiscoveryOutcome {
+    match outcome {
+        llama_harness_core::ToolDiscoveryOutcome::Selected => WireToolDiscoveryOutcome::Selected,
+        llama_harness_core::ToolDiscoveryOutcome::LimitReached => {
+            WireToolDiscoveryOutcome::LimitReached
+        }
+        _ => WireToolDiscoveryOutcome::Selected,
+    }
+}
+fn to_wire_discovery_selection(
+    selection: llama_harness_core::ToolDiscoverySelection,
+) -> WireToolDiscoverySelection {
+    match selection {
+        llama_harness_core::ToolDiscoverySelection::LegacyUnclassified => {
+            WireToolDiscoverySelection::LegacyUnclassified
+        }
+        llama_harness_core::ToolDiscoverySelection::EmptyCatalog => {
+            WireToolDiscoverySelection::EmptyCatalog
+        }
+        llama_harness_core::ToolDiscoverySelection::NoCapacity => {
+            WireToolDiscoverySelection::NoCapacity
+        }
+        llama_harness_core::ToolDiscoverySelection::FullCatalog => {
+            WireToolDiscoverySelection::FullCatalog
+        }
+        llama_harness_core::ToolDiscoverySelection::HotOnly => WireToolDiscoverySelection::HotOnly,
+        llama_harness_core::ToolDiscoverySelection::Exact => WireToolDiscoverySelection::Exact,
+        llama_harness_core::ToolDiscoverySelection::LexicalConfident => {
+            WireToolDiscoverySelection::LexicalConfident
+        }
+        llama_harness_core::ToolDiscoverySelection::LexicalExpanded => {
+            WireToolDiscoverySelection::LexicalExpanded
+        }
+        llama_harness_core::ToolDiscoverySelection::NoMatch => WireToolDiscoverySelection::NoMatch,
+        llama_harness_core::ToolDiscoverySelection::CountLimit => {
+            WireToolDiscoverySelection::CountLimit
+        }
+        llama_harness_core::ToolDiscoverySelection::SchemaByteLimit => {
+            WireToolDiscoverySelection::SchemaByteLimit
+        }
+        _ => WireToolDiscoverySelection::LegacyUnclassified,
+    }
+}
+fn to_wire_strategy_selection_reason(
+    reason: llama_harness_core::StrategySelectionReason,
+) -> WireStrategySelectionReason {
+    match reason {
+        llama_harness_core::StrategySelectionReason::Forced => WireStrategySelectionReason::Forced,
+        llama_harness_core::StrategySelectionReason::AdaptivePlanner => {
+            WireStrategySelectionReason::AdaptivePlanner
+        }
+        llama_harness_core::StrategySelectionReason::PlannerSelectedDirect => {
+            WireStrategySelectionReason::PlannerSelectedDirect
+        }
+        llama_harness_core::StrategySelectionReason::PlannerSelectedPlan => {
+            WireStrategySelectionReason::PlannerSelectedPlan
+        }
+        llama_harness_core::StrategySelectionReason::CapabilityDowngrade => {
+            WireStrategySelectionReason::CapabilityDowngrade
+        }
+        llama_harness_core::StrategySelectionReason::Fallback => {
+            WireStrategySelectionReason::Fallback
+        }
+        _ => WireStrategySelectionReason::CapabilityDowngrade,
+    }
+}
+fn to_wire_strategy_fallback_reason(
+    reason: llama_harness_core::StrategyFallbackReason,
+) -> WireStrategyFallbackReason {
+    match reason {
+        llama_harness_core::StrategyFallbackReason::UnsupportedCapability => {
+            WireStrategyFallbackReason::UnsupportedCapability
+        }
+        llama_harness_core::StrategyFallbackReason::InvalidPlan => {
+            WireStrategyFallbackReason::InvalidPlan
+        }
+        llama_harness_core::StrategyFallbackReason::InvalidProgram => {
+            WireStrategyFallbackReason::InvalidProgram
+        }
+        llama_harness_core::StrategyFallbackReason::ExecutionRecovery => {
+            WireStrategyFallbackReason::ExecutionRecovery
+        }
+        llama_harness_core::StrategyFallbackReason::PlannerFailure => {
+            WireStrategyFallbackReason::PlannerFailure
+        }
+        _ => WireStrategyFallbackReason::PlannerFailure,
+    }
+}
+fn to_wire_program_lifecycle_outcome(
+    outcome: llama_harness_core::ProgramLifecycleOutcome,
+) -> WireProgramLifecycleOutcome {
+    match outcome {
+        llama_harness_core::ProgramLifecycleOutcome::Started => {
+            WireProgramLifecycleOutcome::Started
+        }
+        llama_harness_core::ProgramLifecycleOutcome::Validated => {
+            WireProgramLifecycleOutcome::Validated
+        }
+        llama_harness_core::ProgramLifecycleOutcome::Invalid => {
+            WireProgramLifecycleOutcome::Invalid
+        }
+        llama_harness_core::ProgramLifecycleOutcome::Succeeded => {
+            WireProgramLifecycleOutcome::Succeeded
+        }
+        llama_harness_core::ProgramLifecycleOutcome::Fallback => {
+            WireProgramLifecycleOutcome::Fallback
+        }
+        llama_harness_core::ProgramLifecycleOutcome::Failed => WireProgramLifecycleOutcome::Failed,
+        llama_harness_core::ProgramLifecycleOutcome::Cancelled => {
+            WireProgramLifecycleOutcome::Cancelled
+        }
+        llama_harness_core::ProgramLifecycleOutcome::TimedOut => {
+            WireProgramLifecycleOutcome::TimedOut
+        }
+        llama_harness_core::ProgramLifecycleOutcome::LimitReached => {
+            WireProgramLifecycleOutcome::LimitReached
+        }
+        _ => WireProgramLifecycleOutcome::Failed,
+    }
+}
+fn to_wire_plan_phase(phase: llama_harness_core::PlanPhase) -> WirePlanPhase {
+    match phase {
+        llama_harness_core::PlanPhase::Planning => WirePlanPhase::Planning,
+        llama_harness_core::PlanPhase::Repair => WirePlanPhase::Repair,
+        llama_harness_core::PlanPhase::Validation => WirePlanPhase::Validation,
+        llama_harness_core::PlanPhase::Preflight => WirePlanPhase::Preflight,
+        llama_harness_core::PlanPhase::Recovery => WirePlanPhase::Recovery,
+        _ => WirePlanPhase::Validation,
+    }
+}
+fn to_wire_plan_lifecycle_outcome(
+    outcome: llama_harness_core::PlanLifecycleOutcome,
+) -> WirePlanLifecycleOutcome {
+    match outcome {
+        llama_harness_core::PlanLifecycleOutcome::Started => WirePlanLifecycleOutcome::Started,
+        llama_harness_core::PlanLifecycleOutcome::Succeeded => WirePlanLifecycleOutcome::Succeeded,
+        llama_harness_core::PlanLifecycleOutcome::Invalid => WirePlanLifecycleOutcome::Invalid,
+        llama_harness_core::PlanLifecycleOutcome::Rejected => WirePlanLifecycleOutcome::Rejected,
+        llama_harness_core::PlanLifecycleOutcome::Failed => WirePlanLifecycleOutcome::Failed,
+        llama_harness_core::PlanLifecycleOutcome::Cancelled => WirePlanLifecycleOutcome::Cancelled,
+        llama_harness_core::PlanLifecycleOutcome::TimedOut => WirePlanLifecycleOutcome::TimedOut,
+        llama_harness_core::PlanLifecycleOutcome::LimitReached => {
+            WirePlanLifecycleOutcome::LimitReached
+        }
+        llama_harness_core::PlanLifecycleOutcome::Skipped => WirePlanLifecycleOutcome::Skipped,
+        _ => WirePlanLifecycleOutcome::Failed,
+    }
+}
+fn to_wire_plan_node_outcome(outcome: llama_harness_core::PlanNodeOutcome) -> WirePlanNodeOutcome {
+    match outcome {
+        llama_harness_core::PlanNodeOutcome::Succeeded => WirePlanNodeOutcome::Succeeded,
+        llama_harness_core::PlanNodeOutcome::Failed => WirePlanNodeOutcome::Failed,
+        llama_harness_core::PlanNodeOutcome::Cancelled => WirePlanNodeOutcome::Cancelled,
+        llama_harness_core::PlanNodeOutcome::TimedOut => WirePlanNodeOutcome::TimedOut,
+        llama_harness_core::PlanNodeOutcome::Rejected => WirePlanNodeOutcome::Rejected,
+        llama_harness_core::PlanNodeOutcome::LimitReached => WirePlanNodeOutcome::LimitReached,
+        llama_harness_core::PlanNodeOutcome::Reused => WirePlanNodeOutcome::Reused,
+        _ => WirePlanNodeOutcome::Failed,
     }
 }
 fn to_core_policy(decision: WirePolicyDecision) -> PolicyDecision {
@@ -1115,6 +1592,171 @@ fn to_wire_event(event: RunEvent) -> Option<llama_harness_protocol::WireRunEvent
         RunEvent::ModelResponded { call_number } => {
             llama_harness_protocol::WireRunEvent::ModelResponded { call_number }
         }
+        RunEvent::ToolDiscoveryCompleted {
+            caller,
+            outcome,
+            selection,
+            candidate_count,
+            selected_count,
+            deferred_candidate_count,
+            effective_tool_count_budget,
+            effective_schema_byte_budget,
+            selected_schema_bytes,
+            expansion_count,
+            expansion_limit,
+            catalog_exceeded_budget,
+            duration_ms,
+        } => llama_harness_protocol::WireRunEvent::ToolDiscoveryCompleted {
+            caller: to_wire_tool_caller(caller),
+            outcome: to_wire_discovery_outcome(outcome),
+            selection: to_wire_discovery_selection(selection),
+            candidate_count,
+            selected_count,
+            deferred_candidate_count,
+            effective_tool_count_budget,
+            effective_schema_byte_budget,
+            selected_schema_bytes,
+            expansion_count,
+            expansion_limit,
+            catalog_exceeded_budget,
+            duration_ms,
+        },
+        RunEvent::StrategySelected {
+            requested,
+            selected,
+            reason,
+        } => llama_harness_protocol::WireRunEvent::StrategySelected {
+            requested: to_wire_strategy(requested),
+            selected: to_wire_strategy(selected),
+            reason: to_wire_strategy_selection_reason(reason),
+        },
+        RunEvent::StrategyFallback { from, to, reason } => {
+            llama_harness_protocol::WireRunEvent::StrategyFallback {
+                from: to_wire_strategy(from),
+                to: to_wire_strategy(to),
+                reason: to_wire_strategy_fallback_reason(reason),
+            }
+        }
+        RunEvent::PlanLifecycle {
+            phase,
+            attempt,
+            outcome,
+        } => llama_harness_protocol::WireRunEvent::PlanLifecycle {
+            phase: to_wire_plan_phase(phase),
+            attempt,
+            outcome: to_wire_plan_lifecycle_outcome(outcome),
+        },
+        RunEvent::PlanValidated {
+            attempt,
+            node_count,
+        } => llama_harness_protocol::WireRunEvent::PlanValidated {
+            attempt,
+            node_count,
+        },
+        RunEvent::ProgramLifecycle { attempt, outcome } => {
+            llama_harness_protocol::WireRunEvent::ProgramLifecycle {
+                attempt,
+                outcome: to_wire_program_lifecycle_outcome(outcome),
+            }
+        }
+        RunEvent::ProgramValidated {
+            attempt,
+            statement_count,
+            instruction_count,
+        } => llama_harness_protocol::WireRunEvent::ProgramValidated {
+            attempt,
+            statement_count,
+            instruction_count,
+        },
+        RunEvent::ProgramExecutionCompleted {
+            attempt,
+            fuel_used,
+            scheduling_slices,
+            tool_yields,
+            branches,
+            loop_iterations,
+            fanout_batches,
+            partial_failures,
+            peak_accounted_bytes,
+            duration_ms,
+        } => llama_harness_protocol::WireRunEvent::ProgramExecutionCompleted {
+            attempt,
+            fuel_used,
+            scheduling_slices,
+            tool_yields,
+            branches,
+            loop_iterations,
+            fanout_batches,
+            partial_failures,
+            peak_accounted_bytes,
+            duration_ms,
+        },
+        RunEvent::PlanNodeStarted {
+            node_id,
+            tool_id,
+            attempt,
+            wave,
+        } => llama_harness_protocol::WireRunEvent::PlanNodeStarted {
+            node_id,
+            tool_id,
+            attempt,
+            wave,
+        },
+        RunEvent::PlanNodeCompleted {
+            node_id,
+            tool_id,
+            attempt,
+            wave,
+            ok,
+            outcome,
+            duration_ms,
+        } => llama_harness_protocol::WireRunEvent::PlanNodeCompleted {
+            node_id,
+            tool_id,
+            attempt,
+            wave,
+            ok,
+            outcome: to_wire_plan_node_outcome(outcome),
+            duration_ms,
+        },
+        RunEvent::ToolEffectReused { call_id, tool_id } => {
+            llama_harness_protocol::WireRunEvent::ToolEffectReused { call_id, tool_id }
+        }
+        RunEvent::StrategyUsage {
+            strategy,
+            model_calls,
+            planning_model_calls,
+            repair_model_calls,
+            recovery_model_calls,
+            final_synthesis_model_calls,
+            reactive_model_calls,
+            tool_calls,
+            tool_issued,
+            tool_reused,
+            tool_rejected,
+            tool_pre_dispatch_aborted,
+            tool_completed,
+            tool_failed,
+            tool_cancelled,
+            duration_ms,
+        } => llama_harness_protocol::WireRunEvent::StrategyUsage {
+            strategy: to_wire_strategy(strategy),
+            model_calls,
+            planning_model_calls,
+            repair_model_calls,
+            recovery_model_calls,
+            final_synthesis_model_calls,
+            reactive_model_calls,
+            tool_calls,
+            tool_issued,
+            tool_reused,
+            tool_rejected,
+            tool_pre_dispatch_aborted,
+            tool_completed,
+            tool_failed,
+            tool_cancelled,
+            duration_ms,
+        },
         RunEvent::ToolRejected {
             call_id,
             tool_id,
@@ -1212,5 +1854,231 @@ fn to_wire_result(result: llama_harness_core::RunResult) -> WireRunResult {
         tool_call_limit_reached: result.tool_call_limit_reached,
         repeated_tool_call_limit_reached: result.repeated_tool_call_limit_reached,
         cancelled: result.cancelled,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llama_harness_core::{
+        mock::{final_response, tool_response, MockModelProvider},
+        RunStatus, ToolCall,
+    };
+    use serde_json::{json, Value};
+    use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn core_limit_mapping_preserves_wire_fields_and_defaults_programmatic_only_limits() {
+        let limits = to_core_limits(WireAgentLimits {
+            max_model_calls: 99,
+            max_tool_calls: 99,
+            max_identical_tool_calls: 99,
+            max_run_duration_ms: Some(999_999),
+            max_model_call_duration_ms: Some(999_999),
+            max_output_repairs: 99,
+            max_provider_retries: 99,
+            max_input_bytes: 999_999,
+            max_request_payload_bytes: 999_999,
+            max_model_response_bytes: 9_999_999,
+            max_tool_arguments_bytes: 999_999,
+            max_tool_result_bytes: 9_999_999,
+            max_transcript_bytes: 99_999_999,
+            max_json_depth: 999,
+        });
+
+        assert_eq!(limits.max_model_calls, 32);
+        assert_eq!(limits.max_tool_calls, 64);
+        assert_eq!(limits.max_identical_tool_calls, 8);
+        assert_eq!(limits.max_run_duration_ms, Some(300_000));
+        assert_eq!(limits.max_model_call_duration_ms, Some(120_000));
+        assert_eq!(limits.max_output_repairs, 4);
+        assert_eq!(limits.max_provider_retries, 4);
+        assert_eq!(limits.max_input_bytes, 64 * 1024);
+        assert_eq!(limits.max_request_payload_bytes, 256 * 1024);
+        assert_eq!(limits.max_model_response_bytes, 1024 * 1024);
+        assert_eq!(limits.max_tool_arguments_bytes, 64 * 1024);
+        assert_eq!(limits.max_tool_result_bytes, 1024 * 1024);
+        assert_eq!(limits.max_transcript_bytes, 4 * 1024 * 1024);
+        assert_eq!(limits.max_json_depth, 64);
+        assert_eq!(
+            limits.max_programmatic_program_bytes,
+            AgentLimits::default().max_programmatic_program_bytes
+        );
+        assert_eq!(
+            limits.max_programmatic_fanout_concurrency,
+            AgentLimits::default().max_programmatic_fanout_concurrency
+        );
+    }
+
+    struct CountingTool {
+        definition: ToolDefinition,
+        calls: AtomicU32,
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn definition(&self) -> &ToolDefinition {
+            &self.definition
+        }
+
+        async fn execute(
+            &self,
+            _: Value,
+            _: CancellationToken,
+        ) -> Result<ToolResult, HarnessError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::success(Value::Null))
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_result_does_not_restore_rejected_argument_values() {
+        const SECRET: &str = "sentinel-runtime-argument-secret";
+        let tool = Arc::new(CountingTool {
+            definition: ToolDefinition::new(
+                "read",
+                "Read",
+                "Read",
+                json!({
+                    "type":"object",
+                    "required":["key"],
+                    "properties":{"key":{"type":"string","enum":["allowed"]}},
+                    "additionalProperties":false
+                }),
+            )
+            .with_risk(ToolRisk::Low)
+            .with_read_only(true)
+            .with_idempotent(true),
+            calls: AtomicU32::new(0),
+        });
+        let mut tools = ToolRegistry::default();
+        tools.register(tool.clone()).unwrap();
+        let provider = Arc::new(MockModelProvider::scripted([
+            tool_response(ToolCall::new(
+                "invalid-secret",
+                "read",
+                format!(r#"{{"key":"{SECRET}"}}"#),
+            )),
+            final_response("recovered"),
+        ]));
+        let mut agent = AgentDefinition::new("runtime-test", "Runtime test", "1", "mock-model");
+        agent.tool_allowlist = vec!["read".into()];
+
+        let result = AgentRunner::builder(provider)
+            .tools(tools)
+            .build()
+            .run(RunRequest::new(agent, "read"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
+        let wire = to_wire_result(result);
+        assert_eq!(wire.tool_calls.len(), 1);
+        assert_eq!(wire.tool_calls[0].id, "invalid-secret");
+        assert_eq!(wire.tool_calls[0].tool_id, "read");
+        assert_eq!(wire.tool_calls[0].arguments_json, "{}");
+        assert!(!serde_json::to_string(&wire).unwrap().contains(SECRET));
+    }
+
+    #[test]
+    fn v1_1_tool_and_model_conversions_preserve_public_advanced_metadata() {
+        let definition =
+            ToolDefinition::new("tool", "Tool", "description", json!({"type":"object"}))
+                .with_risk(ToolRisk::Low)
+                .with_idempotent(true)
+                .with_read_only(true)
+                .with_output_schema(json!({"type":"string"}))
+                .with_parallel_safe(true)
+                .with_concurrency_key("shared")
+                .with_cancellation_safety(CancellationSafety::Guaranteed)
+                .with_expected_latency_ms(12)
+                .with_allowed_callers([ToolCaller::Direct, ToolCaller::DeclarativePlan])
+                .with_speculation_policy(SpeculationPolicy::Enabled)
+                .with_issue_safety(IssueSafety::Guaranteed)
+                .with_execution_location(ExecutionLocation::LocalPrivate)
+                .with_network_egress(NetworkEgress::Prohibited);
+        let wire = to_wire_tool_definition(definition.clone());
+        assert_eq!(wire.output_schema, Some(json!({"type":"string"})));
+        assert!(wire.parallel_safe);
+        assert_eq!(wire.concurrency_key.as_deref(), Some("shared"));
+        assert_eq!(wire.cancellation_safety, WireCancellationSafety::Guaranteed);
+        assert_eq!(wire.expected_latency_ms, Some(12));
+        assert!(wire
+            .allowed_callers
+            .contains(&WireToolCaller::DeclarativePlan));
+        assert_eq!(wire.speculation_policy, WireSpeculationPolicy::Enabled);
+        assert_eq!(wire.issue_safety, WireIssueSafety::Guaranteed);
+        assert_eq!(wire.execution_location, WireExecutionLocation::LocalPrivate);
+        assert_eq!(wire.network_egress, WireNetworkEgress::Prohibited);
+        assert_eq!(to_core_tool_definition(wire), definition);
+
+        let limits = llama_harness_core::ProviderCapabilityLimits::new()
+            .with_max_tools(3)
+            .with_max_tool_schema_bytes(4)
+            .with_max_parallel_tool_calls(5)
+            .with_max_streamed_argument_bytes(6)
+            .with_max_streamed_tool_calls(7)
+            .with_max_plan_bytes(8)
+            .with_max_plan_nodes(9)
+            .with_max_program_bytes(10);
+        let capabilities = llama_harness_core::ModelCapabilities::new(true, true, true)
+            .with_strict_tool_schemas(true)
+            .with_streaming_tool_arguments(true)
+            .with_parallel_tool_calls(true)
+            .with_structured_plans(true)
+            .with_programmatic_conformance(
+                llama_harness_core::ProgrammaticConformance::StrictJsonAstV1,
+            )
+            .with_limits(limits);
+        let wire_model = to_wire_model_info(
+            llama_harness_core::ModelInfo::new("model").with_capabilities(capabilities),
+        );
+        assert!(wire_model.capabilities.supports_strict_tool_schemas);
+        assert!(wire_model.capabilities.supports_streaming_tool_arguments);
+        assert!(wire_model.capabilities.supports_parallel_tool_calls);
+        assert!(wire_model.capabilities.supports_structured_plans);
+        assert!(!wire_model.capabilities.supports_programmatic_calling);
+        assert_eq!(wire_model.capabilities.programmatic_conformance, None);
+        assert_eq!(wire_model.capabilities.limits.max_program_bytes, Some(10));
+    }
+
+    #[test]
+    fn v1_0_projection_filters_additive_events_and_tool_metadata() {
+        let mut event = ProtocolMessage::RunEvent(RunEventPayload {
+            trace_id: "trace".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            event: to_wire_event(RunEvent::StrategySelected {
+                requested: RunStrategy::Adaptive,
+                selected: RunStrategy::Direct,
+                reason: llama_harness_core::StrategySelectionReason::CapabilityDowngrade,
+            })
+            .unwrap(),
+        });
+        assert!(!project_v1_0(&mut event));
+        assert!(matches!(
+            to_wire_event(RunEvent::StrategySelected {
+                requested: RunStrategy::Adaptive,
+                selected: RunStrategy::Direct,
+                reason: llama_harness_core::StrategySelectionReason::Fallback,
+            }),
+            Some(llama_harness_protocol::WireRunEvent::StrategySelected {
+                reason: WireStrategySelectionReason::Fallback,
+                ..
+            })
+        ));
+
+        let mut tool = to_wire_tool_definition(
+            ToolDefinition::new("tool", "Tool", "description", json!({}))
+                .with_output_schema(json!({"type":"string"}))
+                .with_parallel_safe(true)
+                .with_cancellation_safety(CancellationSafety::Guaranteed),
+        );
+        project_v1_0_tool(&mut tool);
+        assert_eq!(tool.output_schema, None);
+        assert!(!tool.parallel_safe);
+        assert_eq!(tool.cancellation_safety, WireCancellationSafety::Unknown);
     }
 }

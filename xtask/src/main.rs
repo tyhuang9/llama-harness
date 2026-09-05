@@ -13,7 +13,14 @@ const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 256;
-const FACADE_FEATURES: &[&str] = &["ollama", "observability", "evals", "tauri"];
+const FACADE_FEATURES: &[&str] = &[
+    "ollama",
+    "observability",
+    "evals",
+    "tauri",
+    "programmatic",
+    "mcp",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PublishableCrate {
@@ -21,6 +28,9 @@ struct PublishableCrate {
 }
 
 const PUBLISHABLE_CRATES: &[PublishableCrate] = &[
+    PublishableCrate {
+        name: "llama-harness-programmatic-sandbox",
+    },
     PublishableCrate {
         name: "llama-harness-core",
     },
@@ -35,6 +45,9 @@ const PUBLISHABLE_CRATES: &[PublishableCrate] = &[
     },
     PublishableCrate {
         name: "llama-harness-evals",
+    },
+    PublishableCrate {
+        name: "llama-harness-mcp",
     },
     PublishableCrate {
         name: "llama-harness",
@@ -88,6 +101,18 @@ fn protocol_check(root: &Path) -> CheckResult {
 
 fn release_check(root: &Path) -> CheckResult {
     ensure_clean_tree(root)?;
+    protocol_check(root)?;
+    run_cargo(
+        root,
+        [
+            "test",
+            "--locked",
+            "--package",
+            "llama-harness-runtime",
+            "--test",
+            "stdio",
+        ],
+    )?;
     run_cargo(root, publishable_cargo_arguments(["fmt", "--check"], []))?;
     run_cargo(
         root,
@@ -529,7 +554,7 @@ fn manifest_with_patches(
         );
     }
     if extracted_packages.len() != PUBLISHABLE_CRATES.len() {
-        return Err("cannot generate patches without all six extracted crates".into());
+        return Err("cannot generate patches without all eight extracted crates".into());
     }
 
     let mut patched = manifest.trim_end().to_owned();
@@ -754,18 +779,46 @@ mod tests {
 
     #[test]
     fn publishable_set_is_exact_and_unique() {
-        assert_eq!(PUBLISHABLE_CRATES.len(), 6);
+        assert_eq!(PUBLISHABLE_CRATES.len(), 8);
         let names = PUBLISHABLE_CRATES
             .iter()
             .map(|package| package.name)
             .collect::<HashSet<_>>();
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 8);
         assert!(names.contains("llama-harness"));
         assert!(names.contains("llama-harness-core"));
-        assert_eq!(PUBLISHABLE_CRATES[0].name, "llama-harness-core");
-        assert_eq!(PUBLISHABLE_CRATES[3].name, "llama-harness-tauri");
-        assert_eq!(PUBLISHABLE_CRATES[4].name, "llama-harness-evals");
-        assert_eq!(PUBLISHABLE_CRATES[5].name, "llama-harness");
+        assert!(names.contains("llama-harness-programmatic-sandbox"));
+        assert_eq!(
+            PUBLISHABLE_CRATES[0].name,
+            "llama-harness-programmatic-sandbox"
+        );
+        assert_eq!(PUBLISHABLE_CRATES[1].name, "llama-harness-core");
+        assert_eq!(PUBLISHABLE_CRATES[4].name, "llama-harness-tauri");
+        assert_eq!(PUBLISHABLE_CRATES[5].name, "llama-harness-evals");
+        assert_eq!(PUBLISHABLE_CRATES[6].name, "llama-harness-mcp");
+        assert_eq!(PUBLISHABLE_CRATES[7].name, "llama-harness");
+    }
+
+    #[test]
+    fn release_docs_and_ci_state_the_exact_eight_crate_contract() {
+        assert!(include_str!("../../docs/distribution.md")
+            .contains("These eight Rust-facing crates are the 0.2.0"));
+        assert!(include_str!("../../docs/releasing.md")
+            .contains("The preflight validates the exact eight-crate set"));
+        assert!(include_str!("../../.github/workflows/release-rust.yml")
+            .contains("Test only the eight crates in the Rust release"));
+        let ci = include_str!("../../.github/workflows/ci.yml");
+        assert!(ci.contains("features \"ollama,observability,evals,programmatic,mcp\""));
+        assert!(ci.contains("Check the eight recorded public APIs after the initial release"));
+        assert!(!ci.contains("Check the seven recorded public APIs after the initial release"));
+        let notes = include_str!("../../.github/releases/v0.1.0.md");
+        assert!(notes
+            .contains("`llama-harness-mcp` — optional, provider-neutral MCP tool integration."));
+        assert!(notes.contains("`evals`, `tauri`, `programmatic`, and `mcp` features."));
+        assert!(include_str!("../../docs/releasing.md")
+            .contains("Wait for all four integration versions to be index-visible"));
+        assert!(include_str!("../../docs/guides/releasing.html")
+            .contains("Wait for all four integration versions to be index-visible"));
     }
 
     #[test]
@@ -779,7 +832,7 @@ mod tests {
                 .iter()
                 .filter(|argument| *argument == "--package")
                 .count(),
-            6
+            8
         );
         assert!(!arguments.iter().any(|argument| argument == "--workspace"));
         assert!(!arguments.iter().any(|argument| argument == "--all"));
@@ -793,10 +846,10 @@ mod tests {
 
     #[test]
     fn archive_paths_reject_traversal_and_non_canonical_separators() {
-        assert!(validate_archive_path("llama-harness-0.1.0/src/lib.rs").is_ok());
+        assert!(validate_archive_path("llama-harness-0.2.0/src/lib.rs").is_ok());
         assert!(validate_archive_path("../outside").is_err());
-        assert!(validate_archive_path("llama-harness-0.1.0/../outside").is_err());
-        assert!(validate_archive_path("llama-harness-0.1.0\\src\\lib.rs").is_err());
+        assert!(validate_archive_path("llama-harness-0.2.0/../outside").is_err());
+        assert!(validate_archive_path("llama-harness-0.2.0\\src\\lib.rs").is_err());
     }
 
     #[test]
@@ -818,7 +871,7 @@ mod tests {
             .collect::<Vec<_>>();
         let manifest = manifest_with_patches("[package]\nname = \"consumer\"\n", &packages)
             .expect("patch generation should succeed");
-        assert_eq!(manifest.matches(" = { path = ").count(), 6);
+        assert_eq!(manifest.matches(" = { path = ").count(), 8);
         assert!(manifest.contains("[patch.crates-io]"));
         assert!(manifest.contains("llama-harness = { path = \"/tmp/llama-harness\" }"));
     }

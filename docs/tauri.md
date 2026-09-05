@@ -8,7 +8,7 @@ untrusted presentation surface, not a tool host.
 Enable the helper feature in a consuming application:
 
 ```toml
-llama-harness = { version = "0.1", features = ["ollama", "observability", "tauri"] }
+llama-harness = { version = "0.2.0", features = ["ollama", "observability", "tauri"] }
 ```
 
 `llama_harness::tauri` provides `TauriEventSink` for structured run events,

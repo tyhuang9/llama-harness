@@ -14,6 +14,7 @@ import re
 import subprocess
 from unittest import mock
 
+from scripts import prepare_sdk_runtime_packages
 from scripts.inspect_npm_package import SDK_FILES, inspect_npm_package
 from scripts.inspect_python_packages import PACKAGE_FILES, inspect_wheel
 from scripts.inspect_release_artifacts import PLATFORMS, inspect_release_artifacts
@@ -254,6 +255,106 @@ class InputAndAbiTests(unittest.TestCase):
         output = "Name: GLIBC_2.17 Flags: none  Name: GLIBC_2.35 Name: GLIBCXX_3.4"
         self.assertEqual(required_glibc_versions(output), {(2, 17), (2, 35)})
 
+    def test_sdk_staging_preserves_verified_python_metadata(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        script = root / "scripts" / "prepare_sdk_runtime_packages.py"
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            runtime = temporary / "llama-harness-runtime.exe"
+            runtime.write_bytes(b"runtime")
+            output = temporary / "stage"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--runtime",
+                    str(runtime),
+                    "--platform",
+                    "win32-x64",
+                    "--version",
+                    "0.2.0",
+                    "--out",
+                    str(output),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                (output / "python-source" / "pyproject.toml").read_text(encoding="utf-8"),
+                (root / "sdks" / "python" / "pyproject.toml").read_text(encoding="utf-8"),
+            )
+
+    def test_sdk_staging_reads_authoritative_project_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "pyproject.toml"
+            valid_documents = [
+                '[build-system]\nrequires = []\n\n[project] # SDK metadata\nname = "llama-harness"\nversion = "0.2.0" # release\n',
+                '[project]\ndescription = """\nversion = "6.6.6"\n"""\nversion = "0.2.0"\n',
+                '["project"]\n"version" = "0.2.0"\n',
+            ]
+            for document in valid_documents:
+                with self.subTest(document=document):
+                    project.write_text(document, encoding="utf-8")
+                    self.assertEqual(prepare_sdk_runtime_packages.python_project_version(project), "0.2.0")
+
+            invalid_documents = {
+                "duplicate version": '[project]\nversion = "0.2.0"\nversion = "0.2.1"\n',
+                "quoted duplicate": '[project]\nversion = "0.2.0"\n"version" = "0.2.1"\n',
+                "duplicate table": '[project]\nversion = "0.2.0"\n[project]\nname = "duplicate"\n',
+                "missing version": '[project]\nname = "llama-harness"\n',
+                "malformed version": '[project]\nversion = "0.2.0\n',
+                "numeric version": '[project]\nversion = 2\n',
+                "empty version": '[project]\nversion = ""\n',
+                "non-table project": 'project = "not a table"\n',
+            }
+            for label, document in invalid_documents.items():
+                with self.subTest(label=label):
+                    project.write_text(document, encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "Python SDK version"):
+                        prepare_sdk_runtime_packages.python_project_version(project)
+
+    def test_sdk_staging_requires_stdlib_toml_parser(self) -> None:
+        with mock.patch.object(prepare_sdk_runtime_packages, "tomllib", None):
+            with self.assertRaisesRegex(ValueError, "requires Python 3.11 or newer"):
+                prepare_sdk_runtime_packages.python_project_version(Path("unused.toml"))
+
+    def test_release_gates_check_cargo_runtime_and_sdk_identities(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        validation = (root / "scripts" / "validate_release.ps1").read_text(encoding="utf-8")
+        xtask = (root / "xtask" / "src" / "main.rs").read_text(encoding="utf-8")
+        ci_workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        release_workflow = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+        self.assertIn("cargo metadata --locked --format-version 1 --no-deps", validation)
+        self.assertIn("runtime_hello", validation)
+        self.assertIn("runtime hello version", validation)
+        self.assertIn("npm SDK version", validation)
+        self.assertIn("Python SDK version", validation)
+        self.assertIn("protocol_check(root)?", xtask)
+        self.assertIn('"llama-harness-runtime"', xtask)
+        self.assertIn("Test and inspect the Python SDK acceptance package", release_workflow)
+        self.assertIn("Reviewed main source gate", release_workflow)
+        self.assertIn("refs/heads/main", release_workflow)
+        self.assertEqual(release_workflow.count("${{ inputs.source_commit }}"), 1)
+        self.assertEqual(release_workflow.count("${{ github.sha }}"), 1)
+        self.assertIn("does not match the checked-out main commit", release_workflow)
+        self.assertGreaterEqual(release_workflow.count("persist-credentials: false"), 5)
+        self.assertNotIn("inputs.publish", release_workflow)
+        developer_console_job = ci_workflow.split("developer-console-audit:", 1)[1]
+        self.assertLess(
+            developer_console_job.index("libwebkit2gtk-4.1-dev"),
+            developer_console_job.index("cargo check"),
+        )
+        release_readiness_job = ci_workflow.split("  rust-release-readiness:", 1)[1].split("\n  rust-docs:", 1)[0]
+        self.assertLess(
+            release_readiness_job.index("python-version: 3.12.10"),
+            release_readiness_job.index("python -m unittest"),
+        )
+
     def test_workflows_pin_actions_and_do_not_interpolate_dispatch_version_in_scripts(self) -> None:
         root = Path(__file__).resolve().parents[2]
         workflows = list((root / ".github" / "workflows").glob("*.yml"))
@@ -297,14 +398,16 @@ class InputAndAbiTests(unittest.TestCase):
             "llama-harness-evals",
             "llama-harness-observability",
             "llama-harness-ollama",
+            "llama-harness-programmatic-sandbox",
             "llama-harness-tauri",
+            "llama-harness-mcp",
         ):
             self.assertIn(f'"{crate}"', preflight)
 
 
 class RustReleaseWorkflowTests(unittest.TestCase):
     @staticmethod
-    def run_preflight(root: Path, source_commit: str, version: str = "0.1.0") -> subprocess.CompletedProcess[str]:
+    def run_preflight(root: Path, source_commit: str, version: str = "0.2.0") -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 "pwsh",
@@ -377,7 +480,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                 self.assertIn(command, workflow)
 
         documented_crates = set(
-            re.findall(r"--package (llama-harness(?:-[a-z]+)?)", workflow)
+            re.findall(r"--package (llama-harness(?:-[a-z]+)*)", workflow)
         )
         self.assertEqual(
             documented_crates,
@@ -386,7 +489,9 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                 "llama-harness-ollama",
                 "llama-harness-observability",
                 "llama-harness-evals",
+                "llama-harness-programmatic-sandbox",
                 "llama-harness-tauri",
+                "llama-harness-mcp",
                 "llama-harness",
             },
         )
@@ -420,7 +525,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
             re.DOTALL,
         )
         self.assertIsNotNone(crate_block)
-        crates = set(re.findall(r'"(llama-harness(?:-[a-z]+)?)"', crate_block.group(1)))
+        crates = set(re.findall(r'"(llama-harness(?:-[a-z]+)*)"', crate_block.group(1)))
         self.assertEqual(
             crates,
             {
@@ -428,7 +533,9 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                 "llama-harness-ollama",
                 "llama-harness-observability",
                 "llama-harness-evals",
+                "llama-harness-programmatic-sandbox",
                 "llama-harness-tauri",
+                "llama-harness-mcp",
                 "llama-harness",
             },
         )
@@ -460,7 +567,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                     .replace("publish = false\n", ""),
                     encoding="utf-8",
                 ),
-                "Expected exactly the six supported crates.io packages",
+                "Expected exactly the eight supported crates.io packages",
             ),
             (
                 "MSRV mismatch",
@@ -476,7 +583,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
                 "duplicate changelog",
                 lambda clone: (clone / "CHANGELOG.md").write_text(
                     (clone / "CHANGELOG.md").read_text(encoding="utf-8")
-                    + "\n## 0.1.0 — Unreleased\n\n- Duplicate.\n",
+                    + "\n## 0.2.0 — Unreleased\n\n- Duplicate.\n",
                     encoding="utf-8",
                 ),
                 "exactly one level-two heading",
@@ -484,7 +591,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
             (
                 "empty changelog",
                 lambda clone: (clone / "CHANGELOG.md").write_text(
-                    "# Changelog\n\n## 0.1.0 — Unreleased\n\n## Versioning policy\n\nPolicy.\n",
+                    "# Changelog\n\n## 0.2.0 — Unreleased\n\n## Versioning policy\n\nPolicy.\n",
                     encoding="utf-8",
                 ),
                 "must not be empty",
@@ -492,7 +599,7 @@ class RustReleaseWorkflowTests(unittest.TestCase):
             (
                 "comment-only changelog",
                 lambda clone: (clone / "CHANGELOG.md").write_text(
-                    "# Changelog\n\n## 0.1.0 — Unreleased\n\n<!--\nplaceholder\n-->\n\n"
+                    "# Changelog\n\n## 0.2.0 — Unreleased\n\n<!--\nplaceholder\n-->\n\n"
                     "## Versioning policy\n\nPolicy.\n",
                     encoding="utf-8",
                 ),

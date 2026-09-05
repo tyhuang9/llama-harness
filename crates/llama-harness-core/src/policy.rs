@@ -77,6 +77,24 @@ pub trait PolicyEngine: Send + Sync {
     ) -> Result<PolicyDecision, HarnessError> {
         self.decide(tool, arguments, request).await
     }
+
+    /// Independently decides whether a call may cross the speculative issue boundary.
+    ///
+    /// Ordinary allow decisions and approvals never authorize speculation. Hosts
+    /// must explicitly override this method and return [`PolicyDecision::Allow`]
+    /// for the exact candidate arguments. The broker re-evaluates this decision
+    /// before commit.
+    async fn decide_speculative(
+        &self,
+        _: &ToolCallContext,
+        _: &ToolDefinition,
+        _: &Value,
+        _: &RunRequest,
+    ) -> Result<PolicyDecision, HarnessError> {
+        Ok(PolicyDecision::Deny {
+            reason: "speculative execution requires explicit host policy opt-in".into(),
+        })
+    }
 }
 
 #[async_trait]

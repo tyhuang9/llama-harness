@@ -83,6 +83,7 @@
             <ul>
               <li><a href="guides/embedding.html">Embedding</a></li>
               <li><a href="guides/tools-and-policies.html">Tools and policies</a></li>
+              <li><a href="guides/speculative-tool-calling.html">Guarded speculation</a></li>
               <li><a href="guides/observability.html">Observability</a></li>
               <li><a href="guides/evaluations.html">Evaluations</a></li>
               <li><a href="guides/tauri.html">Tauri</a></li>
@@ -93,7 +94,7 @@
         </nav>
 
         <div class="sidebar-meta">
-          <div><span>Crate</span><strong>0.1.0</strong></div>
+          <div><span>Crate</span><strong>0.2.0</strong></div>
           <div><span>Minimum Rust</span><strong>1.88</strong></div>
         </div>
         <div class="brand-card" aria-label="llama-harness — Run local. Connect any model.">
@@ -108,7 +109,7 @@
             <div class="breadcrumbs" aria-label="Breadcrumb">
               <span>Documentation</span><span aria-hidden="true">/</span><span>Rust</span>
             </div>
-            <div class="intro-label">Rust library · 0.1</div>
+            <div class="intro-label">Rust library · 0.2</div>
             <h1>llama-harness for Rust</h1>
             <p class="lede">
               Build bounded local agent workflows without handing control of
@@ -134,31 +135,23 @@
                 <button
                   class="copy"
                   type="button"
-                  data-copy='[dependencies]&#10;llama-harness = { version = "0.1.0", features = ["ollama"] }&#10;tokio = { version = "1", features = ["macros", "rt-multi-thread"] }'
+                  data-copy='[dependencies]&#10;llama-harness = { version = "0.2.0", features = ["ollama"] }&#10;tokio = { version = "1", features = ["macros", "rt-multi-thread"] }'
                   aria-label="Copy Cargo dependencies"
                 >Copy</button>
               </div>
               <pre><code><span class="muted-code">[dependencies]</span>
-llama-harness = { version = <span class="str">"0.1.0"</span>, features = [<span class="str">"ollama"</span>] }
+llama-harness = { version = <span class="str">"0.2.0"</span>, features = [<span class="str">"ollama"</span>] }
 tokio = { version = <span class="str">"1"</span>, features = [<span class="str">"macros"</span>, <span class="str">"rt-multi-thread"</span>] }</code></pre>
             </div>
             <aside class="callout" aria-label="Publication status">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v5m0 3.5v.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" /></svg>
               <div>
-                <strong>Crates.io indexing is in progress.</strong>
+                <strong>0.2.0 release candidate.</strong>
                 <p>
-                  Until the facade is indexed, pin the reviewed release source
-                  at <code>d9f7a84</code>.
+                  Use the registry dependency only after 0.2.0 is published. For
+                  pre-release source builds, pin the exact commit approved by
+                  your release process; do not depend on a mutable branch.
                 </p>
-                <div class="inline-command">
-                  <code>git = "https://github.com/tyhuang9/llama-harness", rev = "d9f7a84a579a36cd1987c5eeeb30764be70aa8ce"</code>
-                  <button
-                    class="copy compact"
-                    type="button"
-                    data-copy='git = "https://github.com/tyhuang9/llama-harness", rev = "d9f7a84a579a36cd1987c5eeeb30764be70aa8ce"'
-                    aria-label="Copy the reviewed Git source"
-                  >Copy</button>
-                </div>
               </div>
             </aside>
           </section>
@@ -282,6 +275,7 @@ tokio = { version = <span class="str">"1"</span>, features = [<span class="str">
             <div class="guide-grid">
               <a href="guides/embedding.html"><strong>Embedding</strong><span>Build a facade-only Rust application.</span></a>
               <a href="guides/tools-and-policies.html"><strong>Tools and policy</strong><span>Define capabilities and fail-closed authorization.</span></a>
+              <a href="guides/speculative-tool-calling.html"><strong>Guarded speculation</strong><span>Shadow, activate, and evaluate eligible local reads.</span></a>
               <a href="guides/observability.html"><strong>Observability</strong><span>Persist redacted events locally.</span></a>
               <a href="guides/evaluations.html"><strong>Evaluations</strong><span>Run deterministic suites and replays.</span></a>
               <a href="guides/tauri.html"><strong>Tauri</strong><span>Keep desktop capabilities in the Rust backend.</span></a>
@@ -290,7 +284,7 @@ tokio = { version = <span class="str">"1"</span>, features = [<span class="str">
           </section>
 
           <footer class="footer">
-            <span>llama-harness · Rust 0.1</span>
+            <span>llama-harness · Rust 0.2</span>
             <span><a href="https://github.com/tyhuang9/llama-harness">GitHub</a> · <a href="https://docs.rs/llama-harness">Rust API</a> · <a href="guides/security.html">Security</a></span>
           </footer>
         </article>

@@ -11,7 +11,7 @@ default = []
 observability = ["llama-harness/observability"]
 
 [dependencies]
-llama-harness = { version = "0.1.0", path = "../../crates/llama-harness", features = ["tauri"] }
+llama-harness = { version = "0.2.0", path = "../../crates/llama-harness", features = ["tauri"] }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

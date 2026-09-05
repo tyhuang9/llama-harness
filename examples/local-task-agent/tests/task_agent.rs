@@ -91,6 +91,9 @@ async fn ambiguous_disallowed_and_malformed_requests_do_not_mutate_tasks() {
         .errors
         .iter()
         .any(|error| error.code == "tool_rejected"));
+    // Malformed arguments are rejected before canonical tool-call recording so
+    // callers never mistake an unparseable proposal for an executed task action.
+    assert!(malformed.tool_calls.is_empty());
 }
 
 #[tokio::test]

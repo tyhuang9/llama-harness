@@ -619,15 +619,13 @@ mod tests {
     }
 
     fn tool() -> ToolDefinition {
-        ToolDefinition {
-            id: "notes.write".into(),
-            name: "Write note".into(),
-            description: "Writes a note".into(),
-            arguments_schema: serde_json::json!({"type":"object"}),
-            risk: ToolRisk::Medium,
-            idempotent: false,
-            read_only: false,
-        }
+        ToolDefinition::new(
+            "notes.write",
+            "Write note",
+            "Writes a note",
+            serde_json::json!({"type":"object"}),
+        )
+        .with_risk(ToolRisk::Medium)
     }
 
     struct ApprovalPolicy;
@@ -772,6 +770,7 @@ mod tests {
         ]);
         let record = EventRecord::new(
             "run",
+            "execution",
             "trace",
             1,
             1,

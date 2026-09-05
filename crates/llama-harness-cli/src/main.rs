@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use llama_harness_core::{load_agent_manifest_path, AgentDefinition, ModelProvider};
 use llama_harness_evals::{load_suite_path, EvaluationReport, RegressionCase};
-use llama_harness_observability::{ExportedRun, SqliteEventSink, TraceStoreConfig};
+use llama_harness_observability::{ExportedRun, SqliteEventSink};
 use llama_harness_ollama::{OllamaProvider, DEFAULT_OLLAMA_BASE_URL};
 use llama_harness_promptfoo::{generate_workspace, normalize_observations, PromptfooError};
 use std::{
@@ -130,7 +130,16 @@ enum InspectCommand {
 
 #[derive(Args)]
 struct InspectRunArgs {
-    run_id: String,
+    /// Application-visible run ID. It remains supported when it selects one
+    /// logical execution; use --execution-id when an application reused it.
+    #[arg(
+        required_unless_present = "execution_id",
+        conflicts_with = "execution_id"
+    )]
+    run_id: Option<String>,
+    /// Core-generated execution ID from a trace listing.
+    #[arg(long)]
+    execution_id: Option<String>,
     /// Project-local SQLite trace database.
     #[arg(long)]
     db: PathBuf,
@@ -468,11 +477,24 @@ fn run_replay(arguments: ReplayArgs) -> Result<(), CliError> {
 fn run_inspect(command: InspectCommand) -> Result<(), CliError> {
     match command {
         InspectCommand::Run(arguments) => {
-            let store = SqliteEventSink::open(arguments.db, TraceStoreConfig::default())?;
-            let Some(export) = store.export_run(&arguments.run_id)? else {
+            let store = SqliteEventSink::open_read_only(arguments.db)?;
+            let selected = arguments.execution_id.as_deref();
+            let export = match selected {
+                Some(execution_id) => store.export_execution(execution_id)?,
+                None => store.export_run(
+                    arguments
+                        .run_id
+                        .as_deref()
+                        .expect("clap requires run ID or execution ID"),
+                )?,
+            };
+            let Some(export) = export else {
+                let label = selected
+                    .map(|execution_id| format!("execution {execution_id}"))
+                    .or_else(|| arguments.run_id.map(|run_id| format!("run {run_id}")))
+                    .expect("clap requires run ID or execution ID");
                 return Err(CliError::NotFound(format!(
-                    "run {} in the selected trace database",
-                    arguments.run_id
+                    "{label} in the selected trace database"
                 )));
             };
             println!("{}", render_inspected_run(&export, arguments.export_json)?);
@@ -564,8 +586,9 @@ fn render_inspected_run(export: &ExportedRun, as_json: bool) -> Result<String, C
         return Ok(serde_json::to_string_pretty(export)?);
     }
     let mut lines = vec![format!(
-        "run {} trace {}: {} event(s)",
+        "run {} execution {} trace {}: {} event(s)",
         export.run_id,
+        export.execution_id,
         export.trace_id,
         export.events.len()
     )];
@@ -584,7 +607,20 @@ mod tests {
     use super::*;
     use llama_harness_core::{EventRecord, RunEvent, RunStatus};
     use llama_harness_evals::{AssertionFailure, EvaluationCaseResult};
+    use llama_harness_observability::TraceStoreConfig;
     use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_trace_database(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "llama-harness-cli-{name}-{}-{stamp}.sqlite",
+            std::process::id()
+        ))
+    }
 
     fn report() -> EvaluationReport {
         let mut passing = EvaluationCaseResult::new("suite", "passing", "ollama:model", 1);
@@ -648,6 +684,31 @@ mod tests {
     }
 
     #[test]
+    fn inspect_run_requires_exactly_one_run_selector() {
+        assert!(Cli::try_parse_from([
+            "llama-harness",
+            "inspect",
+            "run",
+            "--execution-id",
+            "execution-1",
+            "--db",
+            "traces.sqlite",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "llama-harness",
+            "inspect",
+            "run",
+            "run-1",
+            "--execution-id",
+            "execution-1",
+            "--db",
+            "traces.sqlite",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn report_filters_and_human_output_are_stable() {
         let filtered = filter_report(report(), true, Some("failing"));
         assert_eq!(filtered.results.len(), 1);
@@ -668,6 +729,7 @@ mod tests {
             .append_with_raw(
                 &EventRecord::new(
                     "run-1",
+                    "execution-1",
                     "trace-1",
                     1,
                     1,
@@ -684,7 +746,62 @@ mod tests {
         let human = render_inspected_run(&export, false).unwrap();
         assert!(!json.contains("private credential"));
         assert!(!human.contains("private credential"));
-        assert!(human.contains("run run-1 trace trace-1: 1 event(s)"));
+        assert!(human.contains("run run-1 execution"));
+        assert!(human.contains("trace trace-1: 1 event(s)"));
+    }
+
+    #[test]
+    fn inspect_run_never_creates_a_missing_trace_database() {
+        let path = temporary_trace_database("missing-trace");
+        let error = run_inspect(InspectCommand::Run(InspectRunArgs {
+            run_id: Some("missing".into()),
+            execution_id: None,
+            db: path.clone(),
+            export_json: false,
+        }))
+        .unwrap_err();
+        assert!(matches!(error, CliError::Trace(_)));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn inspect_run_refuses_legacy_schema_until_a_writer_migrates_it() {
+        let path = temporary_trace_database("legacy-trace");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL);
+                 INSERT INTO schema_migrations(version) VALUES (2);
+                 CREATE TABLE trace_events (
+                     run_id TEXT NOT NULL,
+                     execution_id TEXT NOT NULL,
+                     trace_id TEXT NOT NULL,
+                     sequence INTEGER NOT NULL,
+                     timestamp_ms INTEGER NOT NULL,
+                     event_kind TEXT NOT NULL,
+                     status TEXT,
+                     event_json TEXT NOT NULL,
+                     raw_payload_json TEXT,
+                     PRIMARY KEY (execution_id, sequence)
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = run_inspect(InspectCommand::Run(InspectRunArgs {
+            run_id: Some("legacy".into()),
+            execution_id: None,
+            db: path.clone(),
+            export_json: false,
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::Trace(llama_harness_observability::TraceStoreError::InvalidConfiguration(message))
+                if message.contains("writable open") && message.contains("migrate to v3")
+        ));
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

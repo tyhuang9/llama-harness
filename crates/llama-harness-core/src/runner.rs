@@ -1,17 +1,24 @@
 use crate::{
     agent::{RunRequest, RunResult, RunStatus},
+    broker::{
+        BrokerState, PrepareOutcome, SpeculativeCommitOutcome, ToolBroker, ToolConcurrencyLimiter,
+    },
+    discovery::{ToolScope, ToolScopeSelection},
     event::{EventEmitter, EventSink, InMemoryEventSink, RunEvent},
     limits::{compile_trusted_schema, ensure_json_depth, serialized_len, AgentLimits},
     message::Message,
-    model::{ModelProvider, ModelRequest, ModelResponse},
-    policy::{ApprovalHandler, DenyApproval, PolicyDecision, PolicyEngine, SafeDefaultPolicy},
-    tool::{Tool, ToolCall, ToolCallContext, ToolRegistry, ToolResult},
-    GenerationOptions, HarnessError, RunError,
+    model::{
+        ModelCapabilities, ModelProvider, ModelRequest, ModelResponse, StructuredOutputRequest,
+    },
+    policy::{ApprovalHandler, DenyApproval, PolicyEngine, SafeDefaultPolicy},
+    tool::{ToolCall, ToolCaller, ToolRegistry, ToolResult},
+    GenerationOptions, HarnessError, RunError, ToolDiscoveryLimits,
 };
 use jsonschema::Validator;
 use serde_json::Value;
+#[cfg(feature = "programmatic")]
+use std::collections::BTreeSet;
 use std::{
-    collections::HashMap,
     future::Future,
     sync::Arc,
     time::{Duration, Instant as StdInstant},
@@ -22,11 +29,20 @@ use uuid::Uuid;
 
 /// Executes agent runs against a model provider and registered tools.
 pub struct AgentRunner {
-    provider: Arc<dyn ModelProvider>,
-    tools: ToolRegistry,
-    policy: Arc<dyn PolicyEngine>,
-    approvals: Arc<dyn ApprovalHandler>,
-    events: Arc<dyn EventSink>,
+    pub(crate) provider: Arc<dyn ModelProvider>,
+    pub(crate) tools: ToolRegistry,
+    pub(crate) policy: Arc<dyn PolicyEngine>,
+    pub(crate) approvals: Arc<dyn ApprovalHandler>,
+    pub(crate) events: Arc<dyn EventSink>,
+    pub(crate) concurrency: Arc<ToolConcurrencyLimiter>,
+    pub(crate) discovery_limits: ToolDiscoveryLimits,
+    pub(crate) speculation: Option<Arc<crate::speculation::SpeculationController>>,
+    #[cfg(feature = "programmatic")]
+    pub(crate) programmatic: Option<crate::ProgrammaticHostConfig>,
+    #[cfg(feature = "programmatic")]
+    pub(crate) adaptive_programmatic_allowlist: BTreeSet<crate::ProgrammaticWorkloadClass>,
+    #[cfg(feature = "programmatic")]
+    pub(crate) programmatic_admission: Arc<tokio::sync::Semaphore>,
 }
 
 /// Configures an [`AgentRunner`] and its policy, approval, tool, and event integrations.
@@ -36,6 +52,19 @@ pub struct AgentRunnerBuilder {
     policy: Arc<dyn PolicyEngine>,
     approvals: Arc<dyn ApprovalHandler>,
     events: Arc<dyn EventSink>,
+    concurrency: Arc<ToolConcurrencyLimiter>,
+    discovery_limits: ToolDiscoveryLimits,
+    speculation: Option<crate::SpeculationConfig>,
+    #[cfg(feature = "programmatic")]
+    programmatic: Option<crate::ProgrammaticHostConfig>,
+    #[cfg(feature = "programmatic")]
+    adaptive_programmatic_allowlist: BTreeSet<crate::ProgrammaticWorkloadClass>,
+}
+
+pub(crate) struct RunPreflight {
+    pub(crate) output_validator: Option<Validator>,
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) started: StdInstant,
 }
 
 impl AgentRunner {
@@ -47,53 +76,271 @@ impl AgentRunner {
             policy: Arc::new(SafeDefaultPolicy),
             approvals: Arc::new(DenyApproval),
             events: Arc::new(InMemoryEventSink::default()),
+            concurrency: Arc::new(ToolConcurrencyLimiter::default()),
+            discovery_limits: ToolDiscoveryLimits::default(),
+            speculation: None,
+            #[cfg(feature = "programmatic")]
+            programmatic: None,
+            #[cfg(feature = "programmatic")]
+            adaptive_programmatic_allowlist: BTreeSet::new(),
         }
     }
 
-    /// Executes one run. Invalid requests return `Err`; failures after a run starts are captured
-    /// in a terminal `RunResult` and always emit a matching terminal event.
-    pub async fn run(&self, request: RunRequest) -> Result<RunResult, HarnessError> {
-        let output_validator = validate_request(&request)?;
-        let started = StdInstant::now();
-        let deadline = absolute_deadline(request.agent.limits.max_run_duration_ms)?;
-        let run_id = request
-            .run_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let trace_id = request
-            .trace_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let model = request
-            .overrides
-            .model
-            .clone()
-            .unwrap_or_else(|| request.agent.default_model.clone());
-        let mut result = RunResult {
-            id: run_id.clone(),
-            status: RunStatus::Failed,
-            final_output: None,
-            model: model.clone(),
-            tool_calls: vec![],
-            policy_decisions: vec![],
-            approvals: vec![],
-            errors: vec![],
-            duration_ms: 0,
-            trace_id: trace_id.clone(),
-            model_call_limit_reached: false,
-            tool_call_limit_reached: false,
-            repeated_tool_call_limit_reached: false,
-            cancelled: false,
-        };
-        let mut events =
-            EventEmitter::new(run_id.clone(), trace_id.clone(), Arc::clone(&self.events));
-        events.emit(RunEvent::Started { run_id, trace_id });
+    /// Returns pull-only readiness evidence for one registered tool.
+    pub fn speculation_readiness(&self, tool_id: &str) -> crate::SpeculationReadiness {
+        self.speculation.as_ref().map_or_else(
+            || crate::SpeculationReadiness::disabled(tool_id),
+            |controller| controller.readiness(tool_id),
+        )
+    }
 
+    /// Returns pull-only metadata counters for one registered tool.
+    pub fn speculation_metrics(&self, tool_id: &str) -> crate::SpeculationMetrics {
+        self.speculation.as_ref().map_or_else(
+            || crate::SpeculationMetrics::disabled(tool_id),
+            |controller| controller.metrics(tool_id),
+        )
+    }
+
+    /// Explicitly activates one ready tool without affecting other tools.
+    pub fn activate_speculation(&self, tool_id: &str) -> crate::SpeculationReadiness {
+        self.speculation.as_ref().map_or_else(
+            || crate::SpeculationReadiness::disabled(tool_id),
+            |controller| controller.activate(tool_id),
+        )
+    }
+
+    /// Immediately returns one tool to Shadow and clears its readiness streak.
+    pub fn return_speculation_to_shadow(&self, tool_id: &str) -> crate::SpeculationReadiness {
+        self.speculation.as_ref().map_or_else(
+            || crate::SpeculationReadiness::disabled(tool_id),
+            |controller| controller.return_to_shadow(tool_id),
+        )
+    }
+
+    pub(crate) async fn run_direct(
+        &self,
+        request: RunRequest,
+        strategy_events: Option<DirectStrategyEvents>,
+        preflight: RunPreflight,
+        speculation_eligibility: SpeculationEligibility,
+    ) -> Result<RunResult, HarnessError> {
+        self.run_direct_internal(
+            request,
+            strategy_events,
+            preflight,
+            None,
+            speculation_eligibility,
+        )
+        .await
+    }
+
+    /// Continues a pre-effect strategy fallback in the existing run identity,
+    /// event sequence, deadline, model budget, and broker state.
+    #[cfg_attr(not(feature = "programmatic"), allow(dead_code))]
+    pub(crate) async fn run_direct_continuation(
+        &self,
+        request: RunRequest,
+        strategy_events: DirectStrategyEvents,
+        preflight: RunPreflight,
+        continuation: DirectContinuation,
+    ) -> Result<RunResult, HarnessError> {
+        self.run_direct_internal(
+            request,
+            Some(strategy_events),
+            preflight,
+            Some(continuation),
+            SpeculationEligibility::SequentialOnly,
+        )
+        .await
+    }
+
+    async fn run_direct_internal(
+        &self,
+        request: RunRequest,
+        strategy_events: Option<DirectStrategyEvents>,
+        preflight: RunPreflight,
+        mut continuation: Option<DirectContinuation>,
+        mut speculation_eligibility: SpeculationEligibility,
+    ) -> Result<RunResult, HarnessError> {
+        let capabilities = self.provider.capabilities();
+        let prepared_direct_scope = continuation
+            .as_mut()
+            .and_then(|continuation| continuation.prepared_direct_scope.take());
+        let (tool_scope, discovery) = if let Some(scope) = prepared_direct_scope {
+            (scope, None)
+        } else {
+            let selection = self.tools.select_scope_for_run(
+                &request.input,
+                &request.agent.tool_allowlist,
+                ToolCaller::Direct,
+                self.discovery_limits,
+                &capabilities.limits,
+                &request.cancellation,
+                preflight.deadline,
+            );
+            match selection {
+                Ok(ToolScopeSelection::Selected(scope, stats)) => (scope, Some(stats)),
+                Ok(ToolScopeSelection::LimitReached(stats)) => {
+                    if let Some(mut continuation) = continuation {
+                        emit_discovery(&mut continuation.events, ToolCaller::Direct, stats);
+                        apply_terminal_error(
+                            &mut continuation.result,
+                            HarnessError::ResourceLimit("tool discovery budget reached".into()),
+                        );
+                        continuation.result.duration_ms =
+                            preflight.started.elapsed().as_millis() as u64;
+                        return Ok(finish_programmatic_continuation(continuation));
+                    }
+                    let mut completed_scopes = Vec::with_capacity(2);
+                    if let Some((caller, prior)) =
+                        strategy_events.and_then(|events| events.prior_discovery)
+                    {
+                        completed_scopes.push((caller, prior));
+                    }
+                    completed_scopes.push((ToolCaller::Direct, stats));
+                    return Ok(discovery_limit_terminal_result_with_scopes(
+                        &request,
+                        &completed_scopes,
+                        &self.events,
+                        crate::RunStrategy::Direct,
+                        preflight.started,
+                        strategy_events,
+                    ));
+                }
+                Err(error @ (HarnessError::Cancelled | HarnessError::TimedOut(_))) => {
+                    if let Some(mut continuation) = continuation {
+                        apply_terminal_error(&mut continuation.result, error);
+                        continuation.result.duration_ms =
+                            preflight.started.elapsed().as_millis() as u64;
+                        return Ok(finish_programmatic_continuation(continuation));
+                    }
+                    let prior = strategy_events
+                        .and_then(|events| events.prior_discovery)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    return Ok(pre_event_terminal_result_with_scopes(
+                        &request,
+                        error,
+                        &self.events,
+                        crate::RunStrategy::Direct,
+                        preflight.started,
+                        &prior,
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let started = preflight.started;
+        let deadline = preflight.deadline;
+        let (mut result, mut events, mut model_calls, mut broker_state, continuation_usage) =
+            match continuation {
+                Some(continuation) => {
+                    let DirectContinuation {
+                        result,
+                        mut events,
+                        broker_state,
+                        model_calls,
+                        usage,
+                        prepared_direct_scope: _,
+                    } = continuation;
+                    if let Some(discovery) = discovery {
+                        emit_discovery(&mut events, ToolCaller::Direct, discovery);
+                    }
+                    if let Some(strategy_events) = strategy_events {
+                        if let Some(reason) = strategy_events.fallback {
+                            events.emit(RunEvent::StrategyFallback {
+                                from: strategy_events
+                                    .fallback_from
+                                    .unwrap_or(strategy_events.requested),
+                                to: crate::RunStrategy::Direct,
+                                reason,
+                            });
+                        }
+                        events.emit(RunEvent::StrategySelected {
+                            requested: strategy_events.requested,
+                            selected: crate::RunStrategy::Direct,
+                            reason: strategy_events.reason,
+                        });
+                    }
+                    (result, events, model_calls, broker_state, Some(usage))
+                }
+                None => {
+                    let run_id = request
+                        .run_id
+                        .clone()
+                        .unwrap_or_else(|| Uuid::new_v4().to_string());
+                    let trace_id = request
+                        .trace_id
+                        .clone()
+                        .unwrap_or_else(|| Uuid::new_v4().to_string());
+                    let model = request
+                        .overrides
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| request.agent.default_model.clone());
+                    let result = RunResult {
+                        id: run_id.clone(),
+                        status: RunStatus::Failed,
+                        final_output: None,
+                        model,
+                        tool_calls: vec![],
+                        policy_decisions: vec![],
+                        approvals: vec![],
+                        errors: vec![],
+                        duration_ms: 0,
+                        trace_id: trace_id.clone(),
+                        model_call_limit_reached: false,
+                        tool_call_limit_reached: false,
+                        repeated_tool_call_limit_reached: false,
+                        cancelled: false,
+                    };
+                    let mut events = EventEmitter::new(
+                        run_id.clone(),
+                        trace_id.clone(),
+                        Arc::clone(&self.events),
+                    );
+                    events.emit(RunEvent::Started { run_id, trace_id });
+                    if let Some((caller, prior)) =
+                        strategy_events.and_then(|events| events.prior_discovery)
+                    {
+                        emit_discovery(&mut events, caller, prior);
+                    }
+                    if let Some(discovery) = discovery {
+                        emit_discovery(&mut events, ToolCaller::Direct, discovery);
+                    }
+                    if let Some(strategy_events) = strategy_events {
+                        if let Some(reason) = strategy_events.fallback {
+                            events.emit(RunEvent::StrategyFallback {
+                                from: strategy_events
+                                    .fallback_from
+                                    .unwrap_or(strategy_events.requested),
+                                to: crate::RunStrategy::Direct,
+                                reason,
+                            });
+                        }
+                        events.emit(RunEvent::StrategySelected {
+                            requested: strategy_events.requested,
+                            selected: crate::RunStrategy::Direct,
+                            reason: strategy_events.reason,
+                        });
+                    }
+                    (result, events, 0, BrokerState::default(), None)
+                }
+            };
+
+        let model = result.model.clone();
         let mut messages = initial_messages(&request);
-        let mut model_calls = 0;
-        let mut tool_calls = 0;
         let mut output_repairs = 0;
-        let mut identical_calls: HashMap<String, u32> = HashMap::new();
+        let structured_output =
+            agent_structured_output(&capabilities, request.agent.output_schema.as_ref());
+        let broker = ToolBroker::new(
+            &self.tools,
+            &tool_scope,
+            &self.policy,
+            &self.approvals,
+            &self.concurrency,
+        );
 
         'run: loop {
             if let Err(error) =
@@ -104,7 +351,7 @@ impl AgentRunner {
             }
 
             let mut provider_retries = 0;
-            let response = loop {
+            let (response, mut speculative) = loop {
                 if model_calls >= request.agent.limits.max_model_calls {
                     result.status = RunStatus::LimitReached;
                     result.model_call_limit_reached = true;
@@ -121,11 +368,6 @@ impl AgentRunner {
                     break 'run;
                 }
 
-                model_calls += 1;
-                events.emit(RunEvent::ModelRequested {
-                    call_number: model_calls,
-                    model: model.clone(),
-                });
                 let call_cancellation = request.cancellation.child_token();
                 let call_deadline = match provider_deadline(
                     deadline,
@@ -137,42 +379,72 @@ impl AgentRunner {
                         break 'run;
                     }
                 };
-                let completion = self.provider.complete(ModelRequest {
+                let model_request = ModelRequest {
                     model: model.clone(),
                     messages: messages.clone(),
-                    tools: self
-                        .tools
-                        .allowed_definitions(&request.agent.tool_allowlist),
+                    tools: tool_scope.definitions().to_vec(),
+                    prepared_tools: tool_scope.prepared(),
                     generation: merge_generation(
                         &request.agent.generation,
                         &request.overrides.generation,
                     ),
+                    structured_output: structured_output.clone(),
                     metadata: request.metadata.clone(),
                     cancellation: call_cancellation.clone(),
-                });
-
-                match await_guarded(
-                    completion,
-                    &request.cancellation,
-                    call_deadline,
-                    "provider call deadline reached",
-                    Some(&call_cancellation),
-                )
-                .await
+                };
+                if let Err(error) = ensure_model_request_size(&model_request, &request.agent.limits)
                 {
+                    apply_terminal_error(&mut result, error);
+                    break 'run;
+                }
+                model_calls += 1;
+                events.emit(RunEvent::ModelRequested {
+                    call_number: model_calls,
+                    model: model.clone(),
+                });
+                let speculate_this_attempt = speculation_eligibility.begin_provider_attempt();
+                let completion = if let Some(controller) = self.speculation.as_ref().filter(|_| {
+                    speculate_this_attempt && self.provider.capabilities().supports_streaming
+                }) {
+                    crate::speculation::stream_reactive_response(
+                        &self.provider,
+                        &broker,
+                        controller,
+                        &request,
+                        model_request,
+                        &result.id,
+                        &result.trace_id,
+                        model_calls,
+                        call_deadline,
+                    )
+                    .await
+                    .map(|streamed| (streamed.response, streamed.speculative))
+                } else {
+                    await_guarded(
+                        self.provider.complete(model_request),
+                        &request.cancellation,
+                        call_deadline,
+                        "provider call deadline reached",
+                        Some(&call_cancellation),
+                    )
+                    .await
+                    .map(|response| (response, None))
+                };
+
+                match completion {
                     Ok(response) => {
                         events.emit(RunEvent::ModelResponded {
                             call_number: model_calls,
                         });
                         break response;
                     }
-                    Err(HarnessError::RetryableProvider(reason))
+                    Err(HarnessError::RetryableProvider(_))
                         if provider_retries < request.agent.limits.max_provider_retries =>
                     {
                         provider_retries += 1;
                         events.emit(RunEvent::ModelRetrying {
                             next_call_number: model_calls.saturating_add(1),
-                            reason,
+                            reason: "retryable provider failure".into(),
                         });
                     }
                     Err(error) => {
@@ -183,11 +455,21 @@ impl AgentRunner {
             };
 
             if let Err(error) = validate_model_response(&response, &request.agent.limits) {
+                if let (Some(controller), Some(ready)) =
+                    (self.speculation.as_ref(), speculative.take())
+                {
+                    crate::speculation::discard_ready_commit(controller, ready, false);
+                }
                 apply_terminal_error(&mut result, error);
                 break;
             }
 
             if let Some(output) = response.final_output {
+                if let (Some(controller), Some(ready)) =
+                    (self.speculation.as_ref(), speculative.take())
+                {
+                    crate::speculation::discard_ready_commit(controller, ready, false);
+                }
                 if output.trim().is_empty() {
                     result.errors.push(RunError {
                         code: "empty_model_response".into(),
@@ -196,7 +478,7 @@ impl AgentRunner {
                     break;
                 }
                 match validate_output(
-                    output_validator.as_ref(),
+                    preflight.output_validator.as_ref(),
                     &output,
                     request.agent.limits.max_json_depth,
                 ) {
@@ -236,393 +518,526 @@ impl AgentRunner {
                 break;
             }
 
-            messages.push(Message::assistant_tool_calls(response.tool_calls.clone()));
+            let recorded_calls =
+                self.tool_calls_for_transcript(&request, &tool_scope, &response.tool_calls);
+            messages.push(Message::assistant_tool_calls(recorded_calls.clone()));
             if let Err(error) = ensure_transcript(&messages, &request.agent.limits) {
                 apply_terminal_error(&mut result, error);
                 break;
             }
 
-            for call in response.tool_calls {
-                if let Err(error) =
-                    check_stopped(&request.cancellation, deadline, "run deadline reached")
-                {
-                    apply_terminal_error(&mut result, error);
-                    break 'run;
-                }
-                if tool_calls >= request.agent.limits.max_tool_calls {
-                    result.status = RunStatus::LimitReached;
-                    result.tool_call_limit_reached = true;
-                    result.errors.push(RunError {
-                        code: "tool_call_limit".into(),
-                        message: "tool call limit reached".into(),
-                    });
-                    break 'run;
-                }
-                tool_calls += 1;
-                result.tool_calls.push(call.clone());
-
-                if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes
-                {
-                    self.reject(
-                        &mut result,
-                        &mut events,
-                        &call,
-                        format!(
-                            "tool arguments exceed {} bytes",
-                            request.agent.limits.max_tool_arguments_bytes
-                        ),
-                    );
-                    if let Err(error) = push_tool_message(
-                        &mut messages,
-                        &call,
-                        &ToolResult::failure("tool arguments exceed byte limit"),
-                        &request.agent.limits,
-                    ) {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                    continue;
-                }
-
-                let arguments: Value = match serde_json::from_str(&call.arguments_json) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        self.reject(
-                            &mut result,
-                            &mut events,
-                            &call,
-                            format!("malformed JSON: {error}"),
-                        );
-                        if let Err(error) = push_tool_message(
-                            &mut messages,
-                            &call,
-                            &ToolResult::failure("malformed tool arguments"),
-                            &request.agent.limits,
-                        ) {
-                            apply_terminal_error(&mut result, error);
-                            break 'run;
-                        }
-                        continue;
-                    }
-                };
-                if let Err(error) = ensure_json_depth(
-                    "tool arguments",
-                    &arguments,
-                    request.agent.limits.max_json_depth,
-                ) {
-                    self.reject(&mut result, &mut events, &call, error.to_string());
-                    if let Err(error) = push_tool_message(
-                        &mut messages,
-                        &call,
-                        &ToolResult::failure("tool arguments exceed JSON depth limit"),
-                        &request.agent.limits,
-                    ) {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                    continue;
-                }
-
-                let signature = format!("{}:{}", call.tool_id, canonical_json(&arguments));
-                let count = identical_calls.entry(signature).or_default();
-                *count += 1;
-                if *count > request.agent.limits.max_identical_tool_calls {
-                    result.status = RunStatus::LimitReached;
-                    result.repeated_tool_call_limit_reached = true;
-                    result.errors.push(RunError {
-                        code: "repeated_tool_call_limit".into(),
-                        message: "repeated identical tool call limit reached".into(),
-                    });
-                    break 'run;
-                }
-
-                let Some(tool) = self.tools.get(&call.tool_id) else {
-                    self.reject(&mut result, &mut events, &call, "unknown tool".into());
-                    if let Err(error) = push_tool_message(
-                        &mut messages,
-                        &call,
-                        &ToolResult::failure("unknown tool"),
-                        &request.agent.limits,
-                    ) {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                    continue;
-                };
-                if !request
-                    .agent
-                    .tool_allowlist
-                    .iter()
-                    .any(|id| id == &call.tool_id)
-                {
-                    self.reject(
-                        &mut result,
-                        &mut events,
-                        &call,
-                        "tool is not allowed for agent".into(),
-                    );
-                    if let Err(error) = push_tool_message(
-                        &mut messages,
-                        &call,
-                        &ToolResult::failure("tool is not allowed"),
-                        &request.agent.limits,
-                    ) {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                    continue;
-                }
-                if let Err(error) = self.tools.validate(&call.tool_id, &arguments) {
-                    self.reject(&mut result, &mut events, &call, error.to_string());
-                    if let Err(error) = push_tool_message(
-                        &mut messages,
-                        &call,
-                        &ToolResult::failure("tool arguments failed validation"),
-                        &request.agent.limits,
-                    ) {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                    continue;
-                }
-
-                let context = ToolCallContext {
-                    run_id: result.id.clone(),
-                    trace_id: result.trace_id.clone(),
-                    call_id: call.id.clone(),
-                    tool_id: call.tool_id.clone(),
-                };
-                let decision = match await_guarded(
-                    self.policy.decide_with_context(
-                        &context,
-                        tool.definition(),
-                        &arguments,
-                        &request,
-                    ),
-                    &request.cancellation,
-                    deadline,
-                    "policy decision exceeded run deadline",
-                    None,
-                )
-                .await
-                {
-                    Ok(decision) => decision,
-                    Err(error) => {
-                        apply_terminal_error(&mut result, error);
-                        break 'run;
-                    }
-                };
-                events.emit(RunEvent::PolicyDecided {
-                    call_id: call.id.clone(),
-                    decision: decision.clone(),
-                });
-                result.policy_decisions.push(decision.clone());
-
-                match decision {
-                    PolicyDecision::Deny { reason } => {
-                        self.reject(
-                            &mut result,
-                            &mut events,
-                            &call,
-                            format!("policy denied: {reason}"),
-                        );
-                        if let Err(error) = push_tool_message(
-                            &mut messages,
-                            &call,
-                            &ToolResult::failure("policy denied"),
-                            &request.agent.limits,
-                        ) {
-                            apply_terminal_error(&mut result, error);
-                            break 'run;
-                        }
-                    }
-                    PolicyDecision::RequireApproval { .. } => {
-                        events.emit(RunEvent::ApprovalRequested {
-                            call_id: call.id.clone(),
-                            tool_id: call.tool_id.clone(),
-                        });
-                        let mut approval = match await_guarded(
-                            self.approvals.approve_with_context(
-                                &context,
-                                tool.definition(),
-                                &arguments,
+            for (call_index, call) in response.tool_calls.into_iter().enumerate() {
+                if call_index == 0 {
+                    if let (Some(controller), Some(mut ready)) =
+                        (self.speculation.as_ref(), speculative.take())
+                    {
+                        match broker
+                            .commit_speculative(
+                                controller,
                                 &request,
-                            ),
-                            &request.cancellation,
-                            deadline,
-                            "approval exceeded run deadline",
-                            None,
-                        )
-                        .await
+                                &mut result,
+                                &mut events,
+                                &mut broker_state,
+                                &mut ready.execution,
+                                &call,
+                                model_calls,
+                                ready.deadline,
+                                deadline,
+                            )
+                            .await
                         {
-                            Ok(approval) => approval,
+                            Ok(SpeculativeCommitOutcome::Committed(tool_result)) => {
+                                if let Err(error) = push_tool_message(
+                                    &mut messages,
+                                    &call,
+                                    &tool_result,
+                                    &request.agent.limits,
+                                ) {
+                                    apply_terminal_error(&mut result, error);
+                                    break 'run;
+                                }
+                                continue;
+                            }
+                            Ok(SpeculativeCommitOutcome::ExecuteDirect(prepared)) => {
+                                crate::speculation::discard_ready_commit(controller, ready, false);
+                                broker.mark_dispatched(&mut broker_state, &prepared);
+                                let execution =
+                                    match broker.execute(&prepared, &request, deadline).await {
+                                        Ok(execution) => execution,
+                                        Err(error) => {
+                                            broker_state.record_execution_error(&error);
+                                            broker.mark_uncertain(&mut broker_state, &prepared);
+                                            events.emit(RunEvent::ToolCompleted {
+                                                call_id: call.id.clone(),
+                                                tool_id: call.tool_id.clone(),
+                                                ok: false,
+                                            });
+                                            apply_terminal_error(&mut result, error);
+                                            break 'run;
+                                        }
+                                    };
+                                events.emit(RunEvent::ToolCompleted {
+                                    call_id: call.id.clone(),
+                                    tool_id: call.tool_id.clone(),
+                                    ok: execution.result.ok,
+                                });
+                                broker.record_execution(&mut broker_state, &prepared, &execution);
+                                if let Some(error) = execution.validation_error {
+                                    result.errors.push(error);
+                                } else if !execution.result.ok {
+                                    result.errors.push(RunError::new(
+                                        "tool_error",
+                                        "tool returned a failure result",
+                                    ));
+                                }
+                                if let Err(error) = push_tool_message(
+                                    &mut messages,
+                                    &call,
+                                    &execution.result,
+                                    &request.agent.limits,
+                                ) {
+                                    apply_terminal_error(&mut result, error);
+                                    break 'run;
+                                }
+                                continue;
+                            }
+                            Ok(SpeculativeCommitOutcome::Resolved(tool_result)) => {
+                                crate::speculation::discard_ready_commit(controller, ready, false);
+                                if let Err(error) = push_tool_message(
+                                    &mut messages,
+                                    &call,
+                                    &tool_result,
+                                    &request.agent.limits,
+                                ) {
+                                    apply_terminal_error(&mut result, error);
+                                    break 'run;
+                                }
+                                continue;
+                            }
+                            Ok(SpeculativeCommitOutcome::Stop) => {
+                                crate::speculation::discard_ready_commit(controller, ready, false);
+                                break 'run;
+                            }
+                            Ok(SpeculativeCommitOutcome::NotCommitted) => {
+                                crate::speculation::discard_ready_commit(controller, ready, false);
+                            }
+                            Ok(SpeculativeCommitOutcome::DirectError(error)) => {
+                                crate::speculation::discard_ready_commit(
+                                    controller,
+                                    ready,
+                                    matches!(
+                                        error,
+                                        HarnessError::Cancelled | HarnessError::TimedOut(_)
+                                    ),
+                                );
+                                apply_terminal_error(&mut result, error);
+                                break 'run;
+                            }
                             Err(error) => {
+                                let cancelled = matches!(
+                                    error,
+                                    HarnessError::Cancelled | HarnessError::TimedOut(_)
+                                );
+                                crate::speculation::discard_ready_commit(
+                                    controller, ready, cancelled,
+                                );
+                                if cancelled {
+                                    apply_terminal_error(&mut result, error);
+                                    break 'run;
+                                }
+                            }
+                        }
+                    }
+                }
+                let attempts_before = broker_state.tool_calls;
+                let classified_before = broker_state.classified_tool_calls();
+                let outcome = match broker
+                    .prepare(
+                        &request,
+                        &mut result,
+                        &mut events,
+                        &mut broker_state,
+                        call.clone(),
+                        ToolCaller::Direct,
+                        false,
+                        false,
+                        None,
+                        deadline,
+                    )
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if broker_state.tool_calls > attempts_before
+                            && broker_state.classified_tool_calls() == classified_before
+                        {
+                            broker_state.record_pre_dispatch_error(&error);
+                        }
+                        apply_terminal_error(&mut result, error);
+                        break 'run;
+                    }
+                };
+                match outcome {
+                    PrepareOutcome::Ready(prepared) => {
+                        broker.mark_dispatched(&mut broker_state, &prepared);
+                        let execution = match broker.execute(&prepared, &request, deadline).await {
+                            Ok(execution) => execution,
+                            Err(error) => {
+                                broker_state.record_execution_error(&error);
+                                broker.mark_uncertain(&mut broker_state, &prepared);
+                                events.emit(RunEvent::ToolCompleted {
+                                    call_id: call.id.clone(),
+                                    tool_id: call.tool_id.clone(),
+                                    ok: false,
+                                });
                                 apply_terminal_error(&mut result, error);
                                 break 'run;
                             }
                         };
-                        approval.call_id = call.id.clone();
-                        approval.tool_id = call.tool_id.clone();
-                        let granted = approval.granted;
-                        result.approvals.push(approval.clone());
-                        if granted {
-                            if let Err(error) = self
-                                .run_tool(
-                                    &mut result,
-                                    &mut events,
-                                    &mut messages,
-                                    &call,
-                                    tool,
-                                    &context,
-                                    arguments,
-                                    &request.cancellation,
-                                    deadline,
-                                    &request.agent.limits,
-                                )
-                                .await
-                            {
-                                apply_terminal_error(&mut result, error);
-                                break 'run;
-                            }
-                        } else {
-                            self.reject(
-                                &mut result,
-                                &mut events,
-                                &call,
-                                format!("approval denied: {}", approval.reason),
-                            );
-                            if let Err(error) = push_tool_message(
-                                &mut messages,
-                                &call,
-                                &ToolResult::failure("approval denied"),
-                                &request.agent.limits,
-                            ) {
-                                apply_terminal_error(&mut result, error);
-                                break 'run;
-                            }
+                        events.emit(RunEvent::ToolCompleted {
+                            call_id: call.id.clone(),
+                            tool_id: call.tool_id.clone(),
+                            ok: execution.result.ok,
+                        });
+                        broker.record_execution(&mut broker_state, &prepared, &execution);
+                        if let Some(error) = execution.validation_error {
+                            result.errors.push(error);
+                        } else if !execution.result.ok {
+                            result.errors.push(RunError::new(
+                                "tool_error",
+                                "tool returned a failure result",
+                            ));
+                        }
+                        if let Err(error) = push_tool_message(
+                            &mut messages,
+                            &call,
+                            &execution.result,
+                            &request.agent.limits,
+                        ) {
+                            apply_terminal_error(&mut result, error);
+                            break 'run;
                         }
                     }
-                    PolicyDecision::Allow { .. } => {
-                        if let Err(error) = self
-                            .run_tool(
-                                &mut result,
-                                &mut events,
-                                &mut messages,
-                                &call,
-                                tool,
-                                &context,
-                                arguments,
-                                &request.cancellation,
-                                deadline,
-                                &request.agent.limits,
-                            )
-                            .await
+                    PrepareOutcome::Rejected(failure) => {
+                        if let Err(error) =
+                            push_tool_message(&mut messages, &call, &failure, &request.agent.limits)
                         {
                             apply_terminal_error(&mut result, error);
                             break 'run;
                         }
                     }
+                    PrepareOutcome::Reused(failure) => {
+                        if let Err(error) =
+                            push_tool_message(&mut messages, &call, &failure, &request.agent.limits)
+                        {
+                            apply_terminal_error(&mut result, error);
+                            break 'run;
+                        }
+                    }
+                    PrepareOutcome::Stop => break 'run,
                 }
             }
         }
 
         result.duration_ms = started.elapsed().as_millis() as u64;
+        if let Some(usage) = continuation_usage {
+            let continuation = DirectContinuation {
+                result,
+                events,
+                broker_state,
+                model_calls,
+                usage,
+                prepared_direct_scope: None,
+            };
+            return Ok(finish_programmatic_continuation(continuation));
+        }
+        if strategy_events.is_some() {
+            broker_state.finalize_usage();
+            events.emit(RunEvent::StrategyUsage {
+                strategy: crate::RunStrategy::Direct,
+                model_calls,
+                planning_model_calls: 0,
+                repair_model_calls: 0,
+                recovery_model_calls: 0,
+                final_synthesis_model_calls: 0,
+                reactive_model_calls: model_calls,
+                tool_calls: broker_state.tool_calls,
+                tool_issued: broker_state.tool_issued,
+                tool_reused: broker_state.tool_reused,
+                tool_rejected: broker_state.tool_rejected,
+                tool_pre_dispatch_aborted: broker_state.tool_pre_dispatch_aborted,
+                tool_completed: broker_state.tool_completed,
+                tool_failed: broker_state.tool_failed,
+                tool_cancelled: broker_state.tool_cancelled,
+                duration_ms: result.duration_ms,
+            });
+        }
         events.emit(RunEvent::Completed {
             status: result.status.clone(),
         });
         Ok(result)
     }
 
-    fn reject(
+    pub(crate) fn tool_calls_for_transcript(
         &self,
-        result: &mut RunResult,
-        events: &mut EventEmitter,
-        call: &ToolCall,
-        reason: String,
-    ) {
-        events.emit(RunEvent::ToolRejected {
-            call_id: call.id.clone(),
-            tool_id: call.tool_id.clone(),
-            reason: reason.clone(),
-        });
-        result.errors.push(RunError {
-            code: "tool_rejected".into(),
-            message: reason,
-        });
+        request: &RunRequest,
+        scope: &ToolScope,
+        calls: &[ToolCall],
+    ) -> Vec<ToolCall> {
+        calls
+            .iter()
+            .map(|call| {
+                let mut transcript_call = call.clone();
+                if !self.tool_arguments_are_valid(request, scope, call) {
+                    transcript_call.arguments_json = "{}".into();
+                }
+                transcript_call
+            })
+            .collect()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn run_tool(
+    fn tool_arguments_are_valid(
         &self,
-        run: &mut RunResult,
-        events: &mut EventEmitter,
-        messages: &mut Vec<Message>,
+        request: &RunRequest,
+        scope: &ToolScope,
         call: &ToolCall,
-        tool: Arc<dyn Tool>,
-        context: &ToolCallContext,
-        arguments: Value,
-        cancellation: &CancellationToken,
-        deadline: Option<Instant>,
-        limits: &AgentLimits,
-    ) -> Result<(), HarnessError> {
-        // This check closes the cancellation window between policy/approval and invocation.
-        check_stopped(
-            cancellation,
-            deadline,
-            "run deadline reached before tool invocation",
-        )?;
-        let tool_cancellation = cancellation.child_token();
-        let execution = tool.execute_with_context(context, arguments, tool_cancellation.clone());
-        let tool_result = await_guarded(
-            execution,
-            cancellation,
-            deadline,
-            "tool execution exceeded run deadline",
-            Some(&tool_cancellation),
-        )
-        .await;
-
-        let tool_result = match tool_result {
-            Ok(tool_result) => tool_result,
-            Err(error) => {
-                events.emit(RunEvent::ToolCompleted {
-                    call_id: call.id.clone(),
-                    tool_id: call.tool_id.clone(),
-                    ok: false,
-                });
-                return Err(error);
-            }
+    ) -> bool {
+        if call.arguments_json.len() as u64 > request.agent.limits.max_tool_arguments_bytes {
+            return false;
+        }
+        let Ok(arguments) = serde_json::from_str(&call.arguments_json) else {
+            return false;
         };
-        events.emit(RunEvent::ToolCompleted {
-            call_id: call.id.clone(),
-            tool_id: call.tool_id.clone(),
-            ok: tool_result.ok,
-        });
-        if serialized_len(&tool_result)? > limits.max_tool_result_bytes {
-            return Err(HarnessError::ResourceLimit(format!(
-                "tool result exceeds {} bytes",
-                limits.max_tool_result_bytes
-            )));
+        if ensure_json_depth(
+            "tool arguments",
+            &arguments,
+            request.agent.limits.max_json_depth,
+        )
+        .is_err()
+        {
+            return false;
         }
-        ensure_json_depth("tool result", &tool_result.output, limits.max_json_depth)?;
-        push_tool_message(messages, call, &tool_result, limits)?;
-        if !tool_result.ok {
-            run.errors.push(RunError {
-                code: "tool_error".into(),
-                message: tool_result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "tool returned a failure result".into()),
-            });
+        if !scope.contains(&call.tool_id) {
+            return false;
         }
-        Ok(())
+        let Some(tool) = self.tools.get(&call.tool_id) else {
+            return false;
+        };
+        request
+            .agent
+            .tool_allowlist
+            .iter()
+            .any(|id| id == &call.tool_id)
+            && tool.definition().allows_caller(ToolCaller::Direct)
+            && self.tools.validate(&call.tool_id, &arguments).is_ok()
     }
 }
 
+/// One-shot execution state controlling whether a provider attempt may enter
+/// guarded streaming speculation. Every provider attempt consumes the only
+/// eligible state, including an attempt that fails and is retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpeculationEligibility {
+    FirstProviderAttempt,
+    SequentialOnly,
+}
+
+impl SpeculationEligibility {
+    pub(crate) fn begin_provider_attempt(&mut self) -> bool {
+        matches!(
+            std::mem::replace(self, Self::SequentialOnly),
+            Self::FirstProviderAttempt
+        )
+    }
+}
+
+pub(crate) fn discovery_limit_terminal_result(
+    request: &RunRequest,
+    caller: ToolCaller,
+    stats: crate::discovery::ToolDiscoveryStats,
+    event_sink: &Arc<dyn EventSink>,
+    strategy: crate::RunStrategy,
+    started: StdInstant,
+    strategy_events: Option<DirectStrategyEvents>,
+) -> RunResult {
+    discovery_limit_terminal_result_with_scopes(
+        request,
+        &[(caller, stats)],
+        event_sink,
+        strategy,
+        started,
+        strategy_events,
+    )
+}
+
+pub(crate) fn discovery_limit_terminal_result_with_scopes(
+    request: &RunRequest,
+    completed_scopes: &[(ToolCaller, crate::discovery::ToolDiscoveryStats)],
+    event_sink: &Arc<dyn EventSink>,
+    strategy: crate::RunStrategy,
+    started: StdInstant,
+    strategy_events: Option<DirectStrategyEvents>,
+) -> RunResult {
+    let mut result = preflight_terminal_result(
+        request,
+        HarnessError::ResourceLimit("tool discovery budget reached".into()),
+    );
+    result.duration_ms = started.elapsed().as_millis() as u64;
+    let mut events = EventEmitter::new(
+        result.id.clone(),
+        result.trace_id.clone(),
+        Arc::clone(event_sink),
+    );
+    events.emit(RunEvent::Started {
+        run_id: result.id.clone(),
+        trace_id: result.trace_id.clone(),
+    });
+    for (caller, stats) in completed_scopes {
+        emit_discovery(&mut events, *caller, *stats);
+    }
+    if let Some(strategy_events) = strategy_events {
+        if let Some(reason) = strategy_events.fallback {
+            events.emit(RunEvent::StrategyFallback {
+                from: strategy_events
+                    .fallback_from
+                    .unwrap_or(strategy_events.requested),
+                to: strategy,
+                reason,
+            });
+        }
+        events.emit(RunEvent::StrategySelected {
+            requested: strategy_events.requested,
+            selected: strategy,
+            reason: strategy_events.reason,
+        });
+    }
+    emit_zero_strategy_usage(&mut events, strategy, result.duration_ms);
+    events.emit(RunEvent::Completed {
+        status: result.status.clone(),
+    });
+    result
+}
+
+fn emit_zero_strategy_usage(
+    events: &mut EventEmitter,
+    strategy: crate::RunStrategy,
+    duration_ms: u64,
+) {
+    events.emit(RunEvent::StrategyUsage {
+        strategy,
+        model_calls: 0,
+        planning_model_calls: 0,
+        repair_model_calls: 0,
+        recovery_model_calls: 0,
+        final_synthesis_model_calls: 0,
+        reactive_model_calls: 0,
+        tool_calls: 0,
+        tool_issued: 0,
+        tool_reused: 0,
+        tool_rejected: 0,
+        tool_pre_dispatch_aborted: 0,
+        tool_completed: 0,
+        tool_failed: 0,
+        tool_cancelled: 0,
+        duration_ms,
+    });
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DirectStrategyEvents {
+    pub(crate) requested: crate::RunStrategy,
+    pub(crate) reason: crate::StrategySelectionReason,
+    pub(crate) fallback: Option<crate::StrategyFallbackReason>,
+    pub(crate) fallback_from: Option<crate::RunStrategy>,
+    pub(crate) prior_discovery: Option<(ToolCaller, crate::discovery::ToolDiscoveryStats)>,
+}
+
+/// Programmatic counters retained while a pre-effect invalid program falls
+/// through to the direct compatibility path.
+pub(crate) struct ProgrammaticUsage {
+    pub(crate) planning_model_calls: u32,
+    pub(crate) repair_model_calls: u32,
+    pub(crate) final_synthesis_model_calls: u32,
+}
+
+/// Mutable state transferred to direct execution without starting another run.
+pub(crate) struct DirectContinuation {
+    pub(crate) result: RunResult,
+    pub(crate) events: EventEmitter,
+    pub(crate) broker_state: BrokerState,
+    pub(crate) model_calls: u32,
+    pub(crate) usage: ProgrammaticUsage,
+    pub(crate) prepared_direct_scope: Option<ToolScope>,
+}
+
+fn finish_programmatic_continuation(mut continuation: DirectContinuation) -> RunResult {
+    continuation.broker_state.finalize_usage();
+    let usage = continuation.usage;
+    continuation.events.emit(RunEvent::StrategyUsage {
+        strategy: crate::RunStrategy::Direct,
+        model_calls: continuation.model_calls,
+        planning_model_calls: usage.planning_model_calls,
+        repair_model_calls: usage.repair_model_calls,
+        recovery_model_calls: 0,
+        final_synthesis_model_calls: usage.final_synthesis_model_calls,
+        reactive_model_calls: continuation
+            .model_calls
+            .saturating_sub(usage.planning_model_calls)
+            .saturating_sub(usage.repair_model_calls)
+            .saturating_sub(usage.final_synthesis_model_calls),
+        tool_calls: continuation.broker_state.tool_calls,
+        tool_issued: continuation.broker_state.tool_issued,
+        tool_reused: continuation.broker_state.tool_reused,
+        tool_rejected: continuation.broker_state.tool_rejected,
+        tool_pre_dispatch_aborted: continuation.broker_state.tool_pre_dispatch_aborted,
+        tool_completed: continuation.broker_state.tool_completed,
+        tool_failed: continuation.broker_state.tool_failed,
+        tool_cancelled: continuation.broker_state.tool_cancelled,
+        duration_ms: continuation.result.duration_ms,
+    });
+    continuation.events.emit(RunEvent::Completed {
+        status: continuation.result.status.clone(),
+    });
+    continuation.result
+}
+
 impl AgentRunnerBuilder {
+    #[cfg(feature = "programmatic")]
+    /// Explicitly opts this host into bounded programmatic execution.
+    pub fn programmatic(mut self, config: crate::ProgrammaticHostConfig) -> Self {
+        self.programmatic = Some(config);
+        self
+    }
+
+    #[cfg(feature = "programmatic")]
+    /// Allows Adaptive runs to promote selected workload classes to Programmatic execution.
+    ///
+    /// The default allowlist is empty, preserving the Adaptive planner contract and
+    /// behavior from releases that predate Programmatic promotion. Forced
+    /// Programmatic runs do not consult this allowlist.
+    pub fn adaptive_programmatic_allowlist(
+        mut self,
+        workload_classes: impl IntoIterator<Item = crate::ProgrammaticWorkloadClass>,
+    ) -> Self {
+        self.adaptive_programmatic_allowlist
+            .extend(workload_classes);
+        self
+    }
     /// Replaces the tool registry used by the runner.
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Replaces the bounded host limits used for model-facing tool discovery.
+    pub fn discovery_limits(mut self, limits: ToolDiscoveryLimits) -> Self {
+        self.discovery_limits = limits;
+        self
+    }
+
+    /// Explicitly opts this runner into guarded shadow-first speculation.
+    pub fn speculation(mut self, config: crate::SpeculationConfig) -> Self {
+        self.speculation = Some(config);
         self
     }
 
@@ -646,17 +1061,60 @@ impl AgentRunnerBuilder {
 
     /// Builds the configured runner.
     pub fn build(self) -> AgentRunner {
+        #[cfg(feature = "programmatic")]
+        let admission = Arc::new(tokio::sync::Semaphore::new(
+            self.programmatic
+                .as_ref()
+                // Invalid host configuration is rejected when a run is started.
+                // Clamp the construction-time permit count so untrusted builder
+                // input (including zero or `usize::MAX`) cannot panic first.
+                .map_or(1, |config| config.max_active_vms.clamp(1, 16)),
+        ));
         AgentRunner {
             provider: self.provider,
             tools: self.tools,
             policy: self.policy,
             approvals: self.approvals,
             events: self.events,
+            concurrency: self.concurrency,
+            discovery_limits: self.discovery_limits,
+            speculation: self
+                .speculation
+                .map(crate::speculation::SpeculationController::new)
+                .map(Arc::new),
+            #[cfg(feature = "programmatic")]
+            programmatic: self.programmatic,
+            #[cfg(feature = "programmatic")]
+            adaptive_programmatic_allowlist: self.adaptive_programmatic_allowlist,
+            #[cfg(feature = "programmatic")]
+            programmatic_admission: admission,
         }
     }
 }
 
-fn validate_request(request: &RunRequest) -> Result<Option<Validator>, HarnessError> {
+pub(crate) fn emit_discovery(
+    events: &mut EventEmitter,
+    caller: ToolCaller,
+    stats: crate::discovery::ToolDiscoveryStats,
+) {
+    events.emit(RunEvent::ToolDiscoveryCompleted {
+        caller,
+        outcome: stats.outcome,
+        selection: stats.selection,
+        candidate_count: stats.candidate_count,
+        selected_count: stats.selected_count,
+        deferred_candidate_count: stats.deferred_candidate_count,
+        effective_tool_count_budget: stats.effective_tool_count_budget,
+        effective_schema_byte_budget: stats.effective_schema_byte_budget,
+        selected_schema_bytes: stats.selected_schema_bytes,
+        expansion_count: stats.expansion_count,
+        expansion_limit: stats.expansion_limit,
+        catalog_exceeded_budget: stats.catalog_exceeded_budget,
+        duration_ms: stats.duration_ms,
+    });
+}
+
+pub(crate) fn validate_request(request: &RunRequest) -> Result<Option<Validator>, HarnessError> {
     if request.agent.id.trim().is_empty()
         || request.agent.name.trim().is_empty()
         || request.agent.version.trim().is_empty()
@@ -686,9 +1144,19 @@ fn validate_request(request: &RunRequest) -> Result<Option<Validator>, HarnessEr
         || limits.max_tool_result_bytes == 0
         || limits.max_transcript_bytes == 0
         || limits.max_json_depth == 0
+        || limits.max_programmatic_program_bytes == 0
+        || limits.max_programmatic_fanout_concurrency == 0
     {
         return Err(HarnessError::InvalidRequest(
             "call, byte, transcript, and depth limits must be greater than zero".into(),
+        ));
+    }
+    if limits.max_programmatic_program_bytes > crate::limits::HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES
+        || limits.max_programmatic_fanout_concurrency
+            > crate::limits::HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY
+    {
+        return Err(HarnessError::InvalidRequest(
+            "programmatic limits exceed immutable library ceilings".into(),
         ));
     }
     if request.input.len() as u64 > limits.max_input_bytes {
@@ -731,6 +1199,7 @@ fn validate_request(request: &RunRequest) -> Result<Option<Validator>, HarnessEr
         .map(|schema| {
             ensure_json_depth("output schema", schema, limits.max_json_depth)
                 .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?;
+            StructuredOutputRequest::validate_shape("llama_harness_agent_output", schema)?;
             compile_trusted_schema(schema, |error| {
                 HarnessError::InvalidRequest(format!("invalid output schema: {error}"))
             })
@@ -738,7 +1207,93 @@ fn validate_request(request: &RunRequest) -> Result<Option<Validator>, HarnessEr
         .transpose()
 }
 
-fn validate_model_response(
+pub(crate) fn agent_structured_output(
+    capabilities: &ModelCapabilities,
+    schema: Option<&Value>,
+) -> Option<StructuredOutputRequest> {
+    if !capabilities.supports_structured_output {
+        return None;
+    }
+    schema.cloned().map(|schema| {
+        StructuredOutputRequest::from_prevalidated("llama_harness_agent_output", schema, true)
+    })
+}
+
+pub(crate) fn preflight_request(request: &RunRequest) -> Result<RunPreflight, HarnessError> {
+    let output_validator = validate_request(request)?;
+    let started = StdInstant::now();
+    let deadline = absolute_deadline(request.agent.limits.max_run_duration_ms)?;
+    check_stopped(&request.cancellation, deadline, "run deadline reached")?;
+    Ok(RunPreflight {
+        output_validator,
+        deadline,
+        started,
+    })
+}
+
+pub(crate) fn preflight_terminal_result(request: &RunRequest, error: HarnessError) -> RunResult {
+    let run_id = request
+        .run_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let trace_id = request
+        .trace_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let model = request
+        .overrides
+        .model
+        .clone()
+        .unwrap_or_else(|| request.agent.default_model.clone());
+    let mut result = RunResult::new(run_id, RunStatus::Failed, model, trace_id);
+    apply_terminal_error(&mut result, error);
+    result
+}
+
+pub(crate) fn pre_event_terminal_result(
+    request: &RunRequest,
+    error: HarnessError,
+    event_sink: &Arc<dyn EventSink>,
+    strategy: crate::RunStrategy,
+    started: StdInstant,
+) -> RunResult {
+    pre_event_terminal_result_with_scopes(request, error, event_sink, strategy, started, &[])
+}
+
+pub(crate) fn pre_event_terminal_result_with_scopes(
+    request: &RunRequest,
+    error: HarnessError,
+    event_sink: &Arc<dyn EventSink>,
+    strategy: crate::RunStrategy,
+    started: StdInstant,
+    completed_scopes: &[(ToolCaller, crate::discovery::ToolDiscoveryStats)],
+) -> RunResult {
+    debug_assert!(matches!(
+        error,
+        HarnessError::Cancelled | HarnessError::TimedOut(_)
+    ));
+    let mut result = preflight_terminal_result(request, error);
+    result.duration_ms = started.elapsed().as_millis() as u64;
+    let mut events = EventEmitter::new(
+        result.id.clone(),
+        result.trace_id.clone(),
+        Arc::clone(event_sink),
+    );
+    events.emit(RunEvent::Started {
+        run_id: result.id.clone(),
+        trace_id: result.trace_id.clone(),
+    });
+    for (caller, stats) in completed_scopes {
+        emit_discovery(&mut events, *caller, *stats);
+    }
+    emit_zero_strategy_usage(&mut events, strategy, result.duration_ms);
+    events.emit(RunEvent::Completed {
+        status: result.status.clone(),
+    });
+    result
+}
+
+pub(crate) fn validate_model_response(
     response: &ModelResponse,
     limits: &AgentLimits,
 ) -> Result<(), HarnessError> {
@@ -751,7 +1306,20 @@ fn validate_model_response(
     Ok(())
 }
 
-fn validate_output(
+pub(crate) fn ensure_model_request_size(
+    request: &ModelRequest,
+    limits: &AgentLimits,
+) -> Result<(), HarnessError> {
+    if serialized_len(request)? > limits.max_request_payload_bytes {
+        return Err(HarnessError::ResourceLimit(format!(
+            "model request exceeds {} bytes",
+            limits.max_request_payload_bytes
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_output(
     validator: Option<&Validator>,
     output: &str,
     max_json_depth: u32,
@@ -767,7 +1335,7 @@ fn validate_output(
         .map_err(|error| HarnessError::InvalidOutput(error.to_string()))
 }
 
-fn initial_messages(request: &RunRequest) -> Vec<Message> {
+pub(crate) fn initial_messages(request: &RunRequest) -> Vec<Message> {
     let mut messages = vec![];
     if !request.agent.system_instructions.trim().is_empty() {
         messages.push(Message::system(request.agent.system_instructions.clone()));
@@ -777,7 +1345,10 @@ fn initial_messages(request: &RunRequest) -> Vec<Message> {
     messages
 }
 
-fn ensure_transcript(messages: &[Message], limits: &AgentLimits) -> Result<(), HarnessError> {
+pub(crate) fn ensure_transcript(
+    messages: &[Message],
+    limits: &AgentLimits,
+) -> Result<(), HarnessError> {
     let bytes = messages.iter().map(Message::transcript_bytes).sum::<u64>();
     if bytes > limits.max_transcript_bytes {
         return Err(HarnessError::ResourceLimit(format!(
@@ -788,7 +1359,7 @@ fn ensure_transcript(messages: &[Message], limits: &AgentLimits) -> Result<(), H
     Ok(())
 }
 
-fn push_tool_message(
+pub(crate) fn push_tool_message(
     messages: &mut Vec<Message>,
     call: &ToolCall,
     result: &ToolResult,
@@ -801,7 +1372,7 @@ fn push_tool_message(
     ensure_transcript(messages, limits)
 }
 
-fn apply_terminal_error(result: &mut RunResult, error: HarnessError) {
+pub(crate) fn apply_terminal_error(result: &mut RunResult, error: HarnessError) {
     result.status = match error {
         HarnessError::Cancelled => RunStatus::Cancelled,
         HarnessError::ResourceLimit(_) => RunStatus::LimitReached,
@@ -811,7 +1382,7 @@ fn apply_terminal_error(result: &mut RunResult, error: HarnessError) {
     result.errors.push(error.run_error());
 }
 
-fn absolute_deadline(duration_ms: Option<u64>) -> Result<Option<Instant>, HarnessError> {
+pub(crate) fn absolute_deadline(duration_ms: Option<u64>) -> Result<Option<Instant>, HarnessError> {
     duration_ms
         .map(|duration_ms| {
             Instant::now()
@@ -821,7 +1392,7 @@ fn absolute_deadline(duration_ms: Option<u64>) -> Result<Option<Instant>, Harnes
         .transpose()
 }
 
-fn provider_deadline(
+pub(crate) fn provider_deadline(
     run_deadline: Option<Instant>,
     provider_duration_ms: Option<u64>,
 ) -> Result<Option<Instant>, HarnessError> {
@@ -841,7 +1412,7 @@ fn provider_deadline(
     }
 }
 
-fn check_stopped(
+pub(crate) fn check_stopped(
     cancellation: &CancellationToken,
     deadline: Option<Instant>,
     timeout_message: &str,
@@ -855,7 +1426,7 @@ fn check_stopped(
     Ok(())
 }
 
-async fn await_guarded<T, F>(
+pub(crate) async fn await_guarded<T, F>(
     future: F,
     cancellation: &CancellationToken,
     deadline: Option<Instant>,
@@ -893,7 +1464,7 @@ where
     result
 }
 
-fn merge_generation(
+pub(crate) fn merge_generation(
     base: &GenerationOptions,
     override_options: &GenerationOptions,
 ) -> GenerationOptions {
@@ -904,8 +1475,4 @@ fn merge_generation(
             .max_output_tokens
             .or(base.max_output_tokens),
     }
-}
-
-fn canonical_json(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_default()
 }

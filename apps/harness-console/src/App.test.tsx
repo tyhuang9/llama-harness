@@ -49,7 +49,7 @@ describe("developer console", () => {
   it("keeps navigation focusable and shows a redacted event timeline", async () => {
     const api = apiWith({ workspace, rawPayloadPreference: false, redactionKeyFragments: [] });
     vi.mocked(api.listRuns).mockResolvedValue([
-      { runId: "run-1", traceId: "trace-1", startedAtMs: 1, updatedAtMs: 2, eventCount: 1, status: "completed" },
+      { executionId: "execution-1", runId: "run-1", traceId: "trace-1", startedAtMs: 1, updatedAtMs: 2, eventCount: 1, status: "completed" },
     ]);
     vi.mocked(api.listRunEvents).mockResolvedValue([
       { sequence: 1, timestampMs: 2, event: { type: "tool_completed", tool_id: "task.list", ok: true } },
@@ -66,7 +66,7 @@ describe("developer console", () => {
     await screen.findByText("tool_completed");
     expect(screen.getByText("Redacted event timeline")).toBeInTheDocument();
     expect(screen.queryByText("rawPayload")).not.toBeInTheDocument();
-    await waitFor(() => expect(api.listRunEvents).toHaveBeenCalledWith("run-1"));
+    await waitFor(() => expect(api.listRunEvents).toHaveBeenCalledWith("execution-1"));
   });
 
   it("renders a configured project agent manifest without inventing agent data", async () => {

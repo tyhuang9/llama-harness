@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llama-harness"
-version = "0.1.0"
+version = "0.2.0"
 description = "Async Python SDK for the managed llama-harness Rust sidecar"
 readme = "README.md"
 requires-python = ">=3.10"

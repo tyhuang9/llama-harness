@@ -122,7 +122,9 @@ test("landing page is accessible, Rust-first, and uses the approved brand", () =
   assert.match(styles, /--brand-charcoal: #171a20;/);
   assert.match(styles, /--brand-slate: #8b93a1;/);
   assert.doesNotMatch(styles, /#(?:176b4d|0f513a|edf7f2|b9ddcd|174c39)/i);
-  assert.match(index, /d9f7a84a579a36cd1987c5eeeb30764be70aa8ce/);
+  assert.match(index, /Rust library · 0\.2/);
+  assert.match(index, /llama-harness · Rust 0\.2/);
+  assert.doesNotMatch(index, /d9f7a84a579a36cd1987c5eeeb30764be70aa8ce/);
 
   for (const guide of ["embedding", "tools-and-policies", "observability", "evaluations", "tauri", "security", "architecture"]) {
     assert.match(index, new RegExp(`href="guides/${guide}\\.html"`), `${guide} guide is promoted`);
@@ -182,14 +184,18 @@ test("release guide preserves executable Cargo publication commands", () => {
     .filter((line) => line.startsWith("cargo publish "));
 
   assert.deepEqual(publishCommands, [
+    "cargo publish --locked --dry-run --package llama-harness-programmatic-sandbox",
+    "cargo publish --locked --package llama-harness-programmatic-sandbox",
     "cargo publish --locked --dry-run --package llama-harness-core",
     "cargo publish --locked --package llama-harness-core",
     "cargo publish --locked --dry-run --package llama-harness-ollama",
     "cargo publish --locked --dry-run --package llama-harness-observability",
     "cargo publish --locked --dry-run --package llama-harness-tauri",
+    "cargo publish --locked --dry-run --package llama-harness-mcp",
     "cargo publish --locked --package llama-harness-ollama",
     "cargo publish --locked --package llama-harness-observability",
     "cargo publish --locked --package llama-harness-tauri",
+    "cargo publish --locked --package llama-harness-mcp",
     "cargo publish --locked --dry-run --package llama-harness-evals",
     "cargo publish --locked --package llama-harness-evals",
     "cargo publish --locked --dry-run --package llama-harness",

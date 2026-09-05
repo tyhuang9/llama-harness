@@ -4,17 +4,20 @@ use llama_harness_core::{
     AgentDefinition, AgentLimits, AgentRunner, ApprovalHandler, ApprovalRecord, EventRecord,
     GenerationOptions, HarnessError, InMemoryEventSink, JsonMap, Message, MessageRole,
     ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, PolicyDecision,
-    PolicyEngine, ProviderHealth, RunEvent, RunOverrides, RunRequest, RunStatus, Tool, ToolCall,
-    ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    PolicyEngine, ProviderHealth, RunEvent, RunOverrides, RunRequest, RunResult, RunStatus,
+    RunStrategy, Tool, ToolCall, ToolCaller, ToolDefinition, ToolDiscoveryOutcome,
+    ToolDiscoverySelection, ToolRegistry, ToolResult, ToolRisk,
+    HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY, HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
 };
 use serde_json::{json, Value};
 use std::{
     future::pending,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
 };
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 fn request() -> RunRequest {
@@ -85,15 +88,10 @@ struct TestTool {
 impl TestTool {
     fn read(id: &str, schema: Value) -> Self {
         Self {
-            definition: ToolDefinition {
-                id: id.into(),
-                name: id.into(),
-                description: "test tool".into(),
-                arguments_schema: schema,
-                risk: ToolRisk::Low,
-                idempotent: true,
-                read_only: true,
-            },
+            definition: ToolDefinition::new(id, id, "test tool", schema)
+                .with_risk(ToolRisk::Low)
+                .with_idempotent(true)
+                .with_read_only(true),
             calls: AtomicU32::new(0),
             behavior: ToolBehavior::Return(ToolResult::success(json!({"value": "ok"}))),
         }
@@ -136,6 +134,113 @@ impl Tool for TestTool {
             ToolBehavior::Error(error) => Err(error.clone()),
             ToolBehavior::Pending => pending().await,
         }
+    }
+}
+
+struct CancellationBarrierTool {
+    definition: ToolDefinition,
+    calls: AtomicU32,
+    entered: Arc<Notify>,
+    observed_cancellation: AtomicBool,
+    cooperative: bool,
+}
+
+impl CancellationBarrierTool {
+    fn new(cooperative: bool) -> Self {
+        Self {
+            definition: ToolDefinition::new(
+                "read",
+                "read",
+                "cancellation barrier",
+                json!({"type":"object"}),
+            )
+            .with_risk(ToolRisk::Low)
+            .with_idempotent(true)
+            .with_read_only(true),
+            calls: AtomicU32::new(0),
+            entered: Arc::new(Notify::new()),
+            observed_cancellation: AtomicBool::new(false),
+            cooperative,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CancellationBarrierTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(
+        &self,
+        _: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, HarnessError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_waiters();
+        if self.cooperative {
+            cancellation.cancelled().await;
+            self.observed_cancellation.store(true, Ordering::SeqCst);
+            Ok(ToolResult::success(json!({"cancelled": true})))
+        } else {
+            pending().await
+        }
+    }
+}
+
+struct CleanupHoldTool {
+    definition: ToolDefinition,
+    calls: AtomicU32,
+    entered: Arc<Semaphore>,
+    observed_cancellation: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl CleanupHoldTool {
+    fn new() -> Self {
+        Self {
+            definition: ToolDefinition::new(
+                "read",
+                "read",
+                "cleanup hold",
+                json!({"type":"object"}),
+            )
+            .with_risk(ToolRisk::Low)
+            .with_idempotent(true)
+            .with_read_only(true)
+            .with_concurrency_key("cleanup-hold"),
+            calls: AtomicU32::new(0),
+            entered: Arc::new(Semaphore::new(0)),
+            observed_cancellation: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CleanupHoldTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn execute(
+        &self,
+        _: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, HarnessError> {
+        let ordinal = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.add_permits(1);
+        if ordinal == 0 {
+            cancellation.cancelled().await;
+            self.observed_cancellation.add_permits(1);
+        }
+        let permit = self
+            .release
+            .acquire()
+            .await
+            .expect("test cleanup-release semaphore remains open");
+        permit.forget();
+        Ok(ToolResult::success(json!({"ok": true})))
     }
 }
 
@@ -254,6 +359,14 @@ fn completed_events(records: &[EventRecord]) -> Vec<RunStatus> {
         .collect()
 }
 
+fn assert_public_surfaces_exclude(result: &RunResult, events: &InMemoryEventSink, canary: &str) {
+    assert!(!serde_json::to_string(result).unwrap().contains(canary));
+    assert!(!format!("{result:?}").contains(canary));
+    assert!(!serde_json::to_string(&events.events())
+        .unwrap()
+        .contains(canary));
+}
+
 #[tokio::test]
 async fn public_api_runs_a_scripted_final_response() {
     let runner = AgentRunner::builder(Arc::new(MockModelProvider::scripted([final_response(
@@ -263,6 +376,35 @@ async fn public_api_runs_a_scripted_final_response() {
     let result = runner.run(request()).await.unwrap();
     assert_eq!(result.status, RunStatus::Completed);
     assert_eq!(result.final_output.as_deref(), Some("ok"));
+}
+
+#[tokio::test]
+async fn agent_programmatic_limits_fail_closed_for_zero_and_values_above_hard_caps() {
+    for (program_bytes, fanout_concurrency) in [
+        (0, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY),
+        (
+            HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES.saturating_add(1),
+            HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
+        ),
+        (HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES, 0),
+        (
+            HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES,
+            HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY.saturating_add(1),
+        ),
+    ] {
+        let provider = Arc::new(MockModelProvider::scripted([final_response("unused")]));
+        let mut run_request = request();
+        run_request.agent.limits.max_programmatic_program_bytes = program_bytes;
+        run_request.agent.limits.max_programmatic_fanout_concurrency = fanout_concurrency;
+        assert!(matches!(
+            AgentRunner::builder(provider.clone())
+                .build()
+                .run(run_request)
+                .await,
+            Err(HarnessError::InvalidRequest(_))
+        ));
+        assert!(provider.requests().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -290,9 +432,14 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
         .event_sink(events.clone())
         .build();
 
-    let result = runner.run(run_request).await.unwrap();
+    let result = runner
+        .run_with_strategy(run_request, RunStrategy::Direct)
+        .await
+        .unwrap();
     assert_eq!(result.status, RunStatus::Completed);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(result.tool_calls[0].arguments_json, r#"{"key":"one"}"#);
+    assert_eq!(result.tool_calls[1].arguments_json, r#"{"key":"two"}"#);
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(
@@ -311,6 +458,27 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
     assert_eq!(feedback[0].tool_calls[1].id, "second");
     assert_eq!(feedback[1].tool_call_id.as_deref(), Some("first"));
     assert_eq!(feedback[2].tool_call_id.as_deref(), Some("second"));
+    match &events.events()[1].event {
+        RunEvent::ToolDiscoveryCompleted {
+            caller,
+            outcome,
+            selection,
+            candidate_count,
+            selected_count,
+            deferred_candidate_count,
+            catalog_exceeded_budget,
+            ..
+        } => {
+            assert_eq!(*caller, ToolCaller::Direct);
+            assert_eq!(*outcome, ToolDiscoveryOutcome::Selected);
+            assert_eq!(*selection, ToolDiscoverySelection::FullCatalog);
+            assert_eq!(*candidate_count, 1);
+            assert_eq!(*selected_count, 1);
+            assert_eq!(*deferred_candidate_count, 0);
+            assert!(!catalog_exceeded_budget);
+        }
+        event => panic!("expected tool discovery event, got {event:?}"),
+    }
     assert_eq!(
         events
             .events()
@@ -322,6 +490,26 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
                 run_id: String::new(),
                 trace_id: String::new(),
             }),
+            std::mem::discriminant(&RunEvent::ToolDiscoveryCompleted {
+                caller: ToolCaller::Direct,
+                outcome: ToolDiscoveryOutcome::Selected,
+                selection: ToolDiscoverySelection::FullCatalog,
+                candidate_count: 1,
+                selected_count: 1,
+                deferred_candidate_count: 0,
+                effective_tool_count_budget: 0,
+                effective_schema_byte_budget: 0,
+                selected_schema_bytes: 0,
+                expansion_count: 0,
+                expansion_limit: 0,
+                catalog_exceeded_budget: false,
+                duration_ms: 0,
+            }),
+            std::mem::discriminant(&RunEvent::StrategySelected {
+                requested: RunStrategy::Direct,
+                selected: RunStrategy::Direct,
+                reason: llama_harness_core::StrategySelectionReason::Forced,
+            }),
             std::mem::discriminant(&RunEvent::ModelRequested {
                 call_number: 0,
                 model: String::new(),
@@ -354,6 +542,24 @@ async fn multi_step_tool_feedback_preserves_message_and_event_order() {
                 model: String::new(),
             }),
             std::mem::discriminant(&RunEvent::ModelResponded { call_number: 0 }),
+            std::mem::discriminant(&RunEvent::StrategyUsage {
+                strategy: RunStrategy::Direct,
+                model_calls: 0,
+                planning_model_calls: 0,
+                repair_model_calls: 0,
+                recovery_model_calls: 0,
+                final_synthesis_model_calls: 0,
+                reactive_model_calls: 0,
+                tool_calls: 0,
+                tool_issued: 0,
+                tool_reused: 0,
+                tool_rejected: 0,
+                tool_pre_dispatch_aborted: 0,
+                tool_completed: 0,
+                tool_failed: 0,
+                tool_cancelled: 0,
+                duration_ms: 0,
+            }),
             std::mem::discriminant(&RunEvent::Completed {
                 status: RunStatus::Completed,
             }),
@@ -548,6 +754,133 @@ async fn active_cancellation_interrupts_policy_approval_and_tool_awaits() {
     assert_eq!(pending_tool.calls.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn direct_active_tool_cancellation_drains_the_child_token_before_terminal_result() {
+    let tool = Arc::new(CancellationBarrierTool::new(true));
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("barrier", "read", "{}")),
+        final_response("must not synthesize"),
+    ]));
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry(tool.clone()))
+            .build(),
+    );
+    let run_request = request();
+    let cancellation = run_request.cancellation.clone();
+    let entered = tool.entered.clone();
+    let entered_wait = entered.notified();
+    let run = tokio::spawn(async move { runner.run(run_request).await });
+
+    entered_wait.await;
+    cancellation.cancel();
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Cancelled);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(tool.observed_cancellation.load(Ordering::SeqCst));
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn direct_active_tool_deadline_drains_the_child_token_before_terminal_result() {
+    let tool = Arc::new(CancellationBarrierTool::new(true));
+    let provider = Arc::new(MockModelProvider::scripted([tool_response(call(
+        "barrier", "read", "{}",
+    ))]));
+    let mut run_request = request();
+    run_request.agent.limits.max_run_duration_ms = Some(1);
+    let entered = tool.entered.clone();
+    let entered_wait = entered.notified();
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry(tool.clone()))
+            .build(),
+    );
+    let run = tokio::spawn(async move { runner.run(run_request).await });
+
+    entered_wait.await;
+    tokio::time::advance(std::time::Duration::from_millis(2)).await;
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(result.errors.last().unwrap().code, "timed_out");
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(tool.observed_cancellation.load(Ordering::SeqCst));
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn direct_keyed_admission_remains_held_until_cooperative_cleanup_returns() {
+    let tool = Arc::new(CleanupHoldTool::new());
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("first", "read", "{}")),
+        tool_response(call("second", "read", "{}")),
+        final_response("second run complete"),
+    ]));
+    let runner = Arc::new(
+        AgentRunner::builder(provider.clone())
+            .tools(registry(tool.clone()))
+            .build(),
+    );
+
+    let first_request = request();
+    let first_cancellation = first_request.cancellation.clone();
+    let first_run = {
+        let runner = runner.clone();
+        tokio::spawn(async move { runner.run(first_request).await })
+    };
+    tool.entered.acquire().await.unwrap().forget();
+    first_cancellation.cancel();
+    tool.observed_cancellation.acquire().await.unwrap().forget();
+
+    let second_run = {
+        let runner = runner.clone();
+        tokio::spawn(async move { runner.run(request()).await })
+    };
+    while provider.requests().len() < 2 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+
+    tool.release.add_permits(1);
+    tool.entered.acquire().await.unwrap().forget();
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    tool.release.add_permits(1);
+
+    let first = first_run.await.unwrap().unwrap();
+    let second = second_run.await.unwrap().unwrap();
+    assert_eq!(first.status, RunStatus::Cancelled);
+    assert_eq!(second.status, RunStatus::Completed);
+    assert_eq!(provider.requests().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn non_cooperative_tool_cleanup_grace_is_bounded_after_cancellation() {
+    let tool = Arc::new(CancellationBarrierTool::new(false));
+    let provider = Arc::new(MockModelProvider::scripted([tool_response(call(
+        "barrier", "read", "{}",
+    ))]));
+    let runner = Arc::new(
+        AgentRunner::builder(provider)
+            .tools(registry(tool.clone()))
+            .build(),
+    );
+    let run_request = request();
+    let cancellation = run_request.cancellation.clone();
+    let entered = tool.entered.clone();
+    let entered_wait = entered.notified();
+    let run = tokio::spawn(async move { runner.run(run_request).await });
+
+    entered_wait.await;
+    cancellation.cancel();
+    let result = run.await.unwrap().unwrap();
+
+    assert_eq!(result.status, RunStatus::Cancelled);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(!tool.observed_cancellation.load(Ordering::SeqCst));
+}
+
 #[tokio::test(start_paused = true)]
 async fn provider_per_call_timeout_and_absolute_deadline_are_active() {
     let mut provider_timeout = request();
@@ -733,6 +1066,97 @@ async fn callback_errors_return_failed_results_and_terminal_events() {
 }
 
 #[tokio::test]
+async fn direct_public_error_surfaces_exclude_provider_policy_approval_tool_and_output_canaries() {
+    const PROVIDER: &str = "provider-error-canary";
+    const POLICY: &str = "policy-error-canary";
+    const APPROVAL: &str = "approval-error-canary";
+    const TOOL: &str = "tool-error-canary";
+    const OUTPUT: &str = "invalid-output-canary";
+
+    let provider_events = Arc::new(InMemoryEventSink::default());
+    let provider_result =
+        AgentRunner::builder(Arc::new(MockModelProvider::scripted([MockStep::Error(
+            HarnessError::Provider(PROVIDER.into()),
+        )])))
+        .event_sink(provider_events.clone())
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+    assert_public_surfaces_exclude(&provider_result, &provider_events, PROVIDER);
+
+    let policy_events = Arc::new(InMemoryEventSink::default());
+    let policy_result =
+        AgentRunner::builder(Arc::new(MockModelProvider::scripted([tool_response(
+            call("policy", "read", "{}"),
+        )])))
+        .tools(registry(Arc::new(TestTool::read(
+            "read",
+            json!({"type":"object"}),
+        ))))
+        .policy(Arc::new(FixedPolicy(Err(HarnessError::Policy(
+            POLICY.into(),
+        )))))
+        .event_sink(policy_events.clone())
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+    assert_public_surfaces_exclude(&policy_result, &policy_events, POLICY);
+
+    let approval_events = Arc::new(InMemoryEventSink::default());
+    let approval_result =
+        AgentRunner::builder(Arc::new(MockModelProvider::scripted([tool_response(
+            call("approval", "read", "{}"),
+        )])))
+        .tools(registry(Arc::new(TestTool::read(
+            "read",
+            json!({"type":"object"}),
+        ))))
+        .policy(Arc::new(FixedPolicy(Ok(PolicyDecision::RequireApproval {
+            reason: "approval required".into(),
+        }))))
+        .approvals(Arc::new(TestApproval(ApprovalBehavior::Error(
+            HarnessError::Approval(APPROVAL.into()),
+        ))))
+        .event_sink(approval_events.clone())
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+    assert_public_surfaces_exclude(&approval_result, &approval_events, APPROVAL);
+
+    let tool_events = Arc::new(InMemoryEventSink::default());
+    let tool_result = AgentRunner::builder(Arc::new(MockModelProvider::scripted([tool_response(
+        call("tool", "read", "{}"),
+    )])))
+    .tools(registry(Arc::new(
+        TestTool::read("read", json!({"type":"object"})).failing(HarnessError::Tool(TOOL.into())),
+    )))
+    .event_sink(tool_events.clone())
+    .build()
+    .run(request())
+    .await
+    .unwrap();
+    assert_public_surfaces_exclude(&tool_result, &tool_events, TOOL);
+
+    let output_events = Arc::new(InMemoryEventSink::default());
+    let mut output_request = request();
+    output_request.agent.output_schema = Some(json!({"type":"object"}));
+    output_request.agent.limits.max_output_repairs = 0;
+    let output_result =
+        AgentRunner::builder(Arc::new(MockModelProvider::scripted([final_response(
+            OUTPUT,
+        )])))
+        .event_sink(output_events.clone())
+        .build()
+        .run(output_request)
+        .await
+        .unwrap();
+    assert_public_surfaces_exclude(&output_result, &output_events, OUTPUT);
+}
+
+#[tokio::test]
 async fn policy_denial_approval_grant_and_approval_denial_are_recorded() {
     let denied_tool = Arc::new(TestTool::read("read", json!({"type": "object"})));
     let denied = AgentRunner::builder(Arc::new(MockModelProvider::scripted([
@@ -910,6 +1334,56 @@ async fn schema_repair_succeeds_and_exhaustion_fails_at_the_exact_limit() {
 }
 
 #[tokio::test]
+async fn final_output_schema_is_requested_only_from_capable_providers() {
+    let schema = json!({
+        "type":"object",
+        "required":["answer"],
+        "properties":{"answer":{"type":"string"}},
+        "additionalProperties":false
+    });
+    let capable = Arc::new(MockModelProvider::scripted([final_response(
+        r#"{"answer":"done"}"#,
+    )]));
+    let mut capable_request = request();
+    capable_request.agent.output_schema = Some(schema.clone());
+    let result = AgentRunner::builder(capable.clone())
+        .build()
+        .run_with_strategy(capable_request, RunStrategy::Direct)
+        .await
+        .unwrap();
+    assert_eq!(result.status, RunStatus::Completed);
+    let structured = capable.requests()[0]
+        .structured_output
+        .clone()
+        .expect("capable provider receives the final-output contract");
+    assert_eq!(structured.name, "llama_harness_agent_output");
+    assert_eq!(structured.schema, schema);
+    assert!(structured.strict);
+
+    let unsupported = Arc::new(
+        MockModelProvider::scripted([
+            final_response("not json"),
+            final_response(r#"{"answer":"repaired"}"#),
+        ])
+        .with_capabilities(ModelCapabilities::new(true, false, false)),
+    );
+    let mut fallback_request = request();
+    fallback_request.agent.output_schema = Some(schema);
+    fallback_request.agent.limits.max_output_repairs = 1;
+    let result = AgentRunner::builder(unsupported.clone())
+        .build()
+        .run_with_strategy(fallback_request, RunStrategy::Direct)
+        .await
+        .unwrap();
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(unsupported.requests().len(), 2);
+    assert!(unsupported
+        .requests()
+        .iter()
+        .all(|request| request.structured_output.is_none()));
+}
+
+#[tokio::test]
 async fn input_and_transcript_limits_are_inclusive() {
     let mut exact_input = request();
     exact_input.input = "four".into();
@@ -1028,6 +1502,49 @@ async fn request_and_model_response_byte_limits_are_inclusive() {
         .await
         .unwrap();
     assert_eq!(limited.status, RunStatus::LimitReached);
+}
+
+#[tokio::test]
+async fn expanded_direct_requests_are_bounded_before_provider_and_accounting() {
+    for strategy in [RunStrategy::Direct, RunStrategy::Adaptive] {
+        let provider = Arc::new(MockModelProvider::scripted([]));
+        let events = Arc::new(InMemoryEventSink::default());
+        let tool = Arc::new(TestTool::read(
+            "read",
+            json!({
+                "type": "object",
+                "description": "x".repeat(16 * 1024),
+            }),
+        ));
+        let mut run_request = request();
+        run_request.agent.limits.max_request_payload_bytes = 4 * 1024;
+        let result = AgentRunner::builder(provider.clone())
+            .tools(registry(tool as Arc<dyn Tool>))
+            .event_sink(events.clone())
+            .build()
+            .run_with_strategy(run_request, strategy)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, RunStatus::LimitReached, "{strategy:?}");
+        assert!(provider.requests().is_empty(), "{strategy:?}");
+        let records = events.events();
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record.event, RunEvent::ModelRequested { .. })),
+            "{strategy:?}"
+        );
+        assert!(records.iter().any(|record| matches!(
+            record.event,
+            RunEvent::StrategyUsage {
+                strategy: RunStrategy::Direct,
+                model_calls: 0,
+                reactive_model_calls: 0,
+                ..
+            }
+        )));
+    }
 }
 
 #[tokio::test]
@@ -1206,6 +1723,226 @@ async fn malformed_unknown_disallowed_and_schema_invalid_calls_feed_back_without
         .rev()
         .take(4)
         .all(|message| { message.role == MessageRole::Tool && message.tool_call_id.is_some() }));
+}
+
+#[tokio::test]
+async fn invalid_argument_values_are_redacted_from_errors_events_and_transcript() {
+    const SECRET: &str = "sentinel-atomic-argument-secret";
+    let read = Arc::new(TestTool::read(
+        "read",
+        json!({
+            "type":"object",
+            "required":["key"],
+            "properties":{"key":{"type":"string","enum":["allowed"]}},
+            "additionalProperties":false
+        }),
+    ));
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call(
+            "invalid-secret",
+            "read",
+            &format!(r#"{{"key":"{SECRET}"}}"#),
+        )),
+        final_response("recovered"),
+    ]));
+    let events = Arc::new(InMemoryEventSink::default());
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry(read.clone()))
+        .event_sink(events.clone())
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(read.calls.load(Ordering::SeqCst), 0);
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.code == "tool_rejected"
+            && error.message.contains("arguments failed validation")));
+    assert!(result
+        .errors
+        .iter()
+        .all(|error| !error.message.contains(SECRET)));
+    assert_eq!(result.tool_calls.len(), 1);
+    assert_eq!(result.tool_calls[0].id, "invalid-secret");
+    assert_eq!(result.tool_calls[0].tool_id, "read");
+    assert_eq!(result.tool_calls[0].arguments_json, "{}");
+    assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
+
+    let records = events.events();
+    assert!(records.iter().any(|record| matches!(
+        &record.event,
+        RunEvent::ToolRejected { reason, .. }
+            if reason.contains("arguments failed validation") && !reason.contains(SECRET)
+    )));
+    assert!(!serde_json::to_string(&records).unwrap().contains(SECRET));
+
+    let transcript = &provider.requests()[1].messages;
+    assert!(!serde_json::to_string(transcript).unwrap().contains(SECRET));
+    let assistant_call = transcript
+        .iter()
+        .find(|message| message.role == MessageRole::Assistant)
+        .and_then(|message| message.tool_calls.first())
+        .unwrap();
+    assert_eq!(assistant_call.arguments_json, "{}");
+}
+
+#[tokio::test]
+async fn direct_runner_hides_and_rejects_tools_without_direct_permission() {
+    let mut hidden = TestTool::read("read", json!({"type":"object"}));
+    hidden.definition.allowed_callers = [ToolCaller::Programmatic].into();
+    let hidden = Arc::new(hidden);
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("hidden", "read", "{}")),
+        final_response("done"),
+    ]));
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry(hidden.clone()))
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(provider.requests()[0].tools.is_empty());
+    assert_eq!(hidden.calls.load(Ordering::SeqCst), 0);
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.message.contains("tool unavailable")));
+    let feedback: ToolResult = serde_json::from_str(
+        &provider.requests()[1]
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    assert!(!feedback.ok);
+}
+
+#[tokio::test]
+async fn tool_output_schema_accepts_valid_success() {
+    let mut tool = TestTool::read("read", json!({"type":"object"}));
+    tool.definition.output_schema = Some(json!({
+        "type":"object",
+        "required":["value"],
+        "properties":{"value":{"type":"string"}},
+        "additionalProperties":false
+    }));
+    let tool = Arc::new(tool);
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("valid", "read", "{}")),
+        final_response("done"),
+    ]));
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry(tool))
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let feedback: ToolResult = serde_json::from_str(
+        &provider.requests()[1]
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    assert!(feedback.ok);
+    assert_eq!(feedback.output, json!({"value":"ok"}));
+}
+
+#[tokio::test]
+async fn invalid_success_output_fails_closed_without_entering_transcript() {
+    let mut tool = TestTool::read("read", json!({"type":"object"}))
+        .returning(ToolResult::success(json!({"secret":"must-not-leak"})));
+    tool.definition.output_schema = Some(json!({
+        "type":"object",
+        "required":["value"],
+        "properties":{"value":{"type":"string"}},
+        "additionalProperties":false
+    }));
+    let tool = Arc::new(tool);
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("invalid", "read", "{}")),
+        final_response("recovered"),
+    ]));
+    let events = Arc::new(InMemoryEventSink::default());
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry(tool))
+        .event_sink(events.clone())
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(result.errors.iter().any(|error| {
+        error.code == "tool_error" && error.message.contains("output failed validation")
+    }));
+    assert!(result
+        .errors
+        .iter()
+        .all(|error| !error.message.contains("must-not-leak")));
+    let requests = provider.requests();
+    let feedback_message = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::Tool)
+        .unwrap();
+    assert!(!feedback_message.content.contains("must-not-leak"));
+    let feedback: ToolResult = serde_json::from_str(&feedback_message.content).unwrap();
+    assert!(!feedback.ok);
+    assert!(events.events().iter().any(|record| matches!(
+        &record.event,
+        RunEvent::ToolCompleted { call_id, ok, .. } if call_id == "invalid" && !ok
+    )));
+}
+
+#[tokio::test]
+async fn declared_failure_bypasses_success_output_schema() {
+    let mut tool = TestTool::read("read", json!({"type":"object"}))
+        .returning(ToolResult::failure("declared failure"));
+    tool.definition.output_schema = Some(json!({"type":"string"}));
+    let provider = Arc::new(MockModelProvider::scripted([
+        tool_response(call("failure", "read", "{}")),
+        final_response("done"),
+    ]));
+
+    let result = AgentRunner::builder(provider.clone())
+        .tools(registry(Arc::new(tool)))
+        .build()
+        .run(request())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.message == "tool returned a failure result"));
+    let feedback: ToolResult = serde_json::from_str(
+        &provider.requests()[1]
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    assert!(!feedback.ok);
+    assert_eq!(feedback.error.as_deref(), Some("declared failure"));
 }
 
 #[tokio::test]

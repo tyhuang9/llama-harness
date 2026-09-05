@@ -39,16 +39,34 @@ pub use async_trait::async_trait;
 pub use llama_harness_core::{
     load_agent_manifest, load_agent_manifest_path, AgentDefinition, AgentLimits, AgentManifest,
     AgentManifestError, AgentRunner, AgentRunnerBuilder, AllowAllPolicy, ApprovalHandler,
-    ApprovalRecord, DenyApproval, EventRecord, EventSink, ExecutionPlan, GenerationOptions,
-    HarnessError, InMemoryEventSink, JsonMap, Message, MessageRole, ModelCapabilities, ModelInfo,
-    ModelProvider, ModelRequest, ModelResponse, PlanConcurrency, PlanNode, PolicyDecision,
-    PolicyEngine, ProviderHealth, ResultBinding, ResultRef, RunError, RunEvent, RunOverrides,
-    RunRequest, RunResult, RunStatus, RunStrategy, SafeDefaultPolicy, Tool, ToolCall,
-    ToolCallContext, ToolDefinition, ToolRegistry, ToolResult, ToolRisk, Usage,
-    AGENT_MANIFEST_VERSION, MAX_EXECUTION_PLAN_BINDINGS, MAX_EXECUTION_PLAN_BYTES,
+    ApprovalRecord, CancellationSafety, CatalogFingerprint, DenyApproval, EventRecord, EventSink,
+    ExecutionLocation, ExecutionPlan, GenerationOptions, HarnessError, InMemoryEventSink,
+    IssueSafety, JsonMap, Message, MessageRole, ModelCapabilities, ModelEventStream, ModelInfo,
+    ModelProvider, ModelRequest, ModelResponse, ModelStreamController, ModelStreamEvent,
+    ModelStreamFailureKind, NetworkEgress, PartialToolCall, PlanConcurrency, PlanNode,
+    PolicyDecision, PolicyEngine, PreparedToolCatalog, ProgrammaticConformance,
+    ProviderCapabilityLimits, ProviderHealth, ResultBinding, ResultRef, RunError, RunEvent,
+    RunOverrides, RunRequest, RunResult, RunStatus, RunStrategy, SafeDefaultPolicy,
+    SpeculationConfig, SpeculationMetrics, SpeculationMode, SpeculationPolicy,
+    SpeculationReadiness, StructuredOutputRequest, Tool, ToolCall, ToolCallAssembler,
+    ToolCallAssemblyLimits, ToolCallContext, ToolCallDelta, ToolCaller, ToolDefinition,
+    ToolDiscoveryLimits, ToolDiscoveryMetadata, ToolDiscoveryOutcome, ToolDiscoverySelection,
+    ToolExposure, ToolRegistry, ToolResult, ToolRisk, Usage, ValidatedModelStreamEvent,
+    AGENT_MANIFEST_VERSION, CATALOG_FINGERPRINT_VERSION, HARD_MAX_SPECULATION_DURATION_MS,
+    HARD_MAX_SPECULATION_STREAM_EVENTS, MAX_EXECUTION_PLAN_BINDINGS, MAX_EXECUTION_PLAN_BYTES,
     MAX_EXECUTION_PLAN_EDGES, MAX_EXECUTION_PLAN_NODES, MAX_PLAN_ARGUMENT_BYTES,
     MAX_PLAN_ID_LENGTH, MAX_PLAN_JSON_DEPTH, MAX_PLAN_POINTER_LENGTH,
+    MAX_STRUCTURED_OUTPUT_NAME_BYTES, MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES,
+    MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH, MIN_SPECULATION_SHADOW_OBSERVATIONS,
 };
+
+#[cfg(feature = "programmatic")]
+/// Deterministic programmatic sandbox contracts and explicit host configuration.
+pub mod programmatic {
+    pub use llama_harness_core::{
+        programmatic_sandbox::*, ProgrammaticHostConfig, ProgrammaticWorkloadClass,
+    };
+}
 pub use serde_json;
 pub use serde_json::Value as JsonValue;
 pub use tokio_util::sync::CancellationToken;
@@ -71,6 +89,12 @@ pub mod evals {
     pub use llama_harness_evals::*;
 }
 
+#[cfg(feature = "mcp")]
+/// Transport-neutral Model Context Protocol tool adapter.
+pub mod mcp {
+    pub use llama_harness_mcp::*;
+}
+
 #[cfg(feature = "tauri")]
 /// Embedded Tauri event, approval, cancellation, and path helpers.
 pub mod tauri {
@@ -89,5 +113,11 @@ mod tests {
         let _: Result<AgentManifest, AgentManifestError> = load_agent_manifest_path("missing.yaml");
         let context = ToolCallContext::new("run", "trace", "call", "tool");
         assert_eq!(context.run_id, "run");
+        let prepared = PreparedToolCatalog::from_definitions(Vec::new()).unwrap();
+        assert!(prepared.definitions().is_empty());
+        let outcome: ToolDiscoveryOutcome = serde_json::from_str("\"selected\"").unwrap();
+        let selection: ToolDiscoverySelection = serde_json::from_str("\"no_match\"").unwrap();
+        assert_eq!(outcome, ToolDiscoveryOutcome::Selected);
+        assert_eq!(selection, ToolDiscoverySelection::NoMatch);
     }
 }

@@ -18,6 +18,12 @@ protocol channel. Every tool request still goes through the Rust runner's tool
 registry, JSON Schema validation, agent allowlist, policy decision, approval,
 deadline, and cancellation checks before the host callback is requested.
 
+For the 0.2.0 release, each `client_hello` reports the installed SDK's package
+identity and `runtime_hello` reports the child executable's Cargo identity. The
+release gate starts the built child and compares both against npm/Python and
+Cargo metadata before packaging. That check establishes artifact provenance; it
+does not let an SDK bypass ordinary protocol-version negotiation.
+
 SDK runtime lookup accepts an explicit path, `LLAMA_HARNESS_RUNTIME_PATH`, or a
 matching package-owned platform artifact. It never searches arbitrary `PATH`
 locations or downloads code. A sidecar parent owns its child lifetime: `close`

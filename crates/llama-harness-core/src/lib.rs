@@ -2,8 +2,11 @@
 
 #![deny(missing_docs)]
 
+mod adaptive;
 mod agent;
 mod agent_manifest;
+mod broker;
+mod discovery;
 mod error;
 mod event;
 mod limits;
@@ -14,7 +17,11 @@ mod model;
 /// Declarative execution plan contracts and validation.
 pub mod plan;
 mod policy;
+#[cfg(feature = "programmatic")]
+mod programmatic;
 mod runner;
+mod speculation;
+mod streaming;
 mod tool;
 
 pub use agent::{
@@ -24,12 +31,28 @@ pub use agent_manifest::{
     load_agent_manifest, load_agent_manifest_path, AgentManifest, AgentManifestError,
     AGENT_MANIFEST_VERSION,
 };
-pub use error::{HarnessError, RunError};
-pub use event::{EventRecord, EventSink, InMemoryEventSink, RunEvent};
-pub use limits::{AgentLimits, GenerationOptions};
+pub use discovery::{
+    CatalogFingerprint, ToolDiscoveryLimits, ToolDiscoveryMetadata, ToolExposure,
+    CATALOG_FINGERPRINT_VERSION,
+};
+pub use error::{HarnessError, ModelStreamFailureKind, RunError};
+pub use event::{
+    EventRecord, EventSink, InMemoryEventSink, PlanLifecycleOutcome, PlanNodeOutcome, PlanPhase,
+    ProgramLifecycleOutcome, RunEvent, StrategyFallbackReason, StrategySelectionReason,
+    ToolDiscoveryOutcome, ToolDiscoverySelection,
+};
+pub use limits::{
+    AgentLimits, GenerationOptions, HARD_MAX_PROGRAMMATIC_FANOUT_CONCURRENCY,
+    HARD_MAX_PROGRAMMATIC_PROGRAM_BYTES, MAX_STRUCTURED_OUTPUT_NAME_BYTES,
+    MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES, MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH,
+};
+#[cfg(feature = "programmatic")]
+pub use llama_harness_programmatic_sandbox as programmatic_sandbox;
 pub use message::{Message, MessageRole};
 pub use model::{
-    ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, ProviderHealth, Usage,
+    ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse, PreparedToolCatalog,
+    ProgrammaticConformance, ProviderCapabilityLimits, ProviderHealth, StructuredOutputRequest,
+    Usage,
 };
 pub use plan::{
     ExecutionPlan, PlanConcurrency, PlanNode, ResultBinding, ResultRef,
@@ -41,7 +64,20 @@ pub use policy::{
     AllowAllPolicy, ApprovalHandler, ApprovalRecord, DenyApproval, PolicyDecision, PolicyEngine,
     SafeDefaultPolicy,
 };
+#[cfg(feature = "programmatic")]
+pub use programmatic::{ProgrammaticHostConfig, ProgrammaticWorkloadClass};
 pub use runner::{AgentRunner, AgentRunnerBuilder};
+pub use speculation::{
+    SpeculationConfig, SpeculationLatencyHistogram, SpeculationMetrics, SpeculationMode,
+    SpeculationReadiness, HARD_MAX_SPECULATION_DURATION_MS, HARD_MAX_SPECULATION_STREAM_EVENTS,
+    MIN_SPECULATION_SHADOW_OBSERVATIONS,
+};
+pub use streaming::{
+    ModelEventStream, ModelStreamController, ModelStreamEvent, PartialToolCall, ToolCallAssembler,
+    ToolCallAssemblyLimits, ToolCallDelta, ValidatedModelStreamEvent,
+};
 pub use tool::{
-    Tool, ToolCall, ToolCallContext, ToolDefinition, ToolRegistry, ToolResult, ToolRisk,
+    CancellationSafety, ExecutionLocation, GroupToolRegistration, IssueSafety, NetworkEgress,
+    SpeculationPolicy, Tool, ToolCall, ToolCallContext, ToolCaller, ToolDefinition,
+    ToolRegistrationGroup, ToolRegistry, ToolResult, ToolRisk,
 };

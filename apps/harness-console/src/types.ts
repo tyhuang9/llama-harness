@@ -26,6 +26,7 @@ export type ConsolePreferences = {
 };
 
 export type ConsoleRun = {
+  executionId: string;
   runId: string;
   traceId: string;
   startedAtMs: number;
@@ -108,7 +109,7 @@ export type ConsoleApi = {
   connectWorkspace(workspace: ProjectWorkspace): Promise<ConsolePreferences>;
   savePreferences(preferences: ConsolePreferences): Promise<ConsolePreferences>;
   listRuns(query: { traceId?: string; status?: string }): Promise<ConsoleRun[]>;
-  listRunEvents(runId: string): Promise<ConsoleEvent[]>;
+  listRunEvents(executionId: string): Promise<ConsoleEvent[]>;
   listModels(): Promise<ConsoleModels>;
   listAgents(): Promise<AgentDefinition[]>;
   listEvaluationArtifacts(): Promise<EvaluationArtifacts>;

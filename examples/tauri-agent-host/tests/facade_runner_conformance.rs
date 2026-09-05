@@ -71,15 +71,10 @@ impl PolicyEngine for ApprovalForWrites {
 
 fn tool(id: &str, read_only: bool, state: Arc<Mutex<Vec<String>>>) -> StateTool {
     StateTool {
-        definition: ToolDefinition {
-            id: id.into(),
-            name: id.into(),
-            description: id.into(),
-            arguments_schema: serde_json::json!({"type":"object"}),
-            risk: ToolRisk::Medium,
-            idempotent: read_only,
-            read_only,
-        },
+        definition: ToolDefinition::new(id, id, id, serde_json::json!({"type":"object"}))
+            .with_risk(ToolRisk::Medium)
+            .with_idempotent(read_only)
+            .with_read_only(read_only),
         state,
     }
 }

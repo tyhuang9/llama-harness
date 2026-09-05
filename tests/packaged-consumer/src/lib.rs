@@ -181,3 +181,6 @@ pub use llama_harness::evals;
 
 #[cfg(feature = "tauri")]
 pub use llama_harness::tauri;
+
+#[cfg(feature = "programmatic")]
+pub use llama_harness::programmatic;

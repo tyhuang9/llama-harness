@@ -6,11 +6,13 @@ members = [
   "crates/llama-harness-scripted-runtime",
   "crates/llama-harness-tauri",
   "crates/llama-harness-core",
+  "crates/llama-harness-programmatic-sandbox",
   "crates/llama-harness-ollama",
   "crates/llama-harness-observability",
   "crates/llama-harness-evals",
   "crates/llama-harness-promptfoo",
   "crates/llama-harness-cli",
+  "crates/llama-harness-mcp",
   "examples/local-task-agent",
   "examples/tauri-agent-host",
   "xtask",
@@ -19,7 +21,7 @@ exclude = ["apps/harness-console/src-tauri"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.88"

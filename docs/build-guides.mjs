@@ -13,6 +13,7 @@ export const MAX_INLINE_DEPTH = 16;
 
 export const GUIDES = {
   "architecture.md": "architecture.html",
+  "adaptive-tool-calling.md": "adaptive-tool-calling.html",
   "developer-console.md": "developer-console.html",
   "distribution.md": "distribution.html",
   "embedding.md": "embedding.html",
@@ -28,6 +29,7 @@ export const GUIDES = {
   "releasing.md": "releasing.html",
   "sdk-architecture.md": "sdk-architecture.html",
   "security.md": "security.html",
+  "speculative-tool-calling.md": "speculative-tool-calling.html",
   "tauri.md": "tauri.html",
   "tools-and-policies.md": "tools-and-policies.html",
   "typescript-sdk.md": "typescript-sdk.html",

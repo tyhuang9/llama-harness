@@ -1,7 +1,101 @@
-use crate::{GenerationOptions, HarnessError, JsonMap, Message, ToolDefinition};
+use crate::{
+    limits::{
+        compile_trusted_schema, ensure_json_depth, serialized_len,
+        MAX_STRUCTURED_OUTPUT_NAME_BYTES, MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES,
+        MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH,
+    },
+    GenerationOptions, HarnessError, JsonMap, Message, ModelEventStream, ToolDefinition,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug)]
+/// Immutable tool definitions and their exact provider-consumable JSON.
+pub struct PreparedToolCatalog {
+    definitions: Arc<[ToolDefinition]>,
+    serialized_definitions: Arc<[u8]>,
+    provider_tools: Box<RawValue>,
+}
+
+impl PartialEq for PreparedToolCatalog {
+    fn eq(&self, other: &Self) -> bool {
+        self.definitions == other.definitions
+            && self.serialized_definitions == other.serialized_definitions
+            && self.provider_tools.get() == other.provider_tools.get()
+    }
+}
+
+impl PreparedToolCatalog {
+    /// Prepares an immutable catalog for hosts constructing model requests directly.
+    pub fn from_definitions(definitions: Vec<ToolDefinition>) -> Result<Self, HarnessError> {
+        #[derive(Serialize)]
+        struct ProviderTool<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            function: ProviderFunction<'a>,
+        }
+        #[derive(Serialize)]
+        struct ProviderFunction<'a> {
+            name: &'a str,
+            description: &'a str,
+            parameters: &'a serde_json::Value,
+        }
+        let serialized_definitions = serde_json::to_vec(&definitions)
+            .map(Arc::<[u8]>::from)
+            .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?;
+        let provider_tools = definitions
+            .iter()
+            .map(|definition| ProviderTool {
+                kind: "function",
+                function: ProviderFunction {
+                    name: &definition.id,
+                    description: &definition.description,
+                    parameters: &definition.arguments_schema,
+                },
+            })
+            .collect::<Vec<_>>();
+        let provider_tools = RawValue::from_string(
+            serde_json::to_string(&provider_tools)
+                .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?,
+        )
+        .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?;
+        Ok(Self::new(
+            Arc::from(definitions),
+            serialized_definitions,
+            provider_tools,
+        ))
+    }
+
+    pub(crate) fn new(
+        definitions: Arc<[ToolDefinition]>,
+        serialized_definitions: Arc<[u8]>,
+        provider_tools: Box<RawValue>,
+    ) -> Self {
+        Self {
+            definitions,
+            serialized_definitions,
+            provider_tools,
+        }
+    }
+
+    /// Returns the selected definitions in provider order.
+    pub fn definitions(&self) -> &[ToolDefinition] {
+        &self.definitions
+    }
+
+    /// Returns the exact serialized `ToolDefinition` array used for discovery budgets.
+    pub fn serialized_definitions(&self) -> &[u8] {
+        &self.serialized_definitions
+    }
+
+    /// Returns exact JSON for a standard function-tool array without reserializing schemas.
+    pub fn provider_tools_json(&self) -> &RawValue {
+        &self.provider_tools
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
@@ -13,8 +107,14 @@ pub struct ModelRequest {
     pub messages: Vec<Message>,
     /// Tools available to the model for this request.
     pub tools: Vec<ToolDefinition>,
+    #[serde(skip)]
+    /// Immutable prepared form of `tools`, when supplied by the core runner.
+    pub prepared_tools: Option<Arc<PreparedToolCatalog>>,
     /// Generation settings for this request.
     pub generation: GenerationOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional provider-neutral request for schema-constrained output.
+    pub structured_output: Option<StructuredOutputRequest>,
     #[serde(default)]
     /// Provider-specific request metadata.
     pub metadata: JsonMap,
@@ -30,9 +130,102 @@ impl ModelRequest {
             model: model.into(),
             messages: Vec::new(),
             tools: Vec::new(),
+            prepared_tools: None,
             generation: GenerationOptions::default(),
+            structured_output: None,
             metadata: JsonMap::new(),
             cancellation: CancellationToken::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+/// Provider-neutral schema contract for one structured model response.
+///
+/// Providers must treat `schema` as inert JSON Schema and must not resolve
+/// non-local references. Core runners validate the same response again before
+/// any generated plan or program can execute.
+pub struct StructuredOutputRequest {
+    /// Stable provider-facing schema name.
+    pub name: String,
+    /// JSON Schema constraining the complete response value.
+    pub schema: serde_json::Value,
+    /// Whether the provider must reject output outside `schema`.
+    pub strict: bool,
+}
+
+impl StructuredOutputRequest {
+    /// Creates and validates a bounded provider-neutral structured-output request.
+    pub fn new(
+        name: impl Into<String>,
+        schema: serde_json::Value,
+        strict: bool,
+    ) -> Result<Self, HarnessError> {
+        let request = Self {
+            name: name.into(),
+            schema,
+            strict,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Validates name, size, depth, references, and JSON Schema syntax.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        Self::validate_shape(&self.name, &self.schema)?;
+        compile_trusted_schema(&self.schema, |error| {
+            HarnessError::InvalidRequest(format!("invalid structured-output schema: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_shape(
+        name: &str,
+        schema: &serde_json::Value,
+    ) -> Result<(), HarnessError> {
+        if name.is_empty() {
+            return Err(HarnessError::InvalidRequest(
+                "structured-output name must not be empty".into(),
+            ));
+        }
+        if name.len() > MAX_STRUCTURED_OUTPUT_NAME_BYTES {
+            return Err(HarnessError::InvalidRequest(format!(
+                "structured-output name exceeds {MAX_STRUCTURED_OUTPUT_NAME_BYTES} bytes"
+            )));
+        }
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(HarnessError::InvalidRequest(
+                "structured-output name must contain only ASCII letters, digits, '_' or '-'".into(),
+            ));
+        }
+        if serialized_len(schema)? > MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES {
+            return Err(HarnessError::InvalidRequest(format!(
+                "structured-output schema exceeds {MAX_STRUCTURED_OUTPUT_SCHEMA_BYTES} bytes"
+            )));
+        }
+        ensure_json_depth(
+            "structured-output schema",
+            schema,
+            MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH,
+        )
+        .map_err(|error| HarnessError::InvalidRequest(error.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn from_prevalidated(
+        name: impl Into<String>,
+        schema: serde_json::Value,
+        strict: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+            strict,
         }
     }
 }
@@ -114,6 +307,27 @@ pub struct ModelCapabilities {
     pub supports_streaming: bool,
     /// Whether the model supports structured output.
     pub supports_structured_output: bool,
+    #[serde(default)]
+    /// Whether the provider can constrain tool arguments with strict schemas.
+    pub supports_strict_tool_schemas: bool,
+    #[serde(default)]
+    /// Whether tool-call arguments may arrive incrementally while streaming.
+    pub supports_streaming_tool_arguments: bool,
+    #[serde(default)]
+    /// Whether the provider can return multiple tool calls in one response.
+    pub supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    /// Whether the provider can generate provider-native structured plans.
+    pub supports_structured_plans: bool,
+    #[serde(default)]
+    /// Whether the provider can generate programmatic tool workflows.
+    pub supports_programmatic_calling: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Exact program contract the provider explicitly declares it can generate.
+    pub programmatic_conformance: Option<ProgrammaticConformance>,
+    #[serde(default)]
+    /// Provider-advertised resource limits for advanced calling features.
+    pub limits: ProviderCapabilityLimits,
 }
 
 impl ModelCapabilities {
@@ -127,7 +341,147 @@ impl ModelCapabilities {
             supports_tools,
             supports_streaming,
             supports_structured_output,
+            supports_strict_tool_schemas: false,
+            supports_streaming_tool_arguments: false,
+            supports_parallel_tool_calls: false,
+            supports_structured_plans: false,
+            supports_programmatic_calling: false,
+            programmatic_conformance: None,
+            limits: ProviderCapabilityLimits::default(),
         }
+    }
+
+    /// Declares support for strict tool schemas.
+    pub fn with_strict_tool_schemas(mut self, supported: bool) -> Self {
+        self.supports_strict_tool_schemas = supported;
+        self
+    }
+
+    /// Declares support for incrementally streamed tool arguments.
+    pub fn with_streaming_tool_arguments(mut self, supported: bool) -> Self {
+        self.supports_streaming_tool_arguments = supported;
+        self
+    }
+
+    /// Declares support for multiple tool calls in one model response.
+    pub fn with_parallel_tool_calls(mut self, supported: bool) -> Self {
+        self.supports_parallel_tool_calls = supported;
+        self
+    }
+
+    /// Declares support for provider-native structured plans.
+    pub fn with_structured_plans(mut self, supported: bool) -> Self {
+        self.supports_structured_plans = supported;
+        self
+    }
+
+    /// Declares support for programmatic tool workflows.
+    pub fn with_programmatic_calling(mut self, supported: bool) -> Self {
+        self.supports_programmatic_calling = supported;
+        if !supported {
+            self.programmatic_conformance = None;
+        }
+        self
+    }
+
+    /// Declares the exact program contract generated by this provider.
+    pub fn with_programmatic_conformance(mut self, conformance: ProgrammaticConformance) -> Self {
+        self.supports_programmatic_calling = true;
+        self.programmatic_conformance = Some(conformance);
+        self
+    }
+
+    /// Sets resource limits advertised by the provider.
+    pub fn with_limits(mut self, limits: ProviderCapabilityLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+}
+
+/// Explicit provider conformance for programmatic workflow generation.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProgrammaticConformance {
+    /// Strict version-one JSON AST accepted by the deterministic sandbox crate.
+    StrictJsonAstV1,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+#[non_exhaustive]
+/// Optional provider limits for advanced tool-calling capabilities.
+pub struct ProviderCapabilityLimits {
+    /// Maximum number of tools accepted in one request.
+    pub max_tools: Option<u32>,
+    /// Maximum total serialized tool-schema bytes accepted in one request.
+    pub max_tool_schema_bytes: Option<u64>,
+    /// Maximum parallel tool calls returned in one response.
+    pub max_parallel_tool_calls: Option<u32>,
+    /// Maximum streamed tool-argument bytes returned in one call.
+    pub max_streamed_argument_bytes: Option<u64>,
+    /// Maximum streamed tool calls returned in one response.
+    pub max_streamed_tool_calls: Option<u32>,
+    /// Maximum serialized structured-plan bytes.
+    pub max_plan_bytes: Option<u64>,
+    /// Maximum nodes in a structured plan.
+    pub max_plan_nodes: Option<u32>,
+    /// Maximum generated program bytes.
+    pub max_program_bytes: Option<u64>,
+}
+
+impl ProviderCapabilityLimits {
+    /// Creates an empty provider-limit declaration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the maximum number of tools accepted in one request.
+    pub fn with_max_tools(mut self, max_tools: u32) -> Self {
+        self.max_tools = Some(max_tools);
+        self
+    }
+
+    /// Sets the maximum total serialized tool-schema bytes in one request.
+    pub fn with_max_tool_schema_bytes(mut self, max_tool_schema_bytes: u64) -> Self {
+        self.max_tool_schema_bytes = Some(max_tool_schema_bytes);
+        self
+    }
+
+    /// Sets the maximum parallel tool calls returned in one response.
+    pub fn with_max_parallel_tool_calls(mut self, max_parallel_tool_calls: u32) -> Self {
+        self.max_parallel_tool_calls = Some(max_parallel_tool_calls);
+        self
+    }
+
+    /// Sets the maximum streamed argument bytes returned in one tool call.
+    pub fn with_max_streamed_argument_bytes(mut self, max_streamed_argument_bytes: u64) -> Self {
+        self.max_streamed_argument_bytes = Some(max_streamed_argument_bytes);
+        self
+    }
+
+    /// Sets the maximum streamed tool calls returned in one response.
+    pub fn with_max_streamed_tool_calls(mut self, max_streamed_tool_calls: u32) -> Self {
+        self.max_streamed_tool_calls = Some(max_streamed_tool_calls);
+        self
+    }
+
+    /// Sets the maximum serialized structured-plan bytes.
+    pub fn with_max_plan_bytes(mut self, max_plan_bytes: u64) -> Self {
+        self.max_plan_bytes = Some(max_plan_bytes);
+        self
+    }
+
+    /// Sets the maximum nodes in a structured plan.
+    pub fn with_max_plan_nodes(mut self, max_plan_nodes: u32) -> Self {
+        self.max_plan_nodes = Some(max_plan_nodes);
+        self
+    }
+
+    /// Sets the maximum generated program bytes.
+    pub fn with_max_program_bytes(mut self, max_program_bytes: u64) -> Self {
+        self.max_program_bytes = Some(max_program_bytes);
+        self
     }
 }
 
@@ -204,5 +558,16 @@ pub trait ModelProvider: Send + Sync {
     /// Lists models available from the provider.
     async fn list_models(&self) -> Result<Vec<ModelInfo>, HarnessError>;
     /// Completes one model request.
+    ///
+    /// Providers that cannot enforce a supplied [`StructuredOutputRequest`]
+    /// must return [`HarnessError::UnsupportedCapability`] instead of silently
+    /// dropping the contract.
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, HarnessError>;
+    /// Streams one model request when the provider implements streaming.
+    async fn stream(&self, _: ModelRequest) -> Result<ModelEventStream, HarnessError> {
+        Err(HarnessError::UnsupportedCapability(format!(
+            "provider {} does not support streaming",
+            self.id()
+        )))
+    }
 }

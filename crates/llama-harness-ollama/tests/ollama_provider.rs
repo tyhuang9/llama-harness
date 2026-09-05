@@ -1,11 +1,12 @@
 use futures_util::StreamExt;
 use llama_harness_core::{
-    GenerationOptions, HarnessError, Message, MessageRole, ModelProvider, ModelRequest, ToolCall,
-    ToolDefinition, ToolRisk,
+    GenerationOptions, HarnessError, Message, MessageRole, ModelProvider, ModelRequest,
+    ModelStreamEvent, ModelStreamFailureKind, PreparedToolCatalog, StructuredOutputRequest,
+    ToolCall, ToolDefinition, ToolRisk,
 };
 use llama_harness_ollama::{OllamaProvider, OllamaStreamEvent};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -36,15 +37,15 @@ fn request(cancellation: CancellationToken) -> ModelRequest {
 }
 
 fn tool() -> ToolDefinition {
-    ToolDefinition {
-        id: "list_tasks".into(),
-        name: "List tasks".into(),
-        description: "List the current tasks".into(),
-        arguments_schema: json!({"type":"object","additionalProperties":false}),
-        risk: ToolRisk::Low,
-        idempotent: true,
-        read_only: true,
-    }
+    ToolDefinition::new(
+        "list_tasks",
+        "List tasks",
+        "List the current tasks",
+        json!({"type":"object","additionalProperties":false}),
+    )
+    .with_risk(ToolRisk::Low)
+    .with_idempotent(true)
+    .with_read_only(true)
 }
 
 fn provider(base_url: &str) -> OllamaProvider {
@@ -52,6 +53,44 @@ fn provider(base_url: &str) -> OllamaProvider {
         .base_url(base_url)
         .build()
         .unwrap()
+}
+
+#[tokio::test]
+async fn unsupported_structured_output_is_never_silently_dropped() {
+    let provider = OllamaProvider::new().unwrap();
+    assert!(!provider.capabilities().supports_structured_output);
+    let mut model_request = request(CancellationToken::new());
+    model_request.structured_output =
+        Some(StructuredOutputRequest::new("answer", json!({"type":"string"}), true).unwrap());
+
+    assert!(matches!(
+        provider.complete(model_request.clone()).await,
+        Err(HarnessError::UnsupportedCapability(_))
+    ));
+    assert!(matches!(
+        provider.stream_chat(model_request).await,
+        Err(HarnessError::UnsupportedCapability(_))
+    ));
+}
+
+#[tokio::test]
+async fn empty_prepared_catalog_completes_with_legacy_no_tool_body() {
+    let (base_url, task) = server(vec![json_response(
+        200,
+        json!({"model":"qwen3:8b","done":true,"message":{"content":"done"}}),
+    )])
+    .await;
+    let mut model_request = request(CancellationToken::new());
+    model_request.prepared_tools = Some(Arc::new(
+        PreparedToolCatalog::from_definitions(Vec::new()).unwrap(),
+    ));
+
+    let response = provider(&base_url).complete(model_request).await.unwrap();
+
+    assert_eq!(response.final_output.as_deref(), Some("done"));
+    let requests = task.await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(body.get("tools").is_none());
 }
 
 fn json_response(status: u16, body: Value) -> Vec<u8> {
@@ -138,6 +177,7 @@ async fn health_and_model_inventory_use_direct_ollama_endpoints() {
         ["qwen3:8b", "gemma3:4b"]
     );
     assert!(models[0].capabilities.supports_tools);
+    assert!(models[0].capabilities.supports_parallel_tool_calls);
     let requests = task.await.unwrap();
     assert_eq!(
         requests
@@ -329,6 +369,144 @@ async fn streaming_handles_fragmented_ndjson_tool_calls_and_completion() {
 }
 
 #[tokio::test]
+async fn generic_provider_stream_maps_atomic_ollama_tool_calls_to_final_deltas() {
+    let body = concat!(
+        "{\"model\":\"qwen3:8b\",\"message\":{\"content\":\"hello\",\"tool_calls\":[{\"function\":{\"name\":\"list_tasks\",\"arguments\":{}}}]},\"done\":false}\n",
+        "{\"model\":\"qwen3:8b\",\"done\":true,\"prompt_eval_count\":3,\"eval_count\":2}\n"
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n{body}"
+    )
+    .into_bytes();
+    let (base_url, task) = server(vec![response]).await;
+    let provider = provider(&base_url);
+
+    assert!(provider.capabilities().supports_parallel_tool_calls);
+    assert!(!provider.capabilities().supports_streaming_tool_arguments);
+    let mut stream_request = request(CancellationToken::new());
+    stream_request.tools = vec![tool()];
+    let events = ModelProvider::stream(&provider, stream_request)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert!(matches!(
+        &events[0],
+        Ok(ModelStreamEvent::TextDelta { content }) if content == "hello"
+    ));
+    assert!(matches!(
+        &events[1],
+        Ok(ModelStreamEvent::ToolCallDelta(delta))
+            if delta.index == 0
+                && delta.tool_id.as_deref() == Some("list_tasks")
+                && delta.arguments_fragment == "{}"
+                && delta.is_final
+    ));
+    assert!(matches!(
+        &events[2],
+        Ok(ModelStreamEvent::Completed { model, usage })
+            if model == "qwen3:8b" && usage.input_tokens == 3 && usage.output_tokens == 2
+    ));
+    let requests = task.await.unwrap();
+    assert_eq!(requests[0].path, "/api/chat");
+}
+
+#[tokio::test]
+async fn generic_provider_stream_preserves_parallel_atomic_tool_calls_in_order() {
+    let body = concat!(
+        "{\"model\":\"qwen3:8b\",\"message\":{\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"list_tasks\",\"arguments\":{}}},{\"function\":{\"name\":\"get_task\",\"arguments\":{\"id\":\"task-1\"}}}]},\"done\":false}\n",
+        "{\"model\":\"qwen3:8b\",\"done\":true,\"prompt_eval_count\":5,\"eval_count\":3}\n"
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n{body}"
+    )
+    .into_bytes();
+    let (base_url, task) = server(vec![response]).await;
+    let provider = provider(&base_url);
+    let mut stream_request = request(CancellationToken::new());
+    stream_request.tools = vec![
+        tool(),
+        ToolDefinition::new(
+            "get_task",
+            "Get task",
+            "Get one task",
+            json!({
+                "type":"object",
+                "required":["id"],
+                "properties":{"id":{"type":"string"}},
+                "additionalProperties":false
+            }),
+        ),
+    ];
+
+    assert!(provider.capabilities().supports_parallel_tool_calls);
+    let events = ModelProvider::stream(&provider, stream_request)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(events.len(), 3);
+    assert!(events.iter().all(Result::is_ok));
+    let deltas = events
+        .iter()
+        .filter_map(|event| match event.as_ref().unwrap() {
+            ModelStreamEvent::ToolCallDelta(delta) => Some(delta),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deltas.len(), 2);
+    assert_eq!(deltas[0].index, 0);
+    assert_eq!(deltas[0].tool_id.as_deref(), Some("list_tasks"));
+    assert_eq!(deltas[0].arguments_fragment, "{}");
+    assert_eq!(deltas[1].index, 1);
+    assert_eq!(deltas[1].tool_id.as_deref(), Some("get_task"));
+    assert_eq!(deltas[1].arguments_fragment, r#"{"id":"task-1"}"#);
+    assert!(deltas.iter().all(|delta| delta.is_final));
+    assert!(deltas.iter().all(|delta| delta
+        .call_id
+        .as_deref()
+        .is_some_and(|call_id| !call_id.is_empty())));
+    assert_ne!(deltas[0].call_id, deltas[1].call_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Ok(ModelStreamEvent::Completed { .. })))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        &events[2],
+        Ok(ModelStreamEvent::Completed { model, usage })
+            if model == "qwen3:8b" && usage.input_tokens == 5 && usage.output_tokens == 3
+    ));
+    let requests = task.await.unwrap();
+    assert_eq!(requests[0].path, "/api/chat");
+}
+
+#[tokio::test]
+async fn generic_provider_stream_redacts_adapter_errors() {
+    let (base_url, task) = server(vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot-json\n".to_vec(),
+    ])
+    .await;
+    let events = ModelProvider::stream(&provider(&base_url), request(CancellationToken::new()))
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert!(matches!(
+        events.as_slice(),
+        [Err(HarnessError::ModelStream {
+            kind: ModelStreamFailureKind::UpstreamProviderFailure
+        })]
+    ));
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn streaming_rejects_unbounded_or_incomplete_ndjson() {
     let (base_url, task) = server(vec![json_response(
         200,
@@ -446,6 +624,35 @@ async fn cancellation_timeout_and_loopback_controls_fail_safely() {
         result = &mut pending => panic!("request unexpectedly completed: {result:?}"),
     }
     assert!(matches!(pending.await, Err(HarnessError::Cancelled)));
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_stream_cancellation_is_terminal_while_body_is_pending() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        let _ = socket
+            .write_all(b"{\"model\":\"qwen3:8b\",\"done\":true}\n")
+            .await;
+    });
+    let cancellation = CancellationToken::new();
+    let stream = ModelProvider::stream(&provider(&base_url), request(cancellation.clone()))
+        .await
+        .unwrap();
+    cancellation.cancel();
+    let events = stream.collect::<Vec<_>>().await;
+
+    assert!(matches!(events.as_slice(), [Err(HarnessError::Cancelled)]));
     task.abort();
 }
 

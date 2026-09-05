@@ -5,8 +5,9 @@ use crate::{
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use llama_harness_core::{
-    HarnessError, ModelCapabilities, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
-    ProviderHealth,
+    HarnessError, ModelCapabilities, ModelEventStream, ModelInfo, ModelProvider, ModelRequest,
+    ModelResponse, ModelStreamController, ModelStreamEvent, ProviderHealth, ToolCallAssembler,
+    ToolCallAssemblyLimits, ToolCallDelta,
 };
 use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 use serde::Deserialize;
@@ -148,8 +149,8 @@ impl OllamaProvider {
 
     /// Starts a typed NDJSON stream for a model request.
     ///
-    /// The embedded core keeps its provider contract non-streaming; applications that
-    /// need incremental display may consume this adapter alongside their event sink.
+    /// This provider-specific view remains available for compatibility. Generic hosts
+    /// can consume the same response through [`ModelProvider::stream`].
     pub async fn stream_chat(
         &self,
         request: ModelRequest,
@@ -157,10 +158,16 @@ impl OllamaProvider {
         if request.cancellation.is_cancelled() {
             return Err(HarnessError::Cancelled);
         }
+        if request.structured_output.is_some() {
+            return Err(HarnessError::UnsupportedCapability(
+                "Ollama provider does not implement the structured-output contract".into(),
+            ));
+        }
         let body = chat_request(
             request.model,
             &request.messages,
             &request.tools,
+            request.prepared_tools.as_deref(),
             &request.generation,
             self.keep_alive.as_deref(),
             true,
@@ -257,7 +264,7 @@ impl ModelProvider for OllamaProvider {
     }
 
     fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities::new(true, true, false)
+        ModelCapabilities::new(true, true, false).with_parallel_tool_calls(true)
     }
 
     async fn health(&self) -> Result<ProviderHealth, HarnessError> {
@@ -288,11 +295,17 @@ impl ModelProvider for OllamaProvider {
         if request.cancellation.is_cancelled() {
             return Err(HarnessError::Cancelled);
         }
+        if request.structured_output.is_some() {
+            return Err(HarnessError::UnsupportedCapability(
+                "Ollama provider does not implement the structured-output contract".into(),
+            ));
+        }
         let requested_model = request.model.clone();
         let body = chat_request(
             request.model,
             &request.messages,
             &request.tools,
+            request.prepared_tools.as_deref(),
             &request.generation,
             self.keep_alive.as_deref(),
             false,
@@ -324,6 +337,45 @@ impl ModelProvider for OllamaProvider {
                 .with_usage(usage(&response));
         model_response.final_output = final_output;
         Ok(model_response)
+    }
+
+    async fn stream(&self, request: ModelRequest) -> Result<ModelEventStream, HarnessError> {
+        let assembly_limits = ToolCallAssemblyLimits::for_provider(&self.capabilities().limits)?;
+        let assembler = ToolCallAssembler::new(request.tools.clone(), assembly_limits)?;
+        let mut controller = ModelStreamController::new(assembler);
+        let mut events = OllamaProvider::stream_chat(self, request).await?;
+        Ok(Box::pin(async_stream::stream! {
+            let mut call_index = 0_usize;
+            while let Some(event) = events.next().await {
+                let mapped = event.map(|event| match event {
+                    crate::OllamaStreamEvent::TextDelta { content } =>
+                        ModelStreamEvent::TextDelta { content },
+                    crate::OllamaStreamEvent::ToolCall { call } => {
+                        let delta = ToolCallDelta::new(
+                            call_index,
+                            call.arguments_json,
+                            true,
+                        )
+                        .with_call_id(format!("{}-{call_index}", call.id))
+                        .with_tool_id(call.tool_id);
+                        call_index = call_index.saturating_add(1);
+                        ModelStreamEvent::ToolCallDelta(delta)
+                    }
+                    crate::OllamaStreamEvent::Completed { model, usage } =>
+                        ModelStreamEvent::Completed { model, usage },
+                });
+                match controller.push(mapped) {
+                    Ok(validated) => yield Ok(validated.event),
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+            if let Err(error) = controller.finish_eof() {
+                yield Err(error);
+            }
+        }))
     }
 }
 

@@ -103,6 +103,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -210,6 +216,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "blake3"
+version = "1.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.0",
 ]
 
 [[package]]
@@ -457,6 +476,12 @@ dependencies = [
  "bytes",
  "memchr",
 ]
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "cookie"
@@ -1861,11 +1886,12 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "llama-harness"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "llama-harness-core",
  "llama-harness-evals",
+ "llama-harness-mcp",
  "llama-harness-observability",
  "llama-harness-ollama",
  "llama-harness-tauri",
@@ -1876,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "llama-harness-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "llama-harness-core",
@@ -1884,6 +1910,7 @@ dependencies = [
  "llama-harness-observability",
  "llama-harness-ollama",
  "llama-harness-promptfoo",
+ "rusqlite",
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.19",
@@ -1892,10 +1919,14 @@ dependencies = [
 
 [[package]]
 name = "llama-harness-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
+ "blake3",
+ "futures-core",
+ "futures-util",
  "jsonschema",
+ "llama-harness-programmatic-sandbox",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1907,9 +1938,10 @@ dependencies = [
 
 [[package]]
 name = "llama-harness-evals"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "llama-harness-core",
  "llama-harness-observability",
  "serde",
@@ -1917,23 +1949,40 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 
 [[package]]
+name = "llama-harness-mcp"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "futures-util",
+ "llama-harness-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "llama-harness-observability"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "llama-harness-core",
  "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
 name = "llama-harness-ollama"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1947,8 +1996,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "llama-harness-programmatic-sandbox"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "llama-harness-promptfoo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "llama-harness-core",
  "llama-harness-evals",
@@ -1961,7 +2018,7 @@ dependencies = [
 
 [[package]]
 name = "llama-harness-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "schemars 1.2.2",
  "serde",
@@ -1971,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "llama-harness-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "llama-harness-core",
@@ -1986,7 +2043,7 @@ dependencies = [
 
 [[package]]
 name = "llama-harness-scripted-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "llama-harness-core",
  "llama-harness-protocol",
@@ -1997,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "llama-harness-tauri"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "llama-harness-core",
@@ -2012,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "local-task-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "llama-harness",
@@ -3470,7 +3527,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-agent-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "llama-harness",
  "serde",
@@ -4770,7 +4827,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "yoke"

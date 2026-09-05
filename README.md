@@ -24,7 +24,8 @@ your application keeps ownership of its tools, data, policy, and UI.
 - One bounded `AgentRunner` for model calls and tool execution.
 - Application-defined providers, tools, policy, approvals, and event sinks.
 - Fail-closed defaults for state-changing tools and callback failures.
-- Optional Ollama, SQLite observability, evaluation, and Tauri integrations.
+- Optional guarded, shadow-first overlap for explicitly attested local reads.
+- Optional Ollama, MCP tool catalog, SQLite observability, evaluation, and Tauri integrations.
 
 ## Install
 
@@ -33,15 +34,13 @@ uses:
 
 ```toml
 [dependencies]
-llama-harness = { version = "0.1.0", features = ["ollama"] }
+llama-harness = { version = "0.2.0", features = ["ollama"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-If crates.io indexing is still in progress, pin the reviewed `0.1.0` source:
-
-```toml
-llama-harness = { git = "https://github.com/tyhuang9/llama-harness", rev = "d9f7a84a579a36cd1987c5eeeb30764be70aa8ce", features = ["ollama"] }
-```
+For a source review before crates.io indexing completes, pin an exact reviewed
+commit rather than a branch; do not substitute a Git dependency in a release
+consumer verification.
 
 Minimum supported Rust version: **1.88**.
 
@@ -51,6 +50,8 @@ Minimum supported Rust version: **1.88**.
 | `observability` | Redacted, local SQLite run and event storage |
 | `evals` | Deterministic evaluation and replay contracts |
 | `tauri` | Tauri event, approval, cancellation, and trace helpers |
+| `programmatic` | Deterministic sandbox contracts for explicitly configured embedded Rust hosts; unavailable in the managed SDK sidecar |
+| `mcp` | Transport-neutral MCP tool catalog adapters; hosts own transport and credentials |
 
 ## Quick start with Ollama
 
@@ -89,6 +90,8 @@ loop and enforces the boundaries you configure.
 
 - [Start embedding the runner](docs/embedding.md)
 - [Define tools, policy, and approvals](docs/tools-and-policies.md)
+- [Understand adaptive tool calling and recovery](docs/adaptive-tool-calling.md)
+- [Evaluate guarded speculative tool calling](docs/speculative-tool-calling.md)
 - [Add local observability](docs/observability.md)
 - [Build deterministic evaluations](docs/evaluations.md)
 - [Integrate with Tauri](docs/tauri.md)
@@ -100,6 +103,7 @@ The complete end-user documentation is published with
 
 ## Project scope
 
-The `0.1` release supports Rust applications through the `llama-harness`
-facade. TypeScript, Python, and sidecar distribution remain future work and do
-not affect the Rust crate.
+The `0.2` release supports Rust applications through the `llama-harness`
+facade and managed TypeScript and Python child-sidecar SDKs. All SDKs run the
+same local runtime protocol, retain application ownership of tools and policy,
+and never expose a network service.
