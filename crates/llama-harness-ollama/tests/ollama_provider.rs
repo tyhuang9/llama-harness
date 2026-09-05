@@ -563,6 +563,43 @@ async fn streaming_rejects_unbounded_or_incomplete_ndjson() {
     task.await.unwrap();
 }
 
+#[test]
+fn loopback_url_validation_accepts_ipv6_without_admitting_remote_addresses() {
+    for base_url in [
+        "http://localhost:11434",
+        "https://LOCALHOST:11434",
+        "http://127.0.0.1:11434",
+        "http://127.0.0.2:11434",
+        "http://[::1]:11434",
+        "https://[0:0:0:0:0:0:0:1]:11434/api/",
+    ] {
+        assert!(
+            OllamaProvider::builder().base_url(base_url).build().is_ok(),
+            "loopback URL was rejected: {base_url}"
+        );
+    }
+    for base_url in [
+        "http://0.0.0.0:11434",
+        "http://192.168.1.10:11434",
+        "http://[::]:11434",
+        "http://[::2]:11434",
+        "http://[::ffff:127.0.0.1]:11434",
+        "http://[2001:db8::1]:11434",
+        "http://[fe80::1]:11434",
+        "http://[fc00::1]:11434",
+        "http://localhost.example.com:11434",
+        "ftp://[::1]:11434",
+    ] {
+        assert!(
+            matches!(
+                OllamaProvider::builder().base_url(base_url).build(),
+                Err(HarnessError::InvalidRequest(_))
+            ),
+            "non-loopback or unsupported URL was accepted: {base_url}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn cancellation_timeout_and_loopback_controls_fail_safely() {
     assert!(matches!(

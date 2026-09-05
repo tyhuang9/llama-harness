@@ -19,8 +19,12 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 pub const LIST_TASKS_TOOL: &str = "list_tasks";
+pub const GET_TASK_TOOL: &str = "get_task";
 pub const CREATE_TASK_TOOL: &str = "create_task";
 pub const UPDATE_TASK_TOOL: &str = "update_task";
+
+/// Opt-in local-model evaluation runner and evidence contracts.
+pub mod live_eval;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Task {
@@ -96,6 +100,16 @@ impl TaskStore {
         Ok(task)
     }
 
+    fn get(&self, id: &str) -> Result<Task, TaskStoreError> {
+        self.tasks
+            .lock()
+            .map_err(|_| TaskStoreError::Poisoned)?
+            .iter()
+            .find(|task| task.id == id)
+            .cloned()
+            .ok_or_else(|| TaskStoreError::Missing(id.into()))
+    }
+
     fn update(&self, id: &str, status: String) -> Result<Task, TaskStoreError> {
         let status = status.trim().to_owned();
         if status.is_empty() {
@@ -114,6 +128,7 @@ impl TaskStore {
 #[derive(Clone, Copy)]
 enum TaskToolKind {
     List,
+    Get,
     Create,
     Update,
 }
@@ -131,6 +146,19 @@ impl TaskTool {
                 LIST_TASKS_TOOL,
                 "List application tasks.",
                 json!({"type":"object","additionalProperties":false}),
+                ToolRisk::Low,
+                true,
+                true,
+            ),
+            TaskToolKind::Get => (
+                GET_TASK_TOOL,
+                "Get one application task by its opaque ID.",
+                json!({
+                    "type":"object",
+                    "required":["id"],
+                    "properties":{"id":{"type":"string","minLength":1,"maxLength":100}},
+                    "additionalProperties":false
+                }),
                 ToolRisk::Low,
                 true,
                 true,
@@ -189,6 +217,8 @@ impl Tool for TaskTool {
     ) -> Result<ToolResult, HarnessError> {
         let task_result = match self.kind {
             TaskToolKind::List => self.store.snapshot().map(|tasks| json!({"tasks": tasks})),
+            TaskToolKind::Get => argument_string(&arguments, "id")
+                .and_then(|id| self.store.get(&id).map(|task| json!({"task": task}))),
             TaskToolKind::Create => argument_string(&arguments, "title")
                 .and_then(|title| self.store.create(title).map(|task| json!({"task": task}))),
             TaskToolKind::Update => argument_string(&arguments, "id").and_then(|id| {
@@ -224,9 +254,9 @@ impl PolicyEngine for TaskPolicy {
         _: &Value,
         _: &RunRequest,
     ) -> Result<PolicyDecision, HarnessError> {
-        if tool.id == LIST_TASKS_TOOL {
+        if matches!(tool.id.as_str(), LIST_TASKS_TOOL | GET_TASK_TOOL) {
             Ok(PolicyDecision::Allow {
-                reason: "read-only task listing".into(),
+                reason: "read-only task access".into(),
             })
         } else {
             Ok(PolicyDecision::RequireApproval {

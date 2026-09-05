@@ -424,8 +424,13 @@ fn parse_loopback_url(value: &str) -> Result<Url, HarnessError> {
         ));
     }
     let is_loopback = url.host_str().is_some_and(|host| {
+        // URL hosts retain IPv6 brackets; IpAddr expects the address alone.
+        let address = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
         host.eq_ignore_ascii_case("localhost")
-            || host
+            || address
                 .parse::<IpAddr>()
                 .is_ok_and(|address| address.is_loopback())
     });
