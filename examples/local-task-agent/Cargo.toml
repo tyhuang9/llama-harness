@@ -10,6 +10,10 @@ publish = false
 name = "local-task-agent"
 path = "src/main.rs"
 
+[[bin]]
+name = "live-task-agent-eval"
+path = "src/bin/live_task_agent_eval.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 llama-harness = { version = "0.2.0", path = "../../crates/llama-harness", default-features = false, features = ["ollama", "observability", "evals"] }

@@ -1,0 +1,141 @@
+version: 1
+id: local-task-agent-live
+name: Local Task Agent Live Tool Evaluation
+agent: local-task-agent
+agent_version: "1"
+prompt_version: local-task-agent-live-prompt-1
+models: [installed-model-required]
+strategies: [direct, adaptive]
+defaults:
+  repeat: 3
+cases:
+  - id: no-tool
+    fixture:
+      id: no-tool-fixture
+      data:
+        tasks:
+          - {id: task-1, title: Evening medication, status: open}
+    input: >-
+      Do not use any tools or change any task. Reply with exactly
+      {"status":"ok","details":"No task action was requested."}.
+    expected:
+      status: completed
+      forbidden_tools: [list_tasks, get_task, create_task, update_task]
+      max_tool_calls: 0
+  - id: approved-mutation
+    fixture:
+      id: medication-open
+      data:
+        tasks:
+          - {id: task-1, title: Evening medication, status: open}
+    input: >-
+      Mark task task-1 completed. Use update_task exactly once with id task-1
+      and status completed; the application will approve it. Then return JSON
+      with status and details that truthfully report the resulting task.
+    expected:
+      status: completed
+      required_tools: [update_task]
+      required_approval_tools: [update_task]
+      expected_tool_arguments:
+        - tool_id: update_task
+          arguments_subset: {id: task-1, status: completed}
+  - id: duplicate-prevention
+    fixture:
+      id: existing-dentist
+      data:
+        tasks:
+          - {id: task-1, title: Call dentist, status: open}
+    input: >-
+      Before creating any task named Call dentist, list the existing tasks.
+      If that exact title already exists, do not create a duplicate. Return JSON
+      with status and details that truthfully describe the unchanged state.
+    expected:
+      status: completed
+      required_tools: [list_tasks]
+      forbidden_tools: [create_task]
+  - id: dependent-lookup-update
+    fixture:
+      id: opaque-dentist
+      data:
+        tasks:
+          - {id: opaque-7, title: Call dentist, status: open}
+    input: >-
+      First list tasks to find the opaque ID for the task titled Call dentist.
+      Then update the returned ID to status completed exactly once. The update
+      requires approval. Return JSON with status and details.
+    expected:
+      status: completed
+      tool_sequence: [list_tasks, update_task]
+      required_approval_tools: [update_task]
+  - id: independent-reads
+    fixture:
+      id: two-opaque-tasks
+      data:
+        tasks:
+          - {id: alpha-41, title: Call dentist, status: open}
+          - {id: beta-92, title: Evening medication, status: completed}
+    input: >-
+      Read task alpha-41 and task beta-92 with get_task exactly once each, in
+      either order. Do not change anything. Return JSON with status and details
+      containing truthful details for both requested tasks.
+    expected:
+      status: completed
+      required_tools: [get_task]
+      forbidden_tools: [create_task, update_task]
+  - id: ambiguity
+    fixture:
+      id: ambiguous-followups
+      data:
+        tasks:
+          - {id: alpha-1, title: Follow up with client, status: open}
+          - {id: beta-2, title: Follow up with clinician, status: open}
+    input: >-
+      Mark the follow-up complete. There are two plausible tasks and no ID.
+      Do not mutate any task or request approval. Return JSON with status set to
+      clarification_needed and details asking which task to change.
+    expected:
+      status: completed
+      forbidden_tools: [create_task, update_task]
+      forbidden_approval_tools: [create_task, update_task]
+  - id: denied-approval
+    fixture:
+      id: denied-medication
+      data:
+        tasks:
+          - {id: task-1, title: Evening medication, status: open}
+    input: >-
+      Propose updating task task-1 to completed exactly once. The application
+      will deny approval, so do not claim it changed. Return JSON with status
+      not_changed and details describing the denial.
+    expected:
+      status: completed
+      required_tools: [update_task]
+      forbidden_approval_tools: [update_task]
+  - id: transient-read-retry
+    fixture:
+      id: transient-read
+      data:
+        tasks:
+          - {id: task-1, title: Evening medication, status: open}
+    input: >-
+      Read task task-1 with get_task. The first read will transiently fail;
+      retry it once, then return JSON with status and truthful details. Do not
+      change any task.
+    expected:
+      status: completed
+      required_tools: [get_task]
+      forbidden_tools: [create_task, update_task]
+  - id: bounded-read-failure
+    fixture:
+      id: bounded-read
+      data:
+        tasks:
+          - {id: task-1, title: Evening medication, status: open}
+    input: >-
+      Read task task-1 with get_task. Every read will fail. Make at most two
+      attempts, do not change anything, and return JSON with status unavailable
+      and details that honestly say the task could not be read.
+    expected:
+      forbidden_tools: [create_task, update_task]
+      max_model_calls: 3
+      max_tool_calls: 2
