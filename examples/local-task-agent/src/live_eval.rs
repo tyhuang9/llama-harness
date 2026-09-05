@@ -181,6 +181,22 @@ pub struct ToolExecutionEvidence {
     pub injected_failure: bool,
 }
 
+/// A rejected policy-to-approval or approval-to-execution binding attempt.
+#[derive(Clone, Debug, Serialize)]
+pub struct AuditViolationEvidence {
+    /// One-based violation occurrence in the sample-local audit ledger.
+    pub occurrence: u32,
+    /// Shared audit-ledger sequence for ordering against normal audit records.
+    pub audit_sequence: u64,
+    /// Immutable context, when the rejected operation supplied one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<ToolContextEvidence>,
+    /// Arguments supplied to the rejected operation.
+    pub arguments: Value,
+    /// Stable explanation of why the audit boundary rejected the operation.
+    pub reason: String,
+}
+
 /// Strategy information extracted only from runner events.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct StrategyEvidence {
@@ -254,6 +270,8 @@ pub struct LiveSampleEvidence {
     pub approvals: Vec<ApprovalEvidence>,
     /// Every dispatched tool execution observed by the wrapper.
     pub tool_executions: Vec<ToolExecutionEvidence>,
+    /// Hard failures observed while binding policy, approval, and execution boundaries.
+    pub audit_violations: Vec<AuditViolationEvidence>,
     /// Requested, selected, actual, fallback, and usage data from events.
     pub strategy: StrategyEvidence,
     /// Core-runner error when no normalized run was available.
@@ -442,6 +460,11 @@ impl EvalExecutor for LiveEvalExecutor {
         let policy_decisions = snapshot(&policy_audit);
         let approvals = snapshot(&approval_audit);
         let tool_executions = snapshot(&tool_audit);
+        let audit_violations = audit_ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .violations
+            .clone();
         let (run, error) = match run_result {
             Ok(run) => (Some(run), None),
             Err(error) => (None, Some(error.to_string())),
@@ -469,6 +492,7 @@ impl EvalExecutor for LiveEvalExecutor {
             policy_decisions,
             approvals,
             tool_executions,
+            audit_violations,
             strategy,
             error: error.clone(),
         });
@@ -606,6 +630,7 @@ struct AuditLedger {
     next_nonce: u64,
     next_sequence: u64,
     proposals: Vec<AuditProposal>,
+    violations: Vec<AuditViolationEvidence>,
 }
 
 struct AuditProposal {
@@ -618,6 +643,24 @@ struct AuditProposal {
 }
 
 impl AuditLedger {
+    fn reject_binding(
+        &mut self,
+        context: Option<ToolContextEvidence>,
+        arguments: Value,
+        reason: impl Into<String>,
+    ) -> HarnessError {
+        self.next_sequence += 1;
+        let reason = reason.into();
+        self.violations.push(AuditViolationEvidence {
+            occurrence: self.violations.len() as u32 + 1,
+            audit_sequence: self.next_sequence,
+            context,
+            arguments,
+            reason: reason.clone(),
+        });
+        HarnessError::Policy(reason)
+    }
+
     fn record_policy(
         &mut self,
         context: ToolContextEvidence,
@@ -645,22 +688,19 @@ impl AuditLedger {
         arguments: &Value,
         granted: bool,
     ) -> Result<(u64, u64), HarnessError> {
-        let proposal = self
-            .proposals
-            .iter_mut()
-            .rev()
-            .find(|proposal| {
-                same_context(&proposal.context, context)
-                    && proposal.arguments == *arguments
-                    && matches!(proposal.decision, PolicyDecision::RequireApproval { .. })
-                    && proposal.approval.is_none()
-                    && proposal.execution_sequence.is_none()
-            })
-            .ok_or_else(|| {
-                HarnessError::Policy(
-                    "approval could not be bound to one unmatched policy proposal".into(),
-                )
-            })?;
+        let Some(proposal) = self.proposals.iter_mut().rev().find(|proposal| {
+            same_context(&proposal.context, context)
+                && proposal.arguments == *arguments
+                && matches!(proposal.decision, PolicyDecision::RequireApproval { .. })
+                && proposal.approval.is_none()
+                && proposal.execution_sequence.is_none()
+        }) else {
+            return Err(self.reject_binding(
+                Some(context.clone()),
+                arguments.clone(),
+                "approval could not be bound to one unmatched policy proposal",
+            ));
+        };
         self.next_sequence += 1;
         let sequence = self.next_sequence;
         proposal.approval = Some((granted, sequence));
@@ -672,22 +712,19 @@ impl AuditLedger {
         context: &ToolContextEvidence,
         arguments: &Value,
     ) -> Result<(u64, u64), HarnessError> {
-        let proposal = self
-            .proposals
-            .iter_mut()
-            .rev()
-            .find(|proposal| {
-                same_context(&proposal.context, context)
-                    && proposal.arguments == *arguments
-                    && proposal.execution_sequence.is_none()
-                    && (matches!(proposal.decision, PolicyDecision::Allow { .. })
-                        || proposal.approval.is_some_and(|(granted, _)| granted))
-            })
-            .ok_or_else(|| {
-                HarnessError::Policy(
-                    "tool execution could not be bound to one authorized policy proposal".into(),
-                )
-            })?;
+        let Some(proposal) = self.proposals.iter_mut().rev().find(|proposal| {
+            same_context(&proposal.context, context)
+                && proposal.arguments == *arguments
+                && proposal.execution_sequence.is_none()
+                && (matches!(proposal.decision, PolicyDecision::Allow { .. })
+                    || proposal.approval.is_some_and(|(granted, _)| granted))
+        }) else {
+            return Err(self.reject_binding(
+                Some(context.clone()),
+                arguments.clone(),
+                "tool execution could not be bound to one authorized policy proposal",
+            ));
+        };
         self.next_sequence += 1;
         let sequence = self.next_sequence;
         proposal.execution_sequence = Some(sequence);
@@ -718,9 +755,18 @@ impl Tool for AuditedTaskTool {
     async fn execute(
         &self,
         arguments: Value,
-        cancellation: CancellationToken,
+        _: CancellationToken,
     ) -> Result<ToolResult, HarnessError> {
-        self.inner.execute(arguments, cancellation).await
+        let error = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reject_binding(
+                None,
+                arguments,
+                "context-free tool execution was rejected because immutable ToolCallContext is required",
+            );
+        Err(error)
     }
 
     async fn execute_with_context(
@@ -1334,21 +1380,23 @@ fn evaluate_live_contract(
     case_id: &str,
     sample: &LiveSampleEvidence,
 ) -> Vec<llama_harness::evals::AssertionFailure> {
-    let mut failures = Vec::new();
+    let mut failures = audit_violation_failures(sample);
     let contract = match case_contract(case_id) {
         Ok(contract) => contract,
         Err(error) => {
-            return vec![assertion("suite_contract", error.to_string())];
+            failures.push(assertion("suite_contract", error.to_string()));
+            return failures;
         }
     };
     let Some(run) = &sample.run else {
-        return vec![assertion(
+        failures.push(assertion(
             "runner_contract",
             sample
                 .error
                 .clone()
                 .unwrap_or_else(|| "run was absent".into()),
-        )];
+        ));
+        return failures;
     };
     if sample.initial_state != tasks_state(&contract.initial) {
         failures.push(assertion(
@@ -1664,6 +1712,11 @@ fn validate_audit_chain(
 ) -> Vec<llama_harness::evals::AssertionFailure> {
     let mut failures = Vec::new();
     let mut sequences = HashSet::new();
+    for violation in &sample.audit_violations {
+        if !sequences.insert(violation.audit_sequence) {
+            failures.push(assertion("audit_chain", "duplicate audit sequence"));
+        }
+    }
     let mut policies = HashMap::new();
     for policy in &sample.policy_decisions {
         if !sequences.insert(policy.audit_sequence) {
@@ -1803,6 +1856,24 @@ fn validate_audit_chain(
     failures
 }
 
+fn audit_violation_failures(
+    sample: &LiveSampleEvidence,
+) -> Vec<llama_harness::evals::AssertionFailure> {
+    sample
+        .audit_violations
+        .iter()
+        .map(|violation| {
+            assertion(
+                "audit_chain",
+                format!(
+                    "hard audit violation at sequence {}: {}",
+                    violation.audit_sequence, violation.reason
+                ),
+            )
+        })
+        .collect()
+}
+
 fn context_matches_run(context: &ToolContextEvidence, run: &RunResult) -> bool {
     context.run_id == run.id && context.trace_id == run.trace_id && !context.tool_id.is_empty()
 }
@@ -1918,6 +1989,7 @@ mod tests {
             policy_decisions,
             approvals,
             tool_executions,
+            audit_violations: Vec::new(),
             strategy: StrategyEvidence {
                 requested: RunStrategy::Direct,
                 selected: Some(RunStrategy::Direct),
@@ -1931,6 +2003,138 @@ mod tests {
 
     fn has_rule(failures: &[llama_harness::evals::AssertionFailure], rule: &str) -> bool {
         failures.iter().any(|failure| failure.rule == rule)
+    }
+
+    fn audited_create_tool(
+        store: Arc<TaskStore>,
+        ledger: Arc<Mutex<AuditLedger>>,
+    ) -> AuditedTaskTool {
+        AuditedTaskTool {
+            inner: Arc::new(TaskTool::new(TaskToolKind::Create, store)),
+            audit: Arc::new(Mutex::new(Vec::new())),
+            ledger,
+            read_fault: Arc::new(ReadFault::new(ReadFaultMode::None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_audit_bindings_are_retained_and_never_mutate_the_store() {
+        let naked_store = Arc::new(TaskStore::new(Vec::<Task>::new()).unwrap());
+        let naked_ledger = Arc::new(Mutex::new(AuditLedger::default()));
+        let naked_tool = audited_create_tool(Arc::clone(&naked_store), Arc::clone(&naked_ledger));
+        let naked_arguments = json!({"title": "must not be created"});
+        let error = naked_tool
+            .execute(naked_arguments.clone(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HarnessError::Policy(_)));
+        assert!(naked_store.snapshot().unwrap().is_empty());
+        let naked_violations = naked_ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .violations
+            .clone();
+        assert_eq!(naked_violations.len(), 1);
+        assert!(naked_violations[0].context.is_none());
+        assert_eq!(naked_violations[0].arguments, naked_arguments);
+
+        let orphan_ledger = Arc::new(Mutex::new(AuditLedger::default()));
+        let orphan_approval = AuditedStaticApproval {
+            grant: false,
+            audit: Arc::new(Mutex::new(Vec::new())),
+            ledger: Arc::clone(&orphan_ledger),
+        };
+        let orphan_context = ToolCallContext::new("run", "trace", "orphan", CREATE_TASK_TOOL);
+        let orphan_request = RunRequest::new(task_agent_definition("mock").unwrap(), "test");
+        let orphan_error = orphan_approval
+            .approve_with_context(
+                &orphan_context,
+                naked_tool.definition(),
+                &json!({"title": "orphan"}),
+                &orphan_request,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(orphan_error, HarnessError::Policy(_)));
+        assert_eq!(
+            orphan_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .violations
+                .len(),
+            1
+        );
+
+        let denied_store = Arc::new(TaskStore::new(Vec::<Task>::new()).unwrap());
+        let denied_ledger = Arc::new(Mutex::new(AuditLedger::default()));
+        let denied_tool =
+            audited_create_tool(Arc::clone(&denied_store), Arc::clone(&denied_ledger));
+        let denied_policy = AuditedTaskPolicy {
+            audit: Arc::new(Mutex::new(Vec::new())),
+            ledger: Arc::clone(&denied_ledger),
+        };
+        let denied_approval = AuditedStaticApproval {
+            grant: false,
+            audit: Arc::new(Mutex::new(Vec::new())),
+            ledger: Arc::clone(&denied_ledger),
+        };
+        let denied_context = ToolCallContext::new("run", "trace", "denied", CREATE_TASK_TOOL);
+        let denied_request = RunRequest::new(task_agent_definition("mock").unwrap(), "test");
+        let denied_arguments = json!({"title": "must remain absent"});
+        assert!(matches!(
+            denied_policy
+                .decide_with_context(
+                    &denied_context,
+                    denied_tool.definition(),
+                    &denied_arguments,
+                    &denied_request,
+                )
+                .await
+                .unwrap(),
+            PolicyDecision::RequireApproval { .. }
+        ));
+        assert!(
+            !denied_approval
+                .approve_with_context(
+                    &denied_context,
+                    denied_tool.definition(),
+                    &denied_arguments,
+                    &denied_request,
+                )
+                .await
+                .unwrap()
+                .granted
+        );
+        let denied_error = denied_tool
+            .execute_with_context(
+                &denied_context,
+                denied_arguments.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(denied_error, HarnessError::Policy(_)));
+        assert!(denied_store.snapshot().unwrap().is_empty());
+        let denied_violations = denied_ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .violations
+            .clone();
+        assert_eq!(denied_violations.len(), 1);
+        assert_eq!(
+            denied_violations[0].context.as_ref().unwrap().call_id,
+            "denied"
+        );
+        assert_eq!(denied_violations[0].arguments, denied_arguments);
+
+        let mut sample = fixture("no-tool");
+        sample.audit_violations = denied_violations;
+        sample.run = None;
+        sample.error = None;
+        assert!(has_rule(
+            &evaluate_live_contract("no-tool", &sample),
+            "audit_chain"
+        ));
     }
 
     #[test]
