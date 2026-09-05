@@ -21,6 +21,12 @@ All notable changes to this project are documented here.
   counts instead of reinjecting raw intermediate tool data.
 - Document the 0.1-to-0.2 migration, release sequencing, and immutable-package
   rollback boundaries.
+- Accept IPv6 loopback Ollama endpoints while retaining the loopback-only
+  network boundary.
+- Add opt-in, audited live tool-calling evaluation with retained model-specific
+  evidence. Gemma passed the guided task suite; the measured LFM profile remains
+  unqualified. Adaptive used Direct fallback in every measured sample, so this
+  evidence does not establish DAG, Programmatic, or speculative execution.
 
 ## 0.1.0 — Superseded development baseline
 
