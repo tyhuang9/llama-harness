@@ -27,6 +27,9 @@ All notable changes to this project are documented here.
   evidence. Gemma passed the guided task suite; the measured LFM profile remains
   unqualified. Adaptive used Direct fallback in every measured sample, so this
   evidence does not establish DAG, Programmatic, or speculative execution.
+- Add a bounded, balanced local benchmark with independent raw-evidence audit.
+  Gemma passed 120/120 measured dependent-update and eight-read samples; these
+  Direct execution timings establish a workload baseline without promotion.
 
 ## 0.1.0 — Superseded development baseline
 
