@@ -7,6 +7,47 @@ tools, policies, approvals, and the `AgentRunner` instance. This keeps
 evaluations on the same runtime path as an application while avoiding a generic
 shell, filesystem, or database tool.
 
+## Opt-in evaluation with installed local models
+
+The local-task-agent example includes a separate live runner. Ordinary CI
+does not invoke it or require Ollama. An explicitly requested live invocation
+requires a reachable loopback Ollama service and an installed model; it fails
+with a nonzero exit code when prerequisites or assertions fail.
+
+```powershell
+cargo run --locked -p local-task-agent --bin live-task-agent-eval -- --model <installed-model> --strategy direct adaptive --repeat 3 --temperature 0 --top-p 1 --output-tokens 2048 --max-model-call-duration-ms 120000 --max-run-duration-ms 300000 --output live-results.json
+```
+
+Use `--case <case-id>` for a focused run. The application creates a fresh
+in-memory fixture and audits actual tool dispatch, canonical arguments,
+policy decisions, approvals, exact final state and final-answer facts.
+It uses the existing `EvalExecutor` and `AgentRunner`; model responses are
+not scripted during a live run. Deterministic tests separately verify the
+evaluator's assertions and fixture wiring.
+
+The JSON artifact retains the requested strategy, actual strategy from runner
+events, provider-reported usage, generation settings, source provenance,
+synthetic transcripts and ordered application audits. Optional
+`--environment-json <path>` attaches locally collected model digests, Ollama
+version and host information. Capture these before a measured cohort and
+retain failed discovery runs separately when changing prompts or assertions.
+Thinking mode and seeds are not exposed by the current provider; do not claim
+they were controlled.
+
+A `completed` harness run means that the model returned a terminal answer;
+it does not prove that the user's task succeeded. A fabricated confirmation
+with zero tool execution fails the live suite even when the run status is
+`completed`. Output-format failures, incorrect task facts, denied effects,
+model mistakes, evaluator defects and harness defects require separate
+diagnosis. Never derive a correctness rate from cases with no assertions.
+
+The current Ollama integration lacks the structured-plan and Programmatic
+contracts. Explicit requests for those strategies fail admission; Adaptive
+fallback to Direct is recorded as Direct execution. Read the
+[September 5 local results](../evals/local-task-agent/live-ollama-2026-09-05.md)
+and the [follow-up benchmark protocol](../evals/local-task-agent/strategy-benchmark-plan.md)
+before interpreting live results as production or promotion evidence.
+
 ## Suite format
 
 Suites use version `1`, a stable suite and agent ID, one or more model IDs, defaults, and explicit cases. Each case can provide an isolated fixture, input, history/context, agent or prompt-version/override, tags, and deterministic expectations.
